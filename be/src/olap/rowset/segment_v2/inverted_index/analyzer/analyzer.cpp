@@ -65,6 +65,17 @@ std::unique_ptr<lucene::analysis::Analyzer> InvertedIndexAnalyzer::create_analyz
             chinese_analyzer->setMode(lucene::analysis::AnalyzerMode::All);
         }
         analyzer = std::move(chinese_analyzer);
+    } else if (analyser_type == InvertedIndexParserType::PARSER_IK) {
+        auto ik_analyzer =
+                std::make_unique<lucene::analysis::LanguageBasedAnalyzer>(L"ik", false);
+        ik_analyzer->initDict(config::inverted_index_ik_dict_path);
+        auto mode = inverted_index_ctx->parser_mode;
+        if (mode == INVERTED_INDEX_PARSER_SMART) {
+            ik_analyzer->setMode(lucene::analysis::AnalyzerMode::IK_Smart);
+        } else {
+            ik_analyzer->setMode(lucene::analysis::AnalyzerMode::IK_Max_Word);
+        }
+        analyzer = std::move(ik_analyzer);
     } else {
         // default
         analyzer = std::make_unique<lucene::analysis::SimpleAnalyzer<char>>();
