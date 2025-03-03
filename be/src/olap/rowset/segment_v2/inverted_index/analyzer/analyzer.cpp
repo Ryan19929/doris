@@ -29,6 +29,7 @@
 #pragma clang diagnostic pop
 #endif
 #include "olap/rowset/segment_v2/inverted_index/analyzer/icu/ICUAnalyzer.h"
+#include "olap/rowset/segment_v2/inverted_index/analyzer/ik/IKAnalyzer.h"
 #include "olap/rowset/segment_v2/inverted_index/char_filter/char_filter_factory.h"
 
 namespace doris::segment_v2::inverted_index {
@@ -69,6 +70,16 @@ std::unique_ptr<lucene::analysis::Analyzer> InvertedIndexAnalyzer::create_analyz
     } else if (analyser_type == InvertedIndexParserType::PARSER_ICU) {
         analyzer = std::make_unique<ICUAnalyzer>();
         analyzer->initDict(config::inverted_index_dict_path + "/icu");
+    } else if (analyser_type == InvertedIndexParserType::PARSER_IK) {
+        auto ik_analyzer = std::make_unique<IKAnalyzer>();
+        ik_analyzer->initDict(config::inverted_index_dict_path + "/ik");
+        auto mode = inverted_index_ctx->parser_mode;
+        if (mode == INVERTED_INDEX_PARSER_SMART) {
+            ik_analyzer->setMode(true);
+        } else {
+            ik_analyzer->setMode(false);
+        }
+        analyzer = std::move(ik_analyzer);
     } else {
         // default
         analyzer = std::make_unique<lucene::analysis::SimpleAnalyzer<char>>();

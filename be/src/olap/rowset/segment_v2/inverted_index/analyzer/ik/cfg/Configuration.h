@@ -1,5 +1,21 @@
-#pragma once
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
+#pragma once
 
 #include <string>
 #include <vector>
@@ -21,7 +37,8 @@ private:
     std::vector<std::string> ext_stop_word_dict_files_;
 
 public:
-    Configuration() : use_smart_(true), enable_lowercase_(true) {
+    Configuration(bool use_smart = true, bool enable_lowercase_ = true) : use_smart_(use_smart),
+              enable_lowercase_(enable_lowercase_) {
         ext_dict_files_ = {"extra_main.dic", "extra_single_word.dic", "extra_single_word_full.dic",
                            "extra_single_word_low_freq.dic"};
 

@@ -1,28 +1,41 @@
 #include "IKTokenizer.h"
 
-#include "CLucene/_ApiHeader.h"
-#include "core/IKSegmenter.h"
-#include "CLucene/util/CLStreams.h"
-
 namespace doris::segment_v2 {
-CL_NS_USE(analysis)
-CL_NS_USE(util)
 
-IKTokenizer::IKTokenizer(Reader* reader, std::shared_ptr<Configuration> config)
-        : Tokenizer(reader), config_(config) {
-    reset(reader);
-    Tokenizer::lowercase = false;
-    Tokenizer::ownReader = false;
+IKTokenizer::IKTokenizer() {
+    this->lowercase = false;
+    this->ownReader = false;
+
+    config_ = std::make_shared<Configuration>(true, false);
 }
 
-IKTokenizer::IKTokenizer(Reader* reader, std::shared_ptr<Configuration> config, bool isSmart,
-                         bool in_lowercase, bool in_ownReader)
-        : Tokenizer(reader), config_(config) {
-    config_->setUseSmart(isSmart);
-    config_->setEnableLowercase(in_lowercase);
-    reset(reader);
-    Tokenizer::lowercase = in_lowercase;
-    Tokenizer::ownReader = in_ownReader;
+IKTokenizer::IKTokenizer(bool lower_case, bool own_reader, bool is_smart) : IKTokenizer() {
+    this->lowercase = lower_case;
+    this->ownReader = own_reader;
+    config_->setEnableLowercase(lower_case);
+    config_->setUseSmart(is_smart);
+}
+
+// IKTokenizer::IKTokenizer(Reader* reader, std::shared_ptr<Configuration> config)
+//         : Tokenizer(reader), config_(config) {
+//     reset(reader);
+//     Tokenizer::lowercase = false;
+//     Tokenizer::ownReader = false;
+// }
+
+// IKTokenizer::IKTokenizer(Reader* reader, std::shared_ptr<Configuration> config, bool isSmart,
+//                          bool in_lowercase, bool in_ownReader)
+//         : Tokenizer(reader), config_(config) {
+//     config_->setUseSmart(isSmart);
+//     config_->setEnableLowercase(in_lowercase);
+//     reset(reader);
+//     Tokenizer::lowercase = in_lowercase;
+//     Tokenizer::ownReader = in_ownReader;
+// }
+
+void IKTokenizer::initialize(const std::string& dictPath) {
+    config_->setDictPath(dictPath);
+    Dictionary::initial(*config_);
 }
 
 Token* IKTokenizer::next(Token* token) {
@@ -42,7 +55,7 @@ Token* IKTokenizer::next(Token* token) {
     return token;
 }
 
-void IKTokenizer::reset(Reader* reader) {
+void IKTokenizer::reset(lucene::util::Reader* reader) {
     this->input = reader;
     this->buffer_index_ = 0;
     this->data_length_ = 0;
@@ -60,4 +73,4 @@ void IKTokenizer::reset(Reader* reader) {
     data_length_ = tokens_text_.size();
 }
 
-}
+} // namespace doris::segment_v2
