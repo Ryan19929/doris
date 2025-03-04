@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 #include "AnalyzeContext.h"
 
 namespace doris::segment_v2 {
@@ -21,6 +38,8 @@ AnalyzeContext::AnalyzeContext(IKMemoryPool<Cell>& pool)
 AnalyzeContext::~AnalyzeContext() = default;
 
 void AnalyzeContext::reset() {
+    buffer_offset_ = 0;
+    segment_buff_.clear();
     buffer_locker_ = 0;
     org_lexemes_.clear();
     available_ = 0;
@@ -41,8 +60,8 @@ size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
     if (buffer_offset_ == 0) {
         readCount = reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE);
 
-        readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
-
+        // readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
+        readCount = max(0, readCount);
         CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
                                            config_->isEnableLowercase());
     } else {
@@ -52,12 +71,12 @@ size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
                     segment_buff_.data() + typed_runes_[cursor_].getNextBytePosition(), offset);
             readCount = std::max(
                     0, reader->readCopy(segment_buff_.data() + offset, 0, BUFF_SIZE - offset));
-            readCount =
-                    CharacterUtil::adjustToCompleteChar(segment_buff_.data() + offset, readCount) +
-                    offset;
+            // readCount =
+            //         CharacterUtil::adjustToCompleteChar(segment_buff_.data() + offset, readCount) +
+            //         offset;
         } else {
             readCount = std::max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
-            readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
+            //readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
         }
 
         CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,

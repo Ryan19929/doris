@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 #include "IKTokenizer.h"
 
 namespace doris::segment_v2 {
@@ -7,6 +24,7 @@ IKTokenizer::IKTokenizer() {
     this->ownReader = false;
 
     config_ = std::make_shared<Configuration>(true, false);
+    ik_segmenter_ = std::make_unique<IKSegmenter>();
 }
 
 IKTokenizer::IKTokenizer(bool lower_case, bool own_reader, bool is_smart) : IKTokenizer() {
@@ -15,23 +33,6 @@ IKTokenizer::IKTokenizer(bool lower_case, bool own_reader, bool is_smart) : IKTo
     config_->setEnableLowercase(lower_case);
     config_->setUseSmart(is_smart);
 }
-
-// IKTokenizer::IKTokenizer(Reader* reader, std::shared_ptr<Configuration> config)
-//         : Tokenizer(reader), config_(config) {
-//     reset(reader);
-//     Tokenizer::lowercase = false;
-//     Tokenizer::ownReader = false;
-// }
-
-// IKTokenizer::IKTokenizer(Reader* reader, std::shared_ptr<Configuration> config, bool isSmart,
-//                          bool in_lowercase, bool in_ownReader)
-//         : Tokenizer(reader), config_(config) {
-//     config_->setUseSmart(isSmart);
-//     config_->setEnableLowercase(in_lowercase);
-//     reset(reader);
-//     Tokenizer::lowercase = in_lowercase;
-//     Tokenizer::ownReader = in_ownReader;
-// }
 
 void IKTokenizer::initialize(const std::string& dictPath) {
     config_->setDictPath(dictPath);
@@ -62,11 +63,11 @@ void IKTokenizer::reset(lucene::util::Reader* reader) {
     this->tokens_text_.clear();
 
     buffer_.reserve(input->size());
-
-    IKSegmentSingleton::getInstance().setContext(reader, config_);
+    ik_segmenter_->reset(reader);
+    ik_segmenter_->setContext(reader, config_);
 
     Lexeme lexeme;
-    while (IKSegmentSingleton::getInstance().next(lexeme)) {
+    while (ik_segmenter_->next(lexeme)) {
         tokens_text_.emplace_back(lexeme.getText());
     }
 
