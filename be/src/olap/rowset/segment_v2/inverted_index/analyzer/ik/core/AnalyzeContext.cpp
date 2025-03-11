@@ -58,10 +58,8 @@ void AnalyzeContext::setConfig(std::shared_ptr<Configuration> configuration) {
 size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
     int32_t readCount = 0;
     if (buffer_offset_ == 0) {
-        readCount = reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE);
-
-        // readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
-        readCount = max(0, readCount);
+        readCount = max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
+        readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
         CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
                                            config_->isEnableLowercase());
     } else {
@@ -71,18 +69,20 @@ size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
                     segment_buff_.data() + typed_runes_[cursor_].getNextBytePosition(), offset);
             readCount = std::max(
                     0, reader->readCopy(segment_buff_.data() + offset, 0, BUFF_SIZE - offset));
-            // readCount =
-            //         CharacterUtil::adjustToCompleteChar(segment_buff_.data() + offset, readCount) +
-            //         offset;
+            readCount =
+                     CharacterUtil::adjustToCompleteChar(segment_buff_.data() + offset, readCount) +
+                     offset;
         } else {
             readCount = std::max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
-            //readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
+            readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
         }
-
         CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
                                            config_->isEnableLowercase());
     }
-
+    // Ensure readCount is set to 0 in case of
+    // an exceptional situation where typed_runes_ is empty.
+    readCount = typed_runes_.size() == 0 ? 0 : readCount;
+         
     available_ = readCount;
     cursor_ = 0;
     return readCount;

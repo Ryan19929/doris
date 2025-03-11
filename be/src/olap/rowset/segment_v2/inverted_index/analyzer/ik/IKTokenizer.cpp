@@ -34,10 +34,6 @@ IKTokenizer::IKTokenizer(bool lower_case, bool own_reader, bool is_smart) : IKTo
     config_->setUseSmart(is_smart);
 }
 
-void IKTokenizer::initialize(const std::string& dictPath) {
-    config_->setDictPath(dictPath);
-    Dictionary::initial(*config_);
-}
 
 Token* IKTokenizer::next(Token* token) {
     if (buffer_index_ >= data_length_) {
@@ -65,7 +61,7 @@ void IKTokenizer::reset(lucene::util::Reader* reader) {
     buffer_.reserve(input->size());
     ik_segmenter_->reset(reader);
     ik_segmenter_->setContext(reader, config_);
-
+   // ik_segmenter_->printCursor();
     Lexeme lexeme;
     while (ik_segmenter_->next(lexeme)) {
         tokens_text_.emplace_back(lexeme.getText());

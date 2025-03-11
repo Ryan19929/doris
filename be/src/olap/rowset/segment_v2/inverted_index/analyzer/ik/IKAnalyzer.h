@@ -26,19 +26,23 @@ public:
     IKAnalyzer() {
         _lowercase = true;
         _ownReader = false;
+        config_ = std::make_shared<Configuration>(true, false);
+
     }
 
     ~IKAnalyzer() override = default;
 
     bool isSDocOpt() override { return true; }
 
-    void initDict(const std::string& dictPath) override { dictPath_ = dictPath; }
+    void initDict(const std::string& dictPath) override { 
+        config_->setDictPath(dictPath);
+        Dictionary::initial(*config_);
+    }
 
     void setMode(bool isSmart) {isSmart_ = isSmart;}
 
     TokenStream* tokenStream(const TCHAR* fieldName, lucene::util::Reader* reader) override {
         auto* tokenizer = _CLNEW IKTokenizer(_lowercase, _ownReader, isSmart_);
-        tokenizer->initialize(dictPath_);
         tokenizer->reset(reader);
         return (TokenStream*)tokenizer;
     }
@@ -47,7 +51,6 @@ public:
                                      lucene::util::Reader* reader) override {
         if (tokenizer_ == nullptr) {
             tokenizer_ = std::make_unique<IKTokenizer>(_lowercase, _ownReader, isSmart_);
-            tokenizer_->initialize(dictPath_);
         }
         tokenizer_->reset(reader);
         return (TokenStream*)tokenizer_.get();
@@ -57,6 +60,7 @@ private:
     std::string dictPath_;
     std::unique_ptr<IKTokenizer> tokenizer_;
     bool isSmart_;
+    std::shared_ptr<Configuration> config_;
 };
 
 } // namespace doris::segment_v2
