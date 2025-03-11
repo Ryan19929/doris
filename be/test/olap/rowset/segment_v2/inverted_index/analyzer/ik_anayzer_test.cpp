@@ -91,10 +91,6 @@ TEST_F(IKTokenizerTest, TestIKTokenizer) {
     datas.clear();
 }
 
-TEST_F(IKTokenizerTest, TestSpeedTest) {
-    // 构造测试文件路径（需替换为实际路径）
-    std::string testFile = "./be/dict/ik/ratings.csv";
-
 TEST_F(IKTokenizerTest, TestIKRareTokenizer) {
     std::vector<std::string> datas;
 
