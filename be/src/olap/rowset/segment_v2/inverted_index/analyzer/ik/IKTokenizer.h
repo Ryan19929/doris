@@ -31,11 +31,10 @@ namespace doris::segment_v2 {
 
 class IKTokenizer : public Tokenizer {
 public:
-    IKTokenizer();
-    IKTokenizer(bool lowercase, bool ownReader, bool isSmart);
+    IKTokenizer() = delete;
+    IKTokenizer(std::shared_ptr<Configuration> config, bool lowercase, bool ownReader);
     ~IKTokenizer() override = default;
 
-    void initialize(const std::string& dictPath);
     Token* next(Token* token) override;
     void reset(lucene::util::Reader* reader) override;
 

@@ -19,7 +19,7 @@
 
 namespace doris::segment_v2 {
 
-AnalyzeContext::AnalyzeContext(IKMemoryPool<Cell>& pool)
+  AnalyzeContext::AnalyzeContext(IKMemoryPool<Cell>& pool, std::shared_ptr<Configuration> config)
         : segment_buff_(),
           typed_runes_(),
           buffer_offset_(0),
@@ -30,7 +30,7 @@ AnalyzeContext::AnalyzeContext(IKMemoryPool<Cell>& pool)
           org_lexemes_(pool),
           path_map_(),
           results_(),
-          config_(nullptr) {
+          config_(config) {
     segment_buff_.resize(BUFF_SIZE);
     typed_runes_.reserve(BUFF_SIZE);
 }
@@ -51,9 +51,6 @@ void AnalyzeContext::reset() {
     results_ = IKQue<Lexeme>();
 }
 
-void AnalyzeContext::setConfig(std::shared_ptr<Configuration> configuration) {
-    config_ = configuration;
-}
 
 size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
     int32_t readCount = 0;

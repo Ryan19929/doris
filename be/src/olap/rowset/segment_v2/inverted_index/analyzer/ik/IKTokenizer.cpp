@@ -19,21 +19,12 @@
 
 namespace doris::segment_v2 {
 
-IKTokenizer::IKTokenizer() {
-    this->lowercase = false;
-    this->ownReader = false;
-
-    config_ = std::make_shared<Configuration>(true, false);
-    ik_segmenter_ = std::make_unique<IKSegmenter>();
-}
-
-IKTokenizer::IKTokenizer(bool lower_case, bool own_reader, bool is_smart) : IKTokenizer() {
+IKTokenizer::IKTokenizer(std::shared_ptr<Configuration> config, bool lower_case, bool own_reader) {
     this->lowercase = lower_case;
     this->ownReader = own_reader;
-    config_->setEnableLowercase(lower_case);
-    config_->setUseSmart(is_smart);
+    config_ = config;
+    ik_segmenter_ = std::make_unique<IKSegmenter>(config_);
 }
-
 
 Token* IKTokenizer::next(Token* token) {
     if (buffer_index_ >= data_length_) {
@@ -60,8 +51,6 @@ void IKTokenizer::reset(lucene::util::Reader* reader) {
 
     buffer_.reserve(input->size());
     ik_segmenter_->reset(reader);
-    ik_segmenter_->setContext(reader, config_);
-   // ik_segmenter_->printCursor();
     Lexeme lexeme;
     while (ik_segmenter_->next(lexeme)) {
         tokens_text_.emplace_back(lexeme.getText());

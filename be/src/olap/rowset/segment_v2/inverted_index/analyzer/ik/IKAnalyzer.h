@@ -27,22 +27,21 @@ public:
         _lowercase = true;
         _ownReader = false;
         config_ = std::make_shared<Configuration>(true, false);
-
     }
 
     ~IKAnalyzer() override = default;
 
     bool isSDocOpt() override { return true; }
 
-    void initDict(const std::string& dictPath) override { 
+    void initDict(const std::string& dictPath) override {
         config_->setDictPath(dictPath);
         Dictionary::initial(*config_);
     }
 
-    void setMode(bool isSmart) {isSmart_ = isSmart;}
+    void setMode(bool isSmart) { config_->setUseSmart(isSmart); }
 
     TokenStream* tokenStream(const TCHAR* fieldName, lucene::util::Reader* reader) override {
-        auto* tokenizer = _CLNEW IKTokenizer(_lowercase, _ownReader, isSmart_);
+        auto* tokenizer = _CLNEW IKTokenizer(config_, _lowercase, _ownReader);
         tokenizer->reset(reader);
         return (TokenStream*)tokenizer;
     }
@@ -50,7 +49,7 @@ public:
     TokenStream* reusableTokenStream(const TCHAR* fieldName,
                                      lucene::util::Reader* reader) override {
         if (tokenizer_ == nullptr) {
-            tokenizer_ = std::make_unique<IKTokenizer>(_lowercase, _ownReader, isSmart_);
+            tokenizer_ = std::make_unique<IKTokenizer>(config_, _lowercase, _ownReader);
         }
         tokenizer_->reset(reader);
         return (TokenStream*)tokenizer_.get();
@@ -59,7 +58,6 @@ public:
 private:
     std::string dictPath_;
     std::unique_ptr<IKTokenizer> tokenizer_;
-    bool isSmart_;
     std::shared_ptr<Configuration> config_;
 };
 

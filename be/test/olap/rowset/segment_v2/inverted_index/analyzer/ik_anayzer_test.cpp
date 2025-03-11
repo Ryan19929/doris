@@ -21,6 +21,8 @@
 #include <memory>
 #include <sstream>
 #include <filesystem>
+
+#include "olap/rowset/segment_v2/inverted_index/analyzer/ik/IKAnalyzer.h"
 #include "olap/rowset/segment_v2/inverted_index/analyzer/ik/IKAnalyzer.h"
 #include "CLucene/analysis/LanguageBasedAnalyzer.h"
 using namespace lucene::analysis;
@@ -89,6 +91,9 @@ TEST_F(IKTokenizerTest, TestIKTokenizer) {
     datas.clear();
 }
 
+TEST_F(IKTokenizerTest, TestSpeedTest) {
+    // 构造测试文件路径（需替换为实际路径）
+    std::string testFile = "./be/dict/ik/ratings.csv";
 
 TEST_F(IKTokenizerTest, TestIKRareTokenizer) {
     std::vector<std::string> datas;

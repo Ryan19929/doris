@@ -17,20 +17,16 @@
 
 #include "IKSegmenter.h"
 
+#include <memory>
+
 namespace doris::segment_v2 {
 
-IKSegmenter::IKSegmenter()
+IKSegmenter::IKSegmenter(std::shared_ptr<Configuration> config)
         : pool_(10000),
-          context_(std::make_unique<AnalyzeContext>(pool_)),
+          config_(config),
+          context_(std::make_unique<AnalyzeContext>(pool_, config_)),
           segmenters_(loadSegmenters()),
           arbitrator_(IKArbitrator(pool_)) {}
-
-void IKSegmenter::setContext(lucene::util::Reader* input, std::shared_ptr<Configuration> config) {
-    context_->reset();
-    input_ = input;
-    config_ = config;
-    context_->setConfig(config);
-}
 
 std::vector<std::unique_ptr<ISegmenter>> IKSegmenter::loadSegmenters() {
     std::vector<std::unique_ptr<ISegmenter>> segmenters;

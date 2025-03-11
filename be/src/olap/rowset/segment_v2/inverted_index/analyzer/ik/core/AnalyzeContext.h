@@ -79,11 +79,10 @@ public:
         LETTER_SEGMENTER
     };
     const CharacterUtil::TypedRuneArray& getTypedRuneArray() const { return typed_runes_; }
-    explicit AnalyzeContext(IKMemoryPool<Cell>& pool);
+    explicit AnalyzeContext(IKMemoryPool<Cell>& pool, std::shared_ptr<Configuration> config);
     virtual ~AnalyzeContext();
 
     void reset();
-    void setConfig(std::shared_ptr<Configuration> configuration);
 
     size_t getCursor() const { return cursor_; }
     const char* getSegmentBuff() const { return segment_buff_.c_str(); }
