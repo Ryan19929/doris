@@ -13,7 +13,7 @@
 
 namespace doris::segment_v2 {
 
-class CLUCENE_EXPORT DictSegment : public std::enable_shared_from_this<DictSegment> {
+class DictSegment : public std::enable_shared_from_this<DictSegment> {
 private:
     static constexpr size_t ARRAY_LENGTH_LIMIT = 3;
     int32_t key_char_;

@@ -27,7 +27,7 @@
 
 namespace doris::segment_v2 {
 
-class CLUCENE_EXPORT Lexeme {
+class Lexeme {
 public:
     enum class Type {
         // Unknown

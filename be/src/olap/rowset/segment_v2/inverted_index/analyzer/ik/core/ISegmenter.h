@@ -22,7 +22,7 @@
 
 namespace doris::segment_v2 {
 
-class CLUCENE_EXPORT ISegmenter {
+class ISegmenter {
 public:
     virtual ~ISegmenter() {}
 

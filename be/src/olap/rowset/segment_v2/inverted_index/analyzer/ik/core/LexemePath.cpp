@@ -17,8 +17,6 @@
 
 #include "LexemePath.h"
 
-#include <sstream>
-
 namespace doris::segment_v2 {
 
 LexemePath::LexemePath(IKMemoryPool<Cell>& pool)
@@ -29,7 +27,7 @@ LexemePath::LexemePath(LexemePath& other, IKMemoryPool<Cell>& pool)
           path_begin_(other.path_begin_),
           path_end_(other.path_end_),
           payload_length_(other.payload_length_) {
-    auto c = other.getHead();
+    auto* c = other.getHead();
     while (c != nullptr) {
         addLexeme(c->getLexeme());
         c = c->getNext();
@@ -64,9 +62,7 @@ bool LexemePath::addCrossLexeme(Lexeme& lexeme) {
 
     if (checkCross(lexeme)) {
         addLexeme(lexeme);
-        if (lexeme.getByteBegin() + lexeme.getByteLength() > path_end_) {
-            path_end_ = lexeme.getByteBegin() + lexeme.getByteLength();
-        }
+        path_end_ = std::max(path_end_, lexeme.getByteBegin() + lexeme.getByteLength());
         payload_length_ = path_end_ - path_begin_;
         return true;
     }
@@ -89,9 +85,9 @@ bool LexemePath::addNotCrossLexeme(Lexeme& lexeme) {
 
     addLexeme(lexeme);
     payload_length_ += lexeme.getByteLength();
-    auto head = peekFirst();
+    const auto* head = peekFirst();
     path_begin_ = head->getByteBegin();
-    auto tail = peekLast();
+    const auto* tail = peekLast();
     path_end_ = tail->getByteBegin() + tail->getByteLength();
     return true;
 }
@@ -107,7 +103,7 @@ std::optional<Lexeme> LexemePath::removeTail() {
         payload_length_ = 0;
     } else {
         payload_length_ -= tail->getByteLength();
-        auto newTail = peekLast();
+        const auto* newTail = peekLast();
         if (newTail) {
             path_end_ = newTail->getByteBegin() + newTail->getByteLength();
         }
@@ -123,7 +119,7 @@ bool LexemePath::checkCross(const Lexeme& lexeme) const {
 
 size_t LexemePath::getXWeight() const {
     size_t product = 1;
-    auto c = getHead();
+    const auto* c = getHead();
     while (c != nullptr) {
         product *= c->getLexeme().getByteLength();
         c = c->getNext();
@@ -134,7 +130,7 @@ size_t LexemePath::getXWeight() const {
 size_t LexemePath::getPWeight() const {
     size_t pWeight = 0;
     size_t p = 0;
-    auto c = getHead();
+    const auto* c = getHead();
     while (c != nullptr) {
         p++;
         pWeight += p * c->getLexeme().getByteLength();

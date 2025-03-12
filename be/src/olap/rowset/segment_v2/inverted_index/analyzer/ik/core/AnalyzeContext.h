@@ -36,7 +36,7 @@
 
 namespace doris::segment_v2 {
 
-class CLUCENE_EXPORT AnalyzeContext {
+class AnalyzeContext {
 private:
     static const size_t BUFF_SIZE = 4096;
     static const size_t BUFF_EXHAUST_CRITICAL = 100;

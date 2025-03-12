@@ -19,6 +19,8 @@
 
 #include <memory>
 #include <optional>
+#include <algorithm>
+#include <sstream>
 
 #include "CLucene/_ApiHeader.h"
 #include <parallel_hashmap/phmap.h>
@@ -26,7 +28,7 @@
 
 namespace doris::segment_v2 {
 
-class CLUCENE_EXPORT LexemePath : public QuickSortSet {
+class LexemePath : public QuickSortSet {
 public:
     LexemePath(IKMemoryPool<Cell>& pool);
     LexemePath(LexemePath& other, IKMemoryPool<Cell>& pool);
