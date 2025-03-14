@@ -25,6 +25,7 @@
 #include <string>
 
 #include "CLucene/_ApiHeader.h"
+#include "common/logging.h"
 #include "../cfg/Configuration.h"
 #include "CharacterUtil.h"
 #include "LexemePath.h"

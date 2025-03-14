@@ -9,6 +9,7 @@
 
 #include "CLucene/LuceneThreads.h"
 #include "CLucene/analysis/AnalysisHeader.h"
+#include "common/logging.h"
 #include "../cfg/Configuration.h"
 #include "../core/CharacterUtil.h"
 #include "DictSegment.h"
@@ -75,10 +76,26 @@ public:
 
     static Dictionary* getSingleton(const Configuration& cfg, bool useExtDict = false) {
         std::call_once(init_flag_, [&]() {
-            singleton_ = new Dictionary(cfg, useExtDict);
-            singleton_->loadMainDict();
-            singleton_->loadQuantifierDict();
-            singleton_->loadStopWordDict();
+            try {
+                singleton_ = new Dictionary(cfg, useExtDict);
+                try {
+                    singleton_->loadMainDict();
+                    singleton_->loadQuantifierDict();
+                    singleton_->loadStopWordDict();
+                } catch (...) {
+                    // If dictionary loading fails, log the error but don't terminate initialization
+                    LOG(ERROR) << "Error during dictionary initialization";
+                }
+            } catch (const std::bad_alloc&) {
+                // Memory allocation failure is a critical error
+                LOG(ERROR) << "Failed to allocate memory for Dictionary";
+                // In this case, we cannot continue and must throw an exception
+                _CLTHROWA(CL_ERR_OutOfMemory, "Failed to allocate memory for Dictionary");
+            } catch (...) {
+                // Other exceptions
+                LOG(ERROR) << "Exception during Dictionary initialization";
+                _CLTHROWA(CL_ERR_Runtime, "Exception during Dictionary initialization");
+            }
         });
         return singleton_;
     }

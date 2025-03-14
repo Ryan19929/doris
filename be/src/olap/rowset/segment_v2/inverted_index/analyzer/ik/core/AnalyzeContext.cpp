@@ -74,7 +74,12 @@ size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
     }
     // Ensure readCount is set to 0 in case of
     // an exceptional situation where typed_runes_ is empty.
-    readCount = typed_runes_.size() == 0 ? 0 : readCount;
+    if (typed_runes_.size() == 0 && readCount != 0) {
+        std::string error_msg = "typed_runes_ is empty, but readCount is not 0";
+        error_msg += std::to_string(readCount) + " " + std::to_string(typed_runes_.size());
+        LOG(ERROR) << error_msg;
+        readCount = 0;
+    }
          
     available_ = readCount;
     cursor_ = 0;
