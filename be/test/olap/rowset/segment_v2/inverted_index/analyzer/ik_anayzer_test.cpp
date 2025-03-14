@@ -66,7 +66,7 @@ protected:
 };
 
 // Test for Dictionary exception handling
-TEST_F(IKTokenizerTest, Z_TestDictionaryExceptionHandling) {
+TEST_F(IKTokenizerTest, TestDictionaryExceptionHandling) {
     // Test case 1: Test loadDictFile with non-existent file
     Configuration cfg;
     cfg.setDictPath("/non_existent_path");
