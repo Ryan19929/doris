@@ -163,31 +163,19 @@ TEST_F(IKTokenizerTest, TestSingleByteInput) {
     ASSERT_EQ(datas[0], "b");
 }
 
-TEST_F(IKTokenizerTest, TestMultiByteCharBoundary) {
-    std::vector<std::string> datas;
-    // 使用一个包含多字节字符的文本，确保字符边界处理正确
-    std::string multiByteText = "你好世界";
-    tokenize(multiByteText, datas, true);
-    ASSERT_EQ(datas.size(), 2);
-    ASSERT_EQ(datas[0], "你好");
-    ASSERT_EQ(datas[1], "世界");
-}
 
 TEST_F(IKTokenizerTest, TestLargeInput) {
     std::vector<std::string> datas;
-    // 创建一个大于BUFF_SIZE(4096)的输入，测试缓冲区重新填充
     std::string largeText;
     for (int i = 0; i < 1000; i++) {
         largeText += "中国的科技发展在世界上处于领先";
     }
     tokenize(largeText, datas, true);
-    // 验证分词结果数量应该是7000（每个短语分成7个词，重复1000次）
     ASSERT_EQ(datas.size(), 7000);
 }
 
 TEST_F(IKTokenizerTest, TestBufferExhaustCritical) {
     std::vector<std::string> datas;
-    // 创建一个接近BUFF_EXHAUST_CRITICAL(100)的输入
     std::string criticalText;
     for (int i = 0; i < 95; i++) {
         criticalText += "的";
@@ -198,10 +186,8 @@ TEST_F(IKTokenizerTest, TestBufferExhaustCritical) {
 
 TEST_F(IKTokenizerTest, TestMixedLanguageInput) {
     std::vector<std::string> datas;
-    // 测试混合语言输入（中英文、数字、符号等）
     std::string mixedText = "Doris是一个现代化的MPP分析型数据库，可以处理PB级别的数据，支持SQL92和SQL99。";
     tokenize(mixedText, datas, true);
-    // 验证分词结果包含英文单词和中文词语
     std::vector<std::string> expectedTokens = {"doris", "是", "一个", "现代化", "的", "mpp", "分析", "型", "数据库", "可以", "处理", "pb", "级", "别的", "数据", "支持", "sql92", "和", "sql99"};
     ASSERT_EQ(datas.size(), expectedTokens.size());
     for (size_t i = 0; i < datas.size(); i++) {
@@ -211,10 +197,170 @@ TEST_F(IKTokenizerTest, TestMixedLanguageInput) {
 
 TEST_F(IKTokenizerTest, TestSpecialCharacters) {
     std::vector<std::string> datas;
-    // 测试特殊字符和罕见字符的处理
     std::string specialText = "😊🚀👍测试特殊符号：@#¥%……&*（）";
     tokenize(specialText, datas, true);
-    // 验证特殊字符的处理结果
-    ASSERT_GT(datas.size(), 0);
+    ASSERT_EQ(datas.size(), 2);
 }
+
+TEST_F(IKTokenizerTest, TestBufferBoundaryWithSpace) {
+    std::vector<std::string> datas;
+    
+    std::string exactText;
+    int charCount = 4096 / 3;
+    for (int i = 0; i < charCount; i++) {
+        exactText += "中";
+    }
+    exactText += " "; 
+    
+    tokenize(exactText, datas, true);
+    ASSERT_EQ(datas.size(), charCount); 
+    datas.clear();
+    
+    std::string overText;
+    charCount = 4096 / 3 + 1; 
+    for (int i = 0; i < charCount; i++) {
+        overText += "中";
+    }
+    overText += " "; 
+    
+    tokenize(overText, datas, true);
+    ASSERT_EQ(datas.size(), charCount);
+    datas.clear();
+    
+    std::string multiSpaceText;
+    charCount = 4096 / 3 - 3; 
+    for (int i = 0; i < charCount; i++) {
+        multiSpaceText += "中";
+    }
+    multiSpaceText += "   ";
+    
+    tokenize(multiSpaceText, datas, true);
+    ASSERT_EQ(datas.size(), charCount); 
+    datas.clear();
+    
+    std::string spaceAroundBoundaryText;
+    charCount = 4096 / 3 - 2; 
+    for (int i = 0; i < charCount / 2; i++) {
+        spaceAroundBoundaryText += "中";
+    }
+    spaceAroundBoundaryText += " "; 
+    for (int i = 0; i < charCount / 2; i++) {
+        spaceAroundBoundaryText += "中";
+    }
+    spaceAroundBoundaryText += "  "; 
+    
+    tokenize(spaceAroundBoundaryText, datas, true);
+    ASSERT_EQ(datas.size(), charCount-1);
+}
+
+TEST_F(IKTokenizerTest, TestChineseCharacterAtBufferBoundary) {
+    std::vector<std::string> datas;
+    
+    std::string boundaryText;
+    // case1: a complete chinese character cut at the first byte
+    int completeChars = 4096 / 3;
+    for (int i = 0; i < completeChars; i++) {
+        boundaryText += "中";
+    }
+
+    boundaryText += "国";
+    
+    
+    tokenize(boundaryText, datas, true);
+    ASSERT_EQ(datas.size(), completeChars+1);
+    ASSERT_EQ(datas[datas.size() - 1], "国");
+    datas.clear();
+    boundaryText.clear();
+    // case2: a complete chinese character cut at the second byte
+    boundaryText += "  ";
+
+    for (int i = 0; i < completeChars; i++) {
+        boundaryText += "中";
+    }
+
+    boundaryText += "国";
+    
+    tokenize(boundaryText, datas, true);
+    ASSERT_EQ(datas.size(), completeChars);
+    ASSERT_EQ(datas[datas.size() - 1], "中国");
+
+    datas.clear();
+    boundaryText.clear();
+}
+
+TEST_F(IKTokenizerTest, TestLongTextCompareWithJava) {
+    std::vector<std::string> datas;
+    
+    std::string longText = 
+        "随着人工智能技术的快速发展，深度学习、机器学习和神经网络等技术已经在各个领域得到了广泛应用。"
+        "从语音识别、图像处理到自然语言处理，人工智能正在改变我们的生活方式和工作方式。"
+        "在医疗领域，AI辅助诊断系统可以帮助医生更准确地识别疾病；在金融领域，智能算法可以预测市场趋势和风险；"
+        "在教育领域，个性化学习平台可以根据学生的学习情况提供定制化的教学内容。"
+        "然而，随着AI技术的普及，也带来了一系列的伦理和隐私问题。如何确保AI系统的公平性和透明度，"
+        "如何保护用户数据的安全，如何防止AI被滥用，这些都是我们需要思考的问题。"
+        "此外，AI的发展也可能对就业市场产生影响，一些传统工作可能会被自动化系统取代，"
+        "但同时也会创造出新的工作岗位和机会。因此，我们需要积极适应这一变化，"
+        "提升自己的技能和知识，以便在AI时代保持竞争力。"
+        "总的来说，人工智能是一把双刃剑，它既带来了巨大的机遇，也带来了挑战。"
+        "我们需要理性看待AI的发展，既要充分利用它的优势，也要警惕可能的风险，"
+        "共同推动AI技术向着更加健康、可持续的方向发展。";
+    
+    // repeate 4 times
+    int i = 0;
+    while (i < 4) {
+        longText += longText;
+        i++;
+    }    
+    // smart mode
+    tokenize(longText, datas, true); 
+    
+    ASSERT_EQ(datas.size(), 3312);
+
+    // compare first 20 tokens with java
+    std::vector<std::string> javaFirst20Results = {
+        "随着", "人工智能技术", "的", "快速", 
+        "发展", "深度", "学习", "机器", "学习", "和", "神经网络", "等", 
+        "技术", "已经在", "各个领域", "得", "到了", "广泛应用", "从", "语音"
+    };
+    for (size_t i = 0; i < 20; i++) {
+        ASSERT_EQ(datas[i], javaFirst20Results[i]);
+    }
+
+    // compare last 20 tokens with java
+    std::vector<std::string> javaLast20Results = {
+        "发展", "方向", "的", "持续", "可",
+        "健康", "更加", "向着", "技术", "ai", "推动", 
+        "共同", "风险", "的", "可能", "警惕", "也要", "优势", "的", "它"
+    };
+    for (size_t i = 0; i < 20; i++) {
+        ASSERT_EQ(datas[datas.size() - i - 1], javaLast20Results[i]);
+    }
+
+    // max_word mode
+    datas.clear();
+    javaFirst20Results = {
+        "随着", "人工智能技术", "人工智能", "人工", "智能", "技术", "的", 
+        "快速", "发展", "深度", "学习", "机器", "学习", "和", "神经网络", 
+        "神经", "网络", "等", "技术", "已经在"
+    };
+    javaLast20Results = {
+        "发展", "方向", "的", "持续", "可",
+        "健康", "更加", "向着", "技术", "ai", "推动", 
+        "共同", "风险", "的", "可能", "警惕", "也要", "优势", "的", "用它"
+    };
+    
+    tokenize(longText, datas, false);
+    ASSERT_EQ(datas.size(), 4336);
+
+    // compare first 20 tokens with java
+    for (size_t i = 0; i < 20; i++) {
+        ASSERT_EQ(datas[i], javaFirst20Results[i]);
+    }
+
+    // compare last 20 tokens with java
+    for (size_t i = 0; i < 20; i++) {
+        ASSERT_EQ(datas[datas.size() - i - 1], javaLast20Results[i]);
+    }
+}
+
 }

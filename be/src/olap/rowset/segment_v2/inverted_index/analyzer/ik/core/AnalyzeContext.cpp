@@ -56,7 +56,6 @@ size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
     int32_t readCount = 0;
     if (buffer_offset_ == 0) {
         readCount = max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
-        readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
         CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
                                            config_->isEnableLowercase());
     } else {
@@ -66,12 +65,9 @@ size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
                     segment_buff_.data() + typed_runes_[cursor_].getNextBytePosition(), offset);
             readCount = std::max(
                     0, reader->readCopy(segment_buff_.data() + offset, 0, BUFF_SIZE - offset));
-            readCount =
-                     CharacterUtil::adjustToCompleteChar(segment_buff_.data() + offset, readCount) +
-                     offset;
+            readCount += offset;
         } else {
             readCount = std::max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
-            readCount = CharacterUtil::adjustToCompleteChar(segment_buff_.data(), readCount);
         }
         CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
                                            config_->isEnableLowercase());

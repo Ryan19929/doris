@@ -103,6 +103,7 @@ void CharacterUtil::decodeStringToRunes(const char* str, size_t length, TypedRun
     }
 }
 
+// TODO: Maybe delete this function
 size_t CharacterUtil::adjustToCompleteChar(const char* buffer, size_t buffer_length) {
     if (buffer_length == 0) return 0;
 
@@ -118,13 +119,9 @@ size_t CharacterUtil::adjustToCompleteChar(const char* buffer, size_t buffer_len
             unsigned char byte = buffer[adjustedLen - 1];
             if ((byte & 0xC0) != 0x80) {
                 int charLen = 0;
-                if ((byte & 0xE0) == 0xC0)
-                    charLen = 2;
-                else if ((byte & 0xF0) == 0xE0)
-                    charLen = 3;
-                else if ((byte & 0xF8) == 0xF0)
-                    charLen = 4;
-
+                if ((byte & 0xE0) == 0xC0) charLen = 2;
+                else if ((byte & 0xF0) == 0xE0) charLen = 3;
+                else if ((byte & 0xF8) == 0xF0) charLen = 4;
                 if (buffer_length - adjustedLen + 1 < charLen) {
                     return adjustedLen - 1;
                 }
@@ -136,25 +133,12 @@ size_t CharacterUtil::adjustToCompleteChar(const char* buffer, size_t buffer_len
     }
 
     int charLen = 0;
-    if ((last_byte & 0xE0) == 0xC0)
-        charLen = 2;
-    else if ((last_byte & 0xF0) == 0xE0)
-        charLen = 3;
-    else if ((last_byte & 0xF8) == 0xF0)
-        charLen = 4;
+    if ((last_byte & 0xE0) == 0xC0) charLen = 2;
+    else if ((last_byte & 0xF0) == 0xE0) charLen = 3;
+    else if ((last_byte & 0xF8) == 0xF0) charLen = 4;
 
     if (charLen > 1) {
-        size_t remainingBytes = 1;
-        for (size_t i = buffer_length - 2; i >= 0 && remainingBytes < charLen; i--) {
-            if ((buffer[i] & 0xC0) == 0x80) {
-                remainingBytes++;
-            } else {
-                break;
-            }
-        }
-        if (remainingBytes < charLen) {
-            return buffer_length - 1;
-        }
+        return buffer_length - 1;
     }
 
     return buffer_length;
