@@ -17,12 +17,9 @@
 
 #include <gtest/gtest.h>
 
-#include <fstream>
 #include <memory>
 #include <sstream>
-#include <filesystem>
 
-#include "olap/rowset/segment_v2/inverted_index/analyzer/ik/IKAnalyzer.h"
 #include "olap/rowset/segment_v2/inverted_index/analyzer/ik/IKAnalyzer.h"
 #include "CLucene/analysis/LanguageBasedAnalyzer.h"
 using namespace lucene::analysis;
