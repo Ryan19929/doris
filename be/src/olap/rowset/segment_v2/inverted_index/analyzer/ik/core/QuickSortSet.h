@@ -51,7 +51,7 @@ private:
 };
 
 // IK Segmenter's Lexeme Quick Sort Set
-class CLUCENE_EXPORT QuickSortSet {
+class QuickSortSet {
     friend class IKArbitrator;
 
 protected:

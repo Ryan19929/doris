@@ -60,7 +60,7 @@ bool QuickSortSet::addLexeme(Lexeme& lexeme) {
         return true;
     }
     if (tail_->lexeme_ == lexeme) {
-        deallocateCell(new_cell);
+        // new_cell is nullptr here, no need to deallocate
         return false;
     }
 

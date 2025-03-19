@@ -35,7 +35,13 @@ namespace doris::segment_v2 {
     typed_runes_.reserve(BUFF_SIZE);
 }
 
-AnalyzeContext::~AnalyzeContext() = default;
+AnalyzeContext::~AnalyzeContext() {
+    // 确保在析构时释放所有资源
+    for (auto& [_, path] : path_map_) {
+        delete path;
+    }
+    path_map_.clear();
+}
 
 void AnalyzeContext::reset() {
     buffer_offset_ = 0;
@@ -47,7 +53,13 @@ void AnalyzeContext::reset() {
     cursor_ = 0;
     last_useless_char_num_ = 0;
     typed_runes_.clear();
+    
+    // 清理path_map_中的所有LexemePath对象，避免内存泄漏
+    for (auto& [_, path] : path_map_) {
+        delete path;
+    }
     path_map_.clear();
+    
     results_ = IKQue<Lexeme>();
 }
 

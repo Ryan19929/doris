@@ -39,9 +39,9 @@ public:
     bool checkCross(const Lexeme& lexeme) const;
 
     size_t getPathBegin() const { return path_begin_; }
-    size_t getPathEnd() const { return path_begin_; }
+    size_t getPathEnd() const { return path_end_; }
     size_t getPayloadLength() const { return payload_length_; }
-    size_t getPathLength() const { return path_begin_ - path_end_; }
+    size_t getPathLength() const { return path_end_ - path_begin_; }
     size_t size() const { return getSize(); }
 
     size_t getXWeight() const;
