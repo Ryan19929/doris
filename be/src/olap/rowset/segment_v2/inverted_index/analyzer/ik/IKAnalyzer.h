@@ -34,8 +34,13 @@ public:
     bool isSDocOpt() override { return true; }
 
     void initDict(const std::string& dictPath) override {
-        config_->setDictPath(dictPath);
-        Dictionary::initial(*config_);
+        try {
+            config_->setDictPath(dictPath);
+            Dictionary::initial(*config_);
+        } catch (const CLuceneError& e) {
+            LOG(ERROR) << "Failed to initialize dictionary: " << e.what();
+            throw;
+        }
     }
 
     void setMode(bool isSmart) { config_->setUseSmart(isSmart); }

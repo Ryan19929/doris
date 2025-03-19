@@ -15,103 +15,66 @@ Dictionary::Dictionary(const Configuration& cfg, bool use_ext_dict)
 
 void Dictionary::loadDictFile(DictSegment* dict, const std::string& file_path, bool critical,
                               const std::string& dict_name) {
-    try {
-        std::ifstream in(file_path);
-        if (!in.good()) {
-            if (critical) {
-                _CLTHROWA(CL_ERR_IO, (dict_name + " dictionary file not found: " + file_path).c_str());
-            }
-            return;
-        }
+    std::ifstream in(file_path);
+    if (!in.good()) {
+        _CLTHROWA(CL_ERR_IO, (dict_name + " dictionary file not found: " + file_path).c_str());
+    }
 
-        std::string line;
-        while (in.good() && !in.eof()) {
-            try {
-                std::getline(in, line);
-                if (line.empty() || line[0] == '#') {
-                    continue;
-                }
-                try {
-                    dict->fillSegment(line.c_str());
-                } catch (const std::bad_alloc& e) {
-                    // Handle memory allocation failure
-                    LOG(WARNING) << "Memory allocation failed when filling segment with line from " 
-                                << dict_name << ": " << e.what();
-                    continue;
-                } catch (...) {
-                    // Handle other exceptions
-                    LOG(WARNING) << "Exception when filling segment with line from " << dict_name;
-                    continue;
-                }
-            } catch (const std::ios_base::failure& e) {
-                // Handle line reading failure
-                LOG(WARNING) << "Failed to read line from " << dict_name 
-                            << " dictionary file: " << e.what();
-                continue;
-            } catch (...) {
-                // Handle other exceptions
-                LOG(WARNING) << "Exception when reading line from " << dict_name << " dictionary file";
-                continue;
-            }
+    std::string line;
+    while (in.good() && !in.eof()) {
+        std::getline(in, line);
+        if (line.empty() || line[0] == '#') {
+            continue;
         }
-    } catch (const std::ios_base::failure& e) {
-        // Handle file IO exceptions
-        if (critical) {
-            _CLTHROWA(CL_ERR_IO, (dict_name + " dictionary file IO error: " + e.what()).c_str());
-        }
-        LOG(WARNING) << "IO error when reading " << dict_name 
-                    << " dictionary file: " << e.what();
-    } catch (...) {
-        // Handle other exceptions
-        if (critical) {
-            _CLTHROWA(CL_ERR_Runtime, (dict_name + " dictionary loading error").c_str());
-        }
-        LOG(WARNING) << "Error when loading " << dict_name << " dictionary file";
+        dict->fillSegment(line.c_str());
     }
 }
 
 void Dictionary::loadMainDict() {
     try {
+
         loadDictFile(main_dict_.get(), config_->getDictPath() + "/" + config_->getMainDictFile(), true,
                     "Main Dict");
 
-        // Load extension dictionaries
+        // Load extension dictionaries - can fail
         if (load_ext_dict_) {
             for (const auto& extDict : config_->getExtDictFiles()) {
                 try {
                     loadDictFile(main_dict_.get(), config_->getDictPath() + "/" + extDict, false,
                                 "Extra Dict");
-                } catch (...) {
-                    LOG(WARNING) << "Error loading extension dictionary " << extDict;
-                    // Continue loading other extension dictionaries
+                } catch (const CLuceneError& e) {
+                    // Extension dictionary loading failure is logged but doesn't affect main functionality
+                    LOG(WARNING) << "Failed to load extension dictionary " << extDict << ": " << e.what();
                 }
             }
         }
-    } catch (...) {
-        LOG(ERROR) << "Failed to load main dictionary";
-        // Main dictionary loading failure is a serious error, but we log and continue
+    } catch (const CLuceneError& e) {
+        LOG(ERROR) << "Failed to load main dictionary: " << e.what();
+        throw; 
     }
 }
 
 void Dictionary::loadStopWordDict() {
     try {
         loadDictFile(stop_words_.get(), config_->getDictPath() + "/" + config_->getStopWordDictFile(),
-                    false, "Stopword");
-        // Load extension stop words dictionary
+                        false, "Stopword");
+    
+        // Load extension stopword dictionaries
         if (load_ext_dict_) {
             for (const auto& extDict : config_->getExtStopWordDictFiles()) {
                 try {
                     loadDictFile(stop_words_.get(), config_->getDictPath() + "/" + extDict, false,
                                 "Extra Stopword");
-                } catch (...) {
-                    LOG(WARNING) << "Error loading extension stop word dictionary " << extDict;
-                    // Continue loading other extension stop word dictionaries
+                } catch (const CLuceneError& e) {
+                    // Extension stopword loading failure is just logged
+                    LOG(WARNING) << "Failed to load extension stop word dictionary " << extDict << ": " << e.what();
                 }
             }
         }
-    } catch (...) {
-        LOG(WARNING) << "Failed to load stop word dictionary";
-        // Stop word dictionary loading failure is not critical, log and continue
+    } catch (const std::exception& e) {
+        // Catch any other unexpected exceptions
+        LOG(ERROR) << "Unexpected error loading stopword dictionary: " << e.what();
+        throw; 
     }
 }
 
@@ -120,22 +83,30 @@ void Dictionary::loadQuantifierDict() {
         loadDictFile(quantifier_dict_.get(),
                     config_->getDictPath() + "/" + config_->getQuantifierDictFile(), true,
                     "Quantifier");
-    } catch (...) {
-        LOG(ERROR) << "Failed to load quantifier dictionary";
-        // Quantifier dictionary loading failure is serious, but we log and continue
+    } catch (const CLuceneError& e) {
+        LOG(ERROR) << "Failed to load quantifier dictionary: " << e.what();
+        throw; 
     }
 }
 
 void Dictionary::reload() {
-    if (singleton_) {
-        try {
-            singleton_->loadMainDict();
-            singleton_->loadStopWordDict();
-            singleton_->loadQuantifierDict();
-            LOG(INFO) << "Dictionary reloaded successfully";
-        } catch (...) {
-            LOG(ERROR) << "Failed to reload dictionary";
-        }
+    if (!singleton_) {
+        // Singleton doesn't exist, can't reload
+        _CLTHROWA(CL_ERR_IllegalState, "Dictionary not initialized, cannot reload");
+    }
+    
+    try {
+        // Try to reload all dictionaries
+        singleton_->loadMainDict();
+        singleton_->loadStopWordDict();
+        singleton_->loadQuantifierDict();
+
+        init_success_ = true;
+        LOG(INFO) << "Dictionary reloaded successfully";
+    } catch (const CLuceneError& e) {
+        LOG(ERROR) << "Failed to reload dictionary: " << e.what();
+
+        throw;
     }
 }
 

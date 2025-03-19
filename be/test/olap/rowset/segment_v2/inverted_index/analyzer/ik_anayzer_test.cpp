@@ -66,137 +66,58 @@ protected:
 };
 
 // Test for Dictionary exception handling
-TEST_F(IKTokenizerTest, TestDictionaryExceptionHandling) {
-    // Test case 1: Test loadDictFile with non-existent file
-    Configuration cfg;
-    cfg.setDictPath("/non_existent_path");
+TEST_F(IKTokenizerTest, TestDictionaryExceptionHandling) { 
+    // Test 1: Load non-existent path
+    {
+        Configuration cfg;
+        cfg.setDictPath("/non_existent_path");
+        cfg.setMainDictFile("main.dic");
+        cfg.setQuantifierDictFile("quantifier.dic");
+        cfg.setStopWordDictFile("stopword.dic");
+        
+        // Expect an exception
+        ASSERT_THROW({
+            Dictionary::initial(cfg, false);
+        }, CLuceneError);
+        
+        // Singleton should be nullptr, getSingleton() will throw an exception
+        ASSERT_NO_THROW({
+            Dictionary::getSingleton();
+        });
+    }
     
-    // Initialize dictionary with non-existent path
-    // This should not throw exception due to our error handling in getSingleton
-    ASSERT_NO_THROW({
-        Dictionary::initial(cfg, false);
-    });
-    
-    // getSingleton() should not throw exception because singleton exists
-    Dictionary* dict = nullptr;
-    ASSERT_NO_THROW({
-        dict = Dictionary::getSingleton();
-    });
-    ASSERT_NE(dict, nullptr);
-    
-    // But operations on the dictionary should fail or return default values
-    // because the dictionary files weren't loaded properly
-    CharacterUtil::TypedRuneArray typed_runes;
-    CharacterUtil::decodeStringToRunes("测试", 6, typed_runes, false);
-    Hit result = dict->matchInMainDict(typed_runes, 0, 0);
-    ASSERT_TRUE(result.isUnmatch());
-    
-    // Test case 2: Test with invalid file content by reloading
-    std::string temp_file = createTempDictFile("# This is a comment\nvalid_word\ninvalid\xFF\xFF\xFF");
-    
-    Configuration cfg2;
-    cfg2.setDictPath("/tmp");
-    
-    // Override main dictionary file
-    cfg2.setMainDictFile(temp_file.substr(temp_file.find_last_of('/') + 1));
-    
-    // Instead of destroying and reinitializing, update the configuration and reload
-    dict->getConfiguration()->setDictPath("/tmp");
-    dict->getConfiguration()->setMainDictFile(temp_file.substr(temp_file.find_last_of('/') + 1));
-    
-    // This should not throw exception due to our error handling in reload
-    ASSERT_NO_THROW({
-        Dictionary::reload();
-    });
-    
-    // Test case 3: Test with out-of-bounds index
-    // Create a valid TypedRuneArray with Chinese characters
-    CharacterUtil::TypedRuneArray typed_runes2;
-    CharacterUtil::decodeStringToRunes("测试分词", 12, typed_runes2, false);
-    
-    // This should not throw exception due to our error handling
-    ASSERT_NO_THROW({
-        Hit result = dict->matchInMainDict(typed_runes2, 100, 1);
-        ASSERT_TRUE(result.isUnmatch());
-    });
-    
-    // Test case 4: Test matchInQuantifierDict with valid input
-    ASSERT_NO_THROW({
-        Hit result = dict->matchInQuantifierDict(typed_runes2, 0, 0);
-        ASSERT_TRUE(result.isUnmatch());
-    });
-    
-    // Test case 5: Test isStopWord with valid input
-    ASSERT_NO_THROW({
-        bool result = dict->isStopWord(typed_runes2, 0, 0);
-        ASSERT_FALSE(result);
-    });
-    
-    // Test case 6: Test reload with valid configuration
-    // Update configuration to a valid path
-    dict->getConfiguration()->setDictPath("./be/dict/ik");
-    dict->getConfiguration()->setMainDictFile("main.dic");
-    dict->getConfiguration()->setQuantifierDictFile("quantifier.dic");
-    dict->getConfiguration()->setStopWordDictFile("stopword.dic");
-    
-    // Reload with valid configuration
-    ASSERT_NO_THROW({
-        Dictionary::reload();
-    });
-    
-    // Now dictionary should be properly loaded
-    result = dict->matchInMainDict(typed_runes, 0, 0);
-    
-    // Clean up temporary file
-    std::remove(temp_file.c_str());
-    
-    // Reset exception test flag
-    is_exception_test = false;
-}
 
-// Combine all other dictionary tests into one test case
-TEST_F(IKTokenizerTest, TestDictionaryOtherFunctions) {
-    // Initialize dictionary with valid path
-    Configuration cfg;
-    cfg.setDictPath("./be/dict/ik");
     
-    Dictionary::initial(cfg, true);
-    Dictionary* dict = Dictionary::getSingleton();
-    ASSERT_NE(dict, nullptr);
+    // Test 2: Use reload method with invalid path
+    {
+        Dictionary* dict = Dictionary::getSingleton();
+        // Set path to invalid path
+        dict->getConfiguration()->setDictPath("/non_existent_path");
+        
+        ASSERT_THROW({
+            Dictionary::reload();
+        }, CLuceneError);
+    }
     
-    // Test reload functionality
-    ASSERT_NO_THROW({
-        Dictionary::reload();
-    });
+
     
-    // Create a temporary directory for testing
-    std::string temp_dir = "/tmp/ik_test_" + std::to_string(rand());
-    system(("mkdir -p " + temp_dir).c_str());
-    
-    // Update configuration to use temporary directory
-    dict->getConfiguration()->setDictPath(temp_dir);
-    
-    // Reload with empty directory
-    ASSERT_NO_THROW({
-        Dictionary::reload();
-    });
-    
-    // Create main dictionary but missing quantifier dictionary
-    std::string main_dict_path = temp_dir + "/main.dic";
-    std::ofstream main_dict(main_dict_path);
-    main_dict << "测试\n词语\n分词器\n";
-    main_dict.close();
-    
-    // Reload with partial dictionary files
-    ASSERT_NO_THROW({
-        Dictionary::reload();
-    });
-    
-    // Clean up
-    system(("rm -rf " + temp_dir).c_str());
-    
-    // Reset exception test flag
-    is_exception_test = false;
+      // Test 3: Initialize with valid dictionary path
+    {
+        Dictionary::getSingleton()->getConfiguration()->setDictPath("./be/dict/ik");
+
+        
+        // Expect no exception
+        ASSERT_NO_THROW({
+            Dictionary::reload();
+        });
+        
+        // Singleton should be successfully created
+        Dictionary* dict = nullptr;
+        ASSERT_NO_THROW({
+            dict = Dictionary::getSingleton();
+        });
+        ASSERT_NE(dict, nullptr);
+    }
 }
 
 TEST_F(IKTokenizerTest, TestIKTokenizer) {

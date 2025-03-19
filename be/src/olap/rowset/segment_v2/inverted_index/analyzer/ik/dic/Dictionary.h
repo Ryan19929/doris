@@ -20,6 +20,8 @@ class Dictionary {
 private:
     static Dictionary* singleton_;
     static std::once_flag init_flag_;
+    static bool init_success_;
+    
     // Dictionary segment mappings
     std::unique_ptr<DictSegment> main_dict_;
     std::unique_ptr<DictSegment> quantifier_dict_;
@@ -32,6 +34,7 @@ private:
             if (Dictionary::singleton_) {
                 delete Dictionary::singleton_;
                 Dictionary::singleton_ = nullptr;
+                Dictionary::init_success_ = false;
             }
         }
     };
@@ -59,6 +62,7 @@ public:
         if (singleton_) {
             delete singleton_;
             singleton_ = nullptr;
+            init_success_ = false;
         }
     }
     ~Dictionary() {}
@@ -71,6 +75,11 @@ public:
         if (!singleton_) {
             _CLTHROWA(CL_ERR_IllegalState, "Dictionary not initialized");
         }
+        // Just log warning if initialization failed, but still return the object
+        // This allows clients to use the object for reloading
+        if (!init_success_) {
+            LOG(WARNING) << "Dictionary initialization failed previously, the object may not work properly";
+        }
         return singleton_;
     }
 
@@ -78,25 +87,37 @@ public:
         std::call_once(init_flag_, [&]() {
             try {
                 singleton_ = new Dictionary(cfg, useExtDict);
+                // Try to load dictionaries
                 try {
                     singleton_->loadMainDict();
                     singleton_->loadQuantifierDict();
                     singleton_->loadStopWordDict();
-                } catch (...) {
-                    // If dictionary loading fails, log the error but don't terminate initialization
-                    LOG(ERROR) << "Error during dictionary initialization";
+                    // Set success flag if all operations succeed
+                    init_success_ = true;
+                } catch (const CLuceneError& e) {
+                    // Dictionary loading failed, but object was created
+                    init_success_ = false;
+                    LOG(ERROR) << "Dictionary loading failed: " << e.what();
+                    // Keep the object for possible reload
                 }
-            } catch (const std::bad_alloc&) {
-                // Memory allocation failure is a critical error
-                LOG(ERROR) << "Failed to allocate memory for Dictionary";
-                // In this case, we cannot continue and must throw an exception
-                _CLTHROWA(CL_ERR_OutOfMemory, "Failed to allocate memory for Dictionary");
+            } catch (std::bad_alloc& e) {
+                // Memory allocation failure
+                LOG(ERROR) << "Failed to allocate memory for Dictionary: " << e.what();
+                // Let exception propagate to indicate critical failure
+                throw;
             } catch (...) {
-                // Other exceptions
-                LOG(ERROR) << "Exception during Dictionary initialization";
-                _CLTHROWA(CL_ERR_Runtime, "Exception during Dictionary initialization");
+                // Handle other exceptions during object creation
+                LOG(ERROR) << "Unknown error during Dictionary object creation";
+                // Let exception propagate to indicate critical failure
+                throw;
             }
         });
+        
+        // Check initialization result
+        if (!singleton_ || !init_success_) {
+            _CLTHROWA(CL_ERR_IllegalState, "Dictionary initialization failed");
+        }
+        
         return singleton_;
     }
 
@@ -118,6 +139,7 @@ public:
 
 inline Dictionary* Dictionary::singleton_ = nullptr;
 inline std::once_flag Dictionary::init_flag_;
+inline bool Dictionary::init_success_ = false;
 
 inline const std::string Dictionary::PATH_DIC_MAIN = "main.dic";
 inline const std::string Dictionary::PATH_DIC_QUANTIFIER = "quantifier.dic";
