@@ -17,9 +17,9 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
 #include <memory>
 #include <sstream>
-#include <fstream>
 
 #include "olap/rowset/segment_v2/inverted_index/analyzer/ik/IKAnalyzer.h"
 using namespace lucene::analysis;
@@ -51,7 +51,7 @@ protected:
             throw;
         }
     }
-    
+
     // Helper method to create a temporary dictionary file for testing
     std::string createTempDictFile(const std::string& content) {
         std::string temp_file = "/tmp/temp_dict_" + std::to_string(rand()) + ".dic";
@@ -66,7 +66,7 @@ protected:
 };
 
 // Test for Dictionary exception handling
-TEST_F(IKTokenizerTest, TestDictionaryExceptionHandling) { 
+TEST_F(IKTokenizerTest, TestDictionaryExceptionHandling) {
     // Test 1: Load non-existent path
     {
         Configuration cfg;
@@ -74,48 +74,33 @@ TEST_F(IKTokenizerTest, TestDictionaryExceptionHandling) {
         cfg.setMainDictFile("main.dic");
         cfg.setQuantifierDictFile("quantifier.dic");
         cfg.setStopWordDictFile("stopword.dic");
-        
-        // Expect an exception
-        ASSERT_THROW({
-            Dictionary::initial(cfg, false);
-        }, CLuceneError);
-        
-        // Singleton should be nullptr, getSingleton() will throw an exception
-        ASSERT_NO_THROW({
-            Dictionary::getSingleton();
-        });
-    }
-    
 
-    
+        // Expect an exception
+        ASSERT_THROW({ Dictionary::initial(cfg, false); }, CLuceneError);
+
+        // Singleton should be nullptr, getSingleton() will throw an exception
+        ASSERT_NO_THROW({ Dictionary::getSingleton(); });
+    }
+
     // Test 2: Use reload method with invalid path
     {
         Dictionary* dict = Dictionary::getSingleton();
         // Set path to invalid path
         dict->getConfiguration()->setDictPath("/non_existent_path");
-        
-        ASSERT_THROW({
-            Dictionary::reload();
-        }, CLuceneError);
-    }
-    
 
-    
-      // Test 3: Initialize with valid dictionary path
+        ASSERT_THROW({ Dictionary::reload(); }, CLuceneError);
+    }
+
+    // Test 3: Initialize with valid dictionary path
     {
         Dictionary::getSingleton()->getConfiguration()->setDictPath("./be/dict/ik");
 
-        
         // Expect no exception
-        ASSERT_NO_THROW({
-            Dictionary::reload();
-        });
-        
+        ASSERT_NO_THROW({ Dictionary::reload(); });
+
         // Singleton should be successfully created
         Dictionary* dict = nullptr;
-        ASSERT_NO_THROW({
-            dict = Dictionary::getSingleton();
-        });
+        ASSERT_NO_THROW({ dict = Dictionary::getSingleton(); });
         ASSERT_NE(dict, nullptr);
     }
 }
@@ -439,6 +424,71 @@ TEST_F(IKTokenizerTest, TestLongTextCompareWithJava) {
     for (size_t i = 0; i < 20; i++) {
         ASSERT_EQ(datas[datas.size() - i - 1], javaLast20Results[i]);
     }
+}
+
+// Test the exception handling capabilities of the IKTokenizer::reset method
+TEST_F(IKTokenizerTest, TestResetExceptionHandling) {
+    // Create an analyzer and tokenizer
+    IKAnalyzer analyzer;
+    analyzer.initDict("./be/dict/ik");
+
+    // Create a valid reader first to initialize a tokenizer
+    lucene::util::SStringReader<char> validReader;
+    validReader.init("Test text", 9, false);
+    std::unique_ptr<IKTokenizer> tokenizer;
+    tokenizer.reset((IKTokenizer*)analyzer.tokenStream(L"", &validReader));
+
+    // Test case 1: Passing a null pointer to reset
+    // This should throw a CLuceneError with CL_ERR_NullPointer code
+    ASSERT_THROW({ tokenizer->reset(nullptr); }, CLuceneError);
+
+    // Test case 2: Create a mock reader that will cause issues during processing
+    class ProblemReader : public lucene::util::Reader {
+    public:
+        ProblemReader() {}
+        ~ProblemReader() override {}
+
+        // Override size() to return a very large number to potentially trigger allocation issues
+        int64_t size() const override { return INT64_MAX; }
+
+        // Override read to always throw an exception
+        int32_t read(const char*& start, int32_t min, int32_t max) override {
+            throw std::runtime_error("Simulated read error");
+        }
+
+        // Override seeking functionality to always fail
+        void seek(int64_t pos) override { throw std::runtime_error("Simulated seek error"); }
+
+        int64_t getPosition() const override { return 0; }
+        void close() override {}
+    };
+
+    // Create our problematic reader
+    ProblemReader problemReader;
+
+    // Test case 2: Using a reader that throws exceptions during processing
+    // This should be caught and converted to a CLuceneError
+    ASSERT_THROW({ tokenizer->reset(&problemReader); }, CLuceneError);
+
+    // Test case 3: Test successful reset after exception
+    // This verifies the tokenizer can recover after an exception
+    lucene::util::SStringReader<char> recoveryReader;
+    recoveryReader.init("Recovery text", 13, false);
+
+    ASSERT_NO_THROW({ tokenizer->reset(&recoveryReader); });
+
+    // Verify tokenizer works after recovery
+    Token t;
+    std::vector<std::string> tokens;
+    while (tokenizer->next(&t)) {
+        std::string term(t.termBuffer<char>(), t.termLength<char>());
+        tokens.emplace_back(term);
+    }
+
+    // Should tokenize correctly after recovery
+    ASSERT_EQ(tokens.size(), 2);
+    ASSERT_EQ(tokens[0], "recovery");
+    ASSERT_EQ(tokens[1], "text");
 }
 
 } // namespace doris::segment_v2

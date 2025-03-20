@@ -50,12 +50,17 @@ void IKTokenizer::reset(lucene::util::Reader* reader) {
     this->tokens_text_.clear();
 
     buffer_.reserve(input->size());
-    ik_segmenter_->reset(reader);
-    Lexeme lexeme;
-    while (ik_segmenter_->next(lexeme)) {
-        tokens_text_.emplace_back(lexeme.getText());
+    try {
+        ik_segmenter_->reset(reader);
+        Lexeme lexeme;
+        while (ik_segmenter_->next(lexeme)) {
+            tokens_text_.emplace_back(lexeme.getText());
+        }
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to reset IKTokenizer: " << e.what();
+        throw CLuceneError(CL_ERR_Runtime,
+                           std::string("Failed to reset IKTokenizer: ").append(e.what()).c_str());
     }
-
     data_length_ = tokens_text_.size();
 }
 
