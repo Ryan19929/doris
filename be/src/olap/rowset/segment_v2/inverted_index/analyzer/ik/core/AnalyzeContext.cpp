@@ -36,7 +36,7 @@ namespace doris::segment_v2 {
 }
 
 AnalyzeContext::~AnalyzeContext() {
-    // 确保在析构时释放所有资源
+    // Ensure all resources are released during destruction
     for (auto& [_, path] : path_map_) {
         delete path;
     }
@@ -54,7 +54,7 @@ void AnalyzeContext::reset() {
     last_useless_char_num_ = 0;
     typed_runes_.clear();
     
-    // 清理path_map_中的所有LexemePath对象，避免内存泄漏
+    // Clean up all LexemePath objects in path_map_ to avoid memory leaks
     for (auto& [_, path] : path_map_) {
         delete path;
     }
@@ -65,37 +65,58 @@ void AnalyzeContext::reset() {
 
 
 size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
-    int32_t readCount = 0;
-    if (buffer_offset_ == 0) {
-        readCount = max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
-        CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
-                                           config_->isEnableLowercase());
-    } else {
-        size_t offset = available_ - typed_runes_[cursor_].getNextBytePosition();
-        if (offset > 0) {
-            std::memmove(segment_buff_.data(),
-                    segment_buff_.data() + typed_runes_[cursor_].getNextBytePosition(), offset);
-            readCount = std::max(
-                    0, reader->readCopy(segment_buff_.data() + offset, 0, BUFF_SIZE - offset));
-            readCount += offset;
+    try {
+        int32_t readCount = 0;
+        if (buffer_offset_ == 0) {
+            readCount = max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
+            CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
+                                            config_->isEnableLowercase());
         } else {
-            readCount = std::max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
+            size_t offset = available_ - typed_runes_[cursor_].getNextBytePosition();
+            if (offset > 0) {
+                std::memmove(segment_buff_.data(),
+                        segment_buff_.data() + typed_runes_[cursor_].getNextBytePosition(), offset);
+                readCount = std::max(
+                        0, reader->readCopy(segment_buff_.data() + offset, 0, BUFF_SIZE - offset));
+                readCount += offset;
+            } else {
+                readCount = std::max(0, reader->readCopy(segment_buff_.data(), 0, BUFF_SIZE));
+            }
+            CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
+                                            config_->isEnableLowercase());
         }
-        CharacterUtil::decodeStringToRunes(segment_buff_.c_str(), readCount, typed_runes_,
-                                           config_->isEnableLowercase());
-    }
-    // Ensure readCount is set to 0 in case of
-    // an exceptional situation where typed_runes_ is empty.
-    if (typed_runes_.size() == 0 && readCount != 0) {
-        std::string error_msg = "typed_runes_ is empty, but readCount is not 0";
-        error_msg += std::to_string(readCount) + " " + std::to_string(typed_runes_.size());
+        // Ensure readCount is set to 0 in case of
+        // an exceptional situation where typed_runes_ is empty.
+        if (typed_runes_.size() == 0 && readCount != 0) {
+            std::string error_msg = "IK Analyzer: typed_runes_ is empty, but readCount is not 0: ";
+            error_msg += std::to_string(readCount) + " " + std::to_string(typed_runes_.size());
+            LOG(ERROR) << error_msg;
+            _CLTHROWT(CL_ERR_Runtime, error_msg.c_str());
+        }
+            
+        available_ = readCount;
+        cursor_ = 0;
+        return readCount;
+    } catch (const std::exception& e) {
+        // Unified exception handling for all standard exceptions
+        std::string error_msg = "IK Analyzer exception during buffer filling: ";
+        error_msg += e.what();
         LOG(ERROR) << error_msg;
-        readCount = 0;
+        
+        // Select appropriate error code based on exception type
+        int errCode = CL_ERR_Runtime; // Default error code
+        
+        if (dynamic_cast<const std::bad_alloc*>(&e)) {
+            errCode = CL_ERR_OutOfMemory;
+        }
+        
+        _CLTHROWT(errCode, error_msg.c_str());
+    } catch (...) {
+        // Handle unknown exceptions
+        std::string error_msg = "IK Analyzer: Unknown error occurred during buffer filling";
+        LOG(ERROR) << error_msg;
+        _CLTHROWT(CL_ERR_Runtime, error_msg.c_str());
     }
-         
-    available_ = readCount;
-    cursor_ = 0;
-    return readCount;
 }
 
 void AnalyzeContext::addLexeme(Lexeme& lexeme) {

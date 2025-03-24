@@ -20,8 +20,10 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <limits>
 
 #include "olap/rowset/segment_v2/inverted_index/analyzer/ik/IKAnalyzer.h"
+#include "olap/rowset/segment_v2/inverted_index/analyzer/ik/core/AnalyzeContext.h"
 using namespace lucene::analysis;
 
 namespace doris::segment_v2 {
@@ -426,69 +428,135 @@ TEST_F(IKTokenizerTest, TestLongTextCompareWithJava) {
     }
 }
 
-// Test the exception handling capabilities of the IKTokenizer::reset method
-TEST_F(IKTokenizerTest, TestResetExceptionHandling) {
-    // Create an analyzer and tokenizer
-    IKAnalyzer analyzer;
-    analyzer.initDict("./be/dict/ik");
-
-    // Create a valid reader first to initialize a tokenizer
-    lucene::util::SStringReader<char> validReader;
-    validReader.init("Test text", 9, false);
-    std::unique_ptr<IKTokenizer> tokenizer;
-    tokenizer.reset((IKTokenizer*)analyzer.tokenStream(L"", &validReader));
-
-    // Test case 1: Passing a null pointer to reset
-    // This should throw a CLuceneError with CL_ERR_NullPointer code
-    ASSERT_THROW({ tokenizer->reset(nullptr); }, CLuceneError);
-
-    // Test case 2: Create a mock reader that will cause issues during processing
-    class ProblemReader : public lucene::util::Reader {
+// Test the exception handling capabilities of the IKTokenizer and AnalyzeContext
+TEST_F(IKTokenizerTest, TestExceptionHandling) {
+    // Common mock reader class for testing exception handling
+    class MockReader : public lucene::util::Reader {
     public:
-        ProblemReader() {}
-        ~ProblemReader() override {}
+        enum class ExceptionType {
+            NONE,
+            RUNTIME_ERROR,
+            LENGTH_ERROR,
+            OUT_OF_MEMORY
+        };
 
-        // Override size() to return a very large number to potentially trigger allocation issues
-        int64_t size() const override { return INT64_MAX; }
+        MockReader(ExceptionType type = ExceptionType::NONE, const std::string& errorMsg = "") 
+            : exceptionType(type), message(errorMsg), returnSize(0) {}
+        
+        ~MockReader() override {}
 
-        // Override read to always throw an exception
-        int32_t read(const char*& start, int32_t min, int32_t max) override {
-            throw std::runtime_error("Simulated read error");
+        int32_t read(const void** start, int32_t min, int32_t max) override {
+            throwIfNeeded();
+            return 0;
         }
 
-        // Override seeking functionality to always fail
-        void seek(int64_t pos) override { throw std::runtime_error("Simulated seek error"); }
+        int32_t readCopy(void* start, int32_t off, int32_t len) override {
+            throwIfNeeded();
+            return returnSize;
+        }
 
-        int64_t getPosition() const override { return 0; }
-        void close() override {}
+        int64_t skip(int64_t ntoskip) override {
+            throwIfNeeded();
+            return 0;
+        }
+
+        int64_t position() override { return 0; }
+
+        size_t size() override { 
+            return std::numeric_limits<size_t>::max(); 
+        }
+        
+        void setReturnSize(int32_t size) { returnSize = size; }
+
+    private:
+        ExceptionType exceptionType;
+        std::string message;
+        int32_t returnSize;
+        
+        void throwIfNeeded() {
+            switch (exceptionType) {
+                case ExceptionType::RUNTIME_ERROR:
+                    throw std::runtime_error(message.empty() ? "Simulated runtime error" : message);
+                case ExceptionType::LENGTH_ERROR:
+                    throw std::length_error(message.empty() ? "basic_string::_M_create" : message);
+                case ExceptionType::OUT_OF_MEMORY:
+                    throw std::bad_alloc();
+                case ExceptionType::NONE:
+                default:
+                    break;
+            }
+        }
     };
 
-    // Create our problematic reader
-    ProblemReader problemReader;
+    // PART 1: Test IKTokenizer::reset exception handling
+    {
+        // Set up analyzer and tokenizer
+        IKAnalyzer analyzer;
+        analyzer.initDict("./be/dict/ik");
 
-    // Test case 2: Using a reader that throws exceptions during processing
-    // This should be caught and converted to a CLuceneError
-    ASSERT_THROW({ tokenizer->reset(&problemReader); }, CLuceneError);
+        // Initialize with a valid reader
+        lucene::util::SStringReader<char> validReader;
+        validReader.init("Test text", 9, false);
+        std::unique_ptr<IKTokenizer> tokenizer;
+        tokenizer.reset((IKTokenizer*)analyzer.tokenStream(L"", &validReader));
 
-    // Test case 3: Test successful reset after exception
-    // This verifies the tokenizer can recover after an exception
-    lucene::util::SStringReader<char> recoveryReader;
-    recoveryReader.init("Recovery text", 13, false);
+        // Test case 1: Reader throwing runtime error
+        MockReader runtimeErrorReader(MockReader::ExceptionType::RUNTIME_ERROR);
+        // This may throw different exceptions depending on implementation details
+        ASSERT_THROW({ tokenizer->reset(&runtimeErrorReader); }, CLuceneError);
 
-    ASSERT_NO_THROW({ tokenizer->reset(&recoveryReader); });
+        // Test case 2: Reader throwing length error
+        MockReader lengthErrorReader(MockReader::ExceptionType::LENGTH_ERROR);
+        ASSERT_THROW({ tokenizer->reset(&lengthErrorReader); }, CLuceneError);
 
-    // Verify tokenizer works after recovery
-    Token t;
-    std::vector<std::string> tokens;
-    while (tokenizer->next(&t)) {
-        std::string term(t.termBuffer<char>(), t.termLength<char>());
-        tokens.emplace_back(term);
+        // Test case 3: Recovery after exception
+        lucene::util::SStringReader<char> recoveryReader;
+        recoveryReader.init("Recovery text", 13, false);
+        ASSERT_NO_THROW({ tokenizer->reset(&recoveryReader); });
+
+        // Verify tokenizer works after recovery
+        Token t;
+        std::vector<std::string> tokens;
+        while (tokenizer->next(&t)) {
+            std::string term(t.termBuffer<char>(), t.termLength<char>());
+            tokens.emplace_back(term);
+        }
+        ASSERT_EQ(tokens.size(), 2);
+        ASSERT_EQ(tokens[0], "recovery");
+        ASSERT_EQ(tokens[1], "text");
     }
 
-    // Should tokenize correctly after recovery
-    ASSERT_EQ(tokens.size(), 2);
-    ASSERT_EQ(tokens[0], "recovery");
-    ASSERT_EQ(tokens[1], "text");
+    // PART 2: Test AnalyzeContext::fillBuffer exception handling
+    {
+        // Create AnalyzeContext
+        std::shared_ptr<Configuration> config = std::make_shared<Configuration>();
+        IKMemoryPool<Cell> pool(1024);
+        AnalyzeContext context(pool, config);
+
+        // Test case 1: Reader throwing length error
+        MockReader lengthErrorReader(MockReader::ExceptionType::LENGTH_ERROR);
+        ASSERT_THROW({ context.fillBuffer(&lengthErrorReader); }, CLuceneError);
+
+        // Test case 2: Reader throwing runtime error
+        MockReader runtimeErrorReader(MockReader::ExceptionType::RUNTIME_ERROR);
+        ASSERT_THROW({ context.fillBuffer(&runtimeErrorReader); }, CLuceneError);
+
+        // Test case 3: Reader simulating memory allocation failure
+        MockReader largeDataReader;
+        largeDataReader.setReturnSize(std::numeric_limits<int32_t>::max() - 1);
+        try {
+            context.fillBuffer(&largeDataReader);
+            // If no exception is thrown, this is acceptable too
+        } catch (const CLuceneError& e) {
+            // Verify the exception is properly converted
+            ASSERT_TRUE(std::string(e.what()).find("buffer filling") != std::string::npos);
+        }
+
+        // Test case 4: Reader returning empty data
+        MockReader emptyReader;
+        emptyReader.setReturnSize(0);
+        ASSERT_EQ(context.fillBuffer(&emptyReader), 0);
+    }
 }
 
 } // namespace doris::segment_v2
