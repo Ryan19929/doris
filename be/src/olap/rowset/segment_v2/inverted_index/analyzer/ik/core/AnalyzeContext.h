@@ -31,7 +31,6 @@
 #include "LexemePath.h"
 #include "../dic/Dictionary.h"
 #include "../util/IKContainer.h"
-#include "../util/IKMemoryPool.h"
 #include "CLucene/util/CLStreams.h"
 #include <parallel_hashmap/phmap.h>
 

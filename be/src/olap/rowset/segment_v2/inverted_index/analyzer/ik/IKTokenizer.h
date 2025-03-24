@@ -31,7 +31,7 @@ namespace doris::segment_v2 {
 
 class IKTokenizer : public Tokenizer {
 public:
-    IKTokenizer() = delete;
+    IKTokenizer();
     IKTokenizer(std::shared_ptr<Configuration> config, bool lowercase, bool ownReader);
     ~IKTokenizer() override = default;
 

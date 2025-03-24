@@ -21,9 +21,9 @@
 #include <optional>
 #include <algorithm>
 #include <sstream>
+#include <parallel_hashmap/phmap.h>
 
 #include "CLucene/_ApiHeader.h"
-#include <parallel_hashmap/phmap.h>
 #include "QuickSortSet.h"
 
 namespace doris::segment_v2 {
