@@ -78,6 +78,10 @@ std::string get_parser_mode_string_from_properties(
     if (properties.find(INVERTED_INDEX_PARSER_MODE_KEY) != properties.end()) {
         return properties.at(INVERTED_INDEX_PARSER_MODE_KEY);
     } else {
+        auto parser_it = properties.find(INVERTED_INDEX_PARSER_KEY);
+        if (parser_it != properties.end() && parser_it->second == INVERTED_INDEX_PARSER_IK) {
+            return INVERTED_INDEX_PARSER_SMART;
+        }
         return INVERTED_INDEX_PARSER_COARSE_GRANULARITY;
     }
 }
