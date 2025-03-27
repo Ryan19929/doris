@@ -45,6 +45,6 @@ private:
 
     int number_start_;
     int number_end_;
-    IKVector<Hit> count_hits_;
+    std::vector<Hit> count_hits_;
 };
 } // namespace doris::segment_v2

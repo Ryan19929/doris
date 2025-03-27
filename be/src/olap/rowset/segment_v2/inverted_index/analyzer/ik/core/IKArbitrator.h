@@ -39,7 +39,7 @@ private:
     LexemePath* judge(Cell* lexeme_cell, size_t full_text_length);
 
     // Forward traversal, add lexeme, construct a non-ambiguous token combination
-    void forwardPath(Cell* lexeme_cell, LexemePath* path_option, IKStack<Cell*>& conflictStack);
+    void forwardPath(Cell* lexeme_cell, LexemePath* path_option, std::stack<Cell*, std::vector<Cell*>>& conflictStack);
     void forwardPath(Cell* lexeme_cell, LexemePath* path_option);
     // Roll back the token chain until it can accept the specified token
     void backPath(const Lexeme& lexeme, LexemePath* path_option);

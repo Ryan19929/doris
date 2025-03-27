@@ -59,7 +59,7 @@ LexemePath* IKArbitrator::judge(Cell* lexeme_cell, size_t full_text_length) {
     LexemePath* path_option = new LexemePath(pool_);
 
     // Traverse crossPath once and return the stack of conflicting Lexemes
-    IKStack<Cell*> lexemeStack;
+    std::stack<Cell*, std::vector<Cell*>> lexemeStack;
     forwardPath(lexeme_cell, path_option, lexemeStack);
     LexemePath* best_path = new LexemePath(*path_option, pool_);
 
@@ -88,7 +88,7 @@ void IKArbitrator::forwardPath(Cell* lexeme_cell, LexemePath* path_option) {
 }
 
 void IKArbitrator::forwardPath(Cell* lexeme_cell, LexemePath* path_option,
-                               IKStack<Cell*>& conflictStack) {
+                               std::stack<Cell*, std::vector<Cell*>>& conflictStack) {
     auto current_cell = lexeme_cell;
     while (current_cell) {
         if (!path_option->addNotCrossLexeme(current_cell->getLexeme())) {

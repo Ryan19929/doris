@@ -51,7 +51,7 @@ private:
     int arabic_start_ {-1};
     int arabic_end_ {-1};
 
-    IKVector<char> letter_connectors_;
-    IKVector<char> num_connectors_;
+    std::vector<char> letter_connectors_;
+    std::vector<char> num_connectors_;
 };
 } // namespace doris::segment_v2

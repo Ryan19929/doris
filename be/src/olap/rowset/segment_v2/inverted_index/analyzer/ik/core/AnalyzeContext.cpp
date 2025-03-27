@@ -60,7 +60,7 @@ void AnalyzeContext::reset() {
     }
     path_map_.clear();
 
-    results_ = IKQue<Lexeme>();
+    results_ = std::queue<Lexeme>();
 }
 
 size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {

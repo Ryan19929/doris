@@ -33,8 +33,6 @@
 #include "common/logging.h"
 #include "olap/rowset/segment_v2/inverted_index/analyzer/ik/cfg/Configuration.h"
 #include "olap/rowset/segment_v2/inverted_index/analyzer/ik/dic/Dictionary.h"
-#include "olap/rowset/segment_v2/inverted_index/analyzer/ik/util/IKContainer.h"
-
 namespace doris::segment_v2 {
 
 class AnalyzeContext {
@@ -67,7 +65,7 @@ private:
     // LexemePath position index table
     phmap::flat_hash_map<size_t, LexemePath*> path_map_;
     // Final tokenization result set
-    IKQue<Lexeme> results_;
+    std::queue<Lexeme> results_;
     // Tokenizer configuration
     std::shared_ptr<Configuration> config_;
     void outputSingleCJK(size_t index);
