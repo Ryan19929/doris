@@ -21,6 +21,7 @@
 #include <memory>
 #include <vector>
 
+#include "vec/common/arena.h"
 #include "AnalyzeContext.h"
 #include "CJKSegmenter.h"
 #include "CN_QuantifierSegmenter.h"
@@ -40,7 +41,7 @@ public:
 
 private:
     std::vector<std::unique_ptr<ISegmenter>> loadSegmenters();
-    IKMemoryPool<Cell> pool_;
+    vectorized::Arena arena_;
     lucene::util::Reader* input_;
     std::shared_ptr<Configuration> config_;
     std::unique_ptr<AnalyzeContext> context_;
