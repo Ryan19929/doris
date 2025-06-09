@@ -547,6 +547,7 @@ int StorageEngine::_get_and_set_next_disk_index(int64 partition_id,
 void StorageEngine::_get_candidate_stores(TStorageMedium::type storage_medium,
                                           std::vector<DirInfo>& dir_infos) {
     std::vector<double> usages;
+    // First pass: try to get stores with specified storage medium
     for (auto& it : _store_map) {
         DataDir* data_dir = it.second.get();
         if (data_dir->is_used()) {
@@ -560,6 +561,31 @@ void StorageEngine::_get_candidate_stores(TStorageMedium::type storage_medium,
                 dir_info.available_level = 0;
                 usages.push_back(usage);
                 dir_infos.push_back(dir_info);
+            }
+        }
+    }
+    // Second pass: if no stores found with specified medium and fallback is enabled,
+    // try any available storage medium
+    if (dir_infos.empty() && _available_storage_medium_type_count > 1 &&
+        config::enable_storage_medium_fallback) {
+        LOG(INFO) << "No available stores found for specified storage medium " << storage_medium
+                  << ", trying fallback to alternative storage mediums";
+
+        for (auto& it : _store_map) {
+            DataDir* data_dir = it.second.get();
+            if (data_dir->is_used() && !data_dir->reach_capacity_limit(0)) {
+                double usage = data_dir->get_usage(0);
+                DirInfo dir_info;
+                dir_info.data_dir = data_dir;
+                dir_info.usage = usage;
+                dir_info.available_level = 0;
+                usages.push_back(usage);
+                dir_infos.push_back(dir_info);
+
+                LOG(INFO) << "Fallback: selected alternative storage medium "
+                          << data_dir->storage_medium()
+                          << " for tablet creation (originally requested: " << storage_medium
+                          << ")";
             }
         }
     }
