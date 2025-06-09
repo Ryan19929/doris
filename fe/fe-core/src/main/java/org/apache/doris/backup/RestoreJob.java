@@ -127,6 +127,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     private static final String PROP_CLEAN_PARTITIONS = RestoreStmt.PROP_CLEAN_PARTITIONS;
     private static final String PROP_ATOMIC_RESTORE = RestoreStmt.PROP_ATOMIC_RESTORE;
     private static final String PROP_FORCE_REPLACE = RestoreStmt.PROP_FORCE_REPLACE;
+    private static final String PROP_MEDIUM_SYNC_POLICY = RestoreStmt.PROP_MEDIUM_SYNC_POLICY;
     private static final String ATOMIC_RESTORE_TABLE_PREFIX = "__doris_atomic_restore_prefix__";
 
     private static final Logger LOG = LogManager.getLogger(RestoreJob.class);
@@ -219,6 +220,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     private boolean isAtomicRestore = false;
     // Whether to restore the table by replacing the exists but conflicted table.
     private boolean isForceReplace = false;
+    // Medium sync policy: "hdd" or "same_with_upstream"
+    private String mediumSyncPolicy = RestoreStmt.MEDIUM_SYNC_POLICY_HDD;
 
     // restore properties
     @SerializedName("prop")
@@ -237,8 +240,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     public RestoreJob(String label, String backupTs, long dbId, String dbName, BackupJobInfo jobInfo, boolean allowLoad,
             ReplicaAllocation replicaAlloc, long timeoutMs, int metaVersion, boolean reserveReplica,
             boolean reserveColocate, boolean reserveDynamicPartitionEnable, boolean isBeingSynced,
-            boolean isCleanTables, boolean isCleanPartitions, boolean isAtomicRestore, boolean isForceReplace, Env env,
-            long repoId) {
+            boolean isCleanTables, boolean isCleanPartitions, boolean isAtomicRestore, boolean isForceReplace,
+            String mediumSyncPolicy, Env env, long repoId) {
         super(JobType.RESTORE, label, dbId, dbName, timeoutMs, env, repoId);
         this.backupTimestamp = backupTs;
         this.jobInfo = jobInfo;
@@ -260,6 +263,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         if (this.isAtomicRestore) {
             this.isForceReplace = isForceReplace;
         }
+        this.mediumSyncPolicy = mediumSyncPolicy;
         properties.put(PROP_RESERVE_REPLICA, String.valueOf(reserveReplica));
         properties.put(PROP_RESERVE_COLOCATE, String.valueOf(reserveColocate));
         properties.put(PROP_RESERVE_DYNAMIC_PARTITION_ENABLE, String.valueOf(reserveDynamicPartitionEnable));
@@ -268,17 +272,18 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         properties.put(PROP_CLEAN_PARTITIONS, String.valueOf(isCleanPartitions));
         properties.put(PROP_ATOMIC_RESTORE, String.valueOf(isAtomicRestore));
         properties.put(PROP_FORCE_REPLACE, String.valueOf(isForceReplace));
+        properties.put(PROP_MEDIUM_SYNC_POLICY, mediumSyncPolicy);
     }
 
     public RestoreJob(String label, String backupTs, long dbId, String dbName, BackupJobInfo jobInfo, boolean allowLoad,
             ReplicaAllocation replicaAlloc, long timeoutMs, int metaVersion, boolean reserveReplica,
             boolean reserveColocate, boolean reserveDynamicPartitionEnable, boolean isBeingSynced,
-            boolean isCleanTables, boolean isCleanPartitions, boolean isAtomicRestore, boolean isForeReplace, Env env,
-            long repoId,
+            boolean isCleanTables, boolean isCleanPartitions, boolean isAtomicRestore, boolean isForeReplace,
+            String mediumSyncPolicy, Env env, long repoId,
             BackupMeta backupMeta) {
         this(label, backupTs, dbId, dbName, jobInfo, allowLoad, replicaAlloc, timeoutMs, metaVersion, reserveReplica,
                 reserveColocate, reserveDynamicPartitionEnable, isBeingSynced, isCleanTables, isCleanPartitions,
-                isAtomicRestore, isForeReplace, env, repoId);
+                isAtomicRestore, isForeReplace, mediumSyncPolicy, env, repoId);
 
         this.backupMeta = backupMeta;
     }
@@ -301,6 +306,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     public List<ColocatePersistInfo> getColocatePersistInfos() {
         return colocatePersistInfos;
+    }
+
+    public String getMediumSyncPolicy() {
+        return mediumSyncPolicy;
+    }
+
+    public boolean preserveStorageMedium() {
+        return RestoreStmt.MEDIUM_SYNC_POLICY_SAME_WITH_UPSTREAM.equals(mediumSyncPolicy);
     }
 
     public synchronized boolean finishTabletSnapshotTask(SnapshotTask task, TFinishTaskRequest request) {

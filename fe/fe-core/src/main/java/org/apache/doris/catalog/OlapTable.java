@@ -2117,10 +2117,12 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
             }
             partition.setState(PartitionState.NORMAL);
             if (isForBackup) {
-                // set storage medium to HDD for backup job, because we want that the backuped table
-                // can be able to restored to another Doris cluster without SSD disk.
-                // But for other operation such as truncate table, keep the origin storage medium.
-                copied.getPartitionInfo().setDataProperty(partition.getId(), new DataProperty(TStorageMedium.HDD));
+                // For backup jobs, preserve the original storage medium information.
+                // The restore operation will utilize the medium sync policy to determine 
+                // the appropriate storage medium during restoration.
+                LOG.debug("Preserving original storage medium for partition {} during backup: {}", 
+                         partition.getId(), 
+                         copied.getPartitionInfo().getDataProperty(partition.getId()).getStorageMedium());
             }
             for (MaterializedIndex idx : partition.getMaterializedIndices(extState)) {
                 idx.setState(IndexState.NORMAL);
