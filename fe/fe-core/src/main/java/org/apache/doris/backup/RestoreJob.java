@@ -869,8 +869,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
                     // reset all ids in this table
                     String srcDbName = jobInfo.dbName;
+                    LOG.info("Using medium sync policy '{}' for table {}", 
+                            mediumSyncPolicy, remoteOlapTbl.getName());
+                    
                     Status st = remoteOlapTbl.resetIdsForRestore(env, db, replicaAlloc, reserveReplica,
-                            reserveColocate, colocatePersistInfos, srcDbName);
+                            reserveColocate, colocatePersistInfos, srcDbName, mediumSyncPolicy);
                     if (!st.ok()) {
                         status = st;
                         return;
@@ -1403,12 +1406,16 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
             for (Tablet restoreTablet : restoredIdx.getTablets()) {
                 TabletRef baseTabletRef = tabletBases == null ? null : tabletBases.get(restoreTablet.getId());
-                // All restored replicas will be saved to HDD by default.
+                // Determine storage medium based on tablet binding status and medium sync policy
                 TStorageMedium storageMedium = TStorageMedium.HDD;
-                if (tabletBases != null) {
-                    // ensure this tablet is bound to the same backend disk as the origin table's tablet.
+                if (baseTabletRef != null || preserveStorageMedium()) {
+                    // Use storage medium from partition data property in two scenarios:
+                    // 1. Tablet has local binding (baseTabletRef != null): ensures binding to same disk type
+                    // 2. medium_sync_policy = "same_with_upstream": preserves upstream storage medium
+                    // Note: localTbl partition contains the upstream medium info from backup meta
                     storageMedium = localTbl.getPartitionInfo().getDataProperty(restorePart.getId()).getStorageMedium();
-                }
+                } 
+                LOG.debug("tablet {} storage medium {} same with upstream or preserve storage medium", restoreTablet.getId(), storageMedium);
                 TabletMeta tabletMeta = new TabletMeta(db.getId(), localTbl.getId(), restorePart.getId(),
                         restoredIdx.getId(), indexMeta.getSchemaHash(), storageMedium);
                 Env.getCurrentInvertedIndex().addTablet(restoreTablet.getId(), tabletMeta);
@@ -1516,8 +1523,19 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
                 // replicas
                 try {
+                    // Determine preferred storage medium for this partition based on medium sync policy
+                    TStorageMedium preferredMedium = TStorageMedium.HDD;
+                    if (preserveStorageMedium()) {
+                        // When medium_sync_policy is "same_with_upstream", prefer original storage medium from backup
+                        DataProperty partitionDataProperty = remoteTbl.getPartitionInfo().getDataProperty(oldPartId);
+                        if (partitionDataProperty != null) {
+                            preferredMedium = partitionDataProperty.getStorageMedium();
+                        } 
+                    }
+                    LOG.debug("partition {} storage medium {} same with upstream or preserve storage medium", partName, preferredMedium);
                     Pair<Map<Tag, List<Long>>, TStorageMedium> beIdsAndMedium = Env.getCurrentSystemInfo()
-                            .selectBackendIdsForReplicaCreation(replicaAlloc, nextIndexes, null, false, false);
+                            .selectBackendIdsForReplicaCreation(replicaAlloc, nextIndexes, preferredMedium, 
+                                                              false, false);
                     Map<Tag, List<Long>> beIds = beIdsAndMedium.first;
                     for (Map.Entry<Tag, List<Long>> entry : beIds.entrySet()) {
                         for (Long beId : entry.getValue()) {

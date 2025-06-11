@@ -26,6 +26,7 @@ import org.apache.doris.analysis.DataSortInfo;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.IndexDef;
 import org.apache.doris.analysis.SlotDescriptor;
+import org.apache.doris.analysis.RestoreStmt;
 import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.backup.Status;
 import org.apache.doris.backup.Status.ErrCode;
@@ -779,6 +780,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     public Status resetIdsForRestore(Env env, Database db, ReplicaAllocation restoreReplicaAlloc,
             boolean reserveReplica, boolean reserveColocate, List<ColocatePersistInfo> colocatePersistInfos,
             String srcDbName) {
+        return resetIdsForRestore(env, db, restoreReplicaAlloc, reserveReplica, reserveColocate, 
+                colocatePersistInfos, srcDbName, RestoreStmt.MEDIUM_SYNC_POLICY_HDD);
+    }
+
+    public Status resetIdsForRestore(Env env, Database db, ReplicaAllocation restoreReplicaAlloc,
+            boolean reserveReplica, boolean reserveColocate, List<ColocatePersistInfo> colocatePersistInfos,
+            String srcDbName, String mediumSyncPolicy) {
         // ATTN: The meta of the restore may come from different clusters, so the
         // original ID in the meta may conflict with the ID of the new cluster. For
         // example, if a newly allocated ID happens to be the same as an original ID,
@@ -917,9 +925,23 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                                 tag2beIds.put(entry3.getKey(), entry3.getValue().get(i));
                             }
                         } else {
+                            // Determine preferred storage medium for this partition based on medium sync policy
+                            TStorageMedium preferredMedium = TStorageMedium.HDD;
+                            if (RestoreStmt.MEDIUM_SYNC_POLICY_SAME_WITH_UPSTREAM.equals(mediumSyncPolicy)) {
+                                // When medium_sync_policy is "same_with_upstream", use original partition storage medium
+                                DataProperty partitionDataProperty = partitionInfo.getDataProperty(entry.getKey());
+                                if (partitionDataProperty != null) {
+                                    preferredMedium = partitionDataProperty.getStorageMedium();
+                                }
+                            }
+                            LOG.debug("Using storage medium {} for partition {} due to policy '{}'", preferredMedium, entry.getKey(), mediumSyncPolicy);     
+                            
+                            // Always set isStorageMediumSpecified=false to enable try-best logic:
+                            // - First try with preferred medium
+                            // - If no backends available, automatically retry with alternative medium
                             Pair<Map<Tag, List<Long>>, TStorageMedium> tag2beIdsAndMedium =
                                     Env.getCurrentSystemInfo().selectBackendIdsForReplicaCreation(
-                                            replicaAlloc, nextIndexes, null,
+                                            replicaAlloc, nextIndexes, preferredMedium,
                                             false, false);
                             tag2beIds = tag2beIdsAndMedium.first;
                         }
