@@ -933,8 +933,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                                 if (partitionDataProperty != null) {
                                     preferredMedium = partitionDataProperty.getStorageMedium();
                                 }
+                            } else {
+                                // When medium_sync_policy is "hdd", force update partition DataProperty to HDD
+                                partitionInfo.getDataProperty(entry.getKey()).setStorageMedium(TStorageMedium.HDD);
+                                LOG.info("Reset partition {} storage medium to HDD due to policy '{}'", 
+                                    entry.getKey(), mediumSyncPolicy);
                             }
-                            LOG.debug("Using storage medium {} for partition {} due to policy '{}'", preferredMedium, entry.getKey(), mediumSyncPolicy);     
+                            LOG.info("Using storage medium {} for partition {} due to policy '{}'", preferredMedium, entry.getKey(), mediumSyncPolicy);     
                             
                             // Always set isStorageMediumSpecified=false to enable try-best logic:
                             // - First try with preferred medium

@@ -264,6 +264,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             this.isForceReplace = isForceReplace;
         }
         this.mediumSyncPolicy = mediumSyncPolicy;
+        LOG.info("RestoreJob created with mediumSyncPolicy={}, preserveStorageMedium={}, label={}", 
+                 mediumSyncPolicy, preserveStorageMedium(), label);
         properties.put(PROP_RESERVE_REPLICA, String.valueOf(reserveReplica));
         properties.put(PROP_RESERVE_COLOCATE, String.valueOf(reserveColocate));
         properties.put(PROP_RESERVE_DYNAMIC_PARTITION_ENABLE, String.valueOf(reserveDynamicPartitionEnable));
@@ -313,7 +315,22 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public boolean preserveStorageMedium() {
-        return RestoreStmt.MEDIUM_SYNC_POLICY_SAME_WITH_UPSTREAM.equals(mediumSyncPolicy);
+        boolean preserve = RestoreStmt.MEDIUM_SYNC_POLICY_SAME_WITH_UPSTREAM.equals(mediumSyncPolicy);
+        LOG.info("preserveStorageMedium: mediumSyncPolicy={}, preserve={}, jobId={}", 
+                 mediumSyncPolicy, preserve, jobId);
+        return preserve;
+    }
+
+    private boolean isStorageMediumSpecified() {
+        switch (mediumSyncPolicy) {
+            case RestoreStmt.MEDIUM_SYNC_POLICY_HDD:
+                return false; 
+            case RestoreStmt.MEDIUM_SYNC_POLICY_SAME_WITH_UPSTREAM:
+                return false;  
+            default:
+                LOG.warn("Unknown medium sync policy: {}, using non-specified as default", mediumSyncPolicy);
+                return false; // Default to non-specified (allow fallback)
+        }
     }
 
     public synchronized boolean finishTabletSnapshotTask(SnapshotTask task, TFinishTaskRequest request) {
@@ -1415,7 +1432,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     // Note: localTbl partition contains the upstream medium info from backup meta
                     storageMedium = localTbl.getPartitionInfo().getDataProperty(restorePart.getId()).getStorageMedium();
                 } 
-                LOG.debug("tablet {} storage medium {} same with upstream or preserve storage medium", restoreTablet.getId(), storageMedium);
+                LOG.info("tablet {} storage medium {} same with upstream or preserve storage medium", restoreTablet.getId(), storageMedium);
                 TabletMeta tabletMeta = new TabletMeta(db.getId(), localTbl.getId(), restorePart.getId(),
                         restoredIdx.getId(), indexMeta.getSchemaHash(), storageMedium);
                 Env.getCurrentInvertedIndex().addTablet(restoreTablet.getId(), tabletMeta);
@@ -1449,7 +1466,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             objectPool,
                             localTbl.rowStorePageSize(),
                             localTbl.variantEnableFlattenNested(),
-                            localTbl.storagePageSize());
+                            localTbl.storagePageSize(),
+                            isStorageMediumSpecified());
                     task.setInvertedIndexFileStorageFormat(localTbl.getInvertedIndexFileStorageFormat());
                     task.setInRestoreMode(true);
                     if (baseTabletRef != null) {
@@ -2839,6 +2857,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         isCleanPartitions = Boolean.parseBoolean(properties.get(PROP_CLEAN_PARTITIONS));
         isAtomicRestore = Boolean.parseBoolean(properties.get(PROP_ATOMIC_RESTORE));
         isForceReplace = Boolean.parseBoolean(properties.get(PROP_FORCE_REPLACE));
+        mediumSyncPolicy = properties.getOrDefault(PROP_MEDIUM_SYNC_POLICY, RestoreStmt.MEDIUM_SYNC_POLICY_HDD);
+        LOG.info("readOthers: restored mediumSyncPolicy={}, preserveStorageMedium={}, jobId={}", 
+                 mediumSyncPolicy, preserveStorageMedium(), jobId);
     }
 
     @Override
@@ -2850,6 +2871,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         isCleanPartitions = Boolean.parseBoolean(properties.get(PROP_CLEAN_PARTITIONS));
         isAtomicRestore = Boolean.parseBoolean(properties.get(PROP_ATOMIC_RESTORE));
         isForceReplace = Boolean.parseBoolean(properties.get(PROP_FORCE_REPLACE));
+        mediumSyncPolicy = properties.getOrDefault(PROP_MEDIUM_SYNC_POLICY, RestoreStmt.MEDIUM_SYNC_POLICY_HDD);
+        LOG.info("gsonPostProcess: restored mediumSyncPolicy={}, preserveStorageMedium={}, jobId={}", 
+                 mediumSyncPolicy, preserveStorageMedium(), jobId);
     }
 
     @Override

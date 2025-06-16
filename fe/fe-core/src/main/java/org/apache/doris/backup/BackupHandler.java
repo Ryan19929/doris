@@ -670,6 +670,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
             }
             String backupTimestamp = TimeUtils.longToTimeString(
                     jobInfo.getBackupTime(), TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
+            LOG.info("BackupHandler.restore: creating local RestoreJob with mediumSyncPolicy={}, label={}, dbName={}", 
+                     stmt.getMediumSyncPolicy(), stmt.getLabel(), db.getFullName());
             restoreJob = new RestoreJob(stmt.getLabel(), backupTimestamp,
                     db.getId(), db.getFullName(), jobInfo, stmt.allowLoad(), stmt.getReplicaAlloc(),
                     stmt.getTimeoutMs(), metaVersion, stmt.reserveReplica(), stmt.reserveColocate(),
@@ -677,12 +679,14 @@ public class BackupHandler extends MasterDaemon implements Writable {
                     stmt.isCleanTables(), stmt.isCleanPartitions(), stmt.isAtomicRestore(), stmt.isForceReplace(),
                     stmt.getMediumSyncPolicy(), env, Repository.KEEP_ON_LOCAL_REPO_ID, backupMeta);
         } else {
-            restoreJob = new RestoreJob(stmt.getLabel(), stmt.getBackupTimestamp(),
-                db.getId(), db.getFullName(), jobInfo, stmt.allowLoad(), stmt.getReplicaAlloc(),
-                stmt.getTimeoutMs(), stmt.getMetaVersion(), stmt.reserveReplica(), stmt.reserveColocate(),
-                stmt.reserveDynamicPartitionEnable(), stmt.isBeingSynced(), stmt.isCleanTables(),
-                stmt.isCleanPartitions(), stmt.isAtomicRestore(), stmt.isForceReplace(),
-                stmt.getMediumSyncPolicy(), env, repository.getId());
+                    LOG.info("BackupHandler.restore: creating RestoreJob with mediumSyncPolicy={}, label={}, dbName={}", 
+                 stmt.getMediumSyncPolicy(), stmt.getLabel(), db.getFullName());
+        restoreJob = new RestoreJob(stmt.getLabel(), stmt.getBackupTimestamp(),
+            db.getId(), db.getFullName(), jobInfo, stmt.allowLoad(), stmt.getReplicaAlloc(),
+            stmt.getTimeoutMs(), stmt.getMetaVersion(), stmt.reserveReplica(), stmt.reserveColocate(),
+            stmt.reserveDynamicPartitionEnable(), stmt.isBeingSynced(), stmt.isCleanTables(),
+            stmt.isCleanPartitions(), stmt.isAtomicRestore(), stmt.isForceReplace(),
+            stmt.getMediumSyncPolicy(), env, repository.getId());
         }
 
         env.getEditLog().logRestoreJob(restoreJob);
