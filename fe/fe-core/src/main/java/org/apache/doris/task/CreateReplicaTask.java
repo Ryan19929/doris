@@ -132,8 +132,6 @@ public class CreateReplicaTask extends AgentTask {
 
     private boolean variantEnableFlattenNested;
 
-    private boolean isStorageMediumSpecified = true;
-
     public CreateReplicaTask(long backendId, long dbId, long tableId, long partitionId, long indexId, long tabletId,
                              long replicaId, short shortKeyColumnCount, int schemaHash, long version,
                              KeysType keysType, TStorageType storageType,
@@ -160,8 +158,7 @@ public class CreateReplicaTask extends AgentTask {
                              Map<Object, Object> objectPool,
                              long rowStorePageSize,
                              boolean variantEnableFlattenNested,
-                             long storagePageSize,
-                             boolean isStorageMediumSpecified) {
+                             long storagePageSize) {
         super(null, backendId, TTaskType.CREATE, dbId, tableId, partitionId, indexId, tabletId);
 
         this.replicaId = replicaId;
@@ -210,7 +207,6 @@ public class CreateReplicaTask extends AgentTask {
         this.rowStorePageSize = rowStorePageSize;
         this.variantEnableFlattenNested = variantEnableFlattenNested;
         this.storagePageSize = storagePageSize;
-        this.isStorageMediumSpecified = isStorageMediumSpecified;
     }
 
     public void setIsRecoverTask(boolean isRecoverTask) {
@@ -424,8 +420,6 @@ public class CreateReplicaTask extends AgentTask {
         if (binlogConfig != null) {
             createTabletReq.setBinlogConfig(binlogConfig.toThrift());
         }
-
-        createTabletReq.setIsStorageMediumSpecified(isStorageMediumSpecified);
 
         return createTabletReq;
     }
