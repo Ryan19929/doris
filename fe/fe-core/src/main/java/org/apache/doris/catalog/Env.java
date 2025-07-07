@@ -84,6 +84,7 @@ import org.apache.doris.binlog.BinlogGcer;
 import org.apache.doris.binlog.BinlogManager;
 import org.apache.doris.blockrule.SqlBlockRuleMgr;
 import org.apache.doris.catalog.ColocateTableIndex.GroupId;
+import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.DistributionInfo.DistributionInfoType;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.MetaIdGenerator.IdGeneratorBuffer;
@@ -3745,6 +3746,17 @@ public class Env {
             sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM).append("\" = \"");
             sb.append(olapTable.getStorageMedium().name().toLowerCase());
             sb.append("\"");
+        }
+        
+        // strict storage medium
+        // Get strict storage medium from the first partition's data property
+        if (!olapTable.getPartitions().isEmpty()) {
+            Partition firstPartition = olapTable.getPartitions().iterator().next();
+            DataProperty dataProperty = olapTable.getPartitionInfo().getDataProperty(firstPartition.getId());
+            if (dataProperty != null) {
+                sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_STRICT_STORAGE_MEDIUM).append("\" = \"");
+                sb.append(dataProperty.isStrictStorageMedium()).append("\"");
+            }
         }
 
         // storage type
