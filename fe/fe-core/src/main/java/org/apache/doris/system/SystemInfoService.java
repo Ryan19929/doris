@@ -457,23 +457,29 @@ public class SystemInfoService {
     // Select the smallest number of tablets as the starting position of
     // round robin in the BE that match the policy
     public int getStartPosOfRoundRobin(Tag tag, TStorageMedium storageMedium, boolean isStorageMediumSpecified) {
+        return getStartPosOfRoundRobin(tag, storageMedium, isStorageMediumSpecified, false);
+    }
+
+    // round robin in the BE that match the policy with strict storage medium support
+    public int getStartPosOfRoundRobin(Tag tag, TStorageMedium storageMedium, boolean isStorageMediumSpecified, boolean strictStorageMedium) {
         BeSelectionPolicy.Builder builder = new BeSelectionPolicy.Builder()
                 .needScheduleAvailable()
                 .needCheckDiskUsage()
                 .addTags(Sets.newHashSet(tag))
-                .setStorageMedium(storageMedium);
+                .setStorageMedium(storageMedium)
+                .setStrictStorageMedium(strictStorageMedium)
+                .setStorageMediumSpecified(isStorageMediumSpecified);
         if (FeConstants.runningUnitTest || Config.allow_replica_on_same_host) {
             builder.allowOnSameHost();
         }
 
         BeSelectionPolicy policy = builder.build();
+        
         List<Long> beIds = selectBackendIdsByPolicy(policy, -1);
-        if (beIds.isEmpty() && storageMedium != null && !isStorageMediumSpecified) {
-            storageMedium = (storageMedium == TStorageMedium.HDD) ? TStorageMedium.SSD : TStorageMedium.HDD;
-            policy = builder.setStorageMedium(storageMedium).build();
-            beIds = selectBackendIdsByPolicy(policy, -1);
+        
+        if (beIds.isEmpty()) {
+            return -1;
         }
-
         long minBeTabletsNum = Long.MAX_VALUE;
         int minIndex = -1;
         for (int i = 0; i < beIds.size(); ++i) {
@@ -495,14 +501,19 @@ public class SystemInfoService {
      * @param storageMedium
      * @param isStorageMediumSpecified
      * @param isOnlyForCheck set true if only used for check available backend
+     * @param strictStorageMedium if true, enforce strict storage medium allocation without fallback
      * @return return the selected backend ids group by tag.
      * @throws DdlException
      */
     public Pair<Map<Tag, List<Long>>, TStorageMedium> selectBackendIdsForReplicaCreation(
             ReplicaAllocation replicaAlloc, Map<Tag, Integer> nextIndexs,
             TStorageMedium storageMedium, boolean isStorageMediumSpecified,
-            boolean isOnlyForCheck)
+            boolean isOnlyForCheck, boolean strictStorageMedium)
             throws DdlException {
+        // 添加日志：记录传入的strictStorageMedium参数
+        LOG.info("selectBackendIdsForReplicaCreation: strictStorageMedium={}, storageMedium={}, isStorageMediumSpecified={}", 
+                 strictStorageMedium, storageMedium, isStorageMediumSpecified);
+        
         Map<Long, Backend> copiedBackends = Maps.newHashMap(getAllClusterBackendsNoException());
         Map<Tag, List<Long>> chosenBackendIds = Maps.newHashMap();
         Map<Tag, Short> allocMap = replicaAlloc.getAllocMap();
@@ -518,9 +529,20 @@ public class SystemInfoService {
 
             for (Map.Entry<Tag, Short> entry : allocMap.entrySet()) {
                 Tag tag = entry.getKey();
+                
+                // 添加日志：记录为每个Tag构建BeSelectionPolicy时的参数
+                LOG.info("selectBackendIdsForReplicaCreation: Building BeSelectionPolicy for tag={}, strictStorageMedium={}", 
+                         tag, strictStorageMedium);
+                
                 BeSelectionPolicy.Builder builder = new BeSelectionPolicy.Builder()
-                        .needScheduleAvailable().needCheckDiskUsage().addTags(Sets.newHashSet(entry.getKey()))
-                        .setStorageMedium(storageMedium);
+                        .needScheduleAvailable()
+                        .needCheckDiskUsage()
+                        .addTags(Sets.newHashSet(entry.getKey()))
+                        .setStorageMedium(storageMedium)
+                        .setStrictStorageMedium(strictStorageMedium)
+                        .setStorageMediumSpecified(isStorageMediumSpecified)
+                        .setOnlyForCheck(isOnlyForCheck);
+                        
                 if (FeConstants.runningUnitTest || Config.allow_replica_on_same_host) {
                     builder.allowOnSameHost();
                 }
@@ -530,28 +552,17 @@ public class SystemInfoService {
                 }
 
                 BeSelectionPolicy policy = builder.build();
+                
                 List<Long> beIds = selectBackendIdsByPolicy(policy, entry.getValue());
-                // first time empty, retry with different storage medium
-                // if only for check, no need to retry different storage medium to get backend
-                TStorageMedium originalStorageMedium = storageMedium;
-                if (beIds.isEmpty() && storageMedium != null && !isStorageMediumSpecified && !isOnlyForCheck) {
-                    storageMedium = (storageMedium == TStorageMedium.HDD) ? TStorageMedium.SSD : TStorageMedium.HDD;
-                    builder.setStorageMedium(storageMedium);
-                    if (Config.enable_round_robin_create_tablet) {
-                        builder.setNextRoundRobinIndex(nextIndexs.getOrDefault(tag, -1));
-                    }
-                    policy = builder.build();
-                    beIds = selectBackendIdsByPolicy(policy, entry.getValue());
-                }
+                
                 if (Config.enable_round_robin_create_tablet) {
                     nextIndexs.put(tag, policy.nextRoundRobinIndex);
                 }
-                // after retry different storage medium, it's still empty
+                
                 if (beIds.isEmpty()) {
-                    LOG.error("failed backend(s) for policy: {} real medium {}", policy, originalStorageMedium);
                     String errorReplication = "replication tag: " + entry.getKey()
                             + ", replication num: " + entry.getValue()
-                            + ", storage medium: " + originalStorageMedium;
+                            + ", storage medium: " + storageMedium;
                     failedEntries.add(errorReplication);
                 } else {
                     chosenBackendIds.put(entry.getKey(), beIds);
@@ -570,6 +581,19 @@ public class SystemInfoService {
 
         Preconditions.checkState(totalReplicaNum == replicaAlloc.getTotalReplicaNum());
         return Pair.of(chosenBackendIds, storageMedium);
+    }
+
+    /**
+     * Backward compatible method for existing callers.
+     * Uses strictStorageMedium=false to maintain existing behavior.
+     */
+    public Pair<Map<Tag, List<Long>>, TStorageMedium> selectBackendIdsForReplicaCreation(
+            ReplicaAllocation replicaAlloc, Map<Tag, Integer> nextIndexs,
+            TStorageMedium storageMedium, boolean isStorageMediumSpecified,
+            boolean isOnlyForCheck)
+            throws DdlException {
+        return selectBackendIdsForReplicaCreation(replicaAlloc, nextIndexs, storageMedium, 
+                                                isStorageMediumSpecified, isOnlyForCheck, false);
     }
 
     public String getDetailsForCreateReplica(ReplicaAllocation replicaAlloc) {

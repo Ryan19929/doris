@@ -112,7 +112,7 @@ public class RoundRobinCreateTabletTest {
         try {
             Env.getCurrentEnv().getInternalCatalog().createTablets(index, ReplicaState.NORMAL,
                     distributionInfo, 0, replicaAlloc, tabletMeta,
-                    tabletIdSet, idGeneratorBuffer, false);
+                    tabletIdSet, idGeneratorBuffer, false, false);
         } catch (Exception e) {
             System.out.println("failed to create tablets " + e.getMessage());
         }

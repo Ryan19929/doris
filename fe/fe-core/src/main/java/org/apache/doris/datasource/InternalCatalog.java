@@ -2147,7 +2147,8 @@ public class InternalCatalog implements CatalogIf<Database> {
             TabletMeta tabletMeta = new TabletMeta(dbId, tbl.getId(), partitionId, indexId,
                     schemaHash, dataProperty.getStorageMedium());
             realStorageMedium = createTablets(index, ReplicaState.NORMAL, distributionInfo, version, replicaAlloc,
-                tabletMeta, tabletIdSet, idGeneratorBuffer, dataProperty.isStorageMediumSpecified());
+                tabletMeta, tabletIdSet, idGeneratorBuffer, dataProperty.isStorageMediumSpecified(), 
+                dataProperty.isStrictStorageMedium());
             if (realStorageMedium != null && !realStorageMedium.equals(dataProperty.getStorageMedium())) {
                 dataProperty.setStorageMedium(realStorageMedium);
                 LOG.info("real medium not eq default "
@@ -3377,7 +3378,8 @@ public class InternalCatalog implements CatalogIf<Database> {
     @VisibleForTesting
     public TStorageMedium createTablets(MaterializedIndex index, ReplicaState replicaState,
             DistributionInfo distributionInfo, long version, ReplicaAllocation replicaAlloc, TabletMeta tabletMeta,
-            Set<Long> tabletIdSet, IdGeneratorBuffer idGeneratorBuffer, boolean isStorageMediumSpecified)
+            Set<Long> tabletIdSet, IdGeneratorBuffer idGeneratorBuffer, boolean isStorageMediumSpecified,
+            boolean strictStorageMedium)
             throws DdlException {
         ColocateTableIndex colocateIndex = Env.getCurrentColocateIndex();
         SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
@@ -3431,7 +3433,7 @@ public class InternalCatalog implements CatalogIf<Database> {
                 Pair<Map<Tag, List<Long>>, TStorageMedium> chosenBackendIdsAndMedium
                         = systemInfoService.selectBackendIdsForReplicaCreation(
                         replicaAlloc, nextIndexs,
-                        storageMedium, isStorageMediumSpecified, false);
+                        storageMedium, isStorageMediumSpecified, false, strictStorageMedium);
                 chosenBackendIds = chosenBackendIdsAndMedium.first;
                 storageMedium = chosenBackendIdsAndMedium.second;
                 for (Map.Entry<Tag, List<Long>> entry : chosenBackendIds.entrySet()) {

@@ -78,6 +78,7 @@ public class PropertyAnalyzer {
     public static final String PROPERTIES_STORAGE_TYPE = "storage_type";
     public static final String PROPERTIES_STORAGE_MEDIUM = "storage_medium";
     public static final String PROPERTIES_STORAGE_COOLDOWN_TIME = "storage_cooldown_time";
+    public static final String PROPERTIES_STRICT_STORAGE_MEDIUM = "strict_storage_medium";
     // base time for the data in the partition
     public static final String PROPERTIES_DATA_BASE_TIME = "data_base_time_ms";
     // for 1.x -> 2.x migration
@@ -327,6 +328,9 @@ public class PropertyAnalyzer {
             return oldDataProperty;
         }
 
+        // 添加日志：记录传入的属性
+        LOG.info("analyzeDataProperty: Processing properties: {}", properties);
+
         TStorageMedium storageMedium = oldDataProperty.getStorageMedium();
         long cooldownTimestamp = oldDataProperty.getCooldownTimeMs();
         final String oldStoragePolicy = oldDataProperty.getStoragePolicy();
@@ -337,10 +341,16 @@ public class PropertyAnalyzer {
         boolean hasStoragePolicy = false;
         boolean storageMediumSpecified = false;
         boolean isBeingSynced = false;
+        boolean strictStorageMedium = false;
+        boolean strictStorageMediumSpecified = false;
 
         for (Map.Entry<String, String> entry : properties.entrySet()) {
             String key = entry.getKey();
             String value = entry.getValue();
+            
+            // 添加日志：记录正在处理的每个属性
+            LOG.info("analyzeDataProperty: Processing property key='{}', value='{}'", key, value);
+            
             if (key.equalsIgnoreCase(PROPERTIES_STORAGE_MEDIUM)) {
                 if (value.equalsIgnoreCase(TStorageMedium.SSD.name())) {
                     storageMedium = TStorageMedium.SSD;
@@ -364,16 +374,39 @@ public class PropertyAnalyzer {
                 newStoragePolicy = value;
             } else if (key.equalsIgnoreCase(PROPERTIES_IS_BEING_SYNCED)) {
                 isBeingSynced = Boolean.parseBoolean(value);
+            } else if (key.equalsIgnoreCase(PROPERTIES_STRICT_STORAGE_MEDIUM)) {
+                // 添加日志：确认识别到strict_storage_medium
+                LOG.info("analyzeDataProperty: Found strict_storage_medium property with value: {}", value);
+                strictStorageMedium = Boolean.parseBoolean(value);
+                strictStorageMediumSpecified = true;
+                LOG.info("analyzeDataProperty: Set strictStorageMedium={}, strictStorageMediumSpecified={}", 
+                         strictStorageMedium, strictStorageMediumSpecified);
             }
         } // end for properties
+
+        // 添加日志：记录属性移除前的状态
+        LOG.info("analyzeDataProperty: Before removing properties - storageMediumSpecified={}, strictStorageMediumSpecified={}", 
+                 storageMediumSpecified, strictStorageMediumSpecified);
 
         properties.remove(PROPERTIES_STORAGE_MEDIUM);
         properties.remove(PROPERTIES_STORAGE_COOLDOWN_TIME);
         properties.remove(PROPERTIES_STORAGE_POLICY);
         properties.remove(PROPERTIES_DATA_BASE_TIME);
         properties.remove(PROPERTIES_FILE_CACHE_TTL_SECONDS);
+        properties.remove(PROPERTIES_STRICT_STORAGE_MEDIUM);
+
+        // 添加日志：记录属性移除后的状态
+        LOG.info("analyzeDataProperty: After removing properties - remaining properties: {}", properties);
 
         Preconditions.checkNotNull(storageMedium);
+
+        // Validate: strict_storage_medium can only be used when storage_medium is explicitly specified
+        if (strictStorageMediumSpecified && !storageMediumSpecified) {
+            // 添加日志：记录验证失败
+            LOG.warn("analyzeDataProperty: Validation failed - strict_storage_medium specified but storage_medium not specified");
+            throw new AnalysisException(
+                "strict_storage_medium can only be used when storage_medium is explicitly specified");
+        }
 
         if (storageMedium == TStorageMedium.HDD) {
             cooldownTimestamp = DataProperty.MAX_COOLDOWN_TIME_MS;
@@ -443,10 +476,14 @@ public class PropertyAnalyzer {
             }
         }
 
+        // 添加日志：记录最终创建的DataProperty
+        LOG.info("analyzeDataProperty: Creating DataProperty with strictStorageMedium={}", strictStorageMedium);
+
         boolean mutable = PropertyAnalyzer.analyzeBooleanProp(properties, PROPERTIES_MUTABLE, true);
         properties.remove(PROPERTIES_MUTABLE);
 
-        DataProperty dataProperty = new DataProperty(storageMedium, cooldownTimestamp, newStoragePolicy, mutable);
+        DataProperty dataProperty = new DataProperty(storageMedium, cooldownTimestamp, newStoragePolicy, 
+                                                   mutable, strictStorageMedium);
         // check the state of data property
         if (storageMediumSpecified) {
             dataProperty.setStorageMediumSpecified(true);

@@ -49,6 +49,8 @@ public class DataProperty implements Writable, GsonPostProcessable {
     private String storagePolicy;
     @SerializedName(value = "isMutable")
     private boolean isMutable = true;
+    @SerializedName(value = "strictStorageMedium")
+    private boolean strictStorageMedium = false; // Default to false for backward compatibility
     private boolean storageMediumSpecified;
 
     private DataProperty() {
@@ -66,6 +68,7 @@ public class DataProperty implements Writable, GsonPostProcessable {
         this.cooldownTimeMs = other.cooldownTimeMs;
         this.storagePolicy = other.storagePolicy;
         this.isMutable = other.isMutable;
+        this.strictStorageMedium = other.strictStorageMedium;
     }
 
     /**
@@ -84,6 +87,24 @@ public class DataProperty implements Writable, GsonPostProcessable {
         this.cooldownTimeMs = cooldown;
         this.storagePolicy = storagePolicy;
         this.isMutable = isMutable;
+    }
+
+    /**
+     * DataProperty construction with strict storage medium support.
+     *
+     * @param medium storage medium for the init storage of the table
+     * @param cooldown cool down time for SSD->HDD
+     * @param storagePolicy remote storage policy for remote storage
+     * @param isMutable whether the data property is mutable
+     * @param strictStorageMedium whether to enforce strict storage medium allocation
+     */
+    public DataProperty(TStorageMedium medium, long cooldown, String storagePolicy, 
+                       boolean isMutable, boolean strictStorageMedium) {
+        this.storageMedium = medium;
+        this.cooldownTimeMs = cooldown;
+        this.storagePolicy = storagePolicy;
+        this.isMutable = isMutable;
+        this.strictStorageMedium = strictStorageMedium;
     }
 
     public TStorageMedium getStorageMedium() {
@@ -122,6 +143,14 @@ public class DataProperty implements Writable, GsonPostProcessable {
         this.storageMedium = medium;
     }
 
+    public boolean isStrictStorageMedium() {
+        return strictStorageMedium;
+    }
+
+    public void setStrictStorageMedium(boolean strictStorageMedium) {
+        this.strictStorageMedium = strictStorageMedium;
+    }
+
     public static DataProperty read(DataInput in) throws IOException {
         if (Env.getCurrentEnvJournalVersion() >= FeMetaVersion.VERSION_108) {
             String json = Text.readString(in);
@@ -146,7 +175,7 @@ public class DataProperty implements Writable, GsonPostProcessable {
 
     @Override
     public int hashCode() {
-        return Objects.hash(storageMedium, cooldownTimeMs, storagePolicy);
+        return Objects.hash(storageMedium, cooldownTimeMs, storagePolicy, strictStorageMedium);
     }
 
     @Override
@@ -164,7 +193,8 @@ public class DataProperty implements Writable, GsonPostProcessable {
         return this.storageMedium == other.storageMedium
                 && this.cooldownTimeMs == other.cooldownTimeMs
                 && Strings.nullToEmpty(this.storagePolicy).equals(Strings.nullToEmpty(other.storagePolicy))
-                && this.isMutable == other.isMutable;
+                && this.isMutable == other.isMutable
+                && this.strictStorageMedium == other.strictStorageMedium;
     }
 
     @Override
