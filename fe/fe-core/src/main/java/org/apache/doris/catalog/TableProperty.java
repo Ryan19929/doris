@@ -53,7 +53,8 @@ import java.util.Map;
  * TableProperty contains additional information about OlapTable
  * TableProperty includes properties to persistent the additional information
  * Different properties is recognized by prefix such as dynamic_partition
- * If there is different type properties is added, write a method such as buildDynamicProperty to build it.
+ * If there is different type properties is added, write a method such as
+ * buildDynamicProperty to build it.
  */
 public class TableProperty implements Writable, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(TableProperty.class);
@@ -62,8 +63,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
     private Map<String, String> properties;
 
     // the follower variables are built from "properties"
-    private DynamicPartitionProperty dynamicPartitionProperty =
-            EnvFactory.getInstance().createDynamicPartitionProperty(Maps.newHashMap());
+    private DynamicPartitionProperty dynamicPartitionProperty = EnvFactory.getInstance()
+            .createDynamicPartitionProperty(Maps.newHashMap());
     private ReplicaAllocation replicaAlloc = ReplicaAllocation.DEFAULT_ALLOCATION;
     private boolean isInMemory = false;
     private short minLoadReplicaNum = -1;
@@ -85,7 +86,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
      * V1: alpha rowset
      * V2: beta rowset
      *
-     * This property should be set when creating the table, and can only be changed to V2 using Alter Table stmt.
+     * This property should be set when creating the table, and can only be changed
+     * to V2 using Alter Table stmt.
      */
     private TStorageFormat storageFormat = TStorageFormat.DEFAULT;
 
@@ -111,23 +113,19 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     private String compactionPolicy = PropertyAnalyzer.SIZE_BASED_COMPACTION_POLICY;
 
-    private long timeSeriesCompactionGoalSizeMbytes
-                                    = PropertyAnalyzer.TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES_DEFAULT_VALUE;
+    private long timeSeriesCompactionGoalSizeMbytes = PropertyAnalyzer.TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES_DEFAULT_VALUE;
 
-    private long timeSeriesCompactionFileCountThreshold
-                                    = PropertyAnalyzer.TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD_DEFAULT_VALUE;
+    private long timeSeriesCompactionFileCountThreshold = PropertyAnalyzer.TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD_DEFAULT_VALUE;
 
-    private long timeSeriesCompactionTimeThresholdSeconds
-                                    = PropertyAnalyzer.TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS_DEFAULT_VALUE;
+    private long timeSeriesCompactionTimeThresholdSeconds = PropertyAnalyzer.TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS_DEFAULT_VALUE;
 
-    private long timeSeriesCompactionEmptyRowsetsThreshold
-                                    = PropertyAnalyzer.TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD_DEFAULT_VALUE;
+    private long timeSeriesCompactionEmptyRowsetsThreshold = PropertyAnalyzer.TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD_DEFAULT_VALUE;
 
-    private long timeSeriesCompactionLevelThreshold
-                                    = PropertyAnalyzer.TIME_SERIES_COMPACTION_LEVEL_THRESHOLD_DEFAULT_VALUE;
+    private long timeSeriesCompactionLevelThreshold = PropertyAnalyzer.TIME_SERIES_COMPACTION_LEVEL_THRESHOLD_DEFAULT_VALUE;
 
     private String autoAnalyzePolicy = PropertyAnalyzer.ENABLE_AUTO_ANALYZE_POLICY;
 
+    private boolean strictStorageMedium = false;
 
     private DataSortInfo dataSortInfo = new DataSortInfo();
 
@@ -158,6 +156,7 @@ public class TableProperty implements Writable, GsonPostProcessable {
                 buildStorageMedium();
                 buildStoragePolicy();
                 buildIsBeingSynced();
+                buildStrictStorageMedium();
                 buildCompactionPolicy();
                 buildTimeSeriesCompactionGoalSizeMbytes();
                 buildTimeSeriesCompactionFileCountThreshold();
@@ -182,7 +181,7 @@ public class TableProperty implements Writable, GsonPostProcessable {
      * @return this for chained
      */
     public TableProperty resetPropertiesForRestore(boolean reserveDynamicPartitionEnable, boolean reserveReplica,
-                                                   ReplicaAllocation replicaAlloc) {
+            ReplicaAllocation replicaAlloc) {
         // disable dynamic partition
         if (properties.containsKey(DynamicPartitionProperty.ENABLE)) {
             if (!reserveDynamicPartitionEnable) {
@@ -272,7 +271,6 @@ public class TableProperty implements Writable, GsonPostProcessable {
         return disableAutoCompaction;
     }
 
-
     public TableProperty buildVariantEnableFlattenNested() {
         variantEnableFlattenNested = Boolean.parseBoolean(
                 properties.getOrDefault(PropertyAnalyzer.PROPERTIES_VARIANT_ENABLE_FLATTEN_NESTED, "false"));
@@ -318,7 +316,7 @@ public class TableProperty implements Writable, GsonPostProcessable {
     public TableProperty buildRowStorePageSize() {
         rowStorePageSize = Long.parseLong(
                 properties.getOrDefault(PropertyAnalyzer.PROPERTIES_ROW_STORE_PAGE_SIZE,
-                                        Long.toString(PropertyAnalyzer.ROW_STORE_PAGE_SIZE_DEFAULT_VALUE)));
+                        Long.toString(PropertyAnalyzer.ROW_STORE_PAGE_SIZE_DEFAULT_VALUE)));
         return this;
     }
 
@@ -329,7 +327,7 @@ public class TableProperty implements Writable, GsonPostProcessable {
     public TableProperty buildStoragePageSize() {
         storagePageSize = Long.parseLong(
                 properties.getOrDefault(PropertyAnalyzer.PROPERTIES_STORAGE_PAGE_SIZE,
-                                        Long.toString(PropertyAnalyzer.STORAGE_PAGE_SIZE_DEFAULT_VALUE)));
+                        Long.toString(PropertyAnalyzer.STORAGE_PAGE_SIZE_DEFAULT_VALUE)));
         return this;
     }
 
@@ -349,7 +347,7 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public TableProperty buildCompactionPolicy() {
         compactionPolicy = properties.getOrDefault(PropertyAnalyzer.PROPERTIES_COMPACTION_POLICY,
-                                                                PropertyAnalyzer.SIZE_BASED_COMPACTION_POLICY);
+                PropertyAnalyzer.SIZE_BASED_COMPACTION_POLICY);
         return this;
     }
 
@@ -359,8 +357,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public TableProperty buildTimeSeriesCompactionGoalSizeMbytes() {
         timeSeriesCompactionGoalSizeMbytes = Long.parseLong(properties
-                    .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES,
-                    String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES_DEFAULT_VALUE)));
+                .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES,
+                        String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_GOAL_SIZE_MBYTES_DEFAULT_VALUE)));
         return this;
     }
 
@@ -370,8 +368,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public TableProperty buildTimeSeriesCompactionFileCountThreshold() {
         timeSeriesCompactionFileCountThreshold = Long.parseLong(properties
-                    .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD,
-                    String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD_DEFAULT_VALUE)));
+                .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD,
+                        String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_FILE_COUNT_THRESHOLD_DEFAULT_VALUE)));
 
         return this;
     }
@@ -382,8 +380,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public TableProperty buildTimeSeriesCompactionTimeThresholdSeconds() {
         timeSeriesCompactionTimeThresholdSeconds = Long.parseLong(properties
-                    .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS,
-                    String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS_DEFAULT_VALUE)));
+                .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS,
+                        String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_TIME_THRESHOLD_SECONDS_DEFAULT_VALUE)));
 
         return this;
     }
@@ -394,8 +392,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public TableProperty buildTimeSeriesCompactionEmptyRowsetsThreshold() {
         timeSeriesCompactionEmptyRowsetsThreshold = Long.parseLong(properties
-                    .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD,
-                    String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD_DEFAULT_VALUE)));
+                .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD,
+                        String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_EMPTY_ROWSETS_THRESHOLD_DEFAULT_VALUE)));
         return this;
     }
 
@@ -405,8 +403,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public TableProperty buildTimeSeriesCompactionLevelThreshold() {
         timeSeriesCompactionLevelThreshold = Long.parseLong(properties
-                    .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_LEVEL_THRESHOLD,
-                    String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_LEVEL_THRESHOLD_DEFAULT_VALUE)));
+                .getOrDefault(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_LEVEL_THRESHOLD,
+                        String.valueOf(PropertyAnalyzer.TIME_SERIES_COMPACTION_LEVEL_THRESHOLD_DEFAULT_VALUE)));
         return this;
     }
 
@@ -463,6 +461,28 @@ public class TableProperty implements Writable, GsonPostProcessable {
             buildIsBeingSynced();
         }
         return isBeingSynced;
+    }
+
+    public TableProperty buildStrictStorageMedium() {
+        strictStorageMedium = Boolean.parseBoolean(properties.getOrDefault(
+                PropertyAnalyzer.PROPERTIES_STRICT_STORAGE_MEDIUM, "false"));
+        return this;
+    }
+
+    public boolean isStrictStorageMedium() {
+        return strictStorageMedium;
+    }
+
+    public TableProperty setStrictStorageMedium() {
+        properties.put(PropertyAnalyzer.PROPERTIES_STRICT_STORAGE_MEDIUM, "true");
+        strictStorageMedium = true;
+        return this;
+    }
+
+    public TableProperty clearStrictStorageMedium() {
+        properties.remove(PropertyAnalyzer.PROPERTIES_STRICT_STORAGE_MEDIUM);
+        strictStorageMedium = false;
+        return this;
     }
 
     public void removeInvalidProperties() {
@@ -635,11 +655,13 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public boolean getEnableUniqueKeySkipBitmap() {
         return Boolean.parseBoolean(properties.getOrDefault(
-            PropertyAnalyzer.ENABLE_UNIQUE_KEY_SKIP_BITMAP_COLUMN, "false"));
+                PropertyAnalyzer.ENABLE_UNIQUE_KEY_SKIP_BITMAP_COLUMN, "false"));
     }
 
-    // In order to ensure that unique tables without the `enable_unique_key_merge_on_write` property specified
-    // before version 2.1 still maintain the merge-on-read implementation after the upgrade, we will keep
+    // In order to ensure that unique tables without the
+    // `enable_unique_key_merge_on_write` property specified
+    // before version 2.1 still maintain the merge-on-read implementation after the
+    // upgrade, we will keep
     // the default value here as false.
     public boolean getEnableUniqueKeyMergeOnWrite() {
         return Boolean.parseBoolean(properties.getOrDefault(
@@ -682,8 +704,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public int getGroupCommitDataBytes() {
         return Integer.parseInt(properties.getOrDefault(
-            PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_DATA_BYTES,
-            Integer.toString(PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_DATA_BYTES_DEFAULT_VALUE)));
+                PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_DATA_BYTES,
+                Integer.toString(PropertyAnalyzer.PROPERTIES_GROUP_COMMIT_DATA_BYTES_DEFAULT_VALUE)));
     }
 
     public void setRowStoreColumns(List<String> rowStoreColumns) {
@@ -701,7 +723,8 @@ public class TableProperty implements Writable, GsonPostProcessable {
 
     public void buildReplicaAllocation() {
         try {
-            // Must copy the properties because "analyzeReplicaAllocation" will remove the property
+            // Must copy the properties because "analyzeReplicaAllocation" will remove the
+            // property
             // from the properties.
             Map<String, String> copiedProperties = Maps.newHashMap(properties);
             this.replicaAlloc = PropertyAnalyzer.analyzeReplicaAllocationWithoutCheck(
@@ -734,6 +757,7 @@ public class TableProperty implements Writable, GsonPostProcessable {
         buildCompressionType();
         buildStoragePolicy();
         buildIsBeingSynced();
+        buildStrictStorageMedium();
         buildBinlogConfig();
         buildEnableLightSchemaChange();
         buildStoreRowColumn();
@@ -770,8 +794,10 @@ public class TableProperty implements Writable, GsonPostProcessable {
     }
 
     // For some historical reason,
-    // both "dynamic_partition.replication_num" and "dynamic_partition.replication_allocation"
-    // may be exist in "properties". we need remove the "dynamic_partition.replication_num", or it will always replace
+    // both "dynamic_partition.replication_num" and
+    // "dynamic_partition.replication_allocation"
+    // may be exist in "properties". we need remove the
+    // "dynamic_partition.replication_num", or it will always replace
     // the "dynamic_partition.replication_allocation",
     // result in unable to set "dynamic_partition.replication_allocation".
     private void removeDuplicateReplicaNumProperty() {
