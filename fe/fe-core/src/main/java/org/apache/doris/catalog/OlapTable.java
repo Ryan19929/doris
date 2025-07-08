@@ -2524,6 +2524,21 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
         return nameToPartition.containsKey(partitionName);
     }
 
+    public void setStrictStorageMedium() {
+        getOrCreatTableProperty().setStrictStorageMedium().buildStrictStorageMedium();
+    }
+
+    public boolean isStrictStorageMedium() {
+        if (tableProperty != null) {
+            return tableProperty.isStrictStorageMedium();
+        }
+        return false;
+    }
+
+    public void clearStrictStorageMedium() {
+        getOrCreatTableProperty().clearStrictStorageMedium().buildStrictStorageMedium();
+    }
+
     public void setInAtomicRestore() {
         getOrCreatTableProperty().setInAtomicRestore().buildInAtomicRestore();
     }
