@@ -1081,4 +1081,45 @@ public class CreateTableTest extends TestWithFeService {
                         + "\"dynamic_partition.start\" = \"-3\"\n"
                         + ");", true));
     }
+
+    @Test
+    public void testStorageMediumProperty() throws Exception {
+        // 1. Test create table with 'storage_medium' property.
+        // This should implicitly set 'storage_medium_specified' to true.
+        ExceptionChecker.expectThrowsNoException(
+                () -> createTable("create table test.tbl_storage_medium_specified\n" + "(k1 date, k2 int)\n"
+                        + "partition by range(k1)\n" + "(partition p1 values less than('2024-01-01'))\n"
+                        + "distributed by hash(k2) buckets 1\n"
+                        + "properties('replication_num' = '1', 'storage_medium' = 'HDD', 'storage_medium_specified' = 'true'); "));
+        Database db = Env.getCurrentInternalCatalog().getDbOrDdlException("test");
+        OlapTable table = (OlapTable) db.getTableOrDdlException("tbl_storage_medium_specified");
+        Assert.assertEquals("HDD", table.getTableProperty().getStorageMedium().name());
+        Assert.assertTrue(table.getTableProperty().isStorageMediumSpecified());
+        Partition p1 = table.getPartition("p1");
+        Assert.assertEquals("HDD", table.getPartitionInfo().getDataProperty(p1.getId()).getStorageMedium().name());
+
+        // 2. Test create table with partition-level storage_medium override.
+        ExceptionChecker.expectThrowsNoException(() -> createTable("create table test.tbl_storage_medium_override\n"
+                + "(k1 date, k2 int)\n" + "partition by range(k1)\n"
+                + "(partition p1 values less than ('2024-01-01'),\n"
+                + " partition p2 values less than ('2024-02-01'))\n"
+                + "distributed by hash(k2) buckets 1\n"
+                + "properties('replication_num' = '1', 'storage_medium' = 'SSD'); "));
+        OlapTable table2 = (OlapTable) db.getTableOrDdlException("tbl_storage_medium_override");
+        Partition p1_2 = table2.getPartition("p1");
+        Partition p2_2 = table2.getPartition("p2");
+        Assert.assertFalse(table2.getTableProperty().isStorageMediumSpecified());
+        Assert.assertEquals("HDD", table2.getPartitionInfo().getDataProperty(p1_2.getId()).getStorageMedium().name());
+        Assert.assertEquals("HDD", table2.getPartitionInfo().getDataProperty(p2_2.getId()).getStorageMedium().name());
+
+        // 3. Test create table with 'storage_medium_specified' explicitly set.
+        // This property is allowed to be set by user.
+        ExceptionChecker.expectThrowsNoException(
+                () -> createTable("create table test.tbl_explicitly_specified\n" + "(k1 int, k2 int)\n"
+                        + "distributed by hash(k1) buckets 1\n"
+                        + "properties('replication_num' = '1', 'storage_medium' = 'SSD', 'storage_medium_specified' = 'false'); "));
+        OlapTable table3 = (OlapTable) db.getTableOrDdlException("tbl_explicitly_specified");
+        Assert.assertEquals("SSD", table3.getTableProperty().getStorageMedium().name());
+        Assert.assertFalse(table3.getTableProperty().isStorageMediumSpecified());
+    }
 }

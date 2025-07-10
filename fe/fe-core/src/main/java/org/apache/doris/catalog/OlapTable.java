@@ -290,6 +290,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                 String.valueOf(isBeingSynced));
     }
 
+    public void setIsStorageMediumSpecified(boolean isStorageMediumSpecified) {
+        TableProperty tableProperty = getOrCreatTableProperty();
+        tableProperty.modifyTableProperties(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED,
+                String.valueOf(isStorageMediumSpecified));
+        tableProperty.setIsStorageMediumSpecified(isStorageMediumSpecified);
+    }
+
     public String getStorageVaultName() {
         if (Strings.isNullOrEmpty(getStorageVaultId())) {
             return "";
@@ -310,6 +317,10 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
 
     public boolean isBeingSynced() {
         return getOrCreatTableProperty().isBeingSynced();
+    }
+
+    public boolean isStorageMediumSpecified() {
+        return getOrCreatTableProperty().isStorageMediumSpecified();
     }
 
     public boolean isTemporaryPartition(long partitionId) {
