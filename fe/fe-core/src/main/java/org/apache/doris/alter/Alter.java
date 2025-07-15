@@ -1047,11 +1047,15 @@ public class Alter {
             Map<String, String> modifiedProperties = Maps.newHashMap();
             modifiedProperties.putAll(properties);
 
-            // 4.2 handle storage_medium_specified property
-            if (properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED)) {
-                String storageMediumSpecifiedValue = properties.get(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED);
-                boolean isStorageMediumSpecified = Boolean.parseBoolean(storageMediumSpecifiedValue);
-                dataProperty.setStorageMediumSpecified(isStorageMediumSpecified);
+            // 4.2 handle allocation_policy property
+            if (properties.containsKey(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY)) {
+                String allocationPolicyValue = properties.get(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY);
+                try {
+                    DataProperty.AllocationPolicy allocationPolicy = DataProperty.AllocationPolicy.fromString(allocationPolicyValue);
+                    dataProperty.setAllocationPolicy(allocationPolicy);
+                } catch (IllegalArgumentException e) {
+                    throw new AnalysisException(e.getMessage());
+                }
             }
 
             // 4.3 modify partition storage policy

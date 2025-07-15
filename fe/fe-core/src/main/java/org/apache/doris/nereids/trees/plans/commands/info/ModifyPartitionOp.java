@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.commands.info;
 
 import org.apache.doris.alter.AlterOpType;
+import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.analysis.AlterTableClause;
 import org.apache.doris.analysis.ModifyPartitionClause;
 import org.apache.doris.common.AnalysisException;
@@ -113,26 +114,21 @@ public class ModifyPartitionOp extends AlterTableOp {
     // 2. storage_medium && storage_cooldown_time
     // 3. in_memory
     // 4. tablet type
-    // 5. storage_medium_specified
+    // 5. allocation_policy
     private void checkProperties(Map<String, String> properties) throws AnalysisException {
-        // 1. replica allocation
+        // 1. data property
+        PropertyAnalyzer.analyzeDataProperty(properties, DataProperty.DEFAULT_HDD_DATA_PROPERTY);
+
+        // 2. replica allocation
         PropertyAnalyzer.analyzeReplicaAllocation(properties, "");
 
-        // 2. in memory
-        boolean isInMemory = PropertyAnalyzer.analyzeBooleanProp(properties, PropertyAnalyzer.PROPERTIES_INMEMORY,
-                false);
-        if (isInMemory == true) {
+        // 3. in memory
+        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_INMEMORY)) {
             throw new AnalysisException("Not support set 'in_memory'='true' now!");
         }
 
-        // 3. tablet type
+        // 4. tablet type
         PropertyAnalyzer.analyzeTabletType(properties);
-
-        // 4. mutable
-        PropertyAnalyzer.analyzeBooleanProp(properties, PropertyAnalyzer.PROPERTIES_MUTABLE, true);
-
-        // 5. storage_medium_specified
-        PropertyAnalyzer.analyzeStorageMediumSpecified(properties);
     }
 
     @Override

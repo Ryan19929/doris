@@ -66,7 +66,7 @@ public class TableProperty implements GsonPostProcessable {
 
     private String storagePolicy = "";
     private Boolean isBeingSynced = null;
-    private Boolean isStorageMediumSpecified = null;
+    private DataProperty.AllocationPolicy allocationPolicy = null;
     private BinlogConfig binlogConfig;
 
     private TStorageMedium storageMedium = null;
@@ -155,7 +155,7 @@ public class TableProperty implements GsonPostProcessable {
                 buildStorageMedium();
                 buildStoragePolicy();
                 buildIsBeingSynced();
-                buildIsStorageMediumSpecified();
+                buildAllocationPolicy();
                 buildCompactionPolicy();
                 buildTimeSeriesCompactionGoalSizeMbytes();
                 buildTimeSeriesCompactionFileCountThreshold();
@@ -474,25 +474,36 @@ public class TableProperty implements GsonPostProcessable {
         return isBeingSynced;
     }
 
-    public TableProperty buildIsStorageMediumSpecified() {
+    public TableProperty buildAllocationPolicy() {
         // Handle upgrade compatibility: if the property doesn't exist, set default value for old tables
-        if (!properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED)) {
-            properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED, "false");
+        if (!properties.containsKey(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY)) {
+            properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, DataProperty.AllocationPolicy.ADAPTIVE.getValue());
         }
-        isStorageMediumSpecified = Boolean.parseBoolean(
-                properties.get(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED));
+        String allocationPolicyValue = properties.get(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY);
+        try {
+            allocationPolicy = DataProperty.AllocationPolicy.fromString(allocationPolicyValue);
+        } catch (IllegalArgumentException e) {
+            // For upgrade compatibility, fallback to ADAPTIVE if invalid value
+            allocationPolicy = DataProperty.AllocationPolicy.ADAPTIVE;
+        }
         return this;
     }
 
-    public boolean isStorageMediumSpecified() {
-        if (isStorageMediumSpecified == null) {
-            buildIsStorageMediumSpecified();
+    public DataProperty.AllocationPolicy getAllocationPolicy() {
+        if (allocationPolicy == null) {
+            buildAllocationPolicy();
         }
-        return isStorageMediumSpecified;
+        return allocationPolicy;
     }
 
-    public void setIsStorageMediumSpecified(boolean isStorageMediumSpecified) {
-        this.isStorageMediumSpecified = isStorageMediumSpecified;
+    public void setAllocationPolicy(DataProperty.AllocationPolicy allocationPolicy) {
+        this.allocationPolicy = allocationPolicy;
+    }
+
+    // 保持向后兼容
+    @Deprecated
+    public boolean isAllocationPolicyStrict() {
+        return getAllocationPolicy().isStrict();
     }
 
     public void removeInvalidProperties() {
@@ -754,6 +765,7 @@ public class TableProperty implements GsonPostProcessable {
         buildCompressionType();
         buildStoragePolicy();
         buildIsBeingSynced();
+        buildAllocationPolicy();
         buildBinlogConfig();
         buildEnableLightSchemaChange();
         buildStoreRowColumn();

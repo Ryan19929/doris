@@ -101,7 +101,7 @@ public class PartitionsProcDir implements ProcDirInterface {
             .add("Buckets").add("ReplicationNum").add("StorageMedium").add("CooldownTime").add("RemoteStoragePolicy")
             .add("LastConsistencyCheckTime").add("DataSize").add("IsInMemory").add("ReplicaAllocation")
             .add("IsMutable").add("SyncWithBaseTables").add("UnsyncTables").add("CommittedVersion")
-            .add("RowCount").add("StorageMediumSpecified")
+            .add("RowCount").add("AllocationPolicy")
             .build();
 
     private Database db;
@@ -570,10 +570,11 @@ public class PartitionsProcDir implements ProcDirInterface {
                 partitionInfo.add(partition.getRowCount());
                 trow.addToColumnValue(new TCell().setLongVal(partition.getRowCount()));
 
-                // StrictStorageMedium
-                boolean strictStorageMedium = DataProperty.getFinalStorageMediumSpecified(dataProperty, olapTable);
-                partitionInfo.add(strictStorageMedium);
-                trow.addToColumnValue(new TCell().setBoolVal(strictStorageMedium));
+                // AllocationPolicy
+                DataProperty.AllocationPolicy allocationPolicy = DataProperty.getFinalAllocationPolicy(dataProperty, olapTable);
+                String allocationPolicyValue = allocationPolicy.getValue();
+                partitionInfo.add(allocationPolicyValue);
+                trow.addToColumnValue(new TCell().setStringVal(allocationPolicyValue));
 
                 partitionInfos.add(Pair.of(partitionInfo, trow));
             }

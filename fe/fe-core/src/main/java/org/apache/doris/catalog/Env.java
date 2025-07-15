@@ -3725,11 +3725,11 @@ public class Env {
             sb.append("\"");
         }
 
-        // storage medium specified
-        // Call getter method to trigger buildIsStorageMediumSpecified() for upgrade compatibility
-        olapTable.isStorageMediumSpecified();
-        sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED).append("\" = \"");
-        sb.append(olapTable.getTableProperty().getProperties().get(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED)).append("\"");
+        // allocation policy
+        if (olapTable.getTableProperty() != null && olapTable.getTableProperty().getAllocationPolicy() == DataProperty.AllocationPolicy.STRICT) {
+            sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY).append("\" = \"");
+            sb.append(DataProperty.AllocationPolicy.STRICT.name().toLowerCase()).append("\"");
+        }
 
         // storage type
         sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_STORAGE_FORMAT).append("\" = \"");
@@ -5662,7 +5662,7 @@ public class Env {
                 .buildMinLoadReplicaNum()
                 .buildStoragePolicy()
                 .buildStorageMedium()
-                .buildIsStorageMediumSpecified()
+                .buildAllocationPolicy()
                 .buildIsBeingSynced()
                 .buildCompactionPolicy()
                 .buildTimeSeriesCompactionGoalSizeMbytes()

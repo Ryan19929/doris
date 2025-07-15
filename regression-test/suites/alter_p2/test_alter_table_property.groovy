@@ -88,25 +88,25 @@ suite ("test_alter_table_property") {
     def createTableStr = result[0]['Create Table']
     assertTrue(createTableStr.contains("\"storage_medium\" = \"ssd\""))
 
-    // Test storage_medium_specified property
-    sql """ ALTER TABLE ${tableName} SET("storage_medium_specified"="true") """
+    // Test allocation_policy property
+    sql """ ALTER TABLE ${tableName} SET("allocation_policy"="strict") """
 
     def result2 = sql_return_maparray """
     show create table ${tableName}
     """
     logger.info(${result2[0]})
     def createTableStr2 = result2[0]['Create Table']
-    assertTrue(createTableStr2.contains("\"storage_medium_specified\" = \"true\""))
+    assertTrue(createTableStr2.contains("\"allocation_policy\" = \"strict\""))
 
-    // Test setting storage_medium_specified to false
-    sql """ ALTER TABLE ${tableName} SET("storage_medium_specified"="false") """
+    // Test setting allocation_policy to adaptive
+    sql """ ALTER TABLE ${tableName} SET("allocation_policy"="adaptive") """
 
     def result3 = sql_return_maparray """
     show create table ${tableName}
     """
     logger.info(${result3[0]})
     def createTableStr3 = result3[0]['Create Table']
-    assertTrue(createTableStr3.contains("\"storage_medium_specified\" = \"false\""))
+    assertTrue(createTableStr3.contains("\"allocation_policy\" = \"adaptive\""))
 
     sql "DROP TABLE ${tableName}"
 }

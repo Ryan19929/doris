@@ -20,6 +20,7 @@ package org.apache.doris.nereids.trees.plans.commands.info;
 import org.apache.doris.alter.AlterOpType;
 import org.apache.doris.analysis.AlterTableClause;
 import org.apache.doris.analysis.ModifyTablePropertiesClause;
+import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.catalog.DynamicPartitionProperty;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MTMV;
@@ -48,7 +49,7 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
     private String storagePolicy;
 
     private boolean isBeingSynced = false;
-    private boolean isStorageMediumSpecified = false;
+    private DataProperty.AllocationPolicy allocationPolicy = DataProperty.AllocationPolicy.ADAPTIVE;
 
     public ModifyTablePropertiesOp(Map<String, String> properties) {
         super(AlterOpType.MODIFY_TABLE_PROPERTY);
@@ -71,12 +72,18 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
         return isBeingSynced;
     }
 
-    public void setIsStorageMediumSpecified(boolean isStorageMediumSpecified) {
-        this.isStorageMediumSpecified = isStorageMediumSpecified;
+    public void setAllocationPolicy(DataProperty.AllocationPolicy allocationPolicy) {
+        this.allocationPolicy = allocationPolicy;
     }
 
-    public boolean isStorageMediumSpecified() {
-        return isStorageMediumSpecified;
+    public DataProperty.AllocationPolicy getAllocationPolicy() {
+        return allocationPolicy;
+    }
+
+    // 保持向后兼容
+    @Deprecated
+    public boolean isAllocationPolicyStrict() {
+        return allocationPolicy.isStrict();
     }
 
     @Override
@@ -161,11 +168,16 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
             this.needTableStable = false;
             setIsBeingSynced(Boolean.parseBoolean(properties.getOrDefault(
                     PropertyAnalyzer.PROPERTIES_IS_BEING_SYNCED, "false")));
-        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED)) {
-            boolean isStorageMediumSpecified = PropertyAnalyzer.analyzeStorageMediumSpecified(properties);
-            this.needTableStable = false;
-            this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
-            setIsStorageMediumSpecified(isStorageMediumSpecified);
+        } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY)) {
+            String allocationPolicyValue = properties.get(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY);
+            try {
+                DataProperty.AllocationPolicy allocationPolicy = DataProperty.AllocationPolicy.fromString(allocationPolicyValue);
+                this.needTableStable = false;
+                this.opType = AlterOpType.MODIFY_TABLE_PROPERTY_SYNC;
+                setAllocationPolicy(allocationPolicy);
+            } catch (IllegalArgumentException e) {
+                throw new AnalysisException(e.getMessage());
+            }
         } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_ENABLE)
                 || properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_TTL_SECONDS)
                 || properties.containsKey(PropertyAnalyzer.PROPERTIES_BINLOG_MAX_BYTES)

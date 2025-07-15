@@ -34,6 +34,7 @@ import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.DataProperty;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MarkedCountDownLatch;
@@ -169,12 +170,12 @@ public class RestoreJobTest {
         new Expectations() {
             {
                 systemInfoService.selectBackendIdsForReplicaCreation((ReplicaAllocation) any,
-                        Maps.newHashMap(), (TStorageMedium) any, false, true);
+                        Maps.newHashMap(), (TStorageMedium) any, DataProperty.AllocationPolicy.ADAPTIVE, true);
                 minTimes = 0;
                 result = new Delegate() {
                     public synchronized List<Long> selectBackendIdsForReplicaCreation(
                             ReplicaAllocation replicaAlloc, Map<Tag, Integer> nextIndexs,
-                            TStorageMedium medium, boolean isStorageMediumSpecified,
+                            TStorageMedium medium, DataProperty.AllocationPolicy allocationPolicy,
                             boolean isOnlyForCheck) {
                         List<Long> beIds = Lists.newArrayList();
                         beIds.add(CatalogMocker.BACKEND1_ID);

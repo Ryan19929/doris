@@ -290,11 +290,18 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                 String.valueOf(isBeingSynced));
     }
 
-    public void setIsStorageMediumSpecified(boolean isStorageMediumSpecified) {
+    public void setAllocationPolicy(DataProperty.AllocationPolicy allocationPolicy) {
         TableProperty tableProperty = getOrCreatTableProperty();
-        tableProperty.modifyTableProperties(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED,
-                String.valueOf(isStorageMediumSpecified));
-        tableProperty.setIsStorageMediumSpecified(isStorageMediumSpecified);
+        tableProperty.modifyTableProperties(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY,
+                allocationPolicy.getValue());
+        tableProperty.setAllocationPolicy(allocationPolicy);
+    }
+
+    // 保持向后兼容
+    @Deprecated
+    public void setAllocationPolicy(boolean isAllocationPolicyStrict) {
+        setAllocationPolicy(isAllocationPolicyStrict ? 
+            DataProperty.AllocationPolicy.STRICT : DataProperty.AllocationPolicy.ADAPTIVE);
     }
 
     public String getStorageVaultName() {
@@ -319,8 +326,13 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
         return getOrCreatTableProperty().isBeingSynced();
     }
 
-    public boolean isStorageMediumSpecified() {
-        return getOrCreatTableProperty().isStorageMediumSpecified();
+    public DataProperty.AllocationPolicy getAllocationPolicy() {
+        return getOrCreatTableProperty().getAllocationPolicy();
+    }
+
+    @Deprecated
+    public boolean isAllocationPolicyStrict() {
+        return getOrCreatTableProperty().isAllocationPolicyStrict();
     }
 
     public boolean isTemporaryPartition(long partitionId) {
@@ -930,7 +942,7 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                             Pair<Map<Tag, List<Long>>, TStorageMedium> tag2beIdsAndMedium =
                                     Env.getCurrentSystemInfo().selectBackendIdsForReplicaCreation(
                                             replicaAlloc, nextIndexes, null,
-                                            false, false);
+                                            DataProperty.AllocationPolicy.ADAPTIVE, false);
                             tag2beIds = tag2beIdsAndMedium.first;
                         }
                         for (Map.Entry<Tag, List<Long>> entry3 : tag2beIds.entrySet()) {

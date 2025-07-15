@@ -54,7 +54,7 @@ public class ReplicaAllocationTest {
         new Expectations() {
             {
                 systemInfoService.selectBackendIdsForReplicaCreation((ReplicaAllocation) any, Maps.newHashMap(),
-                        (TStorageMedium) any, false, true);
+                        (TStorageMedium) any, DataProperty.AllocationPolicy.ADAPTIVE, true);
                 minTimes = 0;
                 result = new Delegate() {
                     Pair<Map<Tag, List<Long>>, TStorageMedium> selectBackendIdsForReplicaCreation() {

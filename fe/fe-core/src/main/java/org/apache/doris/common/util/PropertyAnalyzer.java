@@ -77,7 +77,7 @@ public class PropertyAnalyzer {
     public static final String PROPERTIES_MIN_LOAD_REPLICA_NUM = "min_load_replica_num";
     public static final String PROPERTIES_STORAGE_TYPE = "storage_type";
     public static final String PROPERTIES_STORAGE_MEDIUM = "storage_medium";
-    public static final String PROPERTIES_STORAGE_MEDIUM_SPECIFIED = "storage_medium_specified";
+    public static final String PROPERTIES_ALLOCATION_POLICY = "allocation_policy";
     public static final String PROPERTIES_STORAGE_COOLDOWN_TIME = "storage_cooldown_time";
     // base time for the data in the partition
     public static final String PROPERTIES_DATA_BASE_TIME = "data_base_time_ms";
@@ -339,7 +339,7 @@ public class PropertyAnalyzer {
         // then we would just set the partition's storage policy the same as the table's
         String newStoragePolicy = oldStoragePolicy;
         boolean hasStoragePolicy = false;
-        boolean storageMediumSpecified = false;
+        DataProperty.AllocationPolicy allocationPolicy = DataProperty.AllocationPolicy.ADAPTIVE;
         boolean isBeingSynced = false;
 
         for (Map.Entry<String, String> entry : properties.entrySet()) {
@@ -353,13 +353,11 @@ public class PropertyAnalyzer {
                 } else {
                     throw new AnalysisException("Invalid storage medium: " + value);
                 }
-            } else if (key.equalsIgnoreCase(PROPERTIES_STORAGE_MEDIUM_SPECIFIED)) {
-                if (value.equalsIgnoreCase("true")) {
-                    storageMediumSpecified = true;
-                } else if (value.equalsIgnoreCase("false")) {
-                    storageMediumSpecified = false;
-                } else {
-                    throw new AnalysisException("Invalid storage_medium_specified value: " + value + ". Must be 'true' or 'false'");
+            } else if (key.equalsIgnoreCase(PROPERTIES_ALLOCATION_POLICY)) {
+                try {
+                    allocationPolicy = DataProperty.AllocationPolicy.fromString(value);
+                } catch (IllegalArgumentException e) {
+                    throw new AnalysisException(e.getMessage());
                 }
             } else if (key.equalsIgnoreCase(PROPERTIES_STORAGE_COOLDOWN_TIME)) {
                 try {
@@ -378,7 +376,7 @@ public class PropertyAnalyzer {
         } // end for properties
 
         properties.remove(PROPERTIES_STORAGE_MEDIUM);
-        properties.remove(PROPERTIES_STORAGE_MEDIUM_SPECIFIED);
+        properties.remove(PROPERTIES_ALLOCATION_POLICY);
         properties.remove(PROPERTIES_STORAGE_COOLDOWN_TIME);
         properties.remove(PROPERTIES_STORAGE_POLICY);
         properties.remove(PROPERTIES_DATA_BASE_TIME);
@@ -457,8 +455,7 @@ public class PropertyAnalyzer {
         boolean mutable = PropertyAnalyzer.analyzeBooleanProp(properties, PROPERTIES_MUTABLE, true);
         properties.remove(PROPERTIES_MUTABLE);
 
-        DataProperty dataProperty = new DataProperty(storageMedium, cooldownTimestamp, newStoragePolicy, mutable);
-        dataProperty.setStorageMediumSpecified(storageMediumSpecified);
+        DataProperty dataProperty = new DataProperty(storageMedium, cooldownTimestamp, newStoragePolicy, mutable, allocationPolicy);
         return dataProperty;
     }
 
@@ -1554,7 +1551,7 @@ public class PropertyAnalyzer {
                 try {
                     SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
                     systemInfoService.selectBackendIdsForReplicaCreation(
-                            replicaAlloc, nextIndexs, null, false, true);
+                            replicaAlloc, nextIndexs, null, DataProperty.AllocationPolicy.ADAPTIVE, true);
                 } catch (DdlException ddlException) {
                     throw new AnalysisException(ddlException.getMessage());
                 }
@@ -1836,19 +1833,5 @@ public class PropertyAnalyzer {
         return properties;
     }
 
-    public static boolean analyzeStorageMediumSpecified(Map<String, String> properties) throws AnalysisException {
-        boolean storageMediumSpecified = false;
-        if (properties != null && properties.containsKey(PROPERTIES_STORAGE_MEDIUM_SPECIFIED)) {
-            String value = properties.get(PROPERTIES_STORAGE_MEDIUM_SPECIFIED);
-            if (value.equalsIgnoreCase("true")) {
-                storageMediumSpecified = true;
-            } else if (value.equalsIgnoreCase("false")) {
-                storageMediumSpecified = false;
-            } else {
-                throw new AnalysisException("Invalid storage_medium_specified value: " + value + ". Must be 'true' or 'false'");
-            }
-            properties.remove(PROPERTIES_STORAGE_MEDIUM_SPECIFIED);
-        }
-        return storageMediumSpecified;
-    }
+    
 }

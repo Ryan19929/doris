@@ -2033,7 +2033,7 @@ public class SchemaChangeHandler extends AlterHandler {
                             indexSchemaMap.get(olapTable.getBaseIndexId()).add(rowColumn);
                         }
                     } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM) || 
-                               properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED)) {
+                               properties.containsKey(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY)) {
                         Env.getCurrentEnv().modifyTableProperties(db, olapTable, properties);
                         return;
                     }
@@ -2320,7 +2320,7 @@ public class SchemaChangeHandler extends AlterHandler {
                 add(PropertyAnalyzer.PROPERTIES_TIME_SERIES_COMPACTION_LEVEL_THRESHOLD);
                 add(PropertyAnalyzer.PROPERTIES_AUTO_ANALYZE_POLICY);
                 add(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM);
-                add(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED);
+                add(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY);
             }
         };
         List<String> notAllowedProps = properties.keySet().stream().filter(s -> !allowedProps.contains(s))
@@ -2412,7 +2412,7 @@ public class SchemaChangeHandler extends AlterHandler {
                 && !properties.containsKey(PropertyAnalyzer.PROPERTIES_SKIP_WRITE_INDEX_ON_LOAD)
                 && !properties.containsKey(PropertyAnalyzer.PROPERTIES_AUTO_ANALYZE_POLICY)
                 && !properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM)
-                && !properties.containsKey(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED)) {
+                && !properties.containsKey(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY)) {
             LOG.info("Properties already up-to-date");
             return;
         }

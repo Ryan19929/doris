@@ -101,7 +101,7 @@ public class CloudInternalCatalog extends InternalCatalog {
                                                    String storagePolicy,
                                                    IdGeneratorBuffer idGeneratorBuffer,
                                                    BinlogConfig binlogConfig,
-                                                   boolean isStorageMediumSpecified)
+                                                   DataProperty.AllocationPolicy allocationPolicy)
             throws DdlException {
         // create base index first.
         Preconditions.checkArgument(tbl.getBaseIndexId() != -1);

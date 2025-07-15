@@ -340,50 +340,50 @@ public class PropertyAnalyzerTest {
         Map<String, String> properties = Maps.newHashMap();
         DataProperty dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.HDD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isStorageMediumSpecified());
+        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
 
         properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.SSD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isStorageMediumSpecified());
+        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
 
         properties.clear();
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED, "true");
+        properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "strict");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.HDD, dataProperty.getStorageMedium());
-        Assert.assertTrue(dataProperty.isStorageMediumSpecified());
+        Assert.assertTrue(dataProperty.isAllocationPolicyStrict());
 
         properties.clear();
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED, "false");
+        properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "adaptive");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.HDD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isStorageMediumSpecified());
+        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
 
         properties.clear();
         properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED, "true");
+        properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "strict");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.SSD, dataProperty.getStorageMedium());
-        Assert.assertTrue(dataProperty.isStorageMediumSpecified());
+        Assert.assertTrue(dataProperty.isAllocationPolicyStrict());
 
         properties.clear();
         properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED, "false");
+        properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "adaptive");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.SSD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isStorageMediumSpecified());
+        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
     }
 
     @Test
-    public void testAnalyzeDataPropertyWithInvalidStorageMediumSpecified() {
+    public void testAnalyzeDataPropertyWithInvalidAllocationPolicy() {
         Map<String, String> properties = Maps.newHashMap();
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM_SPECIFIED, "invalid");
+        properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "invalid");
         
         try {
             PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
-            Assert.fail("Should throw AnalysisException for invalid storage_medium_specified value");
+            Assert.fail("Should throw AnalysisException for invalid allocation_policy value");
         } catch (AnalysisException e) {
-            Assert.assertTrue(e.getMessage().contains("Invalid storage_medium_specified value"));
+            Assert.assertTrue(e.getMessage().contains("Invalid allocation_policy value"));
         }
     }
 }
