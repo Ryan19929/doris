@@ -497,6 +497,7 @@ public class TableProperty implements GsonPostProcessable {
     }
 
     public void setAllocationPolicy(DataProperty.AllocationPolicy allocationPolicy) {
+        modifyTableProperties(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, allocationPolicy.getValue());
         this.allocationPolicy = allocationPolicy;
     }
 
