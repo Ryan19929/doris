@@ -28,7 +28,7 @@ import org.apache.doris.meta.MetaContext;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService.HostInfo;
 import org.apache.doris.thrift.TStorageMedium;
-import org.apache.doris.catalog.DataProperty;
+import org.apache.doris.catalog.DataProperty.AllocationPolicy;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
@@ -410,7 +410,7 @@ public class SystemInfoServiceTest {
         Map<Long, Integer> beCounterMap = Maps.newHashMap();
         for (int i = 0; i < 30000; ++i) {
             Pair<Map<Tag, List<Long>>, TStorageMedium> ret = infoService.selectBackendIdsForReplicaCreation(replicaAlloc,
-                    Maps.newHashMap(), TStorageMedium.HDD, DataProperty.AllocationPolicy.ADAPTIVE, false);
+                    Maps.newHashMap(), TStorageMedium.HDD, AllocationPolicy.ADAPTIVE, false);
             Map<Tag, List<Long>> res = ret.first;
             Assert.assertEquals(3, res.get(Tag.DEFAULT_BACKEND_TAG).size());
             for (Long beId : res.get(Tag.DEFAULT_BACKEND_TAG)) {

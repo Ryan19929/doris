@@ -569,7 +569,7 @@ public class PartitionsProcDir implements ProcDirInterface {
 
                 partitionInfo.add(partition.getRowCount());
                 trow.addToColumnValue(new TCell().setLongVal(partition.getRowCount()));
-                
+
                 String allocationPolicyValue = dataProperty.getAllocationPolicy().getValue();
                 partitionInfo.add(allocationPolicyValue);
                 trow.addToColumnValue(new TCell().setStringVal(allocationPolicyValue));

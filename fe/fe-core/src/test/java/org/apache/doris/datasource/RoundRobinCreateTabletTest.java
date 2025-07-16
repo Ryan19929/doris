@@ -32,6 +32,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
 import org.apache.doris.thrift.TStorageMedium;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy;
 
 import com.google.common.collect.ImmutableMap;
 import org.junit.After;
@@ -113,7 +114,7 @@ public class RoundRobinCreateTabletTest {
         try {
             Env.getCurrentEnv().getInternalCatalog().createTablets(index, ReplicaState.NORMAL,
                     distributionInfo, 0, replicaAlloc, tabletMeta,
-                    tabletIdSet, idGeneratorBuffer, DataProperty.AllocationPolicy.ADAPTIVE);
+                    tabletIdSet, idGeneratorBuffer, AllocationPolicy.ADAPTIVE);
         } catch (Exception e) {
             System.out.println("failed to create tablets " + e.getMessage());
         }

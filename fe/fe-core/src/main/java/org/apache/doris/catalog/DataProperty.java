@@ -55,7 +55,7 @@ public class DataProperty implements GsonPostProcessable {
                     return policy;
                 }
             }
-            throw new IllegalArgumentException("Invalid allocation_policy: " + value
+            throw new IllegalArgumentException("Invalid allocation_policy values: " + value
                     + ". Valid values: strict, adaptive");
         }
 

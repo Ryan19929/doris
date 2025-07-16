@@ -27,6 +27,7 @@ import org.apache.doris.meta.MetaContext;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TStorageMedium;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy;
 
 import com.google.common.collect.Maps;
 import mockit.Delegate;
@@ -54,7 +55,7 @@ public class ReplicaAllocationTest {
         new Expectations() {
             {
                 systemInfoService.selectBackendIdsForReplicaCreation((ReplicaAllocation) any, Maps.newHashMap(),
-                        (TStorageMedium) any, DataProperty.AllocationPolicy.ADAPTIVE, true);
+                        (TStorageMedium) any, AllocationPolicy.ADAPTIVE, true);
                 minTimes = 0;
                 result = new Delegate() {
                     Pair<Map<Tag, List<Long>>, TStorageMedium> selectBackendIdsForReplicaCreation() {
