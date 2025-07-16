@@ -305,7 +305,7 @@ public class CreateTableTest extends TestWithFeService {
                                 + "replication tag: {\"location\" : \"default\"}, replication num: 1, storage medium: SSD",
                         () -> createTable(
                                 "create table test.tb7(key1 int, key2 varchar(10)) distributed by hash(key1) \n"
-                                        + "buckets 1 properties('replication_num' = '1', 'storage_medium' = 'ssd');"));
+                                        + "buckets 1 properties('replication_num' = '1', 'storage_medium' = 'ssd', 'allocation_policy' = 'strict');"));
 
         ExceptionChecker
                 .expectThrowsWithMsg(DdlException.class,
@@ -320,7 +320,7 @@ public class CreateTableTest extends TestWithFeService {
                                 + "    PARTITION `p2` VALUES LESS THAN (\"20\"),\n"
                                 + "    PARTITION `p3` VALUES LESS THAN (\"30\"))\n"
                                 + "distributed by hash(key1)\n"
-                                + "buckets 1 properties('replication_num' = '1', 'storage_medium' = 'ssd');"));
+                                + "buckets 1 properties('replication_num' = '1', 'storage_medium' = 'ssd', 'allocation_policy' = 'strict');"));
 
         ExceptionChecker
                 .expectThrowsWithMsg(DdlException.class, "sequence column only support UNIQUE_KEYS",
