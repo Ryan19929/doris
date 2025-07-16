@@ -20,6 +20,7 @@ package org.apache.doris.system;
 import org.apache.doris.analysis.ModifyBackendClause;
 import org.apache.doris.analysis.ModifyBackendHostNameClause;
 import org.apache.doris.catalog.DataProperty;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy;
 import org.apache.doris.catalog.DiskInfo;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ReplicaAllocation;

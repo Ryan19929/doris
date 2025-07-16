@@ -297,13 +297,6 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
         tableProperty.setAllocationPolicy(allocationPolicy);
     }
 
-    // 保持向后兼容
-    @Deprecated
-    public void setAllocationPolicy(boolean isAllocationPolicyStrict) {
-        setAllocationPolicy(isAllocationPolicyStrict ? 
-            DataProperty.AllocationPolicy.STRICT : DataProperty.AllocationPolicy.ADAPTIVE);
-    }
-
     public String getStorageVaultName() {
         if (Strings.isNullOrEmpty(getStorageVaultId())) {
             return "";
@@ -328,11 +321,6 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
 
     public DataProperty.AllocationPolicy getAllocationPolicy() {
         return getOrCreatTableProperty().getAllocationPolicy();
-    }
-
-    @Deprecated
-    public boolean isAllocationPolicyStrict() {
-        return getOrCreatTableProperty().isAllocationPolicyStrict();
     }
 
     public boolean isTemporaryPartition(long partitionId) {

@@ -500,12 +500,6 @@ public class TableProperty implements GsonPostProcessable {
         this.allocationPolicy = allocationPolicy;
     }
 
-    // 保持向后兼容
-    @Deprecated
-    public boolean isAllocationPolicyStrict() {
-        return getAllocationPolicy().isStrict();
-    }
-
     public void removeInvalidProperties() {
         properties.remove(PropertyAnalyzer.PROPERTIES_STORAGE_POLICY);
         storagePolicy = "";

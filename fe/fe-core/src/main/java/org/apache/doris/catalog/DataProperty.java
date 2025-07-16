@@ -38,31 +38,31 @@ public class DataProperty implements GsonPostProcessable {
     public enum AllocationPolicy {
         STRICT("strict"),
         ADAPTIVE("adaptive");
-        
+
         private final String value;
-        
+
         AllocationPolicy(String value) {
             this.value = value;
         }
-        
+
         public String getValue() {
             return value;
         }
-        
+
         public static AllocationPolicy fromString(String value) {
             for (AllocationPolicy policy : values()) {
                 if (policy.value.equalsIgnoreCase(value)) {
                     return policy;
                 }
             }
-            throw new IllegalArgumentException("Invalid allocation_policy: " + value + 
-                ". Valid values: strict, adaptive");
+            throw new IllegalArgumentException("Invalid allocation_policy: " + value
+                    + ". Valid values: strict, adaptive");
         }
-        
+
         public boolean isStrict() {
             return this == STRICT;
         }
-        
+
         public boolean isAdaptive() {
             return this == ADAPTIVE;
         }
@@ -109,7 +109,8 @@ public class DataProperty implements GsonPostProcessable {
         this(medium, cooldown, storagePolicy, true, AllocationPolicy.ADAPTIVE);
     }
 
-    public DataProperty(TStorageMedium medium, long cooldown, String storagePolicy, boolean isMutable, AllocationPolicy allocationPolicy) {
+    public DataProperty(TStorageMedium medium, long cooldown, String storagePolicy, boolean isMutable,
+            AllocationPolicy allocationPolicy) {
         this.storageMedium = medium;
         this.cooldownTimeMs = cooldown;
         this.storagePolicy = storagePolicy;
@@ -141,10 +142,6 @@ public class DataProperty implements GsonPostProcessable {
         this.allocationPolicy = allocationPolicy;
     }
 
-    public boolean isAllocationPolicyStrict() {
-        return allocationPolicy != null && allocationPolicy == AllocationPolicy.STRICT;
-    }
-
     public boolean isMutable() {
         return isMutable;
     }
@@ -155,42 +152,6 @@ public class DataProperty implements GsonPostProcessable {
 
     public void setStorageMedium(TStorageMedium medium) {
         this.storageMedium = medium;
-    }
-
-    /**
-     * Get the final allocation policy for a partition.
-     * If the partition has its own setting, use it; otherwise use table-level setting.
-     * @param partitionDataProperty the partition's own data property
-     * @param tableAllocationPolicy the table's allocation policy
-     * @return the final allocation policy
-     */
-    public static AllocationPolicy getFinalAllocationPolicy(DataProperty partitionDataProperty, AllocationPolicy tableAllocationPolicy) {
-        if (partitionDataProperty.allocationPolicy != AllocationPolicy.ADAPTIVE) {
-            return partitionDataProperty.allocationPolicy;
-        }
-        return tableAllocationPolicy;
-    }
-
-    /**
-     * Get the final allocation policy for a partition.
-     * If the partition has its own setting, use it; otherwise use table-level setting.
-     * @param partitionDataProperty the partition's own data property
-     * @param olapTable the table to get allocation policy from
-     * @return the final allocation policy
-     */
-    public static AllocationPolicy getFinalAllocationPolicy(DataProperty partitionDataProperty, OlapTable olapTable) {
-        return getFinalAllocationPolicy(partitionDataProperty, olapTable.getAllocationPolicy());
-    }
-
-    /**
-     * Get the final allocation policy as boolean for compatibility.
-     * @param partitionDataProperty the partition's own data property
-     * @param olapTable the table to get allocation policy from
-     * @return true if final policy is STRICT
-     */
-    @Deprecated
-    public static boolean getFinalAllocationPolicyStrict(DataProperty partitionDataProperty, OlapTable olapTable) {
-        return getFinalAllocationPolicy(partitionDataProperty, olapTable).isStrict();
     }
 
     @Override

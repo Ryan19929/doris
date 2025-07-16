@@ -21,6 +21,7 @@ import org.apache.doris.analysis.DataSortInfo;
 import org.apache.doris.analysis.DateLiteral;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.DataProperty;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
@@ -339,7 +340,7 @@ public class PropertyAnalyzer {
         // then we would just set the partition's storage policy the same as the table's
         String newStoragePolicy = oldStoragePolicy;
         boolean hasStoragePolicy = false;
-        DataProperty.AllocationPolicy allocationPolicy = DataProperty.AllocationPolicy.ADAPTIVE;
+        DataProperty.AllocationPolicy allocationPolicy = AllocationPolicy.ADAPTIVE;
         boolean isBeingSynced = false;
 
         for (Map.Entry<String, String> entry : properties.entrySet()) {
@@ -1551,7 +1552,7 @@ public class PropertyAnalyzer {
                 try {
                     SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
                     systemInfoService.selectBackendIdsForReplicaCreation(
-                            replicaAlloc, nextIndexs, null, DataProperty.AllocationPolicy.ADAPTIVE, true);
+                            replicaAlloc, nextIndexs, null, AllocationPolicy.ADAPTIVE, true);
                 } catch (DdlException ddlException) {
                     throw new AnalysisException(ddlException.getMessage());
                 }

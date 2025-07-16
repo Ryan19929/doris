@@ -1591,7 +1591,7 @@ public class InternalCatalog implements CatalogIf<Database> {
                     singlePartitionDesc.isInMemory(),
                     singlePartitionDesc.getTabletType(),
                     storagePolicy, idGeneratorBuffer,
-                    binlogConfig, dataProperty.getAllocationPolicy());
+                    binlogConfig);
 
             // check again
             olapTable = db.getOlapTableOrDdlException(tableName);
@@ -1907,8 +1907,7 @@ public class InternalCatalog implements CatalogIf<Database> {
                                                    TTabletType tabletType,
                                                    String storagePolicy,
                                                    IdGeneratorBuffer idGeneratorBuffer,
-                                                   BinlogConfig binlogConfig,
-                                                   DataProperty.AllocationPolicy allocationPolicy)
+                                                   BinlogConfig binlogConfig)
             throws DdlException {
         // create base index first.
         Preconditions.checkArgument(tbl.getBaseIndexId() != -1);
@@ -1951,7 +1950,7 @@ public class InternalCatalog implements CatalogIf<Database> {
             TabletMeta tabletMeta = new TabletMeta(dbId, tbl.getId(), partitionId, indexId,
                     schemaHash, dataProperty.getStorageMedium());
             realStorageMedium = createTablets(index, ReplicaState.NORMAL, distributionInfo, version, replicaAlloc,
-                tabletMeta, tabletIdSet, idGeneratorBuffer, allocationPolicy);
+                tabletMeta, tabletIdSet, idGeneratorBuffer, dataProperty.getAllocationPolicy());
             if (realStorageMedium != null && !realStorageMedium.equals(dataProperty.getStorageMedium())) {
                 dataProperty.setStorageMedium(realStorageMedium);
                 LOG.info("real medium not eq default "
@@ -2924,8 +2923,7 @@ public class InternalCatalog implements CatalogIf<Database> {
                         isInMemory, tabletType,
                         storagePolicy,
                         idGeneratorBuffer,
-                        binlogConfigForTask,
-                        DataProperty.getFinalAllocationPolicy(partitionInfo.getDataProperty(partitionId), olapTable));
+                        binlogConfigForTask);
                 afterCreatePartitions(db.getId(), olapTable.getId(), null,
                         olapTable.getIndexIdList(), true);
                 olapTable.addPartition(partition);
@@ -3012,8 +3010,7 @@ public class InternalCatalog implements CatalogIf<Database> {
                             versionInfo, bfColumns, tabletIdSet, isInMemory,
                             partitionInfo.getTabletType(entry.getValue()),
                             partionStoragePolicy, idGeneratorBuffer,
-                            binlogConfigForTask,
-                            DataProperty.getFinalAllocationPolicy(dataProperty, olapTable));
+                            binlogConfigForTask);
                     olapTable.addPartition(partition);
                     olapTable.getPartitionInfo().getDataProperty(partition.getId())
                             .setStoragePolicy(partionStoragePolicy);
@@ -3461,9 +3458,7 @@ public class InternalCatalog implements CatalogIf<Database> {
                         copiedTbl.isInMemory(),
                         copiedTbl.getPartitionInfo().getTabletType(oldPartitionId),
                         olapTable.getPartitionInfo().getDataProperty(oldPartitionId).getStoragePolicy(),
-                        idGeneratorBuffer, binlogConfig,
-                        DataProperty.getFinalAllocationPolicy(
-                            copiedTbl.getPartitionInfo().getDataProperty(oldPartitionId), copiedTbl));
+                        idGeneratorBuffer, binlogConfig);
                 newPartitions.add(newPartition);
             }
 

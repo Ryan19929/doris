@@ -80,12 +80,6 @@ public class ModifyTablePropertiesOp extends AlterTableOp {
         return allocationPolicy;
     }
 
-    // 保持向后兼容
-    @Deprecated
-    public boolean isAllocationPolicyStrict() {
-        return allocationPolicy.isStrict();
-    }
-
     @Override
     public void validate(ConnectContext ctx) throws UserException {
         if (properties == null || properties.isEmpty()) {

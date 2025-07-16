@@ -3726,9 +3726,9 @@ public class Env {
         }
 
         // allocation policy
-        if (olapTable.getTableProperty() != null && olapTable.getTableProperty().getAllocationPolicy() == DataProperty.AllocationPolicy.STRICT) {
+        if (olapTable.getAllocationPolicy() != null) {
             sb.append(",\n\"").append(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY).append("\" = \"");
-            sb.append(DataProperty.AllocationPolicy.STRICT.name().toLowerCase()).append("\"");
+            sb.append(olapTable.getAllocationPolicy().name().toLowerCase()).append("\"");
         }
 
         // storage type

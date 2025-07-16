@@ -36,6 +36,8 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy.ADAPTIVE;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy.STRICT;
 
 public class CreateTableTest extends TestWithFeService {
     private static String runningDir = "fe/mocked/CreateTableTest2/" + UUID.randomUUID().toString() + "/";
@@ -1094,7 +1096,7 @@ public class CreateTableTest extends TestWithFeService {
         Database db = Env.getCurrentInternalCatalog().getDbOrDdlException("test");
         OlapTable table = (OlapTable) db.getTableOrDdlException("tbl_storage_medium_specified");
         Assert.assertEquals("HDD", table.getTableProperty().getStorageMedium().name());
-        Assert.assertTrue(table.getTableProperty().isAllocationPolicyStrict());
+        Assert.assertEquals(STRICT, table.getTableProperty().getAllocationPolicy());
         Partition p1 = table.getPartition("p1");
         Assert.assertEquals("HDD", table.getPartitionInfo().getDataProperty(p1.getId()).getStorageMedium().name());
 
@@ -1108,7 +1110,7 @@ public class CreateTableTest extends TestWithFeService {
         OlapTable table2 = (OlapTable) db.getTableOrDdlException("tbl_storage_medium_override");
         Partition p1_2 = table2.getPartition("p1");
         Partition p2_2 = table2.getPartition("p2");
-        Assert.assertFalse(table2.getTableProperty().isAllocationPolicyStrict());
+        Assert.assertEquals(ADAPTIVE, table2.getTableProperty().getAllocationPolicy());
         Assert.assertEquals("HDD", table2.getPartitionInfo().getDataProperty(p1_2.getId()).getStorageMedium().name());
         Assert.assertEquals("HDD", table2.getPartitionInfo().getDataProperty(p2_2.getId()).getStorageMedium().name());
 
@@ -1120,6 +1122,6 @@ public class CreateTableTest extends TestWithFeService {
                         + "properties('replication_num' = '1', 'storage_medium' = 'SSD', 'allocation_policy' = 'adaptive'); "));
         OlapTable table3 = (OlapTable) db.getTableOrDdlException("tbl_explicitly_specified");
         Assert.assertEquals("SSD", table3.getTableProperty().getStorageMedium().name());
-        Assert.assertFalse(table3.getTableProperty().isAllocationPolicyStrict());
+        Assert.assertEquals(ADAPTIVE, table3.getTableProperty().getAllocationPolicy());
     }
 }

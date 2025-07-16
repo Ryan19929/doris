@@ -48,6 +48,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy.ADAPTIVE;
+import static org.apache.doris.catalog.DataProperty.AllocationPolicy.STRICT;
 
 public class PropertyAnalyzerTest {
     @Rule
@@ -340,38 +342,38 @@ public class PropertyAnalyzerTest {
         Map<String, String> properties = Maps.newHashMap();
         DataProperty dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.HDD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
+        Assert.assertEquals(ADAPTIVE, dataProperty.getAllocationPolicy());
 
         properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.SSD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
+        Assert.assertEquals(ADAPTIVE, dataProperty.getAllocationPolicy());
 
         properties.clear();
         properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "strict");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.HDD, dataProperty.getStorageMedium());
-        Assert.assertTrue(dataProperty.isAllocationPolicyStrict());
+        Assert.assertEquals(STRICT, dataProperty.getAllocationPolicy());
 
         properties.clear();
         properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "adaptive");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.HDD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
+        Assert.assertEquals(ADAPTIVE, dataProperty.getAllocationPolicy());
 
         properties.clear();
         properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
         properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "strict");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.SSD, dataProperty.getStorageMedium());
-        Assert.assertTrue(dataProperty.isAllocationPolicyStrict());
+        Assert.assertEquals(STRICT, dataProperty.getAllocationPolicy());
 
         properties.clear();
         properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM, "SSD");
         properties.put(PropertyAnalyzer.PROPERTIES_ALLOCATION_POLICY, "adaptive");
         dataProperty = PropertyAnalyzer.analyzeDataProperty(properties, new DataProperty(TStorageMedium.HDD));
         Assert.assertEquals(TStorageMedium.SSD, dataProperty.getStorageMedium());
-        Assert.assertFalse(dataProperty.isAllocationPolicyStrict());
+        Assert.assertEquals(ADAPTIVE, dataProperty.getAllocationPolicy());
     }
 
     @Test
