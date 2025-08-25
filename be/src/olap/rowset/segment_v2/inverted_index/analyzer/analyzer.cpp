@@ -95,6 +95,9 @@ std::shared_ptr<lucene::analysis::Analyzer> InvertedIndexAnalyzer::create_analyz
                 ik_analyzer->setMode(false);
             }
             analyzer = std::move(ik_analyzer);
+        } else if (analyser_type == InvertedIndexParserType::PARSER_PINYIN) {
+            // TODO(Ryan19929): get pinyin analyzer from config
+            analyzer = std::make_shared<lucene::analysis::SimpleAnalyzer<char>>();
         } else {
             // default
             analyzer = std::make_shared<lucene::analysis::SimpleAnalyzer<char>>();

@@ -40,6 +40,8 @@ std::string inverted_index_parser_type_to_string(InvertedIndexParserType parser_
         return INVERTED_INDEX_PARSER_BASIC;
     case InvertedIndexParserType::PARSER_IK:
         return INVERTED_INDEX_PARSER_IK;
+    case InvertedIndexParserType::PARSER_PINYIN:
+        return INVERTED_INDEX_PARSER_PINYIN;
     default:
         return INVERTED_INDEX_PARSER_UNKNOWN;
     }
@@ -63,6 +65,8 @@ InvertedIndexParserType get_inverted_index_parser_type_from_string(const std::st
         return InvertedIndexParserType::PARSER_BASIC;
     } else if (parser_str_lower == INVERTED_INDEX_PARSER_IK) {
         return InvertedIndexParserType::PARSER_IK;
+    } else if (parser_str_lower == INVERTED_INDEX_PARSER_PINYIN) {
+        return InvertedIndexParserType::PARSER_PINYIN;
     }
 
     return InvertedIndexParserType::PARSER_UNKNOWN;
