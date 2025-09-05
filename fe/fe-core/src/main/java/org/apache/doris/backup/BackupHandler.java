@@ -212,19 +212,28 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
         // Support concurrent job execution using Doris ThreadPoolManager
         List<AbstractJob> currentJobs = getAllCurrentJobs();
+        LOG.info("CONCURRENT_DEBUG: Found {} jobs to execute", currentJobs.size());
+        
         for (AbstractJob job : currentJobs) {
             job.setEnv(env);
+            LOG.info("CONCURRENT_DEBUG: Submitting job {} (state: {}) to thread pool", 
+                    job.getJobId(), job.getState());
             // Execute each job in thread pool for true concurrency following Doris pattern
             if (backupJobExecutor != null) {
                 backupJobExecutor.submit(() -> {
                     try {
+                        LOG.info("CONCURRENT_DEBUG: Job {} starting execution in thread {}", 
+                                job.getJobId(), Thread.currentThread().getName());
                         job.run();
+                        LOG.info("CONCURRENT_DEBUG: Job {} finished execution in thread {}", 
+                                job.getJobId(), Thread.currentThread().getName());
                     } catch (Exception e) {
                         LOG.warn("Exception in concurrent backup job execution: {}", e.getMessage(), e);
                     }
                 });
             } else {
                 // Fallback to original sequential execution if executor not initialized
+                LOG.warn("CONCURRENT_DEBUG: Executor not initialized, falling back to sequential execution");
                 job.run();
             }
         }
