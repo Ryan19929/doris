@@ -335,15 +335,6 @@ public class BackupHandler extends MasterDaemon implements Writable {
         // So we use tryLock() to give up this operation if we can not get lock.
         tryLock();
         try {
-            // Check if there is backup or restore job running on this database
-            AbstractJob currentJob = getCurrentJob(db.getId());
-            if (currentJob != null && !currentJob.isDone()) {
-                ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
-                                               "Can only run one backup or restore job of a database at same time "
-                                               + ", current running: label = " + currentJob.getLabel() + " jobId = "
-                                               + currentJob.getJobId() + ", to run label = " + stmt.getLabel());
-            }
-
             if (stmt instanceof BackupStmt) {
                 backup(repository, db, (BackupStmt) stmt);
             } else if (stmt instanceof RestoreStmt) {
@@ -628,8 +619,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
     private List<AbstractJob> getAllCurrentJobs() {
         jobLock.lock();
         try {
-            return dbIdToBackupOrRestoreJobs.values().stream().filter(CollectionUtils::isNotEmpty)
-                    .map(Deque::getLast).collect(Collectors.toList());
+            return dbIdToBackupOrRestoreJobs.values().stream()
+                    .filter(CollectionUtils::isNotEmpty)
+                    .flatMap(Deque::stream)  // Return all jobs, not just the last one
+                    .filter(job -> !job.isDone())  // Only return unfinished jobs
+                    .collect(Collectors.toList());
         } finally {
             jobLock.unlock();
         }
@@ -640,6 +634,23 @@ public class BackupHandler extends MasterDaemon implements Writable {
         try {
             Deque<AbstractJob> jobs = dbIdToBackupOrRestoreJobs.getOrDefault(dbId, Lists.newLinkedList());
             return jobs.isEmpty() ? null : jobs.getLast();
+        } finally {
+            jobLock.unlock();
+        }
+    }
+
+    // New method to find job by jobId for concurrent backup support
+    private AbstractJob getJobByJobId(long dbId, long jobId) {
+        jobLock.lock();
+        try {
+            Deque<AbstractJob> jobs = dbIdToBackupOrRestoreJobs.get(dbId);
+            if (jobs == null) {
+                return null;
+            }
+            return jobs.stream()
+                    .filter(job -> job.getJobId() == jobId)
+                    .findFirst()
+                    .orElse(null);
         } finally {
             jobLock.unlock();
         }
@@ -753,7 +764,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     public boolean handleFinishedSnapshotTask(SnapshotTask task, TFinishTaskRequest request) {
-        AbstractJob job = getCurrentJob(task.getDbId());
+        // Use jobId to find the exact job for concurrent backup support
+        AbstractJob job = getJobByJobId(task.getDbId(), task.getJobId());
         if (job == null) {
             LOG.warn("failed to find backup or restore job for task: {}", task);
             // return true to remove this task from AgentTaskQueue
@@ -785,7 +797,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     public boolean handleFinishedSnapshotUploadTask(UploadTask task, TFinishTaskRequest request) {
-        AbstractJob job = getCurrentJob(task.getDbId());
+        // Use jobId to find the exact job for concurrent backup support
+        AbstractJob job = getJobByJobId(task.getDbId(), task.getJobId());
         if (job == null || (job instanceof RestoreJob)) {
             LOG.info("invalid upload task: {}, no backup job is found. db id: {}", task, task.getDbId());
             return false;
@@ -800,7 +813,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     public boolean handleDownloadSnapshotTask(DownloadTask task, TFinishTaskRequest request) {
-        AbstractJob job = getCurrentJob(task.getDbId());
+        // Use jobId to find the exact job for concurrent restore support
+        AbstractJob job = getJobByJobId(task.getDbId(), task.getJobId());
         if (!(job instanceof RestoreJob)) {
             LOG.warn("failed to find restore job for task: {}", task);
             // return true to remove this task from AgentTaskQueue
@@ -817,7 +831,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     public boolean handleDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
-        AbstractJob job = getCurrentJob(task.getDbId());
+        // Use jobId to find the exact job for concurrent restore support
+        AbstractJob job = getJobByJobId(task.getDbId(), task.getJobId());
         if (!(job instanceof RestoreJob)) {
             LOG.warn("failed to find restore job for task: {}", task);
             // return true to remove this task from AgentTaskQueue
