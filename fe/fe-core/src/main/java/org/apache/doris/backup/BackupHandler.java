@@ -216,8 +216,10 @@ public class BackupHandler extends MasterDaemon implements Writable {
         
         for (AbstractJob job : currentJobs) {
             job.setEnv(env);
+            String jobState = (job instanceof BackupJob) ? 
+                    ((BackupJob) job).getState().toString() : "UNKNOWN";
             LOG.info("CONCURRENT_DEBUG: Submitting job {} (state: {}) to thread pool", 
-                    job.getJobId(), job.getState());
+                    job.getJobId(), jobState);
             // Execute each job in thread pool for true concurrency following Doris pattern
             if (backupJobExecutor != null) {
                 backupJobExecutor.submit(() -> {
