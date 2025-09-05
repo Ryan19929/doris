@@ -43,6 +43,7 @@ import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Writable;
@@ -81,6 +82,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -107,6 +109,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
+
+    // Thread pool for concurrent backup job execution
+    private ExecutorService backupJobExecutor;
 
     private boolean isInit = false;
 
@@ -136,6 +141,12 @@ public class BackupHandler extends MasterDaemon implements Writable {
         Preconditions.checkNotNull(env);
         super.start();
         repoMgr.start();
+        
+        // Initialize thread pool for concurrent backup job execution
+        if (backupJobExecutor == null) {
+            backupJobExecutor = ThreadPoolManager.newDaemonFixedThreadPool(
+                    Config.max_backup_restore_job_num_per_db, 64, "backup-job-executor", true);
+        }
     }
 
     public RepositoryMgr getRepoMgr() {
@@ -199,9 +210,23 @@ public class BackupHandler extends MasterDaemon implements Writable {
             }
         }
 
-        for (AbstractJob job : getAllCurrentJobs()) {
+        // Support concurrent job execution using Doris ThreadPoolManager
+        List<AbstractJob> currentJobs = getAllCurrentJobs();
+        for (AbstractJob job : currentJobs) {
             job.setEnv(env);
-            job.run();
+            // Execute each job in thread pool for true concurrency following Doris pattern
+            if (backupJobExecutor != null) {
+                backupJobExecutor.submit(() -> {
+                    try {
+                        job.run();
+                    } catch (Exception e) {
+                        LOG.warn("Exception in concurrent backup job execution: {}", e.getMessage(), e);
+                    }
+                });
+            } else {
+                // Fallback to original sequential execution if executor not initialized
+                job.run();
+            }
         }
     }
 
