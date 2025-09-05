@@ -329,20 +329,17 @@ public class BackupHandler extends MasterDaemon implements Writable {
         String dbName = stmt.getDbName();
         Database db = env.getInternalCatalog().getDbOrDdlException(dbName);
 
-        // Try to get sequence lock.
-        // We expect at most one operation on a repo at same time.
-        // But this operation may take a few seconds with lock held.
-        // So we use tryLock() to give up this operation if we can not get lock.
-        tryLock();
-        try {
-            if (stmt instanceof BackupStmt) {
-                backup(repository, db, (BackupStmt) stmt);
-            } else if (stmt instanceof RestoreStmt) {
-                restore(repository, db, (RestoreStmt) stmt);
-            }
-        } finally {
-            seqlock.unlock();
+        // TODO: Support concurrent backup jobs - commenting out seqlock for concurrent support
+        // tryLock();
+        // try {
+        if (stmt instanceof BackupStmt) {
+            backup(repository, db, (BackupStmt) stmt);
+        } else if (stmt instanceof RestoreStmt) {
+            restore(repository, db, (RestoreStmt) stmt);
         }
+        // } finally {
+        //     seqlock.unlock();
+        // }
     }
 
     private void tryLock() throws DdlException {
