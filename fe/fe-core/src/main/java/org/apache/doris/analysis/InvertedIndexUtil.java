@@ -44,7 +44,6 @@ public class InvertedIndexUtil {
     public static String INVERTED_INDEX_PARSER_ICU = "icu";
     public static String INVERTED_INDEX_PARSER_BASIC = "basic";
     public static String INVERTED_INDEX_PARSER_IK = "ik";
-    public static String INVERTED_INDEX_PARSER_PINYIN = "pinyin";
 
     public static String INVERTED_INDEX_PARSER_MODE_KEY = "parser_mode";
     public static String INVERTED_INDEX_PARSER_FINE_GRANULARITY = "fine_grained";
@@ -183,8 +182,7 @@ public class InvertedIndexUtil {
                                 || parser.equals(INVERTED_INDEX_PARSER_CHINESE)
                                     || parser.equals(INVERTED_INDEX_PARSER_ICU)
                                         || parser.equals(INVERTED_INDEX_PARSER_BASIC)
-                                            || parser.equals(INVERTED_INDEX_PARSER_IK)
-                                                || parser.equals(INVERTED_INDEX_PARSER_PINYIN))) {
+                                            || parser.equals(INVERTED_INDEX_PARSER_IK))) {
                 throw new AnalysisException("INVERTED index parser: " + parser
                     + " is invalid for column: " + indexColName + " of type " + colType);
             }
@@ -250,9 +248,9 @@ public class InvertedIndexUtil {
             }
         }
 
-        if (parser != null && !parser.matches("none|english|unicode|chinese|standard|icu|basic|ik|pinyin")) {
+        if (parser != null && !parser.matches("none|english|unicode|chinese|standard|icu|basic|ik")) {
             throw new AnalysisException("Invalid inverted index 'parser' value: " + parser
-                    + ", parser must be none, english, unicode, chinese, icu, basic, ik or pinyin");
+                    + ", parser must be none, english, unicode, chinese, icu, basic or ik");
         }
 
         if (parserMode != null) {
