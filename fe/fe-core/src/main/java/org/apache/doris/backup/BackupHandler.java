@@ -628,8 +628,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
             AbstractJob lastJob = jobs.peekLast();
 
             // Remove duplicate jobs and keep only the latest status
-            // Otherwise, the tasks that have been successfully executed will be repeated when replaying edit log.
-            if (lastJob != null && (lastJob.isPending() || lastJob.getJobId() == job.getJobId())) {
+            // Only remove if it's the exact same job (same jobId) to support concurrent jobs
+            // Note: Removed the isPending() check to allow multiple concurrent pending jobs
+            if (lastJob != null && lastJob.getJobId() == job.getJobId()) {
                 jobs.removeLast();
             }
             jobs.addLast(job);
