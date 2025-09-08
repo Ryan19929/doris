@@ -490,8 +490,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
 
-        // generate job id
-        jobId = env.getNextId();
+        // jobId is now generated at creation time for proper concurrent job identification
+        // jobId = env.getNextId(); // Removed: jobId already set in BackupHandler
         unfinishedTaskIds.clear();
         taskProgress.clear();
         taskErrMsg.clear();

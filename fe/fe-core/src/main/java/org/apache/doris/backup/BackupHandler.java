@@ -525,6 +525,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
         BackupJob backupJob = new BackupJob(stmt.getLabel(), db.getId(),
                 ClusterNamespace.getNameFromFullName(db.getFullName()),
                 tblRefs, stmt.getTimeoutMs(), stmt.getContent(), env, repoId, commitSeq);
+        
+        // Generate jobId immediately for proper job identification in concurrent scenarios
+        // This fixes the issue where all jobs had jobId = -1, causing incorrect job removal
+        backupJob.setJobId(env.getNextId());
+        
         // write log
         env.getEditLog().logBackupJob(backupJob);
 
@@ -599,6 +604,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
                     stmt.isForceReplace(),
                     env, repository.getId());
         }
+
+        // Generate jobId immediately for proper job identification in concurrent scenarios
+        restoreJob.setJobId(env.getNextId());
 
         env.getEditLog().logRestoreJob(restoreJob);
 

@@ -116,6 +116,10 @@ public abstract class AbstractJob implements Writable {
         return jobId;
     }
 
+    public void setJobId(long jobId) {
+        this.jobId = jobId;
+    }
+
     public String getLabel() {
         return label;
     }
