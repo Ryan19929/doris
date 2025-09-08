@@ -631,6 +631,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             // Only remove if it's the exact same job (same jobId) to support concurrent jobs
             // Note: Removed the isPending() check to allow multiple concurrent pending jobs
             if (lastJob != null && lastJob.getJobId() == job.getJobId()) {
+                LOG.info("lastJob id: {}; currentJob id: {}", lastJob.getJobId(), lastJob);
                 jobs.removeLast();
             }
             jobs.addLast(job);
