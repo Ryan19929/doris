@@ -635,12 +635,25 @@ public class BackupHandler extends MasterDaemon implements Writable {
             }
             AbstractJob lastJob = jobs.peekLast();
 
-            // Remove duplicate jobs and keep only the latest status
-            // Only remove if it's the exact same job (same jobId) to support concurrent jobs
-            // Note: Removed the isPending() check to allow multiple concurrent pending jobs
-            if (lastJob != null && lastJob.getJobId() == job.getJobId()) {
-                LOG.info("lastJob id: {}; currentJob id: {}", lastJob.getJobId(), job.getJobId());
-                jobs.removeLast();
+            // Remove duplicate jobs using existing helper methods
+            // 1. Check for exact jobId duplicates (normal case)
+            AbstractJob existingJobWithSameId = findJobByJobId(jobs, job.getJobId());
+            if (existingJobWithSameId != null) {
+                LOG.info("Removing exact duplicate job: jobId={}", job.getJobId());
+                jobs.remove(existingJobWithSameId);
+            }
+            
+            // 2. For EditLog replay safety: check for same label PENDING jobs
+            // This handles replay duplicates correctly even in concurrent scenarios
+            if (job.isPending()) {
+                AbstractJob duplicateJob = findJobByLabel(jobs, job.getLabel(), true);
+                if (duplicateJob != null) {
+                    LOG.info("Found duplicate PENDING job: label={}, existingJobId={}, newJobId={}", 
+                            job.getLabel(), duplicateJob.getJobId(), job.getJobId());
+                    jobs.remove(duplicateJob);
+                    LOG.info("Removed duplicate PENDING job: label={}, jobId={}", 
+                            duplicateJob.getLabel(), duplicateJob.getJobId());
+                }
             }
             jobs.addLast(job);
         } finally {
@@ -690,13 +703,27 @@ public class BackupHandler extends MasterDaemon implements Writable {
             if (jobs == null) {
                 return null;
             }
-            return jobs.stream()
-                    .filter(job -> job.getJobId() == jobId)
-                    .findFirst()
-                    .orElse(null);
+            return findJobByJobId(jobs, jobId);
         } finally {
             jobLock.unlock();
         }
+    }
+
+    // Helper method to find job by jobId in a given queue
+    private AbstractJob findJobByJobId(Deque<AbstractJob> jobs, long jobId) {
+        return jobs.stream()
+                .filter(job -> job.getJobId() == jobId)
+                .findFirst()
+                .orElse(null);
+    }
+
+    // Helper method to find job by label in a given queue
+    private AbstractJob findJobByLabel(Deque<AbstractJob> jobs, String label, boolean pendingOnly) {
+        return jobs.stream()
+                .filter(job -> job.getLabel().equals(label))
+                .filter(job -> !pendingOnly || job.isPending())
+                .findFirst()
+                .orElse(null);
     }
 
     private void checkAndFilterRestoreObjsExistInSnapshot(BackupJobInfo jobInfo,
