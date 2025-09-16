@@ -635,18 +635,33 @@ public class Coordinator implements CoordInterface {
     }
 
     private boolean shouldQueue() {
-        boolean ret = Config.enable_query_queue && !context.getSessionVariable()
-                .getBypassWorkloadGroup() && !isQueryCancelled();
+        boolean enableQueryQueue = Config.enable_query_queue;
+        boolean bypassWorkloadGroup = context.getSessionVariable().getBypassWorkloadGroup();
+        boolean queryIsCancelled = isQueryCancelled();
+        
+        LOG.info("=== SHOULD QUEUE ANALYSIS === enable_query_queue: {}, bypass_workload_group: {}, query_cancelled: {}", 
+                enableQueryQueue, bypassWorkloadGroup, queryIsCancelled);
+        
+        boolean ret = enableQueryQueue && !bypassWorkloadGroup && !queryIsCancelled;
         if (!ret) {
+            LOG.info("=== SHOULD QUEUE FALSE === Basic conditions not met");
             return false;
         }
+        
+        LOG.info("=== SCAN NODES ANALYSIS === Total scanNodes: {}", scanNodes.size());
+        
         // a query with ScanNode need not queue only when all its scan node is SchemaScanNode
-        for (ScanNode scanNode : this.scanNodes) {
+        for (int i = 0; i < scanNodes.size(); i++) {
+            ScanNode scanNode = scanNodes.get(i);
             boolean isSchemaScanNode = scanNode instanceof SchemaScanNode;
+            LOG.info("=== SCAN NODE {} === Type: {}, isSchemaScanNode: {}", 
+                    i, scanNode.getClass().getSimpleName(), isSchemaScanNode);
             if (!isSchemaScanNode) {
+                LOG.info("=== SHOULD QUEUE TRUE === Found non-SchemaScanNode: {}", scanNode.getClass().getSimpleName());
                 return true;
             }
         }
+        LOG.info("=== SHOULD QUEUE FALSE === All ScanNodes are SchemaScanNode or no ScanNodes");
         return false;
     }
 
@@ -657,12 +672,30 @@ public class Coordinator implements CoordInterface {
     // A call to Exec() must precede all other member function calls.
     @Override
     public void exec() throws Exception {
+        // DEBUG: 添加详细的INSERT排队分析日志
+        LOG.info("=== COORDINATOR EXEC DEBUG === Query ID: {}, QueryType: {}, ScanNodes count: {}", 
+                DebugUtil.printId(queryId), 
+                queryOptions != null ? queryOptions.getQueryType() : "null", 
+                scanNodes != null ? scanNodes.size() : 0);
+        
         // LoadTask does not have context, not controlled by queue now
         if (context != null) {
+            LOG.info("=== CONTEXT NOT NULL === User: {}, WorkloadGroup: {}", 
+                    context.getQualifiedUser(), 
+                    context.getSessionVariable().getWorkloadGroup());
+            
             if (Config.enable_workload_group) {
+                LOG.info("=== WORKLOAD GROUP ENABLED === enable_query_queue: {}, bypass_workload_group: {}", 
+                        Config.enable_query_queue, 
+                        context.getSessionVariable().getBypassWorkloadGroup());
+                
                 this.setTWorkloadGroups(context.getEnv().getWorkloadGroupMgr().getWorkloadGroup(context));
                 boolean shouldQueue = this.shouldQueue();
+                
+                LOG.info("=== SHOULD QUEUE RESULT === shouldQueue: {}", shouldQueue);
+                
                 if (shouldQueue) {
+                    LOG.info("=== ENTERING QUEUE LOGIC ===");
                     queryQueue = context.getEnv().getWorkloadGroupMgr().getWorkloadGroupQueryQueue(context);
                     if (queryQueue == null) {
                         // This logic is actually useless, because when could not find query queue, it will
@@ -670,12 +703,18 @@ public class Coordinator implements CoordInterface {
                         throw new UserException("could not find query queue");
                     }
                     queueToken = queryQueue.getToken();
+                    LOG.info("=== GOT QUEUE TOKEN === Queue: {}", queryQueue.debugString());
                     queueToken.get(DebugUtil.printId(queryId),
                             this.queryOptions.getExecutionTimeout() * 1000);
+                } else {
+                    LOG.info("=== SKIP QUEUE === Reason: shouldQueue returned false");
                 }
             } else {
+                LOG.info("=== WORKLOAD GROUP DISABLED ===");
                 context.setWorkloadGroupName("");
             }
+        } else {
+            LOG.info("=== CONTEXT IS NULL === This is likely a LoadTask");
         }
         execInternal();
     }
