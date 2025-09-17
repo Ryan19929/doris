@@ -21,16 +21,21 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <iostream>
 #include <string>
 #include <string_view>
+
+#include "common/config.h"
 
 namespace doris::segment_v2::inverted_index {
 
 namespace {
 // Java 中的常量 PINYIN_MAX_LENGTH
 constexpr int kPinyinMaxLength = 6;
-// 字典文件路径：保持与仓库目录一致
-constexpr const char* kAlphabetDictPath = "be/dict/pinyin/pinyin_alphabet.dict";
+// 字典文件路径：动态从配置中获取，参考其他分词器的做法
+inline std::string get_alphabet_dict_path() {
+    return config::inverted_index_dict_path + "/pinyin/pinyin_alphabet.dict";
+}
 
 static inline bool is_letter(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
@@ -49,10 +54,13 @@ PinyinAlphabetDict::PinyinAlphabetDict() {
 }
 
 void PinyinAlphabetDict::load() {
-    // 读取 be/dict/pinyin/pinyin_alphabet.dict，每行一个词条
-    std::ifstream in(kAlphabetDictPath);
+    // 读取字典文件，每行一个词条
+    std::string dict_path = get_alphabet_dict_path();
+    std::ifstream in(dict_path);
     if (!in.is_open()) {
         // 失败时保持空集合；按 Java 习惯可抛异常，但此处先容忍，避免影响编译
+        // 在测试环境下输出警告信息，便于调试
+        std::cerr << "WARNING: Cannot open pinyin alphabet dictionary: " << dict_path << std::endl;
         return;
     }
     std::string line;

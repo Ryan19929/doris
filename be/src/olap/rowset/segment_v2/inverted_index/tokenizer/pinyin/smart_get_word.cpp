@@ -17,12 +17,21 @@
 
 #include "smart_get_word.h"
 
+#include "common/logging.h"
 #include "unicode/utf8.h"
 
 namespace doris::segment_v2::inverted_index {
 
 template <typename T>
 const std::string SmartGetWord<T>::EMPTYSTRING = "";
+
+template <typename T>
+const std::string SmartGetWord<T>::NULL_RESULT = "\x01NULL\x01"; // 特殊标记表示null
+
+template <typename T>
+const std::string& SmartGetWord<T>::getNullResult() {
+    return NULL_RESULT;
+}
 
 template <typename T>
 SmartGetWord<T>::SmartGetWord(SmartForest<T>* forest, const std::string& content)
@@ -40,10 +49,36 @@ SmartGetWord<T>::SmartGetWord(SmartForest<T>* forest, const std::vector<UChar32>
 template <typename T>
 std::string SmartGetWord<T>::getFrontWords() {
     std::string temp;
+    int loop_count = 0; // 防止无限循环的计数器
+
     do {
+        if (++loop_count > 1000) { // 防止无限循环
+            VLOG(3) << "SmartGetWord::getFrontWords() - 检测到可能的无限循环，强制退出"
+                    << ", chars_.size()=" << chars_.size() << ", i_=" << i_ << ", root_=" << root_
+                    << ", offe=" << offe;
+            return NULL_RESULT; // 强制退出，返回NULL_RESULT
+        }
+
         temp = frontWords();
+        VLOG(5) << "SmartGetWord::getFrontWords() - frontWords()返回: '"
+                << (temp == NULL_RESULT ? "NULL_RESULT" : temp) << "', loop_count=" << loop_count
+                << ", i_=" << i_ << ", root_=" << root_;
+
+        // 如果frontWords()返回NULL_RESULT，表示没有更多内容，直接返回
+        if (temp == NULL_RESULT) {
+            VLOG(4) << "SmartGetWord::getFrontWords() - frontWords()返回NULL_RESULT，结束";
+            return NULL_RESULT;
+        }
+
         temp = checkNumberOrEnglish(temp);
+        VLOG(5) << "SmartGetWord::getFrontWords() - checkNumberOrEnglish()返回: '" << temp << "'";
+
+        // 只有当temp是EMPTYSTRING时才继续循环
+        // 如果temp是有效字符串，应该退出循环
     } while (temp == EMPTYSTRING);
+
+    VLOG(4) << "SmartGetWord::getFrontWords() - 最终返回: '" << temp
+            << "', 循环次数: " << loop_count;
     return temp;
 }
 
@@ -68,7 +103,11 @@ template <typename T>
 std::string SmartGetWord<T>::frontWords() {
     // 对应 Java 中的 frontWords() 方法
     // 实现前向最大匹配算法
+    VLOG(5) << "SmartGetWord::frontWords() - 开始，当前状态: i_=" << i_ << ", root_=" << root_
+            << ", chars_.size()=" << chars_.size() << ", isBack_=" << isBack_;
+
     for (; i_ < static_cast<int>(chars_.size()) + 1; i_++) {
+        VLOG(5) << "SmartGetWord::frontWords() - 循环 i_=" << i_;
         if (i_ == static_cast<int>(chars_.size())) {
             branch_ = nullptr;
         } else {
@@ -76,22 +115,39 @@ std::string SmartGetWord<T>::frontWords() {
         }
 
         if (branch_ == nullptr) {
+            VLOG(5) << "SmartGetWord::frontWords() - branch_为nullptr，重置到forest_";
             branch_ = forest_;
             if (isBack_) {
                 offe = root_;
                 str_ = unicode_to_utf8(chars_, root_, tempOffe_);
+                VLOG(5) << "SmartGetWord::frontWords() - isBack_=true，返回词: '" << str_
+                        << "', tempOffe_=" << tempOffe_;
                 if (str_.length() == 0) {
                     root_ += 1;
                     i_ = root_;
+                    VLOG(5) << "SmartGetWord::frontWords() - 词长度为0，推进: root_=" << root_
+                            << ", i_=" << i_;
                 } else {
                     i_ = root_ + tempOffe_;
                     root_ = i_;
+                    VLOG(5) << "SmartGetWord::frontWords() - 词长度>0，推进: root_=" << root_
+                            << ", i_=" << i_;
                 }
                 isBack_ = false;
                 return str_;
             }
+            // 关键问题：这里可能导致无限循环！
+            VLOG(5) << "SmartGetWord::frontWords() - 非isBack_状态，从root_=" << root_ << "推进到"
+                    << (root_ + 1);
             i_ = root_;
             root_ += 1;
+
+            // 防止无限循环：如果root_已经超出范围，直接返回NULL_RESULT
+            if (root_ >= static_cast<int>(chars_.size())) {
+                VLOG(4) << "SmartGetWord::frontWords() - root_超出范围，提前结束: root_=" << root_
+                        << ", chars_.size()=" << chars_.size();
+                return NULL_RESULT;
+            }
         } else {
             switch (branch_->getStatus()) {
             case SmartForest<T>::WORD_CONTINUE: // status = 2
@@ -122,14 +178,16 @@ std::string SmartGetWord<T>::frontWords() {
     }
 
     tempOffe_ += static_cast<int>(chars_.size());
-    return ""; // 对应 Java 中的 null
+    VLOG(5) << "SmartGetWord::frontWords() - 到达末尾，返回NULL_RESULT"
+            << ", i_=" << i_ << ", chars_.size()=" << chars_.size() << ", root_=" << root_;
+    return NULL_RESULT; // 对应 Java 中的 null
 }
 
 template <typename T>
 std::string SmartGetWord<T>::checkNumberOrEnglish(const std::string& temp) {
     // 验证一个词语的左右边界，不是英文和数字
-    if (temp.empty() || temp == EMPTYSTRING) {
-        return temp;
+    if (temp.empty() || temp == EMPTYSTRING || temp == NULL_RESULT) {
+        return temp; // 直接返回，不做处理
     }
 
     // 先验证最左边
@@ -232,5 +290,4 @@ std::string SmartGetWord<T>::unicode_to_utf8(const std::vector<UChar32>& unicode
 
 // 显式实例化模板
 template class SmartGetWord<std::vector<std::string>>;
-
 } // namespace doris::segment_v2::inverted_index

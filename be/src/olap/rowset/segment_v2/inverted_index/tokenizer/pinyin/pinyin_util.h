@@ -23,6 +23,7 @@
 
 #include "pinyin_format.h"
 #include "smart_forest.h"
+#include "unicode/uchar.h"
 
 namespace doris::segment_v2::inverted_index {
 
@@ -50,6 +51,13 @@ public:
     // 支持各种格式：带/无声调、Unicode标记、首字母缩写等
     // 例如：convert("长江", PinyinFormat::DEFAULT_PINYIN_FORMAT) -> ["chang2", "jiang1"]
     std::vector<std::string> convert(const std::string& text, const PinyinFormat& format) const;
+
+    // 直接接受 Unicode 码点向量的转换方法，更高效，避免重复UTF-8解码
+    // @param codepoints Unicode 码点向量
+    // @param format 输出格式
+    // @return 按码点索引的格式化拼音列表，长度等于 codepoints.size()
+    std::vector<std::string> convert(const std::vector<UChar32>& codepoints,
+                                     const PinyinFormat& format) const;
 
     // 动态增加拼音到多音字词典
     // 对应 Java 的 PinyinUtil.INSTANCE.insertPinyin(word, pinyins)

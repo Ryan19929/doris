@@ -51,9 +51,15 @@ public:
     T getParam() const;                     // 获取当前匹配词汇的参数
     void reset(const std::string& content); // 重置搜索状态
 
+    // 公共常量，方便外部访问
+    static const std::string EMPTYSTRING;
+    static const std::string NULL_RESULT; // 表示Java中的null
+    
+    // 静态方法获取常量值，解决跨编译单元链接问题
+    static const std::string& getNullResult();
+
 private:
     // 对应Java的私有成员变量
-    static const std::string EMPTYSTRING;
     uint8_t status_ = 0;         // byte status
     int root_ = 0;               // int root
     int i_ = 0;                  // int i = this.root

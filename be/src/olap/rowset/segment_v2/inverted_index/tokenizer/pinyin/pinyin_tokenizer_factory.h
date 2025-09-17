@@ -25,7 +25,7 @@ namespace doris::segment_v2::inverted_index {
 
 class PinyinTokenizerFactory : public TokenizerFactory {
 public:
-    PinyinTokenizerFactory() = default;
+    PinyinTokenizerFactory() : config_(std::make_shared<PinyinConfig>()) {}
     ~PinyinTokenizerFactory() override = default;
 
     void initialize(const Settings& settings) override;

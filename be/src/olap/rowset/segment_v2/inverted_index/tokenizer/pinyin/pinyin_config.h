@@ -24,28 +24,28 @@ public:
     PinyinConfig() = default;
     ~PinyinConfig() = default;
 
-    bool lowercase;
-    bool trimWhitespace;
-    bool keepNoneChinese;
-    bool keepNoneChineseInFirstLetter;
-    bool keepNoneChineseInJoinedFullPinyin;
-    bool keepOriginal;
-    bool keepFirstLetter;
-    bool keepSeparateFirstLetter;
-    bool keepNoneChineseTogether;
-    bool noneChinesePinyinTokenize;
-    int limitFirstLetterLength;
-    bool keepFullPinyin;
-    bool keepJoinedFullPinyin;
-    bool removeDuplicateTerm;
-    bool fixedPinyinOffset;
+    bool lowercase = true;
+    bool trimWhitespace = true;
+    bool keepNoneChinese = true;
+    bool keepNoneChineseInFirstLetter = true;
+    bool keepNoneChineseInJoinedFullPinyin = false;
+    bool keepOriginal = false;
+    bool keepFirstLetter = true;
+    bool keepSeparateFirstLetter = false;
+    bool keepNoneChineseTogether = true;
+    bool noneChinesePinyinTokenize = true;
+    int limitFirstLetterLength = 16;
+    bool keepFullPinyin = true;
+    bool keepJoinedFullPinyin = false;
+    bool removeDuplicateTerm = false;
+    bool fixedPinyinOffset = false;
     // After 6.0, offset is strictly constrained, overlapped tokens are not allowed,
     // with this parameter, overlapped token will allowed by ignore offset,
     // please note, all position related query or highlight will become incorrect,
     // you should use multi fields and specify different settings for different query purpose.
     // If you need offset, please set it to false. default: true.
-    bool ignorePinyinOffset;
-    bool keepSeparateChinese;
+    bool ignorePinyinOffset = true;
+    bool keepSeparateChinese = false;
 };
 
 } // namespace doris::segment_v2

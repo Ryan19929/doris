@@ -23,16 +23,24 @@
 #include <sstream>
 #include <string>
 
+#include "common/config.h"
+#include "common/logging.h"
 #include "pinyin_formatter.h"
 #include "smart_get_word.h"
 
 namespace doris::segment_v2::inverted_index {
 
 namespace {
-constexpr uint32_t CJK_START = 0x4E00;
-constexpr uint32_t CJK_END = 0x9FA5;
-constexpr const char* kPinyinTxt = "be/dict/pinyin/pinyin.txt";
-constexpr const char* kPolyphoneTxt = "be/dict/pinyin/polyphone.txt";
+// CJK 统一汉字基本块范围
+constexpr uint32_t CJK_START = 0x4E00; // CJK Unified Ideographs start
+constexpr uint32_t CJK_END = 0x9FA5;   // CJK Unified Ideographs end
+// 词典文件路径：动态从配置中获取，参考其他分词器的做法
+inline std::string get_pinyin_dict_path() {
+    return config::inverted_index_dict_path + "/pinyin/pinyin.txt";
+}
+inline std::string get_polyphone_dict_path() {
+    return config::inverted_index_dict_path + "/pinyin/polyphone.txt";
+}
 } // namespace
 
 PinyinUtil& PinyinUtil::instance() {
@@ -51,7 +59,8 @@ void PinyinUtil::load_pinyin_mapping() {
     _pinyin_dict.clear();
     _pinyin_dict.resize(static_cast<size_t>(CJK_END - CJK_START + 1));
 
-    std::ifstream in(kPinyinTxt);
+    std::string pinyin_path = get_pinyin_dict_path();
+    std::ifstream in(pinyin_path);
     if (!in.is_open()) {
         return; // 保持空表
     }
@@ -95,7 +104,8 @@ void PinyinUtil::load_polyphone_mapping() {
     // 例如：长江=chang jiang
     polyphone_dict_ = std::make_unique<PolyphoneForest>();
 
-    std::ifstream in(kPolyphoneTxt);
+    std::string polyphone_path = get_polyphone_dict_path();
+    std::ifstream in(polyphone_path);
     if (!in.is_open()) {
         return; // 保持空字典
     }
@@ -165,18 +175,37 @@ std::vector<std::string> PinyinUtil::convert(const std::string& text) const {
 
     // 对应 Java：while ((temp = word.getFrontWords()) != null)
     std::string matched_word;
-    while (!(matched_word = word_matcher.next()).empty()) {
-        int match_start_byte = word_matcher.getOffset();
+    while ((matched_word = word_matcher.getFrontWords()) != word_matcher.getNullResult() &&
+           !matched_word.empty()) {
+        int match_start_byte = word_matcher.offe;
         int match_end_byte = match_start_byte + static_cast<int>(matched_word.length());
+
+        VLOG(4) << "PinyinUtil::convert - 多音字匹配: '" << matched_word
+                << "' (字节: " << match_start_byte << "-" << match_end_byte << ")";
 
         // 找到匹配词对应的字符范围
         int char_start = -1, char_end = -1;
+
+        // 找到包含 match_start_byte 的字符索引
         for (size_t i = 0; i < char_byte_starts.size(); ++i) {
-            if (char_start == -1 && char_byte_starts[i] >= match_start_byte) {
+            int char_byte_start = char_byte_starts[i];
+            int char_byte_end = (i + 1 < char_byte_starts.size()) ? char_byte_starts[i + 1]
+                                                                  : static_cast<int>(text.length());
+
+            // 如果匹配开始位置在当前字符范围内
+            if (match_start_byte >= char_byte_start && match_start_byte < char_byte_end) {
                 char_start = static_cast<int>(i);
+                break;
             }
-            if (i + 1 < char_byte_starts.size() && char_byte_starts[i + 1] >= match_end_byte) {
-                char_end = static_cast<int>(i) + 1;
+        }
+
+        // 找到包含 match_end_byte 的字符索引（或第一个超过的字符）
+        for (size_t i = 0; i < char_byte_starts.size(); ++i) {
+            int char_byte_start = char_byte_starts[i];
+
+            // 如果当前字符的起始位置 >= 匹配结束位置，这就是结束字符索引
+            if (char_byte_start >= match_end_byte) {
+                char_end = static_cast<int>(i);
                 break;
             }
         }
@@ -253,6 +282,8 @@ std::vector<std::string> PinyinUtil::convert_with_raw_pinyin(const std::string& 
     std::vector<std::string> result;
     if (text.empty()) return result;
 
+    VLOG(3) << "PinyinUtil::convert_with_raw_pinyin - 开始转换: '" << text << "'";
+
     // 首先将文本转换为字符数组，以便按字符索引处理
     const char* text_ptr = text.c_str();
     int text_len = static_cast<int>(text.length());
@@ -279,17 +310,36 @@ std::vector<std::string> PinyinUtil::convert_with_raw_pinyin(const std::string& 
 
     // 对应 Java：while ((temp = word.getFrontWords()) != null)
     std::string matched_word;
-    while (!(matched_word = word_matcher.next()).empty()) {
-        int match_start_byte = word_matcher.getOffset();
+    while ((matched_word = word_matcher.getFrontWords()) != word_matcher.getNullResult() &&
+           !matched_word.empty()) {
+        int match_start_byte = word_matcher.offe;
         int match_end_byte = match_start_byte + static_cast<int>(matched_word.length());
+
+        VLOG(4) << "PinyinUtil::convert - 多音字匹配: '" << matched_word
+                << "' (字节: " << match_start_byte << "-" << match_end_byte << ")";
 
         // 找到匹配词对应的字符范围
         int char_start = -1, char_end = -1;
+
+        // 找到包含 match_start_byte 的字符索引
         for (size_t i = 0; i < char_byte_starts.size(); ++i) {
-            if (char_byte_starts[i] >= match_start_byte && char_start == -1) {
+            int char_byte_start = char_byte_starts[i];
+            int char_byte_end = (i + 1 < char_byte_starts.size()) ? char_byte_starts[i + 1]
+                                                                  : static_cast<int>(text.length());
+
+            // 如果匹配开始位置在当前字符范围内
+            if (match_start_byte >= char_byte_start && match_start_byte < char_byte_end) {
                 char_start = static_cast<int>(i);
+                break;
             }
-            if (char_byte_starts[i] >= match_end_byte && char_end == -1) {
+        }
+
+        // 找到包含 match_end_byte 的字符索引（或第一个超过的字符）
+        for (size_t i = 0; i < char_byte_starts.size(); ++i) {
+            int char_byte_start = char_byte_starts[i];
+
+            // 如果当前字符的起始位置 >= 匹配结束位置，这就是结束字符索引
+            if (char_byte_start >= match_end_byte) {
                 char_end = static_cast<int>(i);
                 break;
             }
@@ -300,18 +350,27 @@ std::vector<std::string> PinyinUtil::convert_with_raw_pinyin(const std::string& 
         const auto& pinyins = word_matcher.getParam();
         int word_char_count = char_end - char_start;
 
+        VLOG(4) << "PinyinUtil::convert - 字符范围: [" << char_start << ", " << char_end
+                << "), 词长: " << word_char_count << ", 拼音数: " << pinyins.size();
+
         for (int i = 0; i < word_char_count && i < static_cast<int>(pinyins.size()); ++i) {
-            if (char_start + i < static_cast<int>(result.size())) {
-                result[char_start + i] = pinyins[i]; // 保留原始拼音格式
-                processed[char_start + i] = true;
+            int char_idx = char_start + i;
+            if (char_idx >= 0 && char_idx < static_cast<int>(result.size())) {
+                VLOG(5) << "PinyinUtil::convert - 分配拼音: 字符[" << char_idx << "] = '"
+                        << pinyins[i] << "'";
+                result[char_idx] = pinyins[i]; // 保留原始拼音格式
+                processed[char_idx] = true;
             }
         }
     }
 
     // 处理未被多音字匹配的字符，使用单字拼音（原始格式）
+    VLOG(4) << "PinyinUtil::convert - 处理未匹配的单字符";
     for (size_t i = 0; i < chars.size(); ++i) {
         if (!processed[i]) {
             std::string pinyin = to_raw_pinyin(static_cast<uint32_t>(chars[i]));
+            VLOG(5) << "PinyinUtil::convert - 单字符: 字符[" << i << "] U+" << std::hex << chars[i]
+                    << std::dec << " -> '" << pinyin << "'";
             result[i] = pinyin; // 非中文字符会返回空字符串
         }
     }
@@ -329,6 +388,64 @@ std::string PinyinUtil::to_raw_pinyin(uint32_t cp) const {
     size_t comma = raw.find(',');
     if (comma == std::string::npos) return raw;
     return raw.substr(0, comma);
+}
+
+// 直接接受 Unicode 码点向量的转换方法，更高效
+std::vector<std::string> PinyinUtil::convert(const std::vector<UChar32>& codepoints,
+                                             const PinyinFormat& format) const {
+    if (codepoints.empty()) {
+        return {};
+    }
+
+    // 初始化结果数组，长度等于码点数
+    std::vector<std::string> result(codepoints.size());
+
+    // 如果没有多音字词典，直接使用单字拼音
+    if (!polyphone_dict_) {
+        for (size_t i = 0; i < codepoints.size(); ++i) {
+            std::string pinyin = to_pinyin(static_cast<uint32_t>(codepoints[i]));
+            if (pinyin.empty()) {
+                if (!format.isOnlyPinyin()) {
+                    result[i] = "";
+                }
+            } else {
+                result[i] = PinyinFormatter::formatPinyin(pinyin, format);
+            }
+        }
+        return result;
+    }
+
+    // 构造UTF-8字符串用于多音字匹配（临时方案，后续可优化为直接在码点上工作）
+    std::string text;
+    for (UChar32 cp : codepoints) {
+        // 直接使用 ICU 的 UTF-8 编码函数，避免 UnicodeString
+        char utf8_buffer[4];
+        int32_t utf8_len = 0;
+        U8_APPEND_UNSAFE(utf8_buffer, utf8_len, cp);
+        text.append(utf8_buffer, utf8_len);
+    }
+
+    // 使用现有的多音字处理逻辑
+    std::vector<std::string> raw_result = convert_with_raw_pinyin(text);
+
+    // 应用格式化
+    result.clear();
+    result.reserve(raw_result.size());
+
+    for (const std::string& pinyin : raw_result) {
+        if (pinyin.empty()) {
+            if (!format.isOnlyPinyin()) {
+                result.push_back("");
+            }
+        } else {
+            std::string formatted = PinyinFormatter::formatPinyin(pinyin, format);
+            if (!formatted.empty() || !format.isOnlyPinyin()) {
+                result.push_back(formatted);
+            }
+        }
+    }
+
+    return result;
 }
 
 } // namespace doris::segment_v2::inverted_index

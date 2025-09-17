@@ -18,27 +18,52 @@
 #include "chinese_util.h"
 
 #include <unicode/unistr.h>
+#include <unicode/utf8.h>
 
 namespace doris::segment_v2::inverted_index {
 
-// 与 Java 版本一致：对输入字符串按 UTF-16 逐单元检查是否在 [\u4E00, \u9FA5]
-// 返回列表长度等于 Java 的 str.length()（UTF-16 code units 数）
-// - 命中：返回该字符的 UTF-8 表示
-// - 否则：返回空字符串（表示 Java 的 null）
+// 修改为按 Unicode 码点处理，确保与 PinyinUtil::convert 和 PinyinTokenizer 的 runes_ 索引对齐
+// 返回列表长度等于 Unicode 码点数量
+// - 中文字符：返回该字符的 UTF-8 表示
+// - 非中文字符：返回空字符串（表示 Java 的 null）
 std::vector<std::string> ChineseUtil::segmentChinese(const std::string& utf8_text) {
     if (utf8_text.empty()) return {};
 
-    icu::UnicodeString u = icu::UnicodeString::fromUTF8(utf8_text);
     std::vector<std::string> out;
-    out.reserve(static_cast<size_t>(u.length()));
+    const char* text_ptr = utf8_text.c_str();
+    int text_len = static_cast<int>(utf8_text.length());
+    int byte_pos = 0;
 
-    for (int i = 0; i < u.length(); ++i) {
-        UChar cu = u.charAt(i);
-        if (cu >= CJK_UNIFIED_IDEOGRAPHS_START && cu <= CJK_UNIFIED_IDEOGRAPHS_END) {
-            icu::UnicodeString one(cu);
-            std::string s;
-            one.toUTF8String(s);
-            out.emplace_back(std::move(s));
+    // 按 Unicode 码点逐个处理，确保与 PinyinUtil 中的字符数组索引对齐
+    while (byte_pos < text_len) {
+        UChar32 cp;
+        U8_NEXT(text_ptr, byte_pos, text_len, cp);
+
+        if (cp >= CJK_UNIFIED_IDEOGRAPHS_START && cp <= CJK_UNIFIED_IDEOGRAPHS_END) {
+            // 将 UChar32 转换为 UTF-8
+            char utf8_buffer[4];
+            int32_t utf8_len = 0;
+            U8_APPEND_UNSAFE(utf8_buffer, utf8_len, cp);
+            out.emplace_back(utf8_buffer, utf8_len);
+        } else {
+            out.emplace_back(""); // 表示 Java 的 null
+        }
+    }
+    return out;
+}
+
+// 直接接受 Unicode 码点向量的版本，更高效
+std::vector<std::string> ChineseUtil::segmentChinese(const std::vector<UChar32>& codepoints) {
+    std::vector<std::string> out;
+    out.reserve(codepoints.size());
+
+    for (UChar32 cp : codepoints) {
+        if (cp >= CJK_UNIFIED_IDEOGRAPHS_START && cp <= CJK_UNIFIED_IDEOGRAPHS_END) {
+            // 将 UChar32 转换为 UTF-8
+            char utf8_buffer[4];
+            int32_t utf8_len = 0;
+            U8_APPEND_UNSAFE(utf8_buffer, utf8_len, cp);
+            out.emplace_back(utf8_buffer, utf8_len);
         } else {
             out.emplace_back(""); // 表示 Java 的 null
         }

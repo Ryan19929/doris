@@ -25,6 +25,7 @@
 #include "olap/rowset/segment_v2/inverted_index/tokenizer/tokenizer.h"
 #include "pinyin_config.h"
 #include "term_item.h"
+#include "unicode/uchar.h"
 
 namespace doris::segment_v2::inverted_index {
 
@@ -62,7 +63,7 @@ private:
     std::unordered_set<std::string> terms_filter_;
     std::string first_letters_;
     std::string full_pinyin_letters_;
-    std::string source_;
+    std::vector<UChar32> source_codepoints_; // Unicode 码点序列，替代原来的 UTF-8 字符串
 
     // Doris 风格：reset 时从 _in 读取到这两个指针/长度，processInput 中使用
     const char* _char_buffer {nullptr};
@@ -92,6 +93,9 @@ private:
     void processInput();
     // 解析 ASCII 缓冲（对齐 Java 的 parseBuff）：根据配置将缓冲区转为候选
     void parseBuff(std::string& ascii_buff, int& ascii_buff_start);
+
+    // 辅助方法：将 Unicode 码点向量转换为 UTF-8 字符串
+    std::string codepointsToUtf8(const std::vector<UChar32>& codepoints) const;
 };
 
 } // namespace doris::segment_v2::inverted_index

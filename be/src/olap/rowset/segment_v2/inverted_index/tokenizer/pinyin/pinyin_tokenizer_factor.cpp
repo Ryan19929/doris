@@ -28,7 +28,7 @@ void PinyinTokenizerFactory::initialize(const Settings& settings) {
     config_->keepNoneChineseTogether = settings.get_bool("keep_none_chinese_together", true);
     config_->noneChinesePinyinTokenize = settings.get_bool("none_chinese_pinyin_tokenize", true);
     config_->keepOriginal = settings.get_bool("keep_original", false);
-    config_->LimitFirstLetterLength = settings.get_int("limit_first_letter_length", 16);
+    config_->limitFirstLetterLength = settings.get_int("limit_first_letter_length", 16);
     config_->lowercase = settings.get_bool("lowercase", true);
     config_->trimWhitespace = settings.get_bool("trim_whitespace", true);
     config_->keepNoneChineseInFirstLetter =

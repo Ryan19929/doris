@@ -37,13 +37,15 @@ std::string PinyinFormatter::formatPinyin(const std::string& pinyin_str,
 
     std::string result = pinyin_str;
 
+    // 创建可修改的副本（在函数顶级作用域）
+    PinyinFormat working_format = format;
+
     // 处理缩写格式（对应Java：ToneType.WITH_ABBR）
     if (format.getToneType() == ToneType::WITH_ABBR) {
         return abbr(result);
     } else {
         // 处理声调标记与ü字符的兼容性
         // 对应Java：if ((ToneType.WITH_TONE_MARK == format.getToneType()) && ...)
-        PinyinFormat working_format = format; // 创建可修改的副本
         if (working_format.getToneType() == ToneType::WITH_TONE_MARK &&
             (working_format.getYuCharType() == YuCharType::WITH_V ||
              working_format.getYuCharType() == YuCharType::WITH_U_AND_COLON)) {
@@ -86,6 +88,7 @@ std::string PinyinFormatter::formatPinyin(const std::string& pinyin_str,
             }
         }
     }
+
     // 处理大小写
     switch (working_format.getCaseType()) {
     case CaseType::UPPERCASE:

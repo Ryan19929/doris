@@ -23,6 +23,7 @@
 #include "olap/rowset/segment_v2/inverted_index/tokenizer/char/char_group_tokenizer_factory.h"
 #include "olap/rowset/segment_v2/inverted_index/tokenizer/keyword/keyword_tokenizer_factory.h"
 #include "olap/rowset/segment_v2/inverted_index/tokenizer/ngram/edge_ngram_tokenizer_factory.h"
+#include "olap/rowset/segment_v2/inverted_index/tokenizer/pinyin/pinyin_tokenizer_factory.h"
 #include "olap/rowset/segment_v2/inverted_index/tokenizer/standard/standard_tokenizer_factory.h"
 
 namespace doris::segment_v2::inverted_index {
@@ -38,6 +39,7 @@ void AnalysisFactoryMgr::initialise() {
                         []() { return std::make_shared<EdgeNGramTokenizerFactory>(); });
         registerFactory("char_group",
                         []() { return std::make_shared<CharGroupTokenizerFactory>(); });
+        registerFactory("pinyin", []() { return std::make_shared<PinyinTokenizerFactory>(); });
 
         // token_filter
         registerFactory("lowercase", []() { return std::make_shared<LowerCaseFilterFactory>(); });

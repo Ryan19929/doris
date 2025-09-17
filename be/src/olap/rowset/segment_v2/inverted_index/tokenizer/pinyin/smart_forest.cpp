@@ -86,6 +86,10 @@ SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node)
 
     if (bs >= 0) {
         // 找到现有位置
+        // 先保存需要的信息，因为可能会移动branch_node
+        uint8_t branch_status = branch_node->getStatus();
+        T branch_param = branch_node->getParam();
+
         if (bs < static_cast<int>(branches.size()) && !branches[bs]) {
             branches[bs] = std::move(branch_node);
         }
@@ -93,7 +97,7 @@ SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node)
         branch = branches[bs].get();
 
         // 状态合并逻辑 - 完全对应Java的switch语句
-        switch (branch_node->getStatus()) {
+        switch (branch_status) {
         case static_cast<uint8_t>(-1): // case -1:
             branch->setStatus(1);
             break;
@@ -106,7 +110,7 @@ SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node)
             if (branch->getStatus() != 3) {
                 branch->setStatus(2);
             }
-            branch->setParam(branch_node->getParam());
+            branch->setParam(std::move(branch_param));
             break;
         }
 
@@ -115,6 +119,8 @@ SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node)
 
     if (bs < 0) {
         // 需要插入新元素
+        UChar32 c = branch_node->getC(); // 保存字符，因为移动后无法访问
+        SmartForest<T>* result_ptr = nullptr;
 
         // 自动扩展逻辑：如果接近最大值，切换为直接数组定位
         if (!branches.empty() && branches.size() >= MAX_SIZE * rate_) {
@@ -128,8 +134,9 @@ SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node)
                 }
             }
 
-            // 插入新元素
-            tempBranches[branch_node->getC()] = std::move(branch_node);
+            // 插入新元素并保存指针
+            result_ptr = branch_node.get();
+            tempBranches[c] = std::move(branch_node);
 
             // 替换数组
             branches = std::move(tempBranches);
@@ -145,7 +152,8 @@ SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node)
                 newBranches[i] = std::move(branches[i]);
             }
 
-            // 插入新元素
+            // 插入新元素并保存指针
+            result_ptr = branch_node.get();
             newBranches[insert] = std::move(branch_node);
 
             // 复制后半部分 - 对应 System.arraycopy(branches, insert, newBranches, insert + 1, ...)
@@ -156,9 +164,11 @@ SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node)
             // 替换数组
             branches = std::move(newBranches);
         }
+
+        return result_ptr;
     }
 
-    return branch_node.get();
+    return nullptr; // 不应该到达这里
 }
 
 template <typename T>

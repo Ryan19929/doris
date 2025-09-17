@@ -36,9 +36,14 @@ public:
 
     // 对齐 Java: public static List<String> segmentChinese(String str)
     // 说明：
-    // - Java 以 UTF-16 单元遍历；为保持一致，我们将 UTF-8 转为 UTF-16 后按 UChar 逐个判断
+    // - 修改为按 Unicode 码点处理，确保与其他组件索引对齐
     // - 非中文处返回空字符串，表示 Java 的 null
     static std::vector<std::string> segmentChinese(const std::string& utf8_text);
+
+    // 直接接受 Unicode 码点向量的版本，更高效
+    // @param codepoints Unicode 码点向量
+    // @return 按码点索引的中文字符列表，长度等于 codepoints.size()
+    static std::vector<std::string> segmentChinese(const std::vector<UChar32>& codepoints);
 };
 
 } // namespace doris::segment_v2::inverted_index

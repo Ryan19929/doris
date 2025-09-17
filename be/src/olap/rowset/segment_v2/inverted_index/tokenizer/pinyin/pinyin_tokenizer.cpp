@@ -26,6 +26,7 @@
 
 #include "CLucene/analysis/AnalysisHeader.h"
 #include "common/exception.h"
+#include "common/logging.h"
 // 核心拼音分词逻辑实现
 #include "chinese_util.h"
 #include "pinyin_alphabet_tokenizer.h"
@@ -54,6 +55,8 @@ PinyinTokenizer::PinyinTokenizer(std::shared_ptr<doris::segment_v2::PinyinConfig
 }
 
 void PinyinTokenizer::reset() {
+    VLOG(3) << "PinyinTokenizer::reset() - 开始重置分词器";
+
     DorisTokenizer::reset();
     position_ = 0;
     candidate_offset_ = 0;
@@ -67,7 +70,7 @@ void PinyinTokenizer::reset() {
     full_pinyin_letters_.clear();
     terms_filter_.clear();
     candidate_.clear();
-    source_.clear();
+    source_codepoints_.clear();
     last_increment_position_ = 0;
     last_offset_ = 0;
 
@@ -75,14 +78,18 @@ void PinyinTokenizer::reset() {
     _char_buffer = nullptr;
     _char_length = _in->read((const void**)&_char_buffer, 0, static_cast<int32_t>(_in->size()));
 
-    // 将 UTF-8 字节一次性复制为原文快照（仅当需要 keepOriginal/keepJoinedFullPinyin 时真正使用）
-    source_.clear();
-    if (_char_buffer && _char_length > 0) {
-        source_.assign(_char_buffer, _char_buffer + _char_length);
+    VLOG(3) << "PinyinTokenizer::reset() - 读取输入数据: " << _char_length << " 字节";
+    if (_char_length > 0 && _char_buffer) {
+        std::string sample(_char_buffer, std::min(_char_length, 50));
+        VLOG(3) << "PinyinTokenizer::reset() - 输入内容示例: \"" << sample
+                << ((_char_length > 50) ? "...\"" : "\"");
     }
 
     // 立即完成 UTF-8 → Unicode 码点的解码，并记录字节偏移
     decode_to_runes();
+
+    VLOG(3) << "PinyinTokenizer::reset() - 解码完成，Unicode码点数量: " << source_codepoints_.size()
+            << ", Runes数量: " << runes_.size();
 }
 
 // 读取输入，并一次性解析，生成候选项。
@@ -90,34 +97,58 @@ void PinyinTokenizer::reset() {
 // 后续每次 next() 从 candidate_ 中取一个，写入 Token。
 void PinyinTokenizer::processInput() {
     if (!processed_candidate_) {
+        VLOG(3) << "PinyinTokenizer::processInput() - 开始处理输入，生成候选项";
         processed_candidate_ = true;
+
         // Java 等价步骤（说明性占位）：
         // processedCandidate = true;
         // 读取 input -> termAtt.buffer() -> source（本实现已在 reset() 中读取到 source_ 并完成解码）
+        // 使用 Unicode 码点向量版本，避免重复UTF-8解码，确保索引完全对齐
         // 对应 Java：List<String> pinyinList = Pinyin.pinyin(source);
-        // Java 的 Pinyin.pinyin() 实际调用 PinyinUtil.INSTANCE.convert(str, PinyinFormat.TONELESS_PINYIN_FORMAT)
-        auto pinyin_list =
-                PinyinUtil::instance().convert(source_, PinyinFormat::TONELESS_PINYIN_FORMAT);
+        VLOG(3) << "PinyinTokenizer::processInput() - 开始拼音转换，输入码点数量: "
+                << source_codepoints_.size();
+        auto pinyin_list = PinyinUtil::instance().convert(source_codepoints_,
+                                                          PinyinFormat::TONELESS_PINYIN_FORMAT);
+        VLOG(3) << "PinyinTokenizer::processInput() - 拼音转换完成，拼音列表大小: "
+                << pinyin_list.size();
 
         // 对应 Java：List<String> chineseList = ChineseUtil.segmentChinese(source);
-        auto chinese_list = ChineseUtil::segmentChinese(source_);
+        VLOG(3) << "PinyinTokenizer::processInput() - 开始中文分割";
+        auto chinese_list = ChineseUtil::segmentChinese(source_codepoints_);
+        VLOG(3) << "PinyinTokenizer::processInput() - 中文分割完成，中文列表大小: "
+                << chinese_list.size();
+
+        // 验证索引对齐
+        bool index_aligned = (source_codepoints_.size() == pinyin_list.size() &&
+                              pinyin_list.size() == chinese_list.size());
+        VLOG(3) << "PinyinTokenizer::processInput() - 索引对齐检查: "
+                << (index_aligned ? "通过" : "失败") << " (码点:" << source_codepoints_.size()
+                << ", 拼音:" << pinyin_list.size() << ", 中文:" << chinese_list.size() << ")";
 
         // 对应 Java：if (pinyinList.size() == 0 || chineseList.size() == 0) return false;
         if (pinyin_list.empty() || chinese_list.empty()) {
+            VLOG(3) << "PinyinTokenizer::processInput() - 拼音或中文列表为空，跳过处理";
             return;
         }
 
         // 若没有任何可用的 Unicode 码点，提前返回
         if (runes_.empty()) {
+            VLOG(3) << "PinyinTokenizer::processInput() - Runes为空，跳过处理";
             return;
         }
+
         // 生成候选（解码已在 reset 完成）
         // 为贴近 Java 的 incrementToken，这里直接展开候选生成逻辑
+        VLOG(3) << "PinyinTokenizer::processInput() - 开始生成候选项，处理字符数量: "
+                << runes_.size();
         position_ = 0;
         int ascii_buff_start = -1;      // ASCII 段的字节起始（用于 start/end offset）
-        int ascii_buff_char_start = -1; // ASCII 段的“字符索引”起始（对齐 Java 的 i）
+        int ascii_buff_char_start = -1; // ASCII 段的"字符索引"起始（对齐 Java 的 i）
         std::string ascii_buff;
         int char_index = 0; // 遍历 runes_ 时的"字符索引"，等价于 Java 中的 i
+
+        int chinese_count = 0;
+        int ascii_count = 0;
 
         // Java 等价：遍历 source 的字符下标 i
         // String pinyin = pinyinList.get(i); String chinese = chineseList.get(i);
@@ -135,6 +166,11 @@ void PinyinTokenizer::processInput() {
                             (r.cp >= '0' && r.cp <= '9');
 
             if (is_ascii_context) {
+                ascii_count++;
+                VLOG(4) << "PinyinTokenizer::processInput() - 处理ASCII字符: '"
+                        << static_cast<char>(r.cp) << "' (0x" << std::hex << r.cp << std::dec
+                        << "), 索引: " << char_index;
+
                 // 进入 ASCII 上下文时，若缓冲为空，记录段起始（字节与字符索引）
                 if (ascii_buff_start < 0) ascii_buff_start = r.byte_start;
                 if (ascii_buff_char_start < 0)
@@ -143,11 +179,16 @@ void PinyinTokenizer::processInput() {
                 if (is_alnum && config_->keepNoneChinese) {
                     if (config_->keepNoneChineseTogether) {
                         ascii_buff.push_back(static_cast<char>(r.cp));
+                        VLOG(4) << "PinyinTokenizer::processInput() - ASCII字符加入缓冲: '"
+                                << ascii_buff << "'";
                     } else {
                         // 对齐 Java：逐字符输出时，TermItem.position 使用 buffStartPosition+1
                         position_++;
-                        addCandidate(std::string(1, static_cast<char>(r.cp)), r.byte_start,
-                                     r.byte_end, ascii_buff_char_start + 1);
+                        std::string single_char(1, static_cast<char>(r.cp));
+                        addCandidate(single_char, r.byte_start, r.byte_end,
+                                     ascii_buff_char_start + 1);
+                        VLOG(4) << "PinyinTokenizer::processInput() - 添加单个ASCII候选项: '"
+                                << single_char << "', position: " << (ascii_buff_char_start + 1);
                     }
                 }
                 // 对齐 Java：仅当为字母/数字时，参与 firstLetters 与 joinedFullPinyin
@@ -158,31 +199,47 @@ void PinyinTokenizer::processInput() {
                     full_pinyin_letters_.push_back(static_cast<char>(r.cp));
                 }
             } else {
+                // 处理非ASCII字符（主要是中文）
+                chinese_count++;
                 if (!ascii_buff.empty()) {
+                    VLOG(4) << "PinyinTokenizer::processInput() - 处理缓冲的ASCII段: '"
+                            << ascii_buff << "'";
                     parseBuff(ascii_buff, ascii_buff_start);
                     ascii_buff_char_start = -1; // 结束一个 ASCII 段
                 }
 
                 // 中文字符处理：使用从 pinyin_list 获取的拼音（已经过多音字处理）
                 // 对应 Java：String pinyin = pinyinList.get(i); String chinese = chineseList.get(i);
+                VLOG(4) << "PinyinTokenizer::processInput() - 处理中文字符: '" << chinese
+                        << "', 拼音: '" << pinyin << "', 索引: " << char_index << ", 码点: 0x"
+                        << std::hex << r.cp << std::dec;
+
                 bool incr_position = false;
                 if (!pinyin.empty()) {
                     first_letters_.push_back(pinyin[0]);
                     if (config_->keepSeparateFirstLetter && pinyin.length() > 1) {
                         position_++;
                         incr_position = true;
-                        addCandidate(std::string(1, pinyin[0]), r.byte_start, r.byte_end,
-                                     position_);
+                        std::string first_letter(1, pinyin[0]);
+                        addCandidate(first_letter, r.byte_start, r.byte_end, position_);
+                        VLOG(4) << "PinyinTokenizer::processInput() - 添加首字母候选项: '"
+                                << first_letter << "', position: " << position_;
                     }
                     if (config_->keepFullPinyin) {
                         if (!incr_position) position_++;
                         addCandidate(pinyin, r.byte_start, r.byte_end, position_);
+                        VLOG(4) << "PinyinTokenizer::processInput() - 添加完整拼音候选项: '"
+                                << pinyin << "', position: " << position_;
                     }
                     if (config_->keepSeparateChinese) {
                         addCandidate(chinese, r.byte_start, r.byte_end, position_);
+                        VLOG(4) << "PinyinTokenizer::processInput() - 添加中文字符候选项: '"
+                                << chinese << "', position: " << position_;
                     }
                     if (config_->keepJoinedFullPinyin) {
                         full_pinyin_letters_ += pinyin;
+                        VLOG(4) << "PinyinTokenizer::processInput() - 连接拼音累积: '"
+                                << full_pinyin_letters_ << "'";
                     }
                 }
                 last_offset_ = r.byte_end - 1;
@@ -190,51 +247,95 @@ void PinyinTokenizer::processInput() {
             last_offset_ = r.byte_end - 1;
             char_index++; // 前进一个"字符索引"，无论ASCII还是中文分支都要递增
         }
+
+        // 处理剩余的ASCII缓冲
         if (!ascii_buff.empty()) {
+            VLOG(4) << "PinyinTokenizer::processInput() - 处理剩余ASCII缓冲: '" << ascii_buff
+                    << "'";
             parseBuff(ascii_buff, ascii_buff_start);
             ascii_buff_char_start = -1;
         }
+
+        VLOG(3) << "PinyinTokenizer::processInput() - 字符处理完成，中文字符: " << chinese_count
+                << ", ASCII字符: " << ascii_count << ", 首字母累积: '" << first_letters_ << "'"
+                << ", 连接拼音累积: '" << full_pinyin_letters_ << "'";
     }
+
+    // 处理全局候选项
     if (config_->keepOriginal && !processed_original_) {
         processed_original_ = true;
-        addCandidate(source_, 0, static_cast<int>(source_.length()), 1);
+        std::string source_utf8 = codepointsToUtf8(source_codepoints_);
+        addCandidate(source_utf8, 0, static_cast<int>(source_utf8.length()), 1);
+        VLOG(3) << "PinyinTokenizer::processInput() - 添加原文候选项: '" << source_utf8 << "'";
     }
     if (config_->keepJoinedFullPinyin && !processed_full_pinyin_letter_ &&
         !full_pinyin_letters_.empty()) {
         processed_full_pinyin_letter_ = true;
-        addCandidate(full_pinyin_letters_, 0, static_cast<int>(source_.length()), 1);
+        std::string source_utf8 = codepointsToUtf8(source_codepoints_);
+        addCandidate(full_pinyin_letters_, 0, static_cast<int>(source_utf8.length()), 1);
+        VLOG(3) << "PinyinTokenizer::processInput() - 添加连接拼音候选项: '" << full_pinyin_letters_
+                << "'";
         full_pinyin_letters_.clear();
     }
     if (config_->keepFirstLetter && !first_letters_.empty() && !processed_first_letter_) {
         processed_first_letter_ = true;
         std::string fl = first_letters_;
+        VLOG(3) << "PinyinTokenizer::processInput() - 处理首字母候选项，原始首字母: '" << fl << "'";
+
         if (config_->limitFirstLetterLength > 0 &&
             static_cast<int>(fl.length()) > config_->limitFirstLetterLength) {
             fl = fl.substr(0, config_->limitFirstLetterLength);
+            VLOG(3) << "PinyinTokenizer::processInput() - 首字母长度限制，截取后: '" << fl << "'";
         }
         if (config_->lowercase) {
             std::transform(fl.begin(), fl.end(), fl.begin(),
                            [](unsigned char x) { return static_cast<char>(std::tolower(x)); });
+            VLOG(3) << "PinyinTokenizer::processInput() - 首字母转小写后: '" << fl << "'";
         }
         if (!(config_->keepSeparateFirstLetter && fl.length() <= 1)) {
             addCandidate(fl, 0, static_cast<int>(fl.length()), 1);
+            VLOG(3) << "PinyinTokenizer::processInput() - 添加首字母候选项: '" << fl << "'";
+        } else {
+            VLOG(3) << "PinyinTokenizer::processInput() - 跳过首字母候选项（单字符且启用分离模式）";
         }
     }
 
     if (!processed_sort_candidate_) {
         processed_sort_candidate_ = true;
+        VLOG(3) << "PinyinTokenizer::processInput() - 对候选项进行排序，候选项数量: "
+                << candidate_.size();
         std::sort(candidate_.begin(), candidate_.end());
+
+        // 如果启用详细日志，输出前几个候选项
+        if (VLOG_IS_ON(4) && !candidate_.empty()) {
+            int show_count = std::min(static_cast<int>(candidate_.size()), 10);
+            VLOG(4) << "PinyinTokenizer::processInput() - 前" << show_count << "个候选项:";
+            for (int i = 0; i < show_count; ++i) {
+                const auto& item = candidate_[i];
+                VLOG(4) << "  [" << i << "] '" << item.term << "' (offset: " << item.start_offset
+                        << "-" << item.end_offset << ", position: " << item.position << ")";
+            }
+        }
     }
 }
 
 // 根据候选项输出token。若无更多候选则返回nullptr。
 Token* PinyinTokenizer::next(Token* token) {
     if (!done_) {
+        VLOG(3) << "PinyinTokenizer::next() - 首次调用，开始处理输入";
         processInput();
+        done_ = true;
+        VLOG(3) << "PinyinTokenizer::next() - 输入处理完成，总候选项数量: " << candidate_.size();
     }
 
     if (candidate_offset_ < static_cast<int>(candidate_.size())) {
-        const TermItem& item = candidate_[candidate_offset_++];
+        const TermItem& item = candidate_[candidate_offset_];
+
+        VLOG(4) << "PinyinTokenizer::next() - 返回候选项[" << candidate_offset_ << "/"
+                << candidate_.size() << "]: '" << item.term << "' (offset: " << item.start_offset
+                << "-" << item.end_offset << ", position: " << item.position << ")";
+
+        candidate_offset_++;
 
         // 设置 term 文本（注意：setNoCopy 的第三个参数是 term 长度，不是原文 offset）
         const std::string& text = item.term;
@@ -251,9 +352,15 @@ Token* PinyinTokenizer::next(Token* token) {
         if (offset < 0) offset = 0;
         token->setPositionIncrement(offset);
         last_increment_position_ = item.position;
+
+        VLOG(4) << "PinyinTokenizer::next() - Token设置完成: text='" << text
+                << "', startOffset=" << item.start_offset << ", endOffset=" << item.end_offset
+                << ", positionIncrement=" << offset;
+
         return token;
     }
 
+    VLOG(3) << "PinyinTokenizer::next() - 所有候选项已输出完毕，返回nullptr";
     done_ = true;
     return nullptr;
 }
@@ -261,6 +368,9 @@ Token* PinyinTokenizer::next(Token* token) {
 // 添加候选项（Java 等价版本）：入参是 TermItem
 void PinyinTokenizer::addCandidate(const TermItem& item_in) {
     std::string term = item_in.term;
+    VLOG(5) << "PinyinTokenizer::addCandidate() - 尝试添加候选项: '" << term
+            << "' (offset: " << item_in.start_offset << "-" << item_in.end_offset
+            << ", position: " << item_in.position << ")";
     if (config_->lowercase) {
         std::transform(term.begin(), term.end(), term.begin(),
                        [](unsigned char x) { return static_cast<char>(std::tolower(x)); });
@@ -271,16 +381,29 @@ void PinyinTokenizer::addCandidate(const TermItem& item_in) {
         term.erase(term.begin(), std::find_if(term.begin(), term.end(), not_space));
         term.erase(std::find_if(term.rbegin(), term.rend(), not_space).base(), term.end());
     }
-    if (term.empty()) return;
+    if (term.empty()) {
+        VLOG(5) << "PinyinTokenizer::addCandidate() - 候选项为空，跳过";
+        return;
+    }
 
     // 去重key：term + position，或（去重所有位置）仅term
     std::string key = config_->removeDuplicateTerm ? term : term + std::to_string(item_in.position);
     if (terms_filter_.find(key) != terms_filter_.end()) {
+        VLOG(5) << "PinyinTokenizer::addCandidate() - 候选项重复，跳过: '" << term << "'";
         return;
     }
     terms_filter_.insert(std::move(key));
 
     candidate_.emplace_back(term, item_in.start_offset, item_in.end_offset, item_in.position);
+    VLOG(5) << "PinyinTokenizer::addCandidate() - 候选项添加成功: '" << term
+            << "', 当前候选项总数: " << candidate_.size();
+}
+
+// 便捷重载：将参数封装为 TermItem 并复用上面的实现
+void PinyinTokenizer::addCandidate(const std::string& term, int start_offset, int end_offset,
+                                   int position) {
+    TermItem item(term, start_offset, end_offset, position);
+    addCandidate(item);
 }
 
 void PinyinTokenizer::setTerm(std::string term, int start_offset, int end_offset, int position) {
@@ -293,29 +416,59 @@ bool PinyinTokenizer::hasMoreTokens() const {
 }
 
 void PinyinTokenizer::decode_to_runes() {
+    VLOG(3) << "PinyinTokenizer::decode_to_runes() - 开始UTF-8解码";
+
     runes_.clear();
-    if (!_char_buffer || _char_length <= 0) return;
+    source_codepoints_.clear();
+
+    if (!_char_buffer || _char_length <= 0) {
+        VLOG(3) << "PinyinTokenizer::decode_to_runes() - 输入为空，跳过解码";
+        return;
+    }
+
     runes_.reserve(static_cast<size_t>(_char_length));
+    source_codepoints_.reserve(static_cast<size_t>(_char_length));
+
     int32_t i = 0;
+    int invalid_char_count = 0;
+
     while (i < _char_length) {
         UChar32 c = U_UNASSIGNED;
         int32_t prev = i;
         U8_NEXT(_char_buffer, i, _char_length, c);
         if (c < 0) {
             // 对齐 Java Reader 行为：将非法序列映射为 U+FFFD 替代字符，而非直接丢弃
-            Rune r;
-            r.cp = 0xFFFD;
-            r.byte_start = prev;
-            r.byte_end = i; // U8_NEXT 已前进 1 字节
-            runes_.push_back(r);
-            continue;
+            c = 0xFFFD;
+            invalid_char_count++;
+            VLOG(4) << "PinyinTokenizer::decode_to_runes() - 发现非法UTF-8序列，字节位置: " << prev
+                    << ", 替换为U+FFFD";
         }
+
+        // 同时填充 runes_ 和 source_codepoints_
         Rune r;
         r.cp = c;
         r.byte_start = prev;
         r.byte_end = i;
         runes_.push_back(r);
+        source_codepoints_.push_back(c);
+
+        if (VLOG_IS_ON(5)) {
+            // 详细日志：输出每个字符
+            if (c >= 32 && c < 127) {
+                VLOG(5) << "PinyinTokenizer::decode_to_runes() - 码点[" << (runes_.size() - 1)
+                        << "]: '" << static_cast<char>(c) << "' (U+" << std::hex << c << std::dec
+                        << ", 字节: " << prev << "-" << i << ")";
+            } else {
+                VLOG(5) << "PinyinTokenizer::decode_to_runes() - 码点[" << (runes_.size() - 1)
+                        << "]: U+" << std::hex << c << std::dec << " (字节: " << prev << "-" << i
+                        << ")";
+            }
+        }
     }
+
+    VLOG(3) << "PinyinTokenizer::decode_to_runes() - UTF-8解码完成"
+            << ", 总字节数: " << _char_length << ", 解码出码点数: " << source_codepoints_.size()
+            << ", 非法字符数: " << invalid_char_count;
 }
 
 void PinyinTokenizer::parseBuff(std::string& ascii_buff, int& ascii_buff_start) {
@@ -345,6 +498,18 @@ void PinyinTokenizer::parseBuff(std::string& ascii_buff, int& ascii_buff_start) 
     }
     ascii_buff.clear();
     ascii_buff_start = -1;
+}
+
+std::string PinyinTokenizer::codepointsToUtf8(const std::vector<UChar32>& codepoints) const {
+    std::string result;
+    for (UChar32 cp : codepoints) {
+        // 直接使用 ICU 的 UTF-8 编码函数，避免 UnicodeString
+        char utf8_buffer[4];
+        int32_t utf8_len = 0;
+        U8_APPEND_UNSAFE(utf8_buffer, utf8_len, cp);
+        result.append(utf8_buffer, utf8_len);
+    }
+    return result;
 }
 
 } // namespace doris::segment_v2::inverted_index
