@@ -21,6 +21,9 @@
 #include <cctype>
 #include <regex>
 
+#include "unicode/uchar.h"
+#include "unicode/utf8.h"
+
 namespace doris::segment_v2::inverted_index {
 
 // 对应Java中的声调Unicode标记映射表
@@ -111,8 +114,29 @@ std::string PinyinFormatter::abbr(const std::string& str) {
     if (str.empty()) {
         return str;
     }
-    // 对应Java：return str.substring(0, 1)
-    return str.substr(0, 1);
+
+    // 正确处理UTF-8字符：取第一个完整的Unicode字符
+    const char* str_ptr = str.c_str();
+    int str_len = static_cast<int>(str.length());
+    int byte_pos = 0;
+    UChar32 first_char;
+
+    // 使用ICU解码第一个字符
+    U8_NEXT(str_ptr, byte_pos, str_len, first_char);
+
+    if (first_char < 0) {
+        // 无效的UTF-8序列
+        return str.substr(0, 1);
+    }
+
+    // 将第一个字符重新编码为UTF-8
+    std::string result;
+    char utf8_buffer[4];
+    int32_t utf8_len = 0;
+    U8_APPEND_UNSAFE(utf8_buffer, utf8_len, first_char);
+    result.assign(utf8_buffer, utf8_len);
+
+    return result;
 }
 
 std::string PinyinFormatter::capitalize(const std::string& str) {

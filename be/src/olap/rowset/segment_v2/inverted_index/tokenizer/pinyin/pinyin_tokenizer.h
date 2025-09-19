@@ -24,6 +24,7 @@
 
 #include "olap/rowset/segment_v2/inverted_index/tokenizer/tokenizer.h"
 #include "pinyin_config.h"
+#include "rune.h"
 #include "term_item.h"
 #include "unicode/uchar.h"
 
@@ -70,11 +71,6 @@ private:
     int32_t _char_length {0};
 
     // 将 UTF-8 解码后的码点及其字节偏移缓存下来，避免在候选生成时重复计算
-    struct Rune {
-        int32_t byte_start {0};
-        int32_t byte_end {0};
-        UChar32 cp {0};
-    };
     std::vector<Rune> runes_;
 
     // 是否仍有未输出的候选项

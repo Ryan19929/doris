@@ -17,395 +17,253 @@
 
 #include "smart_forest.h"
 
-#include <algorithm>
 #include <iostream>
 
+#include "common/logging.h"
 #include "smart_get_word.h"
 #include "unicode/utf8.h"
 
 namespace doris::segment_v2::inverted_index {
 
-// ===== UTF-8 <-> UChar32 转换工具 =====
+std::vector<Rune> SmartForest::utf8_to_runes(const std::string& utf8_str) {
+    std::vector<Rune> runes;
+    runes.reserve(utf8_str.length()); // 预分配空间
 
-template <typename T>
-std::vector<UChar32> SmartForest<T>::utf8_to_unicode(const std::string& utf8_str) {
-    std::vector<UChar32> result;
-    const char* text_ptr = utf8_str.c_str();
-    int32_t text_len = static_cast<int32_t>(utf8_str.length());
-    int32_t i = 0;
+    int32_t byte_pos = 0;
+    const char* str_ptr = utf8_str.c_str();
+    int32_t str_length = static_cast<int32_t>(utf8_str.length());
 
-    while (i < text_len) {
+    while (byte_pos < str_length) {
         UChar32 cp;
-        U8_NEXT(text_ptr, i, text_len, cp);
-        if (cp == U_SENTINEL) {
-            cp = 0xFFFD; // Unicode 替换字符
+        int32_t byte_start = byte_pos;
+
+        // 使用ICU的UTF-8解码
+        U8_NEXT(str_ptr, byte_pos, str_length, cp);
+
+        if (cp >= 0) { // 有效的Unicode码点
+            runes.emplace_back(byte_start, byte_pos, cp);
         }
-        result.push_back(cp);
-    }
-    return result;
-}
-
-template <typename T>
-std::string SmartForest<T>::unicode_to_utf8(const std::vector<UChar32>& unicode_chars) {
-    return unicode_to_utf8(unicode_chars, 0, static_cast<int>(unicode_chars.size()));
-}
-
-template <typename T>
-std::string SmartForest<T>::unicode_to_utf8(const std::vector<UChar32>& unicode_chars, int start,
-                                            int length) {
-    if (start < 0 || start >= static_cast<int>(unicode_chars.size()) || length <= 0) {
-        return "";
     }
 
-    int end = std::min(start + length, static_cast<int>(unicode_chars.size()));
+    return runes;
+}
+
+std::string SmartForest::runes_to_utf8(const std::vector<Rune>& runes) {
+    return runes_to_utf8(runes, 0, runes.size());
+}
+
+std::string SmartForest::runes_to_utf8(const std::vector<Rune>& runes, size_t start, size_t end) {
     std::string result;
-
-    for (int i = start; i < end; i++) {
-        UChar32 cp = unicode_chars[i];
+    for (size_t i = start; i < end && i < runes.size(); ++i) {
+        UChar32 cp = runes[i].cp;
         char utf8_buffer[4];
-        int32_t utf8_length = 0;
-
-        U8_APPEND_UNSAFE(utf8_buffer, utf8_length, cp);
-        result.append(utf8_buffer, utf8_length);
+        int32_t utf8_len = 0;
+        U8_APPEND_UNSAFE(utf8_buffer, utf8_len, cp);
+        result.append(utf8_buffer, utf8_len);
     }
-
     return result;
 }
 
-// ===== 核心算法实现 =====
-
-template <typename T>
-SmartForest<T>* SmartForest<T>::add(std::unique_ptr<SmartForest<T>> branch_node) {
+SmartForest* SmartForest::add(std::unique_ptr<SmartForest> branch_node) {
     // 对应Java的 public synchronized SmartForest<T> add(SmartForest<T> branch)
-
-    if (branches.empty()) {
-        branches.resize(0); // 对应 branches = new SmartForest[0]
+    if (!branch_node) {
+        return nullptr;
     }
 
-    int bs = getIndex(branch_node->getC());
+    UChar32 c = branch_node->getC();
+    SmartForest* result_ptr = nullptr;
 
-    if (bs >= 0) {
-        // 找到现有位置
-        // 先保存需要的信息，因为可能会移动branch_node
-        uint8_t branch_status = branch_node->getStatus();
-        T branch_param = branch_node->getParam();
+    // 检查是否已存在该字符的分支
+    auto it = branches.find(c);
+    if (it != branches.end()) {
+        // 节点已存在，需要合并状态
+        SmartForest* existing = it->second.get();
+        uint8_t new_status = branch_node->getStatus();
+        uint8_t existing_status = existing->getStatus();
 
-        if (bs < static_cast<int>(branches.size()) && !branches[bs]) {
-            branches[bs] = std::move(branch_node);
-        }
-
-        branch = branches[bs].get();
-
-        // 状态合并逻辑 - 完全对应Java的switch语句
-        switch (branch_status) {
-        case static_cast<uint8_t>(-1): // case -1:
-            branch->setStatus(1);
-            break;
-        case 1: // case 1:
-            if (branch->getStatus() == 3) {
-                branch->setStatus(2);
+        // 状态合并逻辑 - 完全对应Java版本的switch语句
+        switch (new_status) {
+        case CONTINUE:                              // case 1: 新节点是CONTINUE
+            if (existing_status == WORD_END) {      // 现有节点是WORD_END
+                existing->setStatus(WORD_CONTINUE); // 改为WORD_CONTINUE
             }
             break;
-        case 3: // case 3:
-            if (branch->getStatus() != 3) {
-                branch->setStatus(2);
+        case WORD_END:                              // case 3: 新节点是WORD_END
+            if (existing_status != WORD_END) {      // 现有节点不是WORD_END
+                existing->setStatus(WORD_CONTINUE); // 改为WORD_CONTINUE
             }
-            branch->setParam(std::move(branch_param));
+            // Java版本：总是设置参数
+            existing->setParam(branch_node->getParam());
+            break;
+        default:
+            // 其他状态保持现有逻辑
             break;
         }
 
-        return branch;
-    }
-
-    if (bs < 0) {
-        // 需要插入新元素
-        UChar32 c = branch_node->getC(); // 保存字符，因为移动后无法访问
-        SmartForest<T>* result_ptr = nullptr;
-
-        // 自动扩展逻辑：如果接近最大值，切换为直接数组定位
-        if (!branches.empty() && branches.size() >= MAX_SIZE * rate_) {
-            // 对应Java的自动扩展为hash表
-            std::vector<std::unique_ptr<SmartForest<T>>> tempBranches(MAX_SIZE);
-
-            // 复制现有元素 - 对应Java的 tempBranches[b.getC()] = b
-            for (auto& b : branches) {
-                if (b) {
-                    tempBranches[b->getC()] = std::move(b);
-                }
-            }
-
-            // 插入新元素并保存指针
-            result_ptr = branch_node.get();
-            tempBranches[c] = std::move(branch_node);
-
-            // 替换数组
-            branches = std::move(tempBranches);
-        } else {
-            // 二分插入 - 对应Java的数组插入逻辑
-            int insert = -(bs + 1);
-
-            // 创建新数组
-            std::vector<std::unique_ptr<SmartForest<T>>> newBranches(branches.size() + 1);
-
-            // 复制前半部分 - 对应 System.arraycopy(this.branches, 0, newBranches, 0, insert)
-            for (int i = 0; i < insert; i++) {
-                newBranches[i] = std::move(branches[i]);
-            }
-
-            // 插入新元素并保存指针
-            result_ptr = branch_node.get();
-            newBranches[insert] = std::move(branch_node);
-
-            // 复制后半部分 - 对应 System.arraycopy(branches, insert, newBranches, insert + 1, ...)
-            for (int i = insert; i < static_cast<int>(branches.size()); i++) {
-                newBranches[i + 1] = std::move(branches[i]);
-            }
-
-            // 替换数组
-            branches = std::move(newBranches);
-        }
-
-        return result_ptr;
-    }
-
-    return nullptr; // 不应该到达这里
-}
-
-template <typename T>
-int SmartForest<T>::getIndex(UChar32 c) {
-    // 对应Java的 public int getIndex(char c)
-
-    if (branches.empty()) {
-        return -1; // 对应 if (branches == null) return -1
-    }
-
-    if (branches.size() == MAX_SIZE) {
-        // 直接数组定位 - 对应 if (branches.length == MAX_SIZE) return c
-        return static_cast<int>(c);
-    }
-
-    // 二分查找 - 对应 Arrays.binarySearch(this.branches, new SmartForest<T>(c))
-    auto temp_node = std::make_unique<SmartForest<T>>(c);
-
-    // 找到第一个非空元素的位置进行二分查找
-    auto it = std::lower_bound(branches.begin(), branches.end(), temp_node, CharComparator());
-
-    if (it != branches.end() && (*it) && (*it)->getC() == c) {
-        return static_cast<int>(it - branches.begin());
+        result_ptr = existing;
     } else {
-        // 返回插入位置的负数减1，对应Java的 binarySearch 行为
-        return -static_cast<int>(it - branches.begin()) - 1;
+        // 节点不存在，直接插入
+        result_ptr = branch_node.get();
+        branches[c] = std::move(branch_node);
     }
+
+    return result_ptr;
 }
 
-template <typename T>
-bool SmartForest<T>::contains(UChar32 c) {
-    // 对应Java的 public boolean contains(char c)
-    if (branches.empty()) {
-        return false;
-    }
-    return getIndex(c) >= 0; // 简化版：直接使用getIndex
+int SmartForest::getIndex(UChar32 c) {
+    // 使用哈希表，不再需要索引概念
+    // 简单返回字符是否存在
+    return branches.find(c) != branches.end() ? static_cast<int>(c) : -1;
 }
 
-template <typename T>
-int SmartForest<T>::compareTo(UChar32 c) const {
-    // 对应Java的 public int compareTo(char c)
-    if (c_ > c) return 1;
+bool SmartForest::contains(UChar32 c) {
+    return branches.find(c) != branches.end();
+}
+
+int SmartForest::compareTo(UChar32 c) const {
     if (c_ < c) return -1;
+    if (c_ > c) return 1;
     return 0;
 }
 
-template <typename T>
-bool SmartForest<T>::equals(UChar32 c) const {
-    // 对应Java的 public boolean equals(char c)
+bool SmartForest::equals(UChar32 c) const {
     return c_ == c;
 }
 
-// ===== 便利方法实现 =====
+void SmartForest::add(const std::string& keyWord, const ParamType& param) {
+    // 转换为Rune向量后调用Rune版本
+    std::vector<Rune> runes = utf8_to_runes(keyWord);
+    add(runes, param);
+}
 
-template <typename T>
-void SmartForest<T>::add(const std::string& keyWord, T t) {
+void SmartForest::add(const std::vector<Rune>& runes, const ParamType& param) {
     // 对应Java的 public void add(String keyWord, T t)
+    // 移除调试输出以提高性能
 
-    SmartForest<T>* tempBranch = this;
-    auto chars = utf8_to_unicode(keyWord);
+    SmartForest* tempBranch = this;
 
-    for (size_t i = 0; i < chars.size(); i++) {
-        if (i == chars.size() - 1) {
-            // 最后一个字符 - 对应 keyWord.length() == i + 1
-            auto new_node = std::make_unique<SmartForest<T>>(chars[i], 3, std::move(t));
+    for (size_t i = 0; i < runes.size(); i++) {
+        UChar32 cp = runes[i].cp;
+        // 处理字符
+
+        if (i == runes.size() - 1) {
+            // 最后一个字符，标记为词语结束
+            auto new_node = std::make_unique<SmartForest>(cp, WORD_END, param);
             tempBranch->add(std::move(new_node));
         } else {
-            // 中间字符
-            auto new_node = std::make_unique<SmartForest<T>>(chars[i], 1, T {});
+            // 中间字符，标记为继续
+            auto new_node = std::make_unique<SmartForest>(cp, CONTINUE, ParamType {});
             tempBranch->add(std::move(new_node));
         }
 
-        // 移动到下一个节点 - 对应 tempBranch = tempBranch.branches[tempBranch.getIndex(...)]
-        int index = tempBranch->getIndex(chars[i]);
-        if (index >= 0 && index < static_cast<int>(tempBranch->branches.size())) {
-            tempBranch = tempBranch->branches[index].get();
+        // 关键修复：完全对应Java版本逻辑
+        // Java: tempBranch = tempBranch.branches[tempBranch.getIndex(keyWord.charAt(i))];
+        tempBranch = tempBranch->getBranch(cp);
+
+        // 安全检查：如果getBranch返回nullptr，说明添加失败
+        if (!tempBranch) {
+            break;
         }
     }
+    // 添加完成
 }
 
-template <typename T>
-SmartForest<T>* SmartForest<T>::getBranch(UChar32 c) {
+SmartForest* SmartForest::getBranch(UChar32 c) {
     // 对应Java的 public SmartForest<T> getBranch(char c)
-    int index = getIndex(c);
-    if (index < 0) {
-        return nullptr;
-    } else {
-        return (index < static_cast<int>(branches.size())) ? branches[index].get() : nullptr;
-    }
+    auto it = branches.find(c);
+    return it != branches.end() ? it->second.get() : nullptr;
 }
 
-template <typename T>
-SmartForest<T>* SmartForest<T>::getBranch(const std::string& keyWord) {
+SmartForest* SmartForest::getBranch(const std::string& keyWord) {
     // 对应Java的 public SmartForest<T> getBranch(String keyWord)
-
-    SmartForest<T>* tempBranch = this;
-    auto chars = utf8_to_unicode(keyWord);
-
-    for (UChar32 c : chars) {
-        int index = tempBranch->getIndex(c);
-        if (index < 0) {
-            return nullptr;
-        }
-
-        if (index >= static_cast<int>(tempBranch->branches.size()) ||
-            !tempBranch->branches[index]) {
-            return nullptr;
-        }
-
-        tempBranch = tempBranch->branches[index].get();
-    }
-
-    return tempBranch;
+    std::vector<Rune> runes = utf8_to_runes(keyWord);
+    return getBranch(runes);
 }
 
-template <typename T>
-SmartForest<T>* SmartForest<T>::getBranch(const std::vector<UChar32>& chars) {
+SmartForest* SmartForest::getBranch(const std::vector<Rune>& runes) {
     // 对应Java的 public SmartForest<T> getBranch(char[] chars)
+    SmartForest* tempBranch = this;
 
-    SmartForest<T>* tempBranch = this;
-
-    for (UChar32 c : chars) {
-        int index = tempBranch->getIndex(c);
-        if (index < 0) {
+    for (const auto& rune : runes) {
+        if (!tempBranch) {
             return nullptr;
         }
-
-        if (index >= static_cast<int>(tempBranch->branches.size()) ||
-            !tempBranch->branches[index]) {
-            return nullptr;
-        }
-
-        tempBranch = tempBranch->branches[index].get();
+        tempBranch = tempBranch->getBranch(rune.cp);
     }
 
     return tempBranch;
 }
 
-template <typename T>
-std::unique_ptr<SmartGetWord<T>> SmartForest<T>::getWord(const std::string& str) {
+std::unique_ptr<SmartGetWord> SmartForest::getWord(const std::string& str) {
     // 对应Java的 public SmartGetWord<T> getWord(String str)
-    return std::make_unique<SmartGetWord<T>>(this, str);
+    return std::make_unique<SmartGetWord>(this, str);
 }
 
-template <typename T>
-std::unique_ptr<SmartGetWord<T>> SmartForest<T>::getWord(const std::vector<UChar32>& chars) {
+std::unique_ptr<SmartGetWord> SmartForest::getWord(const std::vector<Rune>& runes) {
     // 对应Java的 public SmartGetWord<T> getWord(char[] chars)
-    return std::make_unique<SmartGetWord<T>>(this, chars);
+    return std::make_unique<SmartGetWord>(this, runes);
 }
 
-template <typename T>
-void SmartForest<T>::remove(const std::string& word) {
-    // 对应Java的 public void remove(String word)
-    SmartForest<T>* node = getBranch(word);
+void SmartForest::remove(const std::string& word) {
+    // 简化实现：将节点标记为CONTINUE状态，清空参数
+    SmartForest* node = getBranch(word);
     if (node) {
-        node->status_ = 1;   // 对应 .status = 1
-        node->param_ = T {}; // 对应 .param = null
+        node->setStatus(CONTINUE);
+        node->setParam(ParamType {});
     }
 }
 
-template <typename T>
-void SmartForest<T>::clear() {
-    // 对应Java的 public void clear()
+void SmartForest::clear() {
+    // 清空所有子节点
     branches.clear();
-    branches.resize(MAX_SIZE); // 对应 branches = new SmartForest[MAX_SIZE]
+    branch = nullptr;
 }
 
-template <typename T>
-std::map<std::string, T> SmartForest<T>::toMap() {
-    // 对应Java的 public Map<String, T> toMap()
-
-    std::map<std::string, T> result;
-
-    if (branches.empty()) {
-        return result;
-    }
-
+std::map<std::string, SmartForest::ParamType> SmartForest::toMap() {
+    std::map<std::string, ParamType> result;
     putMap(result, "", branches);
     return result;
 }
 
-template <typename T>
-void SmartForest<T>::putMap(std::map<std::string, T>& result, const std::string& pre,
-                            const std::vector<std::unique_ptr<SmartForest<T>>>& branches_vec) {
+void SmartForest::putMap(
+        std::map<std::string, ParamType>& result, const std::string& pre,
+        const std::unordered_map<UChar32, std::unique_ptr<SmartForest>>& branches_map) {
     // 对应Java的 private void putMap(HashMap<String, T> result, String pre, SmartForest<T>[] branches)
+    for (const auto& [c, branch] : branches_map) {
+        if (!branch) continue;
 
-    for (const auto& sf : branches_vec) {
-        if (!sf) {
-            continue;
+        std::string current_word = pre;
+        char utf8_buffer[4];
+        int32_t utf8_len = 0;
+        U8_APPEND_UNSAFE(utf8_buffer, utf8_len, branch->getC());
+        current_word.append(utf8_buffer, utf8_len);
+
+        if (branch->getStatus() == WORD_END || branch->getStatus() == WORD_CONTINUE) {
+            result[current_word] = branch->getParam();
         }
 
-        std::string key = pre + unicode_to_utf8({sf->c_});
-
-        if (sf->getStatus() == 3) {
-            // 对应 if (branches[i].getStatus() == 3)
-            result[key] = sf->getParam();
-        } else if (sf->getStatus() == 2) {
-            // 对应 else if (branches[i].getStatus() == 2)
-            result[key] = sf->getParam();
-            putMap(result, key, sf->branches);
-        } else {
-            // 对应 else
-            putMap(result, key, sf->branches);
+        if (!branch->getBranches().empty()) {
+            putMap(result, current_word, branch->getBranches());
         }
     }
 }
 
-// ===== 调试功能 =====
+void SmartForest::print(int depth) const {
+    // 调试输出，打印树结构
+    std::string indent(depth * 2, ' ');
+    char utf8_buffer[4];
+    int32_t utf8_len = 0;
+    U8_APPEND_UNSAFE(utf8_buffer, utf8_len, c_);
+    std::string char_str(utf8_buffer, utf8_len);
 
-template <typename T>
-void SmartForest<T>::print(int depth) const {
-    for (int i = 0; i < depth; i++) {
-        std::cout << "  ";
-    }
+    std::cout << indent << "Node: '" << char_str << "' status=" << static_cast<int>(status_)
+              << " param_size=" << param_.size() << std::endl;
 
-    if (c_ == 0) {
-        std::cout << "ROOT";
-    } else {
-        std::cout << "U+" << std::hex << c_ << std::dec;
-    }
-
-    std::cout << " (status=" << static_cast<int>(status_) << ")";
-
-    if (status_ == WORD_CONTINUE || status_ == WORD_END) {
-        std::cout << " [HAS_PARAM]";
-    }
-
-    std::cout << std::endl;
-
-    for (const auto& child : branches) {
-        if (child) {
-            child->print(depth + 1);
+    for (const auto& [c, branch] : branches) {
+        if (branch) {
+            branch->print(depth + 1);
         }
     }
 }
-
-// 显式实例化模板
-template class SmartForest<std::vector<std::string>>;
 
 } // namespace doris::segment_v2::inverted_index

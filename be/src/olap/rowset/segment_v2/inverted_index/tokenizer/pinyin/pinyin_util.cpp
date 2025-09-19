@@ -66,7 +66,12 @@ void PinyinUtil::load_pinyin_mapping() {
     }
     std::string line;
     size_t idx = 0;
+    size_t line_count = 0;
     while (std::getline(in, line)) {
+        line_count++;
+        if (line_count % 10000 == 0) {
+        }
+
         // 允许注释行以#开头；允许空行
         if (line.empty() || line[0] == '#') {
             ++idx;
@@ -88,7 +93,22 @@ void PinyinUtil::load_pinyin_mapping() {
 }
 
 std::string PinyinUtil::to_pinyin(uint32_t cp) const {
-    if (cp < CJK_START || cp > CJK_END) return "";
+    // 对于非中文字符，返回原字符
+    if (cp < CJK_START || cp > CJK_END) {
+        // 将Unicode码点转换为UTF-8字符串
+        std::string result;
+        if (cp <= 0x7F) {
+            result.push_back(static_cast<char>(cp));
+        } else {
+            // 使用ICU的UTF-8编码
+            char buffer[8];
+            int32_t buffer_index = 0;
+            U8_APPEND_UNSAFE(buffer, buffer_index, cp);
+            result.assign(buffer, buffer_index);
+        }
+        return result;
+    }
+
     size_t idx = static_cast<size_t>(cp - CJK_START);
     if (idx >= _pinyin_dict.size()) return "";
     const std::string& raw = _pinyin_dict[idx];
@@ -111,7 +131,12 @@ void PinyinUtil::load_polyphone_mapping() {
     }
 
     std::string line;
+    size_t polyphone_line_count = 0;
     while (std::getline(in, line)) {
+        polyphone_line_count++;
+        if (polyphone_line_count % 100000 == 0) {
+        }
+
         // 允许注释行以#开头；允许空行
         if (line.empty() || line[0] == '#') {
             continue;
@@ -135,6 +160,10 @@ void PinyinUtil::load_polyphone_mapping() {
         }
 
         if (!word.empty() && !pinyins.empty()) {
+            if (polyphone_line_count <= 10) {
+                for (size_t i = 0; i < pinyins.size(); ++i) {
+                }
+            }
             polyphone_dict_->add(word, pinyins);
             // 更新最大长度
             if (static_cast<int>(word.length()) > max_polyphone_len_) {
@@ -145,6 +174,8 @@ void PinyinUtil::load_polyphone_mapping() {
 }
 
 std::vector<std::string> PinyinUtil::convert(const std::string& text) const {
+    VLOG(4) << "PinyinUtil::convert() 开始，输入: '" << text.substr(0, 50)
+            << (text.length() > 50 ? "..." : "") << "'";
     std::vector<std::string> result;
     if (text.empty()) return result;
 
@@ -155,6 +186,7 @@ std::vector<std::string> PinyinUtil::convert(const std::string& text) const {
     std::vector<int> char_byte_starts; // 记录每个字符在原始UTF-8中的字节起始位置
 
     // 解码UTF-8为字符数组
+    VLOG(5) << "PinyinUtil::convert - 开始UTF-8解码";
     int byte_pos = 0;
     while (byte_pos < text_len) {
         char_byte_starts.push_back(byte_pos);
@@ -163,11 +195,13 @@ std::vector<std::string> PinyinUtil::convert(const std::string& text) const {
         if (cp < 0) cp = 0xFFFD; // 替换无效字符
         chars.push_back(cp);
     }
+    VLOG(5) << "PinyinUtil::convert - UTF-8解码完成，字符数: " << chars.size();
 
     // 初始化结果数组，长度等于字符数
     result.resize(chars.size());
 
     // 使用 SmartGetWord 进行多音字匹配
+    VLOG(4) << "PinyinUtil::convert - 创建word_matcher，输入文本长度: " << text.length();
     PolyphoneGetWord word_matcher(polyphone_dict_.get(), text);
 
     // 标记已处理的字符位置
@@ -175,8 +209,19 @@ std::vector<std::string> PinyinUtil::convert(const std::string& text) const {
 
     // 对应 Java：while ((temp = word.getFrontWords()) != null)
     std::string matched_word;
+    int loop_count = 0;
+    VLOG(4) << "PinyinUtil::convert - 开始多音字匹配循环";
     while ((matched_word = word_matcher.getFrontWords()) != word_matcher.getNullResult() &&
            !matched_word.empty()) {
+        loop_count++;
+        VLOG(5) << "PinyinUtil::convert - 循环 #" << loop_count << ", matched_word: '"
+                << matched_word << "'";
+
+        if (loop_count > 10000) {
+            VLOG(3) << "❌ PinyinUtil::convert - 检测到可能的无限循环，已循环" << loop_count
+                    << "次，退出";
+            break;
+        }
         int match_start_byte = word_matcher.offe;
         int match_end_byte = match_start_byte + static_cast<int>(matched_word.length());
 
@@ -379,7 +424,22 @@ std::vector<std::string> PinyinUtil::convert_with_raw_pinyin(const std::string& 
 }
 
 std::string PinyinUtil::to_raw_pinyin(uint32_t cp) const {
-    if (cp < CJK_START || cp > CJK_END) return "";
+    // 对于非中文字符，返回原字符
+    if (cp < CJK_START || cp > CJK_END) {
+        // 将Unicode码点转换为UTF-8字符串
+        std::string result;
+        if (cp <= 0x7F) {
+            result.push_back(static_cast<char>(cp));
+        } else {
+            // 使用ICU的UTF-8编码
+            char buffer[8];
+            int32_t buffer_index = 0;
+            U8_APPEND_UNSAFE(buffer, buffer_index, cp);
+            result.assign(buffer, buffer_index);
+        }
+        return result;
+    }
+
     size_t idx = static_cast<size_t>(cp - CJK_START);
     if (idx >= _pinyin_dict.size()) return "";
     const std::string& raw = _pinyin_dict[idx];
@@ -409,7 +469,12 @@ std::vector<std::string> PinyinUtil::convert(const std::vector<UChar32>& codepoi
                     result[i] = "";
                 }
             } else {
-                result[i] = PinyinFormatter::formatPinyin(pinyin, format);
+                // 对于非中文字符，直接使用原字符，不进行格式化
+                if (codepoints[i] < CJK_START || codepoints[i] > CJK_END) {
+                    result[i] = pinyin;
+                } else {
+                    result[i] = PinyinFormatter::formatPinyin(pinyin, format);
+                }
             }
         }
         return result;
