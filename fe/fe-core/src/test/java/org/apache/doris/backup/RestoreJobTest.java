@@ -338,4 +338,37 @@ public class RestoreJobTest {
         Assert.assertEquals(localPart.getVisibleVersion(), visibleVersion);
         Assert.assertEquals(localPart.getNextVersion(), visibleVersion + 1);
     }
+
+    /**
+     * Test snapshotTaskCount defaults to 0 for a new RestoreJob.
+     */
+    @Test
+    public void testSnapshotTaskCountDefaultZero() {
+        Assert.assertEquals(0, job.getSnapshotTaskCount());
+    }
+
+    /**
+     * Test snapshotTaskCount is persisted during serialization/deserialization.
+     *
+     * Scenario: Set snapshotTaskCount via reflection, serialize and deserialize
+     * Expected: Value should be preserved
+     */
+    @Test
+    public void testSnapshotTaskCountPersisted() throws IOException, AnalysisException {
+        Deencapsulation.setField(job, "snapshotTaskCount", 42);
+        Assert.assertEquals(42, job.getSnapshotTaskCount());
+
+        final Path path = Files.createTempFile("restoreJobStc", "tmp");
+        DataOutputStream out = new DataOutputStream(Files.newOutputStream(path));
+        job.write(out);
+        out.flush();
+        out.close();
+
+        DataInputStream in = new DataInputStream(Files.newInputStream(path));
+        RestoreJob job2 = RestoreJob.read(in);
+        Assert.assertEquals(42, job2.getSnapshotTaskCount());
+
+        in.close();
+        Files.delete(path);
+    }
 }
