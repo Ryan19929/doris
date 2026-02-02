@@ -56,7 +56,15 @@ inline void escape_string(const char* src, size_t* len, char escape_char) {
         if (escape_next_char) {
             ++src;
         } else {
-            *dest_ptr++ = *src++;
+            // https://github.com/apache/doris/pull/52820
+            // This conditional check serves two purposes:
+            // 1. When dest_ptr == src, skip meaningless self-assignment
+            // 2. Avoid dereference crash when both pointers are null
+            if (dest_ptr != src) {
+                *dest_ptr = *src;
+            }
+            dest_ptr++;
+            src++;
         }
     }
 
