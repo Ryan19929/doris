@@ -1041,11 +1041,6 @@ Status TabletManager::load_tablet_from_dir(DataDir* store, TTabletId tablet_id,
             auto to = fmt::format("{}/_binlog/{}", schema_hash_path, new_filename);
             RETURN_IF_ERROR(io::global_local_filesystem()->rename(from, to));
         }
-
-        auto* meta = store->get_meta();
-        // if ingest binlog metas error, it will be gc in gc_unused_binlog_metas
-        RETURN_IF_ERROR(
-                RowsetMetaManager::ingest_binlog_metas(meta, tablet_uid, &rowset_binlog_metas_pb));
     }
 
     // has to change shard id here, because meta file maybe copied from other source
@@ -1053,6 +1048,7 @@ Status TabletManager::load_tablet_from_dir(DataDir* store, TTabletId tablet_id,
     tablet_meta->set_shard_id(shard);
     // load dir is called by clone, restore, storage migration
     // should change tablet uid when tablet object changed
+    TabletUid tablet_uid_for_binlog = tablet_uid;
     tablet_meta->set_tablet_uid(std::move(tablet_uid));
     std::string meta_binary;
     tablet_meta->serialize(&meta_binary);
@@ -1060,6 +1056,16 @@ Status TabletManager::load_tablet_from_dir(DataDir* store, TTabletId tablet_id,
             load_tablet_from_meta(store, tablet_id, schema_hash, meta_binary, true, force, restore,
                                   true),
             absl::Substitute("fail to load tablet. header_path=$0", header_path));
+
+    // Ingest binlog metas after tablet is registered in tablet_map to avoid a race condition
+    // where GC thread may delete binlog metas before tablet is visible via get_tablet().
+    DBUG_EXECUTE_IF("TabletManager.load_tablet_from_dir.after_register", DBUG_BLOCK);
+    if (contain_binlog) {
+        auto* meta = store->get_meta();
+        // if ingest binlog metas error, it will be gc in gc_unused_binlog_metas
+        RETURN_IF_ERROR(RowsetMetaManager::ingest_binlog_metas(meta, tablet_uid_for_binlog,
+                                                               &rowset_binlog_metas_pb));
+    }
 
     return Status::OK();
 }
