@@ -17,52 +17,33 @@
 
 #include "storage/index/inverted/analyzer/ik/IKTokenizer.h"
 
-namespace doris::segment_v2 {
+#include "storage/index/inverted/analyzer/ik/core/CharacterUtil.h"
+
+namespace doris::segment_v2::inverted_index {
 #include "common/compile_check_begin.h"
 
-IKTokenizer::IKTokenizer(std::shared_ptr<Configuration> config, bool lower_case, bool own_reader) {
-    this->lowercase = lower_case;
-    this->ownReader = own_reader;
-    config_ = config;
-    ik_segmenter_ = std::make_unique<IKSegmenter>(config_);
+void IKTokenizer::initialize(std::shared_ptr<segment_v2::Configuration> config, bool lowercase) {
+    _config = std::move(config);
+    _lowercase = lowercase;
+    _ik_segmenter = std::make_unique<segment_v2::IKSegmenter>(_config);
 }
 
 Token* IKTokenizer::next(Token* token) {
-    if (buffer_index_ >= data_length_) {
+    segment_v2::Lexeme lexeme;
+    if (!_ik_segmenter->next(lexeme)) {
         return nullptr;
     }
-
-    std::string& token_text = tokens_text_[buffer_index_++];
-    // full-width to half-width, and lowercase
-    // TODO(ryan19929): do regularizeString in fillBuffer.
-    CharacterUtil::regularizeString(token_text, this->lowercase);
-    size_t size = std::min(token_text.size(), static_cast<size_t>(LUCENE_MAX_WORD_LEN));
-    token->setNoCopy(token_text.data(), 0, static_cast<int32_t>(size));
+    _current_text = lexeme.getText();
+    segment_v2::CharacterUtil::regularizeString(_current_text, _lowercase);
+    size_t size = std::min(_current_text.size(), static_cast<size_t>(LUCENE_MAX_WORD_LEN));
+    set(token, std::string_view(_current_text.data(), size));
     return token;
 }
 
-void IKTokenizer::reset(lucene::util::Reader* reader) {
-    this->input = reader;
-    this->buffer_index_ = 0;
-    this->data_length_ = 0;
-    this->tokens_text_.clear();
-
-    try {
-        buffer_.reserve(input->size());
-        ik_segmenter_->reset(reader);
-        Lexeme lexeme;
-        while (ik_segmenter_->next(lexeme)) {
-            tokens_text_.emplace_back(lexeme.getText());
-        }
-    } catch (const CLuceneError&) {
-        throw;
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "IKTokenizer encountered an uncaught exception: " << e.what();
-        _CLTHROWT(CL_ERR_Runtime,
-                  ("Uncaught exception in IKTokenizer: " + std::string(e.what())).c_str());
-    }
-    data_length_ = static_cast<int32_t>(tokens_text_.size());
+void IKTokenizer::reset() {
+    DorisTokenizer::reset();
+    _ik_segmenter->reset(_in);
 }
 
 #include "common/compile_check_end.h"
-} // namespace doris::segment_v2
+} // namespace doris::segment_v2::inverted_index

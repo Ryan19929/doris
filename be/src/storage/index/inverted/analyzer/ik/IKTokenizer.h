@@ -18,33 +18,28 @@
 #pragma once
 
 #include <memory>
-#include <string_view>
 
-#include "CLucene.h"
-#include "CLucene/analysis/AnalysisHeader.h"
 #include "storage/index/inverted/analyzer/ik/cfg/Configuration.h"
 #include "storage/index/inverted/analyzer/ik/core/IKSegmenter.h"
+#include "storage/index/inverted/tokenizer/tokenizer.h"
 
-using namespace lucene::analysis;
+namespace doris::segment_v2::inverted_index {
 
-namespace doris::segment_v2 {
-
-class IKTokenizer : public Tokenizer {
+class IKTokenizer : public DorisTokenizer {
 public:
-    IKTokenizer();
-    IKTokenizer(std::shared_ptr<Configuration> config, bool lowercase, bool ownReader);
+    IKTokenizer() = default;
     ~IKTokenizer() override = default;
 
+    void initialize(std::shared_ptr<segment_v2::Configuration> config, bool lowercase);
+
     Token* next(Token* token) override;
-    void reset(lucene::util::Reader* reader) override;
+    void reset() override;
 
 private:
-    int32_t buffer_index_ {0};
-    int32_t data_length_ {0};
-    std::string buffer_;
-    std::vector<std::string> tokens_text_;
-    std::shared_ptr<Configuration> config_;
-    std::unique_ptr<IKSegmenter> ik_segmenter_;
+    std::shared_ptr<segment_v2::Configuration> _config;
+    std::unique_ptr<segment_v2::IKSegmenter> _ik_segmenter;
+    bool _lowercase = true;
+    std::string _current_text;
 };
 
-} // namespace doris::segment_v2
+} // namespace doris::segment_v2::inverted_index

@@ -64,7 +64,7 @@ void AnalyzeContext::reset() {
     results_ = std::queue<Lexeme>();
 }
 
-size_t AnalyzeContext::fillBuffer(lucene::util::Reader* reader) {
+size_t AnalyzeContext::fillBuffer(const inverted_index::ReaderPtr& reader) {
     try {
         int32_t readCount = 0;
         if (buffer_offset_ == 0) {

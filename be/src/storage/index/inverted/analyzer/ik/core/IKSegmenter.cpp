@@ -66,7 +66,7 @@ bool IKSegmenter::next(Lexeme& lexeme) {
     return true;
 }
 
-void IKSegmenter::reset(lucene::util::Reader* newInput) {
+void IKSegmenter::reset(const inverted_index::ReaderPtr& newInput) {
     input_ = newInput;
     context_->reset();
     for (const auto& segmenter : segmenters_) {

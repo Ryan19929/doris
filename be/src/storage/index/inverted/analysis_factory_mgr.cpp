@@ -33,6 +33,7 @@
 #include "storage/index/inverted/tokenizer/keyword/keyword_tokenizer_factory.h"
 #include "storage/index/inverted/tokenizer/ngram/edge_ngram_tokenizer_factory.h"
 #include "storage/index/inverted/tokenizer/pinyin/pinyin_tokenizer_factory.h"
+#include "storage/index/inverted/tokenizer/ik/ik_tokenizer_factory.h"
 #include "storage/index/inverted/tokenizer/standard/standard_tokenizer_factory.h"
 
 namespace doris::segment_v2::inverted_index {
@@ -68,6 +69,8 @@ void AnalysisFactoryMgr::initialise() {
                                           []() { return std::make_shared<ICUTokenizerFactory>(); });
         registerFactory<TokenizerFactory>(
                 "pinyin", []() { return std::make_shared<PinyinTokenizerFactory>(); });
+        registerFactory<TokenizerFactory>(
+                "ik", []() { return std::make_shared<IKTokenizerFactory>(); });
 
         // token_filter
         registerFactory<TokenFilterFactory>(

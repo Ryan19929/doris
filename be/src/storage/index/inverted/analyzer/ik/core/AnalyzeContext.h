@@ -35,6 +35,7 @@
 #include "storage/index/inverted/analyzer/ik/core/CharacterUtil.h"
 #include "storage/index/inverted/analyzer/ik/core/LexemePath.h"
 #include "storage/index/inverted/analyzer/ik/dic/Dictionary.h"
+#include "storage/index/inverted/util/reader.h"
 
 namespace doris::segment_v2 {
 
@@ -92,7 +93,7 @@ public:
     size_t getBufferOffset() const { return buffer_offset_; }
     size_t getLastUselessCharNum() const { return last_useless_char_num_; }
 
-    size_t fillBuffer(lucene::util::Reader* reader);
+    size_t fillBuffer(const inverted_index::ReaderPtr& reader);
     bool moveCursor();
     void initCursor();
     bool isBufferConsumed() const;

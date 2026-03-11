@@ -30,19 +30,21 @@
 #include "storage/index/inverted/analyzer/ik/core/ISegmenter.h"
 #include "storage/index/inverted/analyzer/ik/core/LetterSegmenter.h"
 #include "storage/index/inverted/analyzer/ik/core/SurrogatePairSegmenter.h"
+#include "storage/index/inverted/util/reader.h"
+
 namespace doris::segment_v2 {
 
 class IKSegmenter {
 public:
     IKSegmenter(std::shared_ptr<Configuration> config);
     bool next(Lexeme& lexeme);
-    void reset(lucene::util::Reader* newInput);
+    void reset(const inverted_index::ReaderPtr& newInput);
     size_t getLastUselessCharNum();
 
 private:
     std::vector<std::unique_ptr<ISegmenter>> loadSegmenters();
     vectorized::Arena arena_;
-    lucene::util::Reader* input_;
+    inverted_index::ReaderPtr input_;
     std::shared_ptr<Configuration> config_;
     std::unique_ptr<AnalyzeContext> context_;
     std::vector<std::unique_ptr<ISegmenter>> segmenters_;

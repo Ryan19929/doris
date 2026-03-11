@@ -18,15 +18,16 @@
 #pragma once
 
 #include "storage/index/inverted/analyzer/ik/IKTokenizer.h"
+#include "storage/index/inverted/analyzer/ik/dic/Dictionary.h"
+#include "storage/index/inverted/token_stream.h"
 
-namespace doris::segment_v2 {
+namespace doris::segment_v2::inverted_index {
 
 class IKAnalyzer : public Analyzer {
 public:
     IKAnalyzer() {
         _lowercase = true;
         _ownReader = false;
-        config_ = std::make_shared<Configuration>(true, _lowercase);
     }
 
     ~IKAnalyzer() override = default;
@@ -34,36 +35,53 @@ public:
     bool isSDocOpt() override { return true; }
 
     void initDict(const std::string& dictPath) override {
-        try {
-            config_->setDictPath(dictPath);
-            Dictionary::initial(*config_);
-        } catch (const CLuceneError& e) {
-            LOG(ERROR) << "Failed to initialize dictionary: " << e.what();
-            throw;
-        }
+        _dict_path = dictPath;
+        auto config = std::make_shared<segment_v2::Configuration>(_use_smart, _lowercase);
+        config->setDictPath(dictPath);
+        segment_v2::Dictionary::initial(*config);
     }
 
-    void setMode(bool isSmart) { config_->setUseSmart(isSmart); }
+    void setMode(bool isSmart) { _use_smart = isSmart; }
 
     TokenStream* tokenStream(const TCHAR* fieldName, lucene::util::Reader* reader) override {
-        auto* tokenizer = _CLNEW IKTokenizer(config_, _lowercase, _ownReader);
-        tokenizer->reset(reader);
-        return (TokenStream*)tokenizer;
+        throw Exception(ErrorCode::INVERTED_INDEX_NOT_SUPPORTED,
+                        "IKAnalyzer::tokenStream(Reader*) not supported");
     }
 
     TokenStream* reusableTokenStream(const TCHAR* fieldName,
                                      lucene::util::Reader* reader) override {
-        if (tokenizer_ == nullptr) {
-            tokenizer_ = std::make_unique<IKTokenizer>(config_, _lowercase, _ownReader);
+        throw Exception(ErrorCode::INVERTED_INDEX_NOT_SUPPORTED,
+                        "IKAnalyzer::reusableTokenStream(Reader*) not supported");
+    }
+
+    TokenStream* tokenStream(const TCHAR* fieldName, const ReaderPtr& reader) override {
+        auto components = create_components();
+        components->set_reader(reader);
+        components->get_token_stream()->reset();
+        return new TokenStreamWrapper(components->get_token_stream());
+    }
+
+    TokenStream* reusableTokenStream(const TCHAR* fieldName, const ReaderPtr& reader) override {
+        if (!_reuse_token_stream) {
+            _reuse_token_stream = create_components();
         }
-        tokenizer_->reset(reader);
-        return (TokenStream*)tokenizer_.get();
-    };
+        _reuse_token_stream->set_reader(reader);
+        return _reuse_token_stream->get_token_stream().get();
+    }
 
 private:
-    std::string dictPath_;
-    std::unique_ptr<IKTokenizer> tokenizer_;
-    std::shared_ptr<Configuration> config_;
+    TokenStreamComponentsPtr create_components() {
+        auto config = std::make_shared<segment_v2::Configuration>(_use_smart, _lowercase);
+        config->setDictPath(_dict_path);
+        auto tk = std::make_shared<IKTokenizer>();
+        tk->initialize(config, _lowercase);
+        TokenStreamPtr ts = tk;
+        return std::make_shared<TokenStreamComponents>(tk, ts);
+    }
+
+    bool _use_smart = true;
+    std::string _dict_path;
+    TokenStreamComponentsPtr _reuse_token_stream;
 };
 
-} // namespace doris::segment_v2
+} // namespace doris::segment_v2::inverted_index
