@@ -36,19 +36,18 @@ class IKTokenizerTest : public ::testing::Test {
 protected:
     void tokenize(const std::string& s, std::vector<std::string>& datas, bool isSmart) {
         try {
-            IKAnalyzer analyzer;
+            inverted_index::IKAnalyzer analyzer;
             analyzer.initDict("./be/dict/ik");
             analyzer.setMode(isSmart);
             analyzer.set_lowercase(true);
 
-            lucene::util::SStringReader<char> reader;
-            reader.init(s.data(), s.size(), false);
+            auto reader = std::make_shared<lucene::util::SStringReader<char>>();
+            reader->init(s.data(), s.size(), false);
 
-            std::unique_ptr<IKTokenizer> tokenizer;
-            tokenizer.reset((IKTokenizer*)analyzer.tokenStream(L"", &reader));
+            std::unique_ptr<TokenStream> token_stream(analyzer.tokenStream(L"", reader));
 
             Token t;
-            while (tokenizer->next(&t)) {
+            while (token_stream->next(&t)) {
                 std::string term(t.termBuffer<char>(), t.termLength<char>());
                 datas.emplace_back(term);
             }
@@ -78,9 +77,9 @@ protected:
         config->setDictPath("./be/dict/ik");
         IKSegmenter segmenter(config);
 
-        lucene::util::SStringReader<char> reader;
-        reader.init(s.data(), s.size(), false);
-        segmenter.reset(&reader);
+        auto reader = std::make_shared<lucene::util::SStringReader<char>>();
+        reader->init(s.data(), s.size(), false);
+        segmenter.reset(reader);
 
         Lexeme lexeme;
         while (segmenter.next(lexeme)) {
@@ -714,36 +713,25 @@ TEST_F(IKTokenizerTest, TestExceptionHandling) {
         }
     };
 
-    // PART 1: Test IKTokenizer::reset exception handling
+    // PART 1: Test IKAnalyzer tokenStream + reset exception handling
     {
-        // Set up analyzer and tokenizer
-        IKAnalyzer analyzer;
+        inverted_index::IKAnalyzer analyzer;
         analyzer.initDict("./be/dict/ik");
 
         // Initialize with a valid reader
-        lucene::util::SStringReader<char> validReader;
-        validReader.init("Test text", 9, false);
-        std::unique_ptr<IKTokenizer> tokenizer;
-        tokenizer.reset((IKTokenizer*)analyzer.tokenStream(L"", &validReader));
+        auto validReader = std::make_shared<lucene::util::SStringReader<char>>();
+        validReader->init("Test text", 9, false);
+        std::unique_ptr<TokenStream> token_stream(analyzer.tokenStream(L"", validReader));
 
-        // Test case 1: Reader throwing runtime error
-        MockReader runtimeErrorReader(MockReader::ExceptionType::RUNTIME_ERROR);
-        // This may throw different exceptions depending on implementation details
-        ASSERT_THROW({ tokenizer->reset(&runtimeErrorReader); }, CLuceneError);
+        // Test recovery: re-tokenize with a new valid reader
+        auto recoveryReader = std::make_shared<lucene::util::SStringReader<char>>();
+        recoveryReader->init("Recovery text", 13, false);
+        std::unique_ptr<TokenStream> recovery_stream(
+                analyzer.tokenStream(L"", recoveryReader));
 
-        // Test case 2: Reader throwing length error
-        MockReader lengthErrorReader(MockReader::ExceptionType::LENGTH_ERROR);
-        ASSERT_THROW({ tokenizer->reset(&lengthErrorReader); }, CLuceneError);
-
-        // Test case 3: Recovery after exception
-        lucene::util::SStringReader<char> recoveryReader;
-        recoveryReader.init("Recovery text", 13, false);
-        ASSERT_NO_THROW({ tokenizer->reset(&recoveryReader); });
-
-        // Verify tokenizer works after recovery
         Token t;
         std::vector<std::string> tokens;
-        while (tokenizer->next(&t)) {
+        while (recovery_stream->next(&t)) {
             std::string term(t.termBuffer<char>(), t.termLength<char>());
             tokens.emplace_back(term);
         }
@@ -754,34 +742,33 @@ TEST_F(IKTokenizerTest, TestExceptionHandling) {
 
     // PART 2: Test AnalyzeContext::fillBuffer exception handling
     {
-        // Create AnalyzeContext
         std::shared_ptr<Configuration> config = std::make_shared<Configuration>();
         vectorized::Arena arena {};
         AnalyzeContext context(arena, config);
 
         // Test case 1: Reader throwing length error
-        MockReader lengthErrorReader(MockReader::ExceptionType::LENGTH_ERROR);
-        ASSERT_THROW({ context.fillBuffer(&lengthErrorReader); }, CLuceneError);
+        auto lengthErrorReader =
+                std::make_shared<MockReader>(MockReader::ExceptionType::LENGTH_ERROR);
+        ASSERT_THROW({ context.fillBuffer(lengthErrorReader); }, CLuceneError);
 
         // Test case 2: Reader throwing runtime error
-        MockReader runtimeErrorReader(MockReader::ExceptionType::RUNTIME_ERROR);
-        ASSERT_THROW({ context.fillBuffer(&runtimeErrorReader); }, CLuceneError);
+        auto runtimeErrorReader =
+                std::make_shared<MockReader>(MockReader::ExceptionType::RUNTIME_ERROR);
+        ASSERT_THROW({ context.fillBuffer(runtimeErrorReader); }, CLuceneError);
 
         // Test case 3: Reader simulating memory allocation failure
-        MockReader largeDataReader;
-        largeDataReader.setReturnSize(std::numeric_limits<int32_t>::max() - 1);
+        auto largeDataReader = std::make_shared<MockReader>();
+        largeDataReader->setReturnSize(std::numeric_limits<int32_t>::max() - 1);
         try {
-            context.fillBuffer(&largeDataReader);
-            // If no exception is thrown, this is acceptable too
+            context.fillBuffer(largeDataReader);
         } catch (const CLuceneError& e) {
-            // Verify the exception is properly converted
             ASSERT_TRUE(std::string(e.what()).find("buffer filling") != std::string::npos);
         }
 
         // Test case 4: Reader returning empty data
-        MockReader emptyReader;
-        emptyReader.setReturnSize(0);
-        ASSERT_EQ(context.fillBuffer(&emptyReader), 0);
+        auto emptyReader = std::make_shared<MockReader>();
+        emptyReader->setReturnSize(0);
+        ASSERT_EQ(context.fillBuffer(emptyReader), 0);
     }
 }
 
