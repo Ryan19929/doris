@@ -22,9 +22,9 @@
 namespace doris::segment_v2::inverted_index {
 #include "common/compile_check_begin.h"
 
-void IKTokenizer::initialize(std::shared_ptr<segment_v2::Configuration> config, bool lowercase) {
+void IKTokenizer::initialize(std::shared_ptr<segment_v2::Configuration> config, bool lower) {
     _config = std::move(config);
-    _lowercase = lowercase;
+    _lowercase = lower;
     _ik_segmenter = std::make_unique<segment_v2::IKSegmenter>(_config);
 }
 

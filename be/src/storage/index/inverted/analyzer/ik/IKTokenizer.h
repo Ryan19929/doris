@@ -30,7 +30,7 @@ public:
     IKTokenizer() = default;
     ~IKTokenizer() override = default;
 
-    void initialize(std::shared_ptr<segment_v2::Configuration> config, bool lowercase);
+    void initialize(std::shared_ptr<segment_v2::Configuration> config, bool lower);
 
     Token* next(Token* token) override;
     void reset() override;
