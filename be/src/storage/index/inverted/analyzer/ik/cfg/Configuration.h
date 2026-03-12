@@ -21,11 +21,10 @@
 #include <vector>
 
 namespace doris::segment_v2 {
-// TODO(ryan19929): Optimize the design of the Configuration class, remove duplicate configurations (like mode and lowercase)
+
 class Configuration {
 private:
     bool use_smart_;
-    // TODO(ryan19929): delete config_->lower_case_, because it is always true(java version is same)
     bool enable_lowercase_;
     std::string dict_path_;
 
@@ -39,8 +38,8 @@ private:
     std::vector<std::string> ext_stop_word_dict_files_;
 
 public:
-    Configuration(bool use_smart = true, bool enable_lowercase_ = true)
-            : use_smart_(use_smart), enable_lowercase_(enable_lowercase_) {
+    Configuration(bool use_smart = true, bool enable_lowercase = true)
+            : use_smart_(use_smart), enable_lowercase_(enable_lowercase) {
         ext_dict_files_ = {"extra_main.dic", "extra_single_word.dic", "extra_single_word_full.dic",
                            "extra_single_word_low_freq.dic"};
 
