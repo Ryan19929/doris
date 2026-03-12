@@ -64,7 +64,7 @@ private:
     static const std::string PATH_DIC_QUANTIFIER;
     static const std::string PATH_DIC_STOP;
 
-    explicit Dictionary(const Configuration& cfg, bool use_ext_dict = false);
+    explicit Dictionary(const Configuration& cfg, bool use_ext_dict = true);
 
     void loadMainDict();
     void loadStopWordDict();
@@ -86,7 +86,7 @@ public:
     }
     ~Dictionary() {}
 
-    static void initial(const Configuration& cfg, bool useExtDict = false) {
+    static void initial(const Configuration& cfg, bool useExtDict = true) {
         getSingleton(cfg, useExtDict);
     }
 
@@ -103,7 +103,7 @@ public:
         return singleton_;
     }
 
-    static Dictionary* getSingleton(const Configuration& cfg, bool useExtDict = false) {
+    static Dictionary* getSingleton(const Configuration& cfg, bool useExtDict = true) {
         std::call_once(init_flag_, [&]() {
             try {
                 singleton_ = new Dictionary(cfg, useExtDict);
