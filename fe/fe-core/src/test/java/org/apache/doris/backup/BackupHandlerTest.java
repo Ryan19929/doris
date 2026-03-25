@@ -1067,6 +1067,519 @@ public class BackupHandlerTest {
         Assert.assertEquals(0, handler.getGlobalSnapshotTasks());
     }
 
+    // ========== Scheduling Rules: checkConcurrency Tests ==========
+
+    @Test
+    public void testCheckConcurrencyRejectsDuplicateLabel() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, Map<String, Long>> labelIdx = Deencapsulation.getField(h, "labelIndex");
+            Map<String, Long> labels = new java.util.concurrent.ConcurrentHashMap<>();
+            labels.put("dup_label", 100L);
+            labelIdx.put(dbId, labels);
+
+            boolean thrown = false;
+            try {
+                Deencapsulation.invoke(h, "checkConcurrency",
+                        dbId, "dup_label", true, false, Lists.newArrayList());
+            } catch (Exception e) {
+                thrown = true;
+                Assert.assertTrue(e.getMessage().contains("Label already exists"));
+            }
+            Assert.assertTrue("Should reject duplicate label", thrown);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCheckConcurrencyRejectsConcurrencyLimit() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        int saved = Config.max_backup_restore_concurrent_num_per_db;
+        Config.max_backup_restore_concurrent_num_per_db = 2;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.activeBackups = 1;
+            s.activeRestores = 1;
+            stats.put(dbId, s);
+
+            boolean thrown = false;
+            try {
+                Deencapsulation.invoke(h, "checkConcurrency",
+                        dbId, "new_label", true, false, Lists.newArrayList());
+            } catch (Exception e) {
+                thrown = true;
+                Assert.assertTrue(e.getMessage().contains("Concurrency limit reached"));
+            }
+            Assert.assertTrue("Should reject at concurrency limit", thrown);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+            Config.max_backup_restore_concurrent_num_per_db = saved;
+        }
+    }
+
+    @Test
+    public void testCheckConcurrencyRejectsBackupWhenFullDbBackupExists() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.backupDatabaseJobId = 1L;
+            s.backupDatabaseLabel = "full_backup";
+            stats.put(dbId, s);
+
+            boolean thrown = false;
+            try {
+                Deencapsulation.invoke(h, "checkConcurrency",
+                        dbId, "new_backup", true, false, Lists.newArrayList());
+            } catch (Exception e) {
+                thrown = true;
+                Assert.assertTrue(e.getMessage().contains("full database backup"));
+            }
+            Assert.assertTrue("Should reject backup when full-db backup exists", thrown);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCheckConcurrencyAllowsRestoreEvenWhenFullDbRestoreExists() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.restoreDatabaseJobId = 1L;
+            s.restoreDatabaseLabel = "full_restore";
+            stats.put(dbId, s);
+
+            // Should NOT throw — restore is queued via canActivate, not hard-rejected
+            Deencapsulation.invoke(h, "checkConcurrency",
+                    dbId, "new_restore", false, false, Lists.newArrayList());
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    // ========== Scheduling Rules: canActivate Tests ==========
+
+    @Test
+    public void testCanActivateBlockedByConcurrencyLimit() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        int saved = Config.max_backup_restore_concurrent_num_per_db;
+        Config.max_backup_restore_concurrent_num_per_db = 2;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.runningBackups = 2;
+            stats.put(dbId, s);
+
+            BackupJob job = new BackupJob("bk", dbId, "db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, true, false);
+            Assert.assertFalse("Should be blocked by concurrency limit", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+            Config.max_backup_restore_concurrent_num_per_db = saved;
+        }
+    }
+
+    @Test
+    public void testCanActivateBackupBlockedByRunningRestore() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.runningRestores = 1;
+            stats.put(dbId, s);
+
+            BackupJob job = new BackupJob("bk", dbId, "db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, true, false);
+            Assert.assertFalse("Backup should be blocked by running restore", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCanActivateRestoreBlockedByRunningBackup() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.runningBackups = 1;
+            stats.put(dbId, s);
+
+            RestoreJob job = new RestoreJob();
+            Deencapsulation.setField(job, "jobId", 1L);
+            Deencapsulation.setField(job, "dbId", dbId);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, false, false);
+            Assert.assertFalse("Restore should be blocked by running backup", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCanActivateFullDbBackupWaitsForRunningBackups() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.runningBackups = 1;
+            stats.put(dbId, s);
+
+            BackupJob job = new BackupJob("full_bk", dbId, "db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, true, true);
+            Assert.assertFalse("Full-db backup should wait for running backups", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCanActivateBackupBlockedByRunningFullDbBackup() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.runningBackupDatabaseJobId = 100L;
+            stats.put(dbId, s);
+
+            List<TableRefInfo> refs = Lists.newArrayList();
+            refs.add(new TableRefInfo(new TableNameInfo("t1"),
+                    null, null, null, null, null, null, null));
+            BackupJob job = new BackupJob("tbl_bk", dbId, "db",
+                    refs, 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, true, false);
+            Assert.assertFalse("Backup should be blocked by running full-db backup", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCanActivateRestoreBlockedByFullDbRestore() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            BackupHandler.DatabaseJobStats s = new BackupHandler.DatabaseJobStats();
+            s.restoreDatabaseJobId = 100L;
+            stats.put(dbId, s);
+
+            RestoreJob job = new RestoreJob();
+            Deencapsulation.setField(job, "jobId", 1L);
+            Deencapsulation.setField(job, "dbId", dbId);
+            List<TableRefInfo> refs = Lists.newArrayList();
+            refs.add(new TableRefInfo(new TableNameInfo("t1"),
+                    null, null, null, null, null, null, null));
+            job.setTableRefs(refs);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, false, false);
+            Assert.assertFalse("Restore should be blocked by running full-db restore", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCanActivateRestoreBlockedByTableConflict() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            stats.put(dbId, new BackupHandler.DatabaseJobStats());
+
+            Map<Long, Set<String>> restoring = Deencapsulation.getField(h, "restoringTables");
+            Set<String> tables = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            tables.add("conflict_table");
+            restoring.put(dbId, tables);
+
+            RestoreJob job = new RestoreJob();
+            Deencapsulation.setField(job, "jobId", 1L);
+            Deencapsulation.setField(job, "dbId", dbId);
+            List<TableRefInfo> refs = Lists.newArrayList();
+            refs.add(new TableRefInfo(new TableNameInfo("conflict_table"),
+                    null, null, null, null, null, null, null));
+            job.setTableRefs(refs);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, false, false);
+            Assert.assertFalse("Restore should be blocked by table conflict", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCanActivateRestoreAllowedWhenNoTableConflict() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            stats.put(dbId, new BackupHandler.DatabaseJobStats());
+
+            Map<Long, Set<String>> restoring = Deencapsulation.getField(h, "restoringTables");
+            Set<String> tables = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            tables.add("table_a");
+            restoring.put(dbId, tables);
+
+            RestoreJob job = new RestoreJob();
+            Deencapsulation.setField(job, "jobId", 1L);
+            Deencapsulation.setField(job, "dbId", dbId);
+            List<TableRefInfo> refs = Lists.newArrayList();
+            refs.add(new TableRefInfo(new TableNameInfo("table_b"),
+                    null, null, null, null, null, null, null));
+            job.setTableRefs(refs);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, false, false);
+            Assert.assertTrue("Restore should be allowed when no table conflict", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCanActivateAllClear() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            Map<Long, BackupHandler.DatabaseJobStats> stats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            stats.put(dbId, new BackupHandler.DatabaseJobStats());
+
+            BackupJob job = new BackupJob("bk", dbId, "db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+
+            boolean result = Deencapsulation.invoke(h, "canActivate",
+                    dbId, (AbstractJob) job, true, false);
+            Assert.assertTrue("Should activate when all clear", result);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    // ========== CANCEL with Label Filter Tests ==========
+
+    @Test
+    public void testCancelAllJobsInConcurrencyMode() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = db.getId();
+
+        try {
+            for (int i = 0; i < 3; i++) {
+                BackupJob job = new BackupJob("backup_" + i, dbId, CatalogMocker.TEST_DB_NAME,
+                        Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+                Deencapsulation.setField(job, "jobId", (long) (i + 1));
+                Deencapsulation.setField(job, "state", BackupJob.BackupJobState.SNAPSHOTING);
+                Deencapsulation.invoke(h, "addActiveJob", dbId, job);
+            }
+
+            h.cancel(new CancelBackupCommand(CatalogMocker.TEST_DB_NAME, false));
+
+            List<AbstractJob> jobs = Deencapsulation.invoke(h, "getAllRunningJobs");
+            for (AbstractJob job : jobs) {
+                if (job instanceof BackupJob) {
+                    Assert.assertTrue("All backup jobs should be done", job.isDone());
+                }
+            }
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testCancelWithLabelFilterOnlyCancelsMatchingJob() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = db.getId();
+
+        try {
+            BackupJob target = new BackupJob("target_job", dbId, CatalogMocker.TEST_DB_NAME,
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+            Deencapsulation.setField(target, "jobId", 1L);
+            Deencapsulation.setField(target, "state", BackupJob.BackupJobState.SNAPSHOTING);
+
+            BackupJob other = new BackupJob("other_job", dbId, CatalogMocker.TEST_DB_NAME,
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+            Deencapsulation.setField(other, "jobId", 2L);
+            Deencapsulation.setField(other, "state", BackupJob.BackupJobState.SNAPSHOTING);
+
+            Deencapsulation.invoke(h, "addActiveJob", dbId, target);
+            Deencapsulation.invoke(h, "addActiveJob", dbId, other);
+
+            h.cancel(new CancelBackupCommand(CatalogMocker.TEST_DB_NAME, false, "target_job", false));
+
+            Assert.assertTrue("target_job should be cancelled", target.isDone());
+            Assert.assertFalse("other_job should NOT be cancelled", other.isDone());
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    // ========== FE Restart Rebuild Completeness Tests ==========
+
+    @Test
+    public void testRebuildConcurrencyStateRebuildsLabelIndex() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            BackupJob job = new BackupJob("test_label", dbId, "test_db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+            Deencapsulation.setField(job, "jobId", 1L);
+            Deencapsulation.setField(job, "state", BackupJob.BackupJobState.SNAPSHOTING);
+
+            java.util.Deque<AbstractJob> deque = new java.util.LinkedList<>();
+            deque.add(job);
+            Map<Long, java.util.Deque<AbstractJob>> legacy =
+                    Deencapsulation.getField(h, "dbIdToBackupOrRestoreJobs");
+            legacy.put(dbId, deque);
+
+            Deencapsulation.invoke(h, "rebuildConcurrencyStateAfterRestart");
+
+            Map<Long, Map<String, Long>> labelIdx = Deencapsulation.getField(h, "labelIndex");
+            Assert.assertTrue("labelIndex should contain the job label",
+                    labelIdx.containsKey(dbId) && labelIdx.get(dbId).containsKey("test_label"));
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testRebuildConcurrencyStateRebuildsDbJobStats() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            BackupJob bJob = new BackupJob("backup1", dbId, "test_db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+            Deencapsulation.setField(bJob, "jobId", 1L);
+            Deencapsulation.setField(bJob, "state", BackupJob.BackupJobState.SNAPSHOTING);
+
+            RestoreJob rJob = new RestoreJob();
+            Deencapsulation.setField(rJob, "jobId", 2L);
+            Deencapsulation.setField(rJob, "dbId", dbId);
+            Deencapsulation.setField(rJob, "label", "restore1");
+            Deencapsulation.setField(rJob, "state", RestoreJob.RestoreJobState.SNAPSHOTING);
+
+            java.util.Deque<AbstractJob> deque = new java.util.LinkedList<>();
+            deque.add(bJob);
+            deque.add(rJob);
+            Map<Long, java.util.Deque<AbstractJob>> legacy =
+                    Deencapsulation.getField(h, "dbIdToBackupOrRestoreJobs");
+            legacy.put(dbId, deque);
+
+            Deencapsulation.invoke(h, "rebuildConcurrencyStateAfterRestart");
+
+            Map<Long, BackupHandler.DatabaseJobStats> dbStats =
+                    Deencapsulation.getField(h, "dbJobStats");
+            Assert.assertTrue("dbJobStats should contain the database", dbStats.containsKey(dbId));
+            BackupHandler.DatabaseJobStats s = dbStats.get(dbId);
+            Assert.assertEquals("Should have 1 active backup", 1, s.activeBackups);
+            Assert.assertEquals("Should have 1 active restore", 1, s.activeRestores);
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testRebuildConcurrencyStateRebuildsAllowedJobIds() throws Exception {
+        Config.enable_table_level_backup_concurrency = true;
+        BackupHandler h = new BackupHandler(env);
+        long dbId = 1L;
+
+        try {
+            BackupJob running = new BackupJob("running", dbId, "test_db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+            Deencapsulation.setField(running, "jobId", 1L);
+            Deencapsulation.setField(running, "state", BackupJob.BackupJobState.SNAPSHOTING);
+
+            BackupJob pending = new BackupJob("pending", dbId, "test_db",
+                    Lists.newArrayList(), 3600000L, BackupCommand.BackupContent.ALL, env, 0L, 0L);
+            Deencapsulation.setField(pending, "jobId", 2L);
+            Deencapsulation.setField(pending, "state", BackupJob.BackupJobState.PENDING);
+
+            java.util.Deque<AbstractJob> deque = new java.util.LinkedList<>();
+            deque.add(running);
+            deque.add(pending);
+            Map<Long, java.util.Deque<AbstractJob>> legacy =
+                    Deencapsulation.getField(h, "dbIdToBackupOrRestoreJobs");
+            legacy.put(dbId, deque);
+
+            Deencapsulation.invoke(h, "rebuildConcurrencyStateAfterRestart");
+
+            Set<Long> allowed = Deencapsulation.getField(h, "allowedJobIds");
+            Assert.assertTrue("Running job should be in allowedJobIds", allowed.contains(1L));
+        } finally {
+            Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
     /**
      * Test rebuildConcurrencyStateAfterRestart correctly sums globalSnapshotTasks
      * from all active running jobs.

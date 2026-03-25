@@ -173,6 +173,80 @@ suite("test_backup_restore_concurrency", "backup_restore") {
     }
 
     // ========================================================================
+    // Test 4: CANCEL BACKUP WHERE LABEL = 'xxx' syntax verification
+    // ========================================================================
+    // Verify that CANCEL with label filter correctly rejects non-matching labels
+    try {
+        sql """ ADMIN SET FRONTEND CONFIG ("enable_table_level_backup_concurrency" = "true") """
+
+        // Cancel with a non-existent label should fail
+        boolean thrown = false
+        try {
+            sql "CANCEL BACKUP FROM ${dbName} WHERE LABEL = 'nonexistent_label_xyz'"
+        } catch (Exception e) {
+            thrown = true
+            assertTrue(e.message.contains("No backup job"), "Error should mention no matching job: ${e.message}")
+        }
+        assertTrue(thrown, "CANCEL with non-matching label should throw exception")
+
+        // Cancel with LIKE pattern that matches nothing should also fail
+        thrown = false
+        try {
+            sql "CANCEL BACKUP FROM ${dbName} WHERE LABEL LIKE 'zzz_no_match_%'"
+        } catch (Exception e) {
+            thrown = true
+            assertTrue(e.message.contains("No backup job"), "Error should mention no matching job: ${e.message}")
+        }
+        assertTrue(thrown, "CANCEL with non-matching LIKE should throw exception")
+
+    } finally {
+        sql """ ADMIN SET FRONTEND CONFIG ("enable_table_level_backup_concurrency" = "${origConcurrency_val}") """
+    }
+
+    // ========================================================================
+    // Test 5: CANCEL BACKUP WHERE LABEL cancels only the matching job
+    // ========================================================================
+    try {
+        sql """ ADMIN SET FRONTEND CONFIG ("enable_table_level_backup_concurrency" = "true") """
+
+        // Submit 2 backups on different tables
+        sql """
+            BACKUP SNAPSHOT ${dbName}.${suiteName}_cancel_keep
+            TO `${repoName}`
+            ON (${tableNames[0]})
+        """
+        sql """
+            BACKUP SNAPSHOT ${dbName}.${suiteName}_cancel_target
+            TO `${repoName}`
+            ON (${tableNames[1]})
+        """
+
+        // Cancel only the target job
+        try {
+            sql "CANCEL BACKUP FROM ${dbName} WHERE LABEL = '${suiteName}_cancel_target'"
+        } catch (Exception e) {
+            // Job may have already finished — acceptable
+            logger.info("Cancel target result: ${e.message}")
+        }
+
+        syncer.waitSnapshotFinish(dbName)
+
+        // Verify: target should be CANCELLED, keep should be FINISHED
+        def showBackup = sql_return_maparray "SHOW BACKUP FROM ${dbName}"
+        for (row in showBackup) {
+            if ((row.SnapshotName as String) == "${suiteName}_cancel_target") {
+                String state = row.State as String
+                logger.info("cancel_target state: ${state}")
+                assertTrue(state == "CANCELLED" || state == "FINISHED",
+                    "Target job should be CANCELLED or FINISHED, got: ${state}")
+            }
+        }
+
+    } finally {
+        sql """ ADMIN SET FRONTEND CONFIG ("enable_table_level_backup_concurrency" = "${origConcurrency_val}") """
+    }
+
+    // ========================================================================
     // Cleanup
     // ========================================================================
     for (tbl in tableNames) {

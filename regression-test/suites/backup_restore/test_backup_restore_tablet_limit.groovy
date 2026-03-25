@@ -160,6 +160,36 @@ suite("test_backup_restore_tablet_limit", "backup_restore") {
     result = sql "SELECT * FROM ${dbName}.${tableName}"
     assertEquals(result.size(), values.size())
 
+    // ========== Test 5: restore per-job tablet limit rejects restore ==========
+    // Use the snapshot from Test 4 to test restore rejection
+    try {
+        sql """ ADMIN SET FRONTEND CONFIG ("max_backup_tablets_per_job" = "0") """
+
+        sql "TRUNCATE TABLE ${dbName}.${tableName}"
+
+        sql """
+            RESTORE SNAPSHOT ${dbName}.${normalSnapshot}
+            FROM `${repoName}`
+            ON ( `${tableName}`)
+            PROPERTIES
+            (
+                "backup_timestamp" = "${snapshot}",
+                "reserve_replica" = "true"
+            )
+        """
+
+        syncer.waitAllRestoreFinish(dbName)
+
+        def showRestore = sql "SHOW RESTORE FROM ${dbName}"
+        logger.info("SHOW RESTORE after per-job limit: ${showRestore}")
+        assertTrue(showRestore.size() > 0)
+        def lastRestore = showRestore[showRestore.size() - 1]
+        assertEquals("CANCELLED", lastRestore[4] as String)
+        assertTrue((lastRestore[16] as String).contains("exceeds the limit"))
+    } finally {
+        sql """ ADMIN SET FRONTEND CONFIG ("max_backup_tablets_per_job" = "${origMaxTablets_val}") """
+    }
+
     sql "DROP TABLE ${dbName}.${tableName} FORCE"
     sql "DROP DATABASE ${dbName} FORCE"
     sql "DROP REPOSITORY `${repoName}`"
