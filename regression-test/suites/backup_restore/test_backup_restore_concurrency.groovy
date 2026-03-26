@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_backup_restore_concurrency", "backup_restore") {
+suite("test_backup_restore_concurrency", "backup_restore,nonConcurrent") {
     String suiteName = "test_backup_restore_concurrency"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbName = "${suiteName}_db"
