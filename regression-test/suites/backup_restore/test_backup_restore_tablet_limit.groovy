@@ -185,7 +185,7 @@ suite("test_backup_restore_tablet_limit", "backup_restore,nonConcurrent") {
         assertTrue(showRestore.size() > 0)
         def lastRestore = showRestore[showRestore.size() - 1]
         assertEquals("CANCELLED", lastRestore[4] as String)
-        assertTrue((lastRestore[16] as String).contains("exceeds the limit"))
+        assertTrue((lastRestore[19] as String).contains("exceeds the limit"))
     } finally {
         sql """ ADMIN SET FRONTEND CONFIG ("max_backup_tablets_per_job" = "${origMaxTablets_val}") """
     }
