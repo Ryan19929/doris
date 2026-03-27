@@ -163,6 +163,10 @@ public class RestoreJobTest {
                 Env.getCurrentSystemInfo();
                 minTimes = 0;
                 result = systemInfoService;
+
+                env.getBackupHandler();
+                minTimes = 0;
+                result = backupHandler;
             }
         };
 
@@ -370,5 +374,54 @@ public class RestoreJobTest {
 
         in.close();
         Files.delete(path);
+    }
+
+    @Test
+    public void testSetAndGetTableRefs() {
+        Assert.assertNotNull(job.getTableRefs());
+        Assert.assertTrue(job.getTableRefs().isEmpty());
+
+        List<org.apache.doris.info.TableRefInfo> refs = Lists.newArrayList();
+        refs.add(new org.apache.doris.info.TableRefInfo(
+                new org.apache.doris.info.TableNameInfo("test_tbl"),
+                null, null, null, null, null, null, null));
+        job.setTableRefs(refs);
+
+        Assert.assertEquals(1, job.getTableRefs().size());
+        Assert.assertEquals("test_tbl", job.getTableRefs().get(0).getTableNameInfo().getTbl());
+    }
+
+    @Test
+    public void testGetInfoQueuePosBlockReasonDisabled() {
+        org.apache.doris.common.Config.enable_table_level_backup_concurrency = false;
+
+        List<String> info = job.getFullInfo();
+        Assert.assertTrue(info.size() >= 23);
+        Assert.assertEquals("", info.get(info.size() - 2));
+        Assert.assertEquals("", info.get(info.size() - 1));
+    }
+
+    @Test
+    public void testGetInfoQueuePosBlockReasonEnabled() {
+        org.apache.doris.common.Config.enable_table_level_backup_concurrency = true;
+
+        try {
+            List<String> info = job.getFullInfo();
+            Assert.assertTrue(info.size() >= 23);
+            String queuePos = info.get(info.size() - 2);
+            Assert.assertNotNull(queuePos);
+        } finally {
+            org.apache.doris.common.Config.enable_table_level_backup_concurrency = false;
+        }
+    }
+
+    @Test
+    public void testGetInfoBriefQueuePosBlockReason() {
+        org.apache.doris.common.Config.enable_table_level_backup_concurrency = false;
+
+        List<String> info = job.getBriefInfo();
+        Assert.assertTrue(info.size() >= 20);
+        Assert.assertEquals("", info.get(info.size() - 2));
+        Assert.assertEquals("", info.get(info.size() - 1));
     }
 }

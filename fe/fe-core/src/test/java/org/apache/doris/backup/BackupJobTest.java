@@ -833,4 +833,20 @@ public class BackupJobTest {
             backupHandler.addGlobalSnapshotTasks(-backupHandler.getGlobalSnapshotTasks());
         }
     }
+
+    @Test
+    public void testExecutionGateBlocksInConcurrentMode() {
+        boolean savedConcurrency = Config.enable_table_level_backup_concurrency;
+        Config.enable_table_level_backup_concurrency = true;
+        try {
+            AgentTaskQueue.clearAllTasks();
+            // Do NOT call allowJobExecution, so job is not in allowedJobIds
+            Deencapsulation.setField(job, "jobId", id.getAndIncrement());
+            job.run();
+            // Job should stay PENDING because it lacks execution permission
+            Assert.assertEquals(BackupJobState.PENDING, job.getState());
+        } finally {
+            Config.enable_table_level_backup_concurrency = savedConcurrency;
+        }
+    }
 }
