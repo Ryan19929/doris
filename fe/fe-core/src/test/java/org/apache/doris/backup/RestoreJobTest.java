@@ -163,10 +163,6 @@ public class RestoreJobTest {
                 Env.getCurrentSystemInfo();
                 minTimes = 0;
                 result = systemInfoService;
-
-                env.getBackupHandler();
-                minTimes = 0;
-                result = backupHandler;
             }
         };
 
@@ -404,6 +400,13 @@ public class RestoreJobTest {
     @Test
     public void testGetInfoQueuePosBlockReasonEnabled() {
         org.apache.doris.common.Config.enable_table_level_backup_concurrency = true;
+
+        new MockUp<Env>() {
+            @Mock
+            public BackupHandler getBackupHandler() {
+                return backupHandler;
+            }
+        };
 
         try {
             List<String> info = job.getFullInfo();
