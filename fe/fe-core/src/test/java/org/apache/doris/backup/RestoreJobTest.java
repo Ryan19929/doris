@@ -40,6 +40,7 @@ import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MarkedCountDownLatch;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
@@ -172,18 +173,21 @@ public class RestoreJobTest {
         new Expectations() {
             {
                 systemInfoService.selectBackendIdsForReplicaCreation((ReplicaAllocation) any,
-                        Maps.newHashMap(), (TStorageMedium) any, MediumAllocationMode.ADAPTIVE, true);
+                        (Map<Tag, Integer>) any, (TStorageMedium) any, (MediumAllocationMode) any, anyBoolean);
                 minTimes = 0;
                 result = new Delegate() {
-                    public synchronized List<Long> selectBackendIdsForReplicaCreation(
+                    public synchronized Pair<Map<Tag, List<Long>>, TStorageMedium>
+                            selectBackendIdsForReplicaCreation(
                             ReplicaAllocation replicaAlloc, Map<Tag, Integer> nextIndexs,
                             TStorageMedium medium, MediumAllocationMode mediumAllocationMode,
                             boolean isOnlyForCheck) {
-                        List<Long> beIds = Lists.newArrayList();
-                        beIds.add(CatalogMocker.BACKEND1_ID);
-                        beIds.add(CatalogMocker.BACKEND2_ID);
-                        beIds.add(CatalogMocker.BACKEND3_ID);
-                        return beIds;
+                        Map<Tag, List<Long>> beIds = Maps.newHashMap();
+                        List<Long> ids = Lists.newArrayList();
+                        ids.add(CatalogMocker.BACKEND1_ID);
+                        ids.add(CatalogMocker.BACKEND2_ID);
+                        ids.add(CatalogMocker.BACKEND3_ID);
+                        beIds.put(Tag.DEFAULT_BACKEND_TAG, ids);
+                        return Pair.of(beIds, medium != null ? medium : TStorageMedium.HDD);
                     }
                 };
             }

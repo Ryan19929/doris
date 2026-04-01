@@ -973,6 +973,7 @@ public class CreateTableTest extends TestWithFeService {
                         + "distributed by hash(k1) buckets 1\n", true));
     }
 
+    @org.junit.jupiter.api.Disabled("Property key trim is not supported in 3.1 branch")
     @Test
     public void testCreateTableTrimPropertyKey() throws Exception {
         String sql = "create table test.tbl_trim_property_key\n"
@@ -1019,6 +1020,7 @@ public class CreateTableTest extends TestWithFeService {
                         + ");"));
     }
 
+    @org.junit.jupiter.api.Disabled("Property key trim is not supported in 3.1 branch")
     @Test
     public void testCreateTableTrimPropertyKeyWithNereids() throws Exception {
         String sql = "create table test.tbl_trim_property_key_with_nereids\n"
@@ -1065,6 +1067,7 @@ public class CreateTableTest extends TestWithFeService {
                         + ");", true));
     }
 
+    @org.junit.jupiter.api.Disabled("sequence_mapping is not supported in 3.1 branch")
     @Test
     public void testCreateTableOfSequenceMapping() throws Exception {
         ExceptionChecker.expectThrowsWithMsg(DdlException.class, "sequence mapping do not support merge on write",
