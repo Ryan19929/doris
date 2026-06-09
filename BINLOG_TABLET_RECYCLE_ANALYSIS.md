@@ -101,6 +101,41 @@ tablet 均衡创建新副本时，BE clone 流程会主动携带 `_binlog`。
 
 迁移完成后，新 tablet 路径会拥有对应数据文件、binlog 文件和 meta。旧 tablet 路径如果没有对应有效 tablet meta，会被路径 GC 检测到并移动到 trash。相关兜底逻辑在 `TabletManager::try_delete_unused_tablet_path()`：当路径存在但 meta 不存在或不匹配时，将整个 schema hash 目录移动到 trash。
 
+## 完整迁移时序
+
+一次完整的 tablet 迁移可以拆成“复制目标”和“处理源端”两段。
+
+跨 BE 均衡/clone 的典型时序是：
+
+1. FE 选择目标 BE 创建新副本。
+2. 目标 BE 向源 BE 请求 snapshot，请求中带 `is_copy_binlog=true`。
+3. 源 BE snapshot 同时包含普通 rowset 文件、binlog 文件和 `rowset_binlog_metas.pb`。
+4. 目标 BE 下载 snapshot。
+5. 目标 BE 将普通 rowset 文件接入目标 tablet。
+6. 目标 BE 创建自己的 `_binlog`，把下载到的 `.binlog`/`.binlog-index` 文件转换为 `_binlog` 下的 `.dat`/`.idx` 文件，并导入 binlog meta。
+7. 目标副本 clone 成功后，FE 将其纳入副本集合。
+8. 如果本次均衡需要减少源端副本，FE 后续下发 drop tablet 到源 BE。
+9. 源 BE 将源 tablet 置为 `TABLET_SHUTDOWN`，再由 trash sweep 将整个源 tablet 目录移入 trash 或直接删除。
+
+本机 storage migration 的时序类似，但复制发生在同一个 BE 的不同 data dir 之间：
+
+1. BE 在目标 data dir 创建新的 tablet 路径。
+2. 复制普通 rowset 文件。
+3. 复制 `_binlog` 文件并保存 `rowset_binlog_metas.pb`。
+4. 生成并保存新 tablet meta。
+5. 新路径接管 tablet。
+6. 旧路径如果不再对应有效 tablet meta，会由 path GC 或 tablet trash 流程移动到 trash 或删除。
+
+因此，迁移后源端 `_binlog` 的回收方式取决于源 tablet 是否仍然存活：
+
+| 源端状态 | 源端 `_binlog` 回收方式 |
+| --- | --- |
+| 源 tablet 仍是有效副本 | 继续作为该副本的 binlog 保留，按正常 binlog GC 过期 |
+| 源 tablet 被均衡删除 | 随源 tablet 目录进入 trash 或直接删除，不再等待 binlog TTL |
+| 本机迁移旧路径已无有效 tablet meta | 由 path GC/tablet trash 回收整个旧路径，不按 binlog TTL 单独判断 |
+
+也就是说，迁移会把 `_binlog` 带到目标端；但源端 `_binlog` 不是永远只能等 binlog 过期。只有源 tablet 仍然活着时，它才按 binlog GC 规则保留；源 tablet 一旦被删除或旧路径失效，`_binlog` 就跟随 tablet 目录回收。
+
 ## tablet 删除和表删除
 
 tablet 删除不是直接 `rm -rf` tablet 目录，而是分阶段完成。
