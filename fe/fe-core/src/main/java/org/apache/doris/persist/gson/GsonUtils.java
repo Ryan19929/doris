@@ -213,8 +213,8 @@ import org.apache.doris.mtmv.MTMVSnapshotIf;
 import org.apache.doris.mtmv.MTMVTimestampSnapshot;
 import org.apache.doris.mtmv.MTMVVersionSnapshot;
 import org.apache.doris.persist.gson.GsonUtilsBase.AtomicBooleanAdapter;
-import org.apache.doris.persist.gson.GsonUtilsBase.GuavaMultimapAdapter;
-import org.apache.doris.persist.gson.GsonUtilsBase.GuavaTableAdapter;
+import org.apache.doris.persist.gson.GsonUtilsBase.GuavaMultimapTypeAdapterFactory;
+import org.apache.doris.persist.gson.GsonUtilsBase.GuavaTableTypeAdapterFactory;
 import org.apache.doris.persist.gson.GsonUtilsBase.HiddenAnnotationExclusionStrategy;
 import org.apache.doris.persist.gson.GsonUtilsBase.ImmutableListDeserializer;
 import org.apache.doris.persist.gson.GsonUtilsBase.ImmutableMapDeserializer;
@@ -232,9 +232,7 @@ import org.apache.doris.transaction.TxnCommitAttachment;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Multimap;
 import com.google.common.collect.Range;
-import com.google.common.collect.Table;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.ReflectionAccessFilter;
@@ -254,8 +252,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * For inherited class serialization, see "org.apache.doris.common.util.GsonDerivedClassSerializationTest.java"
  *
  * And developers may need to add other serialization adapters for custom complex java classes.
- * You need implement a class to implements JsonSerializer and JsonDeserializer, and register it to GSON_BUILDER.
- * See the following "GuavaTableAdapter" and "GuavaMultimapAdapter" for example.
+ * You need implement a class to implements TypeAdapterFactory (preferred, streaming mode) or
+ * JsonSerializer/JsonDeserializer (tree mode, may cause large transient memory for big objects),
+ * and register it to GSON_BUILDER.
+ * See "GuavaTableTypeAdapterFactory" and "GuavaMultimapTypeAdapterFactory" in GsonUtilsBase for example.
  */
 public class GsonUtils {
 
@@ -615,8 +615,8 @@ public class GsonUtils {
             .serializeSpecialFloatingPointValues()
             .enableComplexMapKeySerialization()
             .addReflectionAccessFilter(ReflectionAccessFilter.BLOCK_INACCESSIBLE_JAVA)
-            .registerTypeHierarchyAdapter(Table.class, new GuavaTableAdapter<>())
-            .registerTypeHierarchyAdapter(Multimap.class, new GuavaMultimapAdapter<>())
+            .registerTypeAdapterFactory(new GuavaTableTypeAdapterFactory())
+            .registerTypeAdapterFactory(new GuavaMultimapTypeAdapterFactory())
             .registerTypeAdapterFactory(new PostProcessTypeAdapterFactory())
             .registerTypeAdapterFactory(new PreProcessTypeAdapterFactory())
             .registerTypeAdapter(ImmutableMap.class, new ImmutableMapDeserializer())

@@ -75,8 +75,8 @@ import org.apache.doris.catalog.StructType;
 import org.apache.doris.catalog.TemplateType;
 import org.apache.doris.catalog.VariantType;
 import org.apache.doris.persist.gson.GsonUtilsBase.AtomicBooleanAdapter;
-import org.apache.doris.persist.gson.GsonUtilsBase.GuavaMultimapAdapter;
-import org.apache.doris.persist.gson.GsonUtilsBase.GuavaTableAdapter;
+import org.apache.doris.persist.gson.GsonUtilsBase.GuavaMultimapTypeAdapterFactory;
+import org.apache.doris.persist.gson.GsonUtilsBase.GuavaTableTypeAdapterFactory;
 import org.apache.doris.persist.gson.GsonUtilsBase.HiddenAnnotationExclusionStrategy;
 import org.apache.doris.persist.gson.GsonUtilsBase.ImmutableListDeserializer;
 import org.apache.doris.persist.gson.GsonUtilsBase.ImmutableMapDeserializer;
@@ -86,8 +86,6 @@ import org.apache.doris.persist.gson.GsonUtilsBase.SkipClassExclusionStrategy;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Multimap;
-import com.google.common.collect.Table;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.ReflectionAccessFilter;
@@ -174,8 +172,8 @@ public class GsonUtilsCatalog {
             .serializeSpecialFloatingPointValues()
             .enableComplexMapKeySerialization()
             .addReflectionAccessFilter(ReflectionAccessFilter.BLOCK_INACCESSIBLE_JAVA)
-            .registerTypeHierarchyAdapter(Table.class, new GuavaTableAdapter<>())
-            .registerTypeHierarchyAdapter(Multimap.class, new GuavaMultimapAdapter<>())
+            .registerTypeAdapterFactory(new GuavaTableTypeAdapterFactory())
+            .registerTypeAdapterFactory(new GuavaMultimapTypeAdapterFactory())
             .registerTypeAdapterFactory(new PostProcessTypeAdapterFactory())
             .registerTypeAdapterFactory(new PreProcessTypeAdapterFactory())
             .registerTypeAdapter(ImmutableMap.class, new ImmutableMapDeserializer())
