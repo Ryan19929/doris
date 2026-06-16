@@ -557,6 +557,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
         BackupJob backupJob = new BackupJob(command.getLabel(), db.getId(),
                 db.getFullName(),
                 tableRefInfoList, command.getTimeoutMs(), command.getContent(), env, repoId, commitSeq);
+        backupJob.setJobStreamingJson(command.getJobStreamingJson());
         // write log
         env.getEditLog().logBackupJob(backupJob);
 
@@ -636,6 +637,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
                     command.isForceReplace(), env, repository.getId());
             }
         }
+        restoreJob.setJobStreamingJson(command.getJobStreamingJson());
 
         env.getEditLog().logRestoreJob(restoreJob);
 

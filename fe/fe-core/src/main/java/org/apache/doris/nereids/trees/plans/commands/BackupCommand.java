@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.StmtType;
+import org.apache.doris.backup.AbstractJob;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
@@ -69,6 +70,7 @@ public class BackupCommand extends Command implements ForwardWithSync {
 
     private BackupType type = BackupType.FULL;
     private BackupContent content = BackupContent.ALL;
+    private Boolean jobStreamingJson = null;
 
     private final LabelNameInfo labelNameInfo;
     private final String repoName;
@@ -216,10 +218,30 @@ public class BackupCommand extends Command implements ForwardWithSync {
             copiedProperties.remove(PROP_CONTENT);
         }
 
+        jobStreamingJson = eatOptionalBooleanProperty(copiedProperties, AbstractJob.PROP_JOB_STREAMING_JSON);
+
         if (!copiedProperties.isEmpty()) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
                     "Unknown backup job properties: " + copiedProperties.keySet());
         }
+    }
+
+    private Boolean eatOptionalBooleanProperty(Map<String, String> copiedProperties, String name)
+            throws AnalysisException {
+        String value = copiedProperties.get(name);
+        if (value == null) {
+            return null;
+        }
+        copiedProperties.remove(name);
+        if (value.equalsIgnoreCase("default")) {
+            return null;
+        }
+        if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false")) {
+            return Boolean.valueOf(value);
+        }
+        ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
+                "Invalid boolean property " + name + " value: " + value);
+        return null;
     }
 
     public List<TableRefInfo> getTableRefInfos() {
@@ -244,6 +266,10 @@ public class BackupCommand extends Command implements ForwardWithSync {
 
     public BackupContent getContent() {
         return content;
+    }
+
+    public Boolean getJobStreamingJson() {
+        return jobStreamingJson;
     }
 
     public String getLabel() {

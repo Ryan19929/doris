@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.commands;
 
 import org.apache.doris.analysis.StmtType;
+import org.apache.doris.backup.AbstractJob;
 import org.apache.doris.backup.BackupJobInfo;
 import org.apache.doris.backup.BackupMeta;
 import org.apache.doris.backup.Repository;
@@ -88,6 +89,7 @@ public class RestoreCommand extends Command implements ForwardWithSync {
     private boolean isCleanPartitions = false;
     private boolean isAtomicRestore = false;
     private boolean isForceReplace = false;
+    private Boolean jobStreamingJson = null;
 
     private final LabelNameInfo labelNameInfo;
     private final String repoName;
@@ -307,6 +309,8 @@ public class RestoreCommand extends Command implements ForwardWithSync {
         // is force replace
         isForceReplace = eatBooleanProperty(copiedProperties, PROP_FORCE_REPLACE, isForceReplace);
 
+        jobStreamingJson = eatOptionalBooleanProperty(copiedProperties, AbstractJob.PROP_JOB_STREAMING_JSON);
+
         if (!copiedProperties.isEmpty()) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
                     "Unknown restore job properties: " + copiedProperties.keySet());
@@ -329,6 +333,24 @@ public class RestoreCommand extends Command implements ForwardWithSync {
             copiedProperties.remove(name);
         }
         return retval;
+    }
+
+    private Boolean eatOptionalBooleanProperty(Map<String, String> copiedProperties, String name)
+            throws AnalysisException {
+        String value = copiedProperties.get(name);
+        if (value == null) {
+            return null;
+        }
+        copiedProperties.remove(name);
+        if (value.equalsIgnoreCase("default")) {
+            return null;
+        }
+        if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false")) {
+            return Boolean.valueOf(value);
+        }
+        ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
+                "Invalid boolean property " + name + " value: " + value);
+        return null;
     }
 
     public List<TableRefInfo> getTableRefInfos() {
@@ -405,6 +427,10 @@ public class RestoreCommand extends Command implements ForwardWithSync {
 
     public boolean isForceReplace() {
         return isForceReplace;
+    }
+
+    public Boolean getJobStreamingJson() {
+        return jobStreamingJson;
     }
 
     public boolean isLocal() {

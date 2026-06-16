@@ -26,15 +26,20 @@ import com.google.gson.JsonParseException;
 import com.google.gson.JsonPrimitive;
 import com.google.gson.TypeAdapter;
 import com.google.gson.TypeAdapterFactory;
+import com.google.gson.internal.JsonReaderInternalAccess;
 import com.google.gson.internal.Streams;
 import com.google.gson.reflect.TypeToken;
 import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 import com.google.gson.stream.JsonWriter;
 
 import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
 import java.lang.reflect.Modifier;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 /**
  * Adapts values whose runtime type may differ from their declaration type. This
@@ -186,6 +191,7 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
 
     private final boolean maintainType;
     private Class<? extends T> defaultType = null;
+    private BooleanSupplier streamingDispatchEnabled = () -> false;
 
     private RuntimeTypeAdapterFactory(Class<?> baseType, String typeFieldName, boolean maintainType) {
         if (typeFieldName == null || baseType == null) {
@@ -255,6 +261,27 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
     }
 
     /**
+     * Enables streaming dispatch. Only valid for factories without
+     * {@code maintainType} and without a default subtype, where the type field
+     * is guaranteed to be the first json field.
+     */
+    public RuntimeTypeAdapterFactory<T> withStreamingDispatch() {
+        return withStreamingDispatch(() -> true);
+    }
+
+    public RuntimeTypeAdapterFactory<T> withStreamingDispatch(BooleanSupplier streamingDispatchEnabled) {
+        if (streamingDispatchEnabled == null) {
+            throw new NullPointerException();
+        }
+        if (maintainType) {
+            throw new IllegalStateException("streaming dispatch does not support maintainType");
+        }
+        EnteredObjectJsonReader.ensureInternalAccessHookInstalled();
+        this.streamingDispatchEnabled = streamingDispatchEnabled;
+        return this;
+    }
+
+    /**
      * Registers {@code type} for using when label not found
      */
     public RuntimeTypeAdapterFactory<T> registerDefaultSubtype(Class<? extends T> type) {
@@ -303,6 +330,10 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         return new TypeAdapter<R>() {
             @Override
             public R read(JsonReader in) throws IOException {
+                if (streamingDispatchEnabled.getAsBoolean() && defaultDelegate == null
+                        && in.peek() == JsonToken.BEGIN_OBJECT) {
+                    return readStreaming(in);
+                }
                 JsonElement jsonElement = Streams.parse(in);
                 JsonElement labelJsonElement;
                 if (maintainType) {
@@ -330,6 +361,27 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
                 return delegate.fromJsonTree(jsonElement);
             }
 
+            private R readStreaming(JsonReader in) throws IOException {
+                in.beginObject();
+                if (!in.hasNext()) {
+                    throw new JsonParseException("cannot deserialize " + baseType
+                            + " because it does not define a field named " + typeFieldName);
+                }
+                String firstName = in.nextName();
+                if (!typeFieldName.equals(firstName)) {
+                    throw new JsonParseException("cannot deserialize " + baseType + " in streaming mode because"
+                            + " the first field is '" + firstName + "' instead of '" + typeFieldName + "'");
+                }
+                String label = in.nextString();
+                @SuppressWarnings("unchecked") // registration requires that subtype extends T
+                TypeAdapter<R> delegate = (TypeAdapter<R>) labelToDelegate.get(label);
+                if (delegate == null) {
+                    throw new JsonParseException("cannot deserialize " + baseType + " subtype named " + label
+                            + "; did you forget to register a subtype?");
+                }
+                return delegate.read(new EnteredObjectJsonReader(in));
+            }
+
             @Override
             public void write(JsonWriter out, R value) throws IOException {
                 Class<?> srcType = value.getClass();
@@ -339,6 +391,10 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
                 if (delegate == null) {
                     throw new JsonParseException(
                             "cannot serialize " + srcType.getName() + "; did you forget to register a subtype?");
+                }
+                if (streamingDispatchEnabled.getAsBoolean()) {
+                    delegate.write(new TypeFieldInjectingJsonWriter(out, typeFieldName, label, srcType), value);
+                    return;
                 }
                 JsonObject jsonObject = delegate.toJsonTree(value).getAsJsonObject();
 
@@ -361,5 +417,307 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
                 Streams.write(clone, out);
             }
         }.nullSafe();
+    }
+
+    private static final class TypeFieldInjectingJsonWriter extends JsonWriter {
+        private static final Writer UNUSED_WRITER = new Writer() {
+            @Override
+            public void write(char[] buffer, int offset, int counter) {
+                throw new AssertionError("all methods should be forwarded to the delegate writer");
+            }
+
+            @Override
+            public void flush() {
+                throw new AssertionError();
+            }
+
+            @Override
+            public void close() {
+                throw new AssertionError();
+            }
+        };
+
+        private final JsonWriter delegate;
+        private final String typeFieldName;
+        private final String label;
+        private final Class<?> srcType;
+        private int depth = 0;
+        private boolean typeFieldWritten = false;
+
+        TypeFieldInjectingJsonWriter(JsonWriter delegate, String typeFieldName, String label, Class<?> srcType) {
+            super(UNUSED_WRITER);
+            this.delegate = delegate;
+            this.typeFieldName = typeFieldName;
+            this.label = label;
+            this.srcType = srcType;
+            setLenient(delegate.isLenient());
+            setHtmlSafe(delegate.isHtmlSafe());
+            setSerializeNulls(delegate.getSerializeNulls());
+        }
+
+        private void requireInsideObject() {
+            if (depth == 0) {
+                throw new JsonParseException("cannot serialize " + srcType.getName()
+                        + " in streaming mode because it is not serialized as a json object");
+            }
+        }
+
+        @Override
+        public JsonWriter beginObject() throws IOException {
+            delegate.beginObject();
+            depth++;
+            if (!typeFieldWritten) {
+                typeFieldWritten = true;
+                delegate.name(typeFieldName);
+                delegate.value(label);
+            }
+            return this;
+        }
+
+        @Override
+        public JsonWriter endObject() throws IOException {
+            delegate.endObject();
+            depth--;
+            return this;
+        }
+
+        @Override
+        public JsonWriter beginArray() throws IOException {
+            requireInsideObject();
+            delegate.beginArray();
+            depth++;
+            return this;
+        }
+
+        @Override
+        public JsonWriter endArray() throws IOException {
+            delegate.endArray();
+            depth--;
+            return this;
+        }
+
+        @Override
+        public JsonWriter name(String name) throws IOException {
+            if (depth == 1 && typeFieldName.equals(name)) {
+                throw new JsonParseException("cannot serialize " + srcType.getName()
+                        + " because it already defines a field named " + typeFieldName);
+            }
+            delegate.name(name);
+            return this;
+        }
+
+        @Override
+        public JsonWriter value(String value) throws IOException {
+            requireInsideObject();
+            delegate.value(value);
+            return this;
+        }
+
+        @Override
+        public JsonWriter jsonValue(String value) throws IOException {
+            requireInsideObject();
+            delegate.jsonValue(value);
+            return this;
+        }
+
+        @Override
+        public JsonWriter nullValue() throws IOException {
+            requireInsideObject();
+            delegate.nullValue();
+            return this;
+        }
+
+        @Override
+        public JsonWriter value(boolean value) throws IOException {
+            requireInsideObject();
+            delegate.value(value);
+            return this;
+        }
+
+        @Override
+        public JsonWriter value(Boolean value) throws IOException {
+            requireInsideObject();
+            delegate.value(value);
+            return this;
+        }
+
+        @Override
+        public JsonWriter value(float value) throws IOException {
+            requireInsideObject();
+            delegate.value(value);
+            return this;
+        }
+
+        @Override
+        public JsonWriter value(double value) throws IOException {
+            requireInsideObject();
+            delegate.value(value);
+            return this;
+        }
+
+        @Override
+        public JsonWriter value(long value) throws IOException {
+            requireInsideObject();
+            delegate.value(value);
+            return this;
+        }
+
+        @Override
+        public JsonWriter value(Number value) throws IOException {
+            requireInsideObject();
+            delegate.value(value);
+            return this;
+        }
+
+        @Override
+        public boolean isLenient() {
+            return delegate.isLenient();
+        }
+
+        @Override
+        public void flush() throws IOException {
+            delegate.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+    }
+
+    private static final class EnteredObjectJsonReader extends JsonReader {
+        private static final Reader UNUSED_READER = new Reader() {
+            @Override
+            public int read(char[] buffer, int offset, int count) {
+                throw new AssertionError("all methods should be forwarded to the delegate reader");
+            }
+
+            @Override
+            public void close() {
+                throw new AssertionError();
+            }
+        };
+
+        static {
+            final JsonReaderInternalAccess gsonBuiltin = JsonReaderInternalAccess.INSTANCE;
+            JsonReaderInternalAccess.INSTANCE = new JsonReaderInternalAccess() {
+                @Override
+                public void promoteNameToValue(JsonReader reader) throws IOException {
+                    while (reader instanceof EnteredObjectJsonReader) {
+                        reader = ((EnteredObjectJsonReader) reader).delegate;
+                    }
+                    gsonBuiltin.promoteNameToValue(reader);
+                }
+            };
+        }
+
+        static void ensureInternalAccessHookInstalled() {
+        }
+
+        private final JsonReader delegate;
+        private boolean topObjectEntered = false;
+
+        EnteredObjectJsonReader(JsonReader delegate) {
+            super(UNUSED_READER);
+            this.delegate = delegate;
+            setLenient(delegate.isLenient());
+        }
+
+        @Override
+        public void beginObject() throws IOException {
+            if (!topObjectEntered) {
+                topObjectEntered = true;
+                return;
+            }
+            delegate.beginObject();
+        }
+
+        @Override
+        public JsonToken peek() throws IOException {
+            if (!topObjectEntered) {
+                return JsonToken.BEGIN_OBJECT;
+            }
+            return delegate.peek();
+        }
+
+        @Override
+        public void endObject() throws IOException {
+            delegate.endObject();
+        }
+
+        @Override
+        public void beginArray() throws IOException {
+            delegate.beginArray();
+        }
+
+        @Override
+        public void endArray() throws IOException {
+            delegate.endArray();
+        }
+
+        @Override
+        public boolean hasNext() throws IOException {
+            return delegate.hasNext();
+        }
+
+        @Override
+        public String nextName() throws IOException {
+            return delegate.nextName();
+        }
+
+        @Override
+        public String nextString() throws IOException {
+            return delegate.nextString();
+        }
+
+        @Override
+        public boolean nextBoolean() throws IOException {
+            return delegate.nextBoolean();
+        }
+
+        @Override
+        public void nextNull() throws IOException {
+            delegate.nextNull();
+        }
+
+        @Override
+        public double nextDouble() throws IOException {
+            return delegate.nextDouble();
+        }
+
+        @Override
+        public long nextLong() throws IOException {
+            return delegate.nextLong();
+        }
+
+        @Override
+        public int nextInt() throws IOException {
+            return delegate.nextInt();
+        }
+
+        @Override
+        public void skipValue() throws IOException {
+            delegate.skipValue();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+
+        @Override
+        public String getPath() {
+            return delegate.getPath();
+        }
+
+        @Override
+        public String getPreviousPath() {
+            return delegate.getPreviousPath();
+        }
+
+        @Override
+        public String toString() {
+            return delegate.toString();
+        }
     }
 }

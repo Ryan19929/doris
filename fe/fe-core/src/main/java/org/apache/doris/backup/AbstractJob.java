@@ -22,6 +22,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.persist.gson.BackupRestoreJobJsonMode;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.persist.gson.GsonUtilsBase;
 
@@ -43,6 +44,7 @@ import java.util.Map;
  */
 public abstract class AbstractJob implements Writable {
     public static final String COMPRESSED_JOB_ID = "COMPRESSED";
+    public static final String PROP_JOB_STREAMING_JSON = "job_streaming_json";
 
     public enum JobType {
         BACKUP, RESTORE, BACKUP_COMPRESSED, RESTORE_COMPRESSED
@@ -93,6 +95,9 @@ public abstract class AbstractJob implements Writable {
     // save err msg of tasks
     @SerializedName("msg")
     protected Map<Long, String> taskErrMsg = Maps.newHashMap();
+
+    @SerializedName("jsj")
+    private Boolean jobStreamingJson;
 
     protected AbstractJob(JobType type) {
         this.type = type;
@@ -154,6 +159,14 @@ public abstract class AbstractJob implements Writable {
         return repoId;
     }
 
+    public void setJobStreamingJson(Boolean jobStreamingJson) {
+        this.jobStreamingJson = jobStreamingJson;
+    }
+
+    public Boolean getJobStreamingJson() {
+        return jobStreamingJson;
+    }
+
     public abstract void run();
 
     public abstract Status cancel();
@@ -173,11 +186,13 @@ public abstract class AbstractJob implements Writable {
     public abstract Status updateRepo(Repository repo);
 
     public static AbstractJob read(DataInput in) throws IOException {
-        String json = Text.readString(in);
-        if (COMPRESSED_JOB_ID.equals(json)) {
-            return GsonUtilsBase.fromJsonCompressed(in, AbstractJob.class, GsonUtils.GSON);
-        } else {
-            return GsonUtils.GSON.fromJson(json, AbstractJob.class);
+        try (BackupRestoreJobJsonMode.Scope ignored = BackupRestoreJobJsonMode.withMode(true)) {
+            String json = Text.readString(in);
+            if (COMPRESSED_JOB_ID.equals(json)) {
+                return GsonUtilsBase.fromJsonCompressed(in, AbstractJob.class, GsonUtils.GSON);
+            } else {
+                return GsonUtils.GSON.fromJson(json, AbstractJob.class);
+            }
         }
     }
 
@@ -197,13 +212,19 @@ public abstract class AbstractJob implements Writable {
         // For a completed job, there's no need to save it with compressed serialization as it has
         // no snapshot or backup meta info, making it small in size. This helps maintain compatibility
         // more easily.
-        if (!isDone() && ((type == JobType.BACKUP && Config.backup_job_compressed_serialization)
-                || (type == JobType.RESTORE && Config.restore_job_compressed_serialization))) {
-            Text.writeString(out, COMPRESSED_JOB_ID);
-            GsonUtilsBase.toJsonCompressed(out, this, GsonUtils.GSON);
-        } else {
-            Text.writeString(out, GsonUtils.GSON.toJson(this));
+        try (BackupRestoreJobJsonMode.Scope ignored = BackupRestoreJobJsonMode.withMode(isJobStreamingJsonEnabled())) {
+            if (!isDone() && ((type == JobType.BACKUP && Config.backup_job_compressed_serialization)
+                    || (type == JobType.RESTORE && Config.restore_job_compressed_serialization))) {
+                Text.writeString(out, COMPRESSED_JOB_ID);
+                GsonUtilsBase.toJsonCompressed(out, this, GsonUtils.GSON);
+            } else {
+                Text.writeString(out, GsonUtils.GSON.toJson(this));
+            }
         }
+    }
+
+    private boolean isJobStreamingJsonEnabled() {
+        return jobStreamingJson == null || jobStreamingJson;
     }
 
     @Override
