@@ -17,6 +17,8 @@
 
 package org.apache.doris.persist.gson;
 
+import org.apache.doris.common.Config;
+
 import com.google.common.collect.HashBasedTable;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -81,6 +83,14 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
                 .registerSubtype(BadShape.class, BadShape.class.getSimpleName());
     }
 
+    private static RuntimeTypeAdapterFactory<Shape> newDynamicFactory() {
+        return RuntimeTypeAdapterFactory.of(Shape.class, "clazz")
+                .withStreamingDispatch(() -> Config.enable_backup_restore_job_streaming_json)
+                .registerSubtype(Circle.class, Circle.class.getSimpleName())
+                .registerSubtype(Rectangle.class, Rectangle.class.getSimpleName())
+                .registerSubtype(BadShape.class, BadShape.class.getSimpleName());
+    }
+
     private static Gson newGson(boolean streaming) {
         // mirror the relevant GSON_BUILDER settings
         return new GsonBuilder()
@@ -90,8 +100,17 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
                 .create();
     }
 
+    private static Gson newDynamicGson() {
+        return new GsonBuilder()
+                .serializeSpecialFloatingPointValues()
+                .enableComplexMapKeySerialization()
+                .registerTypeAdapterFactory(newDynamicFactory())
+                .create();
+    }
+
     private static final Gson TREE_GSON = newGson(false);
     private static final Gson STREAMING_GSON = newGson(true);
+    private static final Gson DYNAMIC_GSON = newDynamicGson();
 
     private static Circle buildCircle() {
         Circle circle = new Circle();
@@ -169,6 +188,44 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
             Assert.fail("expect JsonParseException");
         } catch (JsonParseException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("the first field is 'w'"));
+        }
+    }
+
+    @Test
+    public void testDynamicSwitchFallsBackToTreeRead() {
+        boolean oldValue = Config.enable_backup_restore_job_streaming_json;
+        try {
+            String typeFieldSecond = "{\"w\":7,\"clazz\":\"Rectangle\",\"h\":8}";
+            Config.enable_backup_restore_job_streaming_json = false;
+            Rectangle byTree = (Rectangle) DYNAMIC_GSON.fromJson(typeFieldSecond, Shape.class);
+            Assert.assertEquals(7, byTree.width);
+
+            Config.enable_backup_restore_job_streaming_json = true;
+            try {
+                DYNAMIC_GSON.fromJson(typeFieldSecond, Shape.class);
+                Assert.fail("expect JsonParseException");
+            } catch (JsonParseException e) {
+                Assert.assertTrue(e.getMessage(), e.getMessage().contains("the first field is 'w'"));
+            }
+        } finally {
+            Config.enable_backup_restore_job_streaming_json = oldValue;
+        }
+    }
+
+    @Test
+    public void testDynamicStreamingWriteByteIdenticalWithTree() {
+        boolean oldValue = Config.enable_backup_restore_job_streaming_json;
+        try {
+            Circle circle = buildCircle();
+            String treeJson = TREE_GSON.toJson(circle, Shape.class);
+
+            Config.enable_backup_restore_job_streaming_json = false;
+            Assert.assertEquals(treeJson, DYNAMIC_GSON.toJson(circle, Shape.class));
+
+            Config.enable_backup_restore_job_streaming_json = true;
+            Assert.assertEquals(treeJson, DYNAMIC_GSON.toJson(circle, Shape.class));
+        } finally {
+            Config.enable_backup_restore_job_streaming_json = oldValue;
         }
     }
 

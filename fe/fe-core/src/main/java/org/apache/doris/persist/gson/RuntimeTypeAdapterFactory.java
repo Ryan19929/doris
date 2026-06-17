@@ -39,6 +39,7 @@ import java.io.Writer;
 import java.lang.reflect.Modifier;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.BooleanSupplier;
 
 /**
  * Adapts values whose runtime type may differ from their declaration type. This
@@ -199,7 +200,7 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
     // alive during write/read. Streaming read requires the type field to be the
     // first field, which holds for all Doris-generated journals/images since
     // tree mode always emits it first.
-    private boolean streamingDispatch = false;
+    private BooleanSupplier streamingDispatchEnabled = () -> false;
 
     private RuntimeTypeAdapterFactory(Class<?> baseType, String typeFieldName, boolean maintainType) {
         if (typeFieldName == null || baseType == null) {
@@ -274,6 +275,13 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
      * is guaranteed to be the first json field.
      */
     public RuntimeTypeAdapterFactory<T> withStreamingDispatch() {
+        return withStreamingDispatch(() -> true);
+    }
+
+    public RuntimeTypeAdapterFactory<T> withStreamingDispatch(BooleanSupplier streamingDispatchEnabled) {
+        if (streamingDispatchEnabled == null) {
+            throw new NullPointerException();
+        }
         if (maintainType) {
             throw new IllegalStateException("streaming dispatch does not support maintainType");
         }
@@ -282,7 +290,7 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         // The hook field is a plain non-volatile static, so installing it lazily on
         // the first streaming read could in theory be invisible to other threads.
         EnteredObjectJsonReader.ensureInternalAccessHookInstalled();
-        this.streamingDispatch = true;
+        this.streamingDispatchEnabled = streamingDispatchEnabled;
         return this;
     }
 
@@ -335,7 +343,8 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         return new TypeAdapter<R>() {
             @Override
             public R read(JsonReader in) throws IOException {
-                if (streamingDispatch && defaultDelegate == null && in.peek() == JsonToken.BEGIN_OBJECT) {
+                if (streamingDispatchEnabled.getAsBoolean() && defaultDelegate == null
+                        && in.peek() == JsonToken.BEGIN_OBJECT) {
                     return readStreaming(in);
                 }
                 JsonElement jsonElement = Streams.parse(in);
@@ -397,7 +406,7 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
                     throw new JsonParseException(
                             "cannot serialize " + srcType.getName() + "; did you forget to register a subtype?");
                 }
-                if (streamingDispatch) {
+                if (streamingDispatchEnabled.getAsBoolean()) {
                     delegate.write(new TypeFieldInjectingJsonWriter(out, typeFieldName, label, srcType), value);
                     return;
                 }

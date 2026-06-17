@@ -587,7 +587,7 @@ public class GsonUtils {
     private static RuntimeTypeAdapterFactory<org.apache.doris.backup.AbstractJob>
             jobBackupTypeAdapterFactory
                     = RuntimeTypeAdapterFactory.of(org.apache.doris.backup.AbstractJob.class, "clazz")
-                    .withStreamingDispatch()
+                    .withStreamingDispatch(() -> Config.enable_backup_restore_job_streaming_json)
                     .registerSubtype(BackupJob.class, BackupJob.class.getSimpleName())
                     .registerSubtype(RestoreJob.class, RestoreJob.class.getSimpleName())
                     .registerSubtype(CloudRestoreJob.class, CloudRestoreJob.class.getSimpleName());
@@ -864,6 +864,10 @@ public class GsonUtils {
 
             @Override
             public void write(JsonWriter out, Table<R, C, V> src) throws IOException {
+                if (!Config.enable_backup_restore_job_streaming_json) {
+                    Streams.write(toTableJsonTree(src), out);
+                    return;
+                }
                 out.beginObject();
                 out.name("clazz").value(src.getClass().getSimpleName());
                 out.name("rowKeys");
@@ -893,6 +897,33 @@ public class GsonUtils {
                 out.endObject();
             }
 
+            private JsonObject toTableJsonTree(Table<R, C, V> src) {
+                JsonObject object = new JsonObject();
+                object.addProperty("clazz", src.getClass().getSimpleName());
+                JsonArray rowKeys = new JsonArray();
+                Map<R, Integer> rowKeyToIndex = new HashMap<>();
+                for (R rowKey : src.rowKeySet()) {
+                    rowKeyToIndex.put(rowKey, rowKeyToIndex.size());
+                    rowKeys.add(rowKeyAdapter.toJsonTree(rowKey));
+                }
+                object.add("rowKeys", rowKeys);
+                JsonArray columnKeys = new JsonArray();
+                Map<C, Integer> columnKeyToIndex = new HashMap<>();
+                for (C columnKey : src.columnKeySet()) {
+                    columnKeyToIndex.put(columnKey, columnKeyToIndex.size());
+                    columnKeys.add(columnKeyAdapter.toJsonTree(columnKey));
+                }
+                object.add("columnKeys", columnKeys);
+                JsonArray cells = new JsonArray();
+                for (Table.Cell<R, C, V> cell : src.cellSet()) {
+                    cells.add(rowKeyToIndex.get(cell.getRowKey()));
+                    cells.add(columnKeyToIndex.get(cell.getColumnKey()));
+                    cells.add(valueAdapter.toJsonTree(cell.getValue()));
+                }
+                object.add("cells", cells);
+                return object;
+            }
+
             // dispatch by runtime class, same as the tree mode JsonSerializationContext.serialize(src)
             @SuppressWarnings("unchecked")
             private void writeByRuntimeType(JsonWriter out, Object src) throws IOException {
@@ -902,6 +933,9 @@ public class GsonUtils {
 
             @Override
             public Table<R, C, V> read(JsonReader in) throws IOException {
+                if (!Config.enable_backup_restore_job_streaming_json) {
+                    return fromTableJsonTree(Streams.parse(in).getAsJsonObject());
+                }
                 in.beginObject();
                 expectName(in, "clazz");
                 String tableClazz = in.nextString();
@@ -940,6 +974,39 @@ public class GsonUtils {
                 in.endArray();
                 in.endObject();
                 return table;
+            }
+
+            private Table<R, C, V> fromTableJsonTree(JsonObject object) {
+                String tableClazz = object.get("clazz").getAsString();
+                Table<R, C, V> table = newTable(tableClazz);
+                JsonArray rowKeysJsonArray = object.getAsJsonArray("rowKeys");
+                List<R> rowKeys = new ArrayList<>();
+                for (JsonElement jsonElement : rowKeysJsonArray) {
+                    rowKeys.add(rowKeyAdapter.fromJsonTree(jsonElement));
+                }
+                JsonArray columnKeysJsonArray = object.getAsJsonArray("columnKeys");
+                List<C> columnKeys = new ArrayList<>();
+                for (JsonElement jsonElement : columnKeysJsonArray) {
+                    columnKeys.add(columnKeyAdapter.fromJsonTree(jsonElement));
+                }
+                JsonArray cellsJsonArray = object.getAsJsonArray("cells");
+                for (int i = 0; i < cellsJsonArray.size(); i = i + 3) {
+                    int rowIndex = cellsJsonArray.get(i).getAsInt();
+                    int columnIndex = cellsJsonArray.get(i + 1).getAsInt();
+                    V value = valueAdapter.fromJsonTree(cellsJsonArray.get(i + 2));
+                    table.put(rowKeys.get(rowIndex), columnKeys.get(columnIndex), value);
+                }
+                return table;
+            }
+
+            private Table<R, C, V> newTable(String tableClazz) {
+                switch (tableClazz) {
+                    case "HashBasedTable":
+                        return HashBasedTable.create();
+                    default:
+                        Preconditions.checkState(false, "unknown guava table class: " + tableClazz);
+                        return null;
+                }
             }
         }
     }
