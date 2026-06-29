@@ -136,6 +136,7 @@ public class SessionVariablesTest extends TestWithFeService {
         Assertions.assertEquals(numOfForwardVars, vars.size());
 
         vars.put(SessionVariable.ENABLE_PROFILE, "true");
+        vars.put(SessionVariable.ENABLE_PRELOAD_EXTERNAL_METADATA, "true");
         vars.put(SessionVariable.INSERT_VISIBLE_TIMEOUT_RETURN_MODE, "ERROR");
         sessionVariable.setForwardedSessionVariables(vars);
         Assertions.assertTrue(sessionVariable.enableProfile);
@@ -147,6 +148,7 @@ public class SessionVariablesTest extends TestWithFeService {
         vars.put(SessionVariable.EXTERNAL_TABLE_DML_RETURN_STATUS, "COMMITTED");
         sessionVariable.setForwardedSessionVariables(vars);
         Assertions.assertTrue(sessionVariable.enableProfile);
+        Assertions.assertTrue(sessionVariable.isEnablePreloadExternalMetadata());
         Assertions.assertEquals(SessionVariable.EXTERNAL_TABLE_DML_RETURN_STATUS_COMMITTED,
                 sessionVariable.getExternalTableDmlReturnStatus());
     }
