@@ -3075,6 +3075,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setStatus(status);
 
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 
@@ -3189,6 +3190,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setStatus(status);
 
         if (status.getStatusCode() != TStatusCode.OK) {
+            setMasterAddressIfValid(result::setMasterAddress);
             return result;
         }
 
