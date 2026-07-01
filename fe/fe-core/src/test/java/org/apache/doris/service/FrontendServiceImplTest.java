@@ -49,12 +49,16 @@ import org.apache.doris.thrift.TGetDbsParams;
 import org.apache.doris.thrift.TGetDbsResult;
 import org.apache.doris.thrift.TGetMasterTokenRequest;
 import org.apache.doris.thrift.TGetMasterTokenResult;
+import org.apache.doris.thrift.TGetSnapshotRequest;
+import org.apache.doris.thrift.TGetSnapshotResult;
 import org.apache.doris.thrift.TLockBinlogRequest;
 import org.apache.doris.thrift.TLockBinlogResult;
 import org.apache.doris.thrift.TMetadataTableRequestParams;
 import org.apache.doris.thrift.TMetadataType;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TNullableStringLiteral;
+import org.apache.doris.thrift.TRestoreSnapshotRequest;
+import org.apache.doris.thrift.TRestoreSnapshotResult;
 import org.apache.doris.thrift.TRollbackTxnRequest;
 import org.apache.doris.thrift.TRollbackTxnResult;
 import org.apache.doris.thrift.TSchemaTableName;
@@ -178,6 +182,14 @@ public class FrontendServiceImplTest {
             TLockBinlogResult lockBinlogResult = impl.lockBinlog(new TLockBinlogRequest());
             Assert.assertEquals(TStatusCode.NOT_MASTER, lockBinlogResult.getStatus().getStatusCode());
             assertNotMasterWithAddress(lockBinlogResult.getMasterAddress());
+
+            TGetSnapshotResult getSnapshotResult = impl.getSnapshot(new TGetSnapshotRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, getSnapshotResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(getSnapshotResult.getMasterAddress());
+
+            TRestoreSnapshotResult restoreSnapshotResult = impl.restoreSnapshot(new TRestoreSnapshotRequest());
+            Assert.assertEquals(TStatusCode.NOT_MASTER, restoreSnapshotResult.getStatus().getStatusCode());
+            assertNotMasterWithAddress(restoreSnapshotResult.getMasterAddress());
         }
     }
 
