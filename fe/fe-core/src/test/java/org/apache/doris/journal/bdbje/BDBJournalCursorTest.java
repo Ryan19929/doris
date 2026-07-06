@@ -22,12 +22,16 @@ import org.apache.doris.catalog.Env;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.sleepycat.je.Database;
+import com.sleepycat.je.rep.InsufficientLogException;
+import com.sleepycat.je.rep.RollbackException;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.RepeatedTest;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.io.File;
 import java.io.IOException;
@@ -38,6 +42,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
@@ -120,5 +125,64 @@ public class BDBJournalCursorTest {
 
         bdbJournalCursor = BDBJournalCursor.getJournalCursor(bdbEnvironment, 1, 10);
         Assertions.assertTrue(bdbJournalCursor == null);
+    }
+
+    @RepeatedTest(1)
+    public void testGetJournalCursorNotSwallowRestartRequiredException() {
+        BDBEnvironment env = Mockito.mock(BDBEnvironment.class);
+        RollbackException rollbackEx = Mockito.mock(RollbackException.class);
+        Mockito.when(env.getDatabaseNames()).thenThrow(rollbackEx);
+
+        // Mock a checkpoint thread so that exitOnRestartRequired() rethrows the exception
+        // instead of exiting the test JVM. The point is: RestartRequiredException must NOT be
+        // swallowed by the generic catch and turned into a null cursor.
+        try (MockedStatic<Env> mockedEnvStatic = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS)) {
+            mockedEnvStatic.when(Env::isCheckpointThread).thenReturn(true);
+            Assertions.assertThrows(RollbackException.class,
+                    () -> BDBJournalCursor.getJournalCursor(env, 1, 10));
+        }
+    }
+
+    @RepeatedTest(1)
+    public void testGetJournalCursorNullOnInsufficientLogException() {
+        BDBEnvironment env = Mockito.mock(BDBEnvironment.class);
+        InsufficientLogException insufficientLogEx = Mockito.mock(InsufficientLogException.class);
+        Mockito.when(env.getDatabaseNames()).thenThrow(insufficientLogEx);
+
+        // Keep the legacy behavior: a null cursor, then the replayer will retry in the next
+        // cycle and trigger NetworkRestore in BDBJEJournal.getDatabaseNames().
+        Assertions.assertNull(BDBJournalCursor.getJournalCursor(env, 1, 10));
+    }
+
+    @RepeatedTest(1)
+    public void testNextNotSwallowRestartRequiredException() throws Exception {
+        BDBEnvironment env = Mockito.mock(BDBEnvironment.class);
+        Database database = Mockito.mock(Database.class);
+        Mockito.when(env.getDatabaseNames()).thenReturn(Arrays.asList(1L));
+        Mockito.when(env.openDatabase("1")).thenReturn(database);
+
+        Env mockEnv = Mockito.mock(Env.class);
+        Mockito.when(mockEnv.getForceSkipJournalIds()).thenReturn(new ArrayList<>());
+
+        try (MockedStatic<Env> mockedEnvStatic = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS)) {
+            mockedEnvStatic.when(Env::getCurrentEnv).thenReturn(mockEnv);
+            mockedEnvStatic.when(Env::isCheckpointThread).thenReturn(true);
+
+            BDBJournalCursor cursor = BDBJournalCursor.getJournalCursor(env, 1, 10);
+            Assertions.assertNotNull(cursor);
+
+            // RestartRequiredException must not be swallowed and turned into a null entry
+            RollbackException rollbackEx = Mockito.mock(RollbackException.class);
+            Mockito.doThrow(rollbackEx).when(database)
+                    .get(Mockito.any(), Mockito.any(), Mockito.any(), Mockito.any());
+            Assertions.assertThrows(RollbackException.class, cursor::next);
+
+            // While InsufficientLogException keeps the legacy behavior: return null and let the
+            // replayer trigger NetworkRestore in the next cycle.
+            InsufficientLogException insufficientLogEx = Mockito.mock(InsufficientLogException.class);
+            Mockito.doThrow(insufficientLogEx).when(database)
+                    .get(Mockito.any(), Mockito.any(), Mockito.any(), Mockito.any());
+            Assertions.assertNull(cursor.next());
+        }
     }
 }

@@ -27,6 +27,8 @@ import com.sleepycat.je.Database;
 import com.sleepycat.je.DatabaseEntry;
 import com.sleepycat.je.LockMode;
 import com.sleepycat.je.OperationStatus;
+import com.sleepycat.je.rep.InsufficientLogException;
+import com.sleepycat.je.rep.RestartRequiredException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -58,6 +60,14 @@ public class BDBJournalCursor implements JournalCursor {
         BDBJournalCursor cursor = null;
         try {
             cursor = new BDBJournalCursor(env, fromKey, toKey, exitIfNotFound);
+        } catch (InsufficientLogException e) {
+            // Return a null cursor. The replayer will retry in the next cycle, and the
+            // getMaxJournalId() call will trigger NetworkRestore in BDBJEJournal.getDatabaseNames().
+            LOG.warn("catch an InsufficientLogException when creating journal cursor. fromKey:{}", fromKey, e);
+        } catch (RestartRequiredException e) {
+            // Do NOT let the generic catch below swallow it, otherwise the FE will keep running
+            // with metadata that has diverged from the new master. See exitOnRestartRequired().
+            throw BDBJEJournal.exitOnRestartRequired(e);
         } catch (Exception e) {
             LOG.error("new BDBJournalCursor error.", e);
         }
@@ -157,6 +167,15 @@ public class BDBJournalCursor implements JournalCursor {
                     System.exit(-1);
                 }
             }
+        } catch (InsufficientLogException e) {
+            // Return null. The replayer will retry in the next cycle, and the getMaxJournalId()
+            // call will trigger NetworkRestore in BDBJEJournal.getDatabaseNames().
+            LOG.warn("catch an InsufficientLogException when getting next JournalEntity. key:{}", currentKey, e);
+            return null;
+        } catch (RestartRequiredException e) {
+            // Do NOT let the generic catch below swallow it, otherwise the FE will keep running
+            // with metadata that has diverged from the new master. See exitOnRestartRequired().
+            throw BDBJEJournal.exitOnRestartRequired(e);
         } catch (Exception e) {
             LOG.warn("Catch an exception when get next JournalEntity. key:{}", currentKey, e);
             return null;

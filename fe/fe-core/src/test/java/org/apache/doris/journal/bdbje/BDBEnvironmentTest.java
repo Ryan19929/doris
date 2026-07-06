@@ -34,6 +34,8 @@ import com.sleepycat.je.LockMode;
 import com.sleepycat.je.OperationStatus;
 import com.sleepycat.je.rep.InsufficientAcksException;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
+import com.sleepycat.je.rep.RollbackException;
+import com.sleepycat.je.rep.RollbackProhibitedException;
 import com.sleepycat.je.rep.impl.RepImpl;
 import com.sleepycat.je.rep.util.ReplicationGroupAdmin;
 import org.apache.commons.io.FileUtils;
@@ -750,5 +752,26 @@ public class BDBEnvironmentTest {
                 LOG.info("close {} | {}", entryPair.second.name, entryPair.second.dir);
             });
         }
+    }
+
+    @RepeatedTest(1)
+    public void testGetDatabaseNamesRethrowRestartRequiredException() {
+        // RollbackException must be rethrown to the caller (BDBJEJournal), which will exit the
+        // process, because the FE can not rollback its in-memory catalog.
+        BDBEnvironment rollbackEnvironment = new BDBEnvironment(true, false);
+        ReplicatedEnvironment rollbackReplicatedEnvironment = Mockito.mock(ReplicatedEnvironment.class);
+        Mockito.when(rollbackReplicatedEnvironment.getDatabaseNames())
+                .thenThrow(Mockito.mock(RollbackException.class));
+        Deencapsulation.setField(rollbackEnvironment, "replicatedEnvironment", rollbackReplicatedEnvironment);
+        Assertions.assertThrows(RollbackException.class, rollbackEnvironment::getDatabaseNames);
+
+        // RollbackProhibitedException must be rethrown too, instead of falling into the
+        // EnvironmentFailureException retry loop below it.
+        BDBEnvironment prohibitedEnvironment = new BDBEnvironment(true, false);
+        ReplicatedEnvironment prohibitedReplicatedEnvironment = Mockito.mock(ReplicatedEnvironment.class);
+        Mockito.when(prohibitedReplicatedEnvironment.getDatabaseNames())
+                .thenThrow(Mockito.mock(RollbackProhibitedException.class));
+        Deencapsulation.setField(prohibitedEnvironment, "replicatedEnvironment", prohibitedReplicatedEnvironment);
+        Assertions.assertThrows(RollbackProhibitedException.class, prohibitedEnvironment::getDatabaseNames);
     }
 }
