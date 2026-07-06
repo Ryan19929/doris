@@ -21,6 +21,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.LogUtils;
+import org.apache.doris.common.io.CountingDataOutputStream;
 import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.NetUtils;
@@ -51,6 +52,7 @@ import com.sleepycat.je.rep.ReplicaWriteException;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
 import com.sleepycat.je.rep.RollbackException;
 import com.sleepycat.je.rep.TimeConsistencyPolicy;
+import org.apache.commons.io.output.NullOutputStream;
 import org.apache.commons.lang3.time.StopWatch;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -727,20 +729,16 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         entity.setOpCode(op);
         entity.setData(writable);
 
-        DataOutputBuffer buffer = new DataOutputBuffer(OUTPUT_BUFFER_INIT_SIZE);
-        entity.write(buffer);
-
-        DatabaseEntry theData = new DatabaseEntry(buffer.getData());
+        // only count the serialized size instead of buffering the whole entity,
+        // the entity of a huge backup/restore job may take GBs in memory
+        CountingDataOutputStream countingStream = new CountingDataOutputStream(new NullOutputStream());
+        entity.write(countingStream);
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("opCode = {}, journal size = {}", op, theData.getSize());
+            LOG.debug("opCode = {}, journal size = {}", op, countingStream.getCount());
         }
 
         // 1GB
-        if (theData.getSize() > (1 << 30)) {
-            return true;
-        }
-
-        return false;
+        return countingStream.getCount() > (1 << 30);
     }
 }
