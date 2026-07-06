@@ -33,6 +33,8 @@ import com.sleepycat.je.LockMode;
 import com.sleepycat.je.OperationStatus;
 import com.sleepycat.je.rep.InsufficientAcksException;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
+import com.sleepycat.je.rep.RollbackException;
+import com.sleepycat.je.rep.RollbackProhibitedException;
 import com.sleepycat.je.rep.impl.RepImpl;
 import com.sleepycat.je.rep.util.ReplicationGroupAdmin;
 import mockit.Expectations;
@@ -45,6 +47,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.RepeatedTest;
+import org.mockito.Mockito;
 
 import java.io.File;
 import java.io.IOException;
@@ -672,5 +675,26 @@ public class BDBEnvironmentTest {
         key = new DatabaseEntry(new byte[]{1, 2, 3});
         DatabaseEntry readValue = new DatabaseEntry();
         Assertions.assertEquals(OperationStatus.SUCCESS, masterDb.get(null, key, readValue, LockMode.READ_COMMITTED));
+    }
+
+    @RepeatedTest(1)
+    public void testGetDatabaseNamesRethrowRestartRequiredException() {
+        // RollbackException must be rethrown to the caller (BDBJEJournal), which will exit the
+        // process, because the FE can not rollback its in-memory catalog.
+        BDBEnvironment rollbackEnvironment = new BDBEnvironment(true, false);
+        ReplicatedEnvironment rollbackReplicatedEnvironment = Mockito.mock(ReplicatedEnvironment.class);
+        Mockito.when(rollbackReplicatedEnvironment.getDatabaseNames())
+                .thenThrow(Mockito.mock(RollbackException.class));
+        Deencapsulation.setField(rollbackEnvironment, "replicatedEnvironment", rollbackReplicatedEnvironment);
+        Assertions.assertThrows(RollbackException.class, rollbackEnvironment::getDatabaseNames);
+
+        // RollbackProhibitedException must be rethrown too, instead of falling into the
+        // EnvironmentFailureException retry loop below it.
+        BDBEnvironment prohibitedEnvironment = new BDBEnvironment(true, false);
+        ReplicatedEnvironment prohibitedReplicatedEnvironment = Mockito.mock(ReplicatedEnvironment.class);
+        Mockito.when(prohibitedReplicatedEnvironment.getDatabaseNames())
+                .thenThrow(Mockito.mock(RollbackProhibitedException.class));
+        Deencapsulation.setField(prohibitedEnvironment, "replicatedEnvironment", prohibitedReplicatedEnvironment);
+        Assertions.assertThrows(RollbackProhibitedException.class, prohibitedEnvironment::getDatabaseNames);
     }
 }

@@ -316,6 +316,7 @@ import com.google.common.collect.Sets;
 import com.sleepycat.je.rep.InsufficientLogException;
 import com.sleepycat.je.rep.NetworkRestore;
 import com.sleepycat.je.rep.NetworkRestoreConfig;
+import com.sleepycat.je.rep.RestartRequiredException;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
@@ -2873,6 +2874,14 @@ public class Env {
                     NetworkRestoreConfig config = new NetworkRestoreConfig();
                     config.setRetainLogFiles(false);
                     restore.execute(insufficientLogEx, config);
+                    System.exit(-1);
+                } catch (RestartRequiredException restartRequiredEx) {
+                    // Defense in depth. RollbackException and the like should have been handled
+                    // in the journal implementation (see BDBJEJournal.exitOnRestartRequired), but
+                    // never let the generic catch below swallow it: once BDBJE has rolled back
+                    // committed journals, continuing to run will leave this FE's in-memory catalog
+                    // diverged from the new master forever.
+                    LOG.error("replayer thread catch a RestartRequiredException, will exit.", restartRequiredEx);
                     System.exit(-1);
                 } catch (Throwable e) {
                     LOG.error("replayer thread catch an exception when replay journal.", e);

@@ -30,6 +30,7 @@ import org.apache.doris.system.SystemInfoService.HostInfo;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
+import com.sleepycat.je.rep.RollbackException;
 import mockit.Mock;
 import mockit.MockUp;
 import org.apache.commons.io.FileUtils;
@@ -38,6 +39,8 @@ import org.apache.logging.log4j.Logger;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.RepeatedTest;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
 
 import java.io.DataOutput;
 import java.io.File;
@@ -336,5 +339,19 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
         Assertions.assertEquals(11, journalId);
 
         journal.close();
+    }
+
+    @RepeatedTest(1)
+    public void testExitOnRestartRequiredRethrowInCheckpointThread() {
+        RollbackException rollbackEx = Mockito.mock(RollbackException.class);
+        try (MockedStatic<Env> mockedEnvStatic = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS)) {
+            mockedEnvStatic.when(Env::isCheckpointThread).thenReturn(true);
+            // The checkpoint thread replays journals on the standalone checkpoint catalog of
+            // Master FE, so exitOnRestartRequired() should rethrow the exception and let the
+            // checkpoint framework give up this round instead of exiting the process.
+            Assertions.assertThrows(RollbackException.class, () -> {
+                throw BDBJEJournal.exitOnRestartRequired(rollbackEx);
+            });
+        }
     }
 }

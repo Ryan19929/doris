@@ -43,7 +43,7 @@ import com.sleepycat.je.rep.NodeType;
 import com.sleepycat.je.rep.RepInternal;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
 import com.sleepycat.je.rep.ReplicationConfig;
-import com.sleepycat.je.rep.RollbackException;
+import com.sleepycat.je.rep.RestartRequiredException;
 import com.sleepycat.je.rep.StateChangeListener;
 import com.sleepycat.je.rep.util.DbResetRepGroup;
 import com.sleepycat.je.rep.util.ReplicationGroupAdmin;
@@ -348,9 +348,12 @@ public class BDBEnvironment {
             try {
                 names = replicatedEnvironment.getDatabaseNames();
                 break;
-            } catch (InsufficientLogException e) {
-                throw e;
-            } catch (RollbackException e) {
+            } catch (RestartRequiredException e) {
+                // InsufficientLogException, RollbackException, RollbackProhibitedException, etc.
+                // They are subclasses of EnvironmentFailureException, so this catch must come first,
+                // otherwise they would be swallowed by the retry loop below. Rethrow and let the
+                // caller (BDBJEJournal) decide how to recover: NetworkRestore for
+                // InsufficientLogException, exit for the others.
                 throw e;
             } catch (EnvironmentFailureException e) {
                 tried++;

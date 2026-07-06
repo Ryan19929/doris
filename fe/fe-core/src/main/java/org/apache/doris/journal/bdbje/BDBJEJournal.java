@@ -48,7 +48,7 @@ import com.sleepycat.je.rep.NetworkRestoreConfig;
 import com.sleepycat.je.rep.ReplicaConsistencyException;
 import com.sleepycat.je.rep.ReplicaWriteException;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
-import com.sleepycat.je.rep.RollbackException;
+import com.sleepycat.je.rep.RestartRequiredException;
 import com.sleepycat.je.rep.TimeConsistencyPolicy;
 import org.apache.commons.lang3.time.StopWatch;
 import org.apache.logging.log4j.LogManager;
@@ -549,10 +549,8 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                 break;
             } catch (InsufficientLogException insufficientLogEx) {
                 reSetupBdbEnvironment(insufficientLogEx);
-            } catch (RollbackException rollbackEx) {
-                LOG.warn("catch rollback log exception. will reopen the ReplicatedEnvironment.", rollbackEx);
-                bdbEnvironment.close();
-                bdbEnvironment.openReplicatedEnvironment(new File(environmentPath));
+            } catch (RestartRequiredException restartEx) {
+                throw exitOnRestartRequired(restartEx);
             }
         }
     }
@@ -586,6 +584,40 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         bdbEnvironment.close();
         bdbEnvironment.setup(new File(environmentPath), selfNodeName, selfNodeHostPort,
                 NetUtils.getHostPortInAccessibleFormat(helperNode.getHost(), helperNode.getPort()));
+    }
+
+    /**
+     * Exit the FE process when BDBJE requires the environment to be restarted, e.g. RollbackException
+     * (this replica's log diverged from the new master and BDBJE has hard-rolled back the divergent
+     * suffix) or RollbackProhibitedException. InsufficientLogException should be handled by
+     * reSetupBdbEnvironment() before reaching here.
+     *
+     * <p>Doris FE can not rollback its in-memory catalog or the replayed journal id, so the only safe
+     * reaction is to exit, then replay journals from the local image and the new master's stream after
+     * restart. Reopening the environment in the same process would leave the in-memory state ahead of
+     * the rolled-back on-disk journal, so the journals re-written by the new master with the same ids
+     * (e.g. OP_MASTER_INFO_CHANGE) would be silently skipped by the replayer, which makes this FE
+     * behave normally but hold stale metadata forever (e.g. keep forwarding requests to the old master).
+     *
+     * <p>NOTE: never rely on RollbackException.getEarliestTransactionId() to decide whether any durable
+     * transaction has been rolled back. The exception object may be published to other threads before
+     * it is fully constructed (this-escape in the constructor chain of EnvironmentFailureException),
+     * so it can spuriously report 0 (see the wrapSelf() copy made by re-throwing sites).
+     *
+     * <p>The checkpoint thread replays journals on the standalone checkpoint catalog of Master FE, so
+     * just rethrow and let the checkpoint framework give up this round of checkpoint.
+     *
+     * <p>This method never returns normally. It is declared to return a RuntimeException so that
+     * callers can write {@code throw exitOnRestartRequired(e)} to end the control flow explicitly.
+     */
+    static RuntimeException exitOnRestartRequired(RestartRequiredException restartEx) {
+        if (Env.isCheckpointThread()) {
+            throw restartEx;
+        }
+        LOG.error("catch a RestartRequiredException, will exit and replay journals"
+                + " from image and the master's stream after restart.", restartEx);
+        System.exit(-1);
+        throw restartEx; // unreachable, just to end the control flow
     }
 
     @Override
@@ -673,21 +705,8 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                 } else {
                     throw insufficientLogEx;
                 }
-            } catch (RollbackException rollbackEx) {
-                if (!Env.isCheckpointThread()) {
-                    // Because Doris FE can not rollback its edit log, so it should restart and replay the new master's
-                    // edit log.
-                    if (rollbackEx.getEarliestTransactionId() != 0) {
-                        LOG.error("Catch rollback log exception and it may have replayed outdated "
-                                + "logs, so exec System.exit(-1).", rollbackEx);
-                        System.exit(-1);
-                    }
-                    LOG.warn("catch rollback log exception. will reopen the ReplicatedEnvironment.", rollbackEx);
-                    bdbEnvironment.close();
-                    bdbEnvironment.openReplicatedEnvironment(new File(environmentPath));
-                } else {
-                    throw rollbackEx;
-                }
+            } catch (RestartRequiredException restartEx) {
+                throw exitOnRestartRequired(restartEx);
             }
         }
 
