@@ -80,6 +80,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 
 
@@ -1068,6 +1069,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             env.getBackupHandler().addSnapshot(label, this);
             return;
         }
+
+        cleanupLocalJobDir();
     }
 
     private boolean uploadFile(String localFilePath, String remoteFilePath) {
@@ -1130,18 +1133,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 break;
         }
 
-        // clean the backup job dir
-        if (localJobDirPath != null) {
-            try {
-                File jobDir = new File(localJobDirPath.toString());
-                if (jobDir.exists()) {
-                    Files.walk(localJobDirPath, FileVisitOption.FOLLOW_LINKS).sorted(Comparator.reverseOrder())
-                            .map(Path::toFile).forEach(File::delete);
-                }
-            } catch (Exception e) {
-                LOG.warn("failed to clean the backup job dir: " + localJobDirPath.toString());
-            }
-        }
+        cleanupLocalJobDir();
 
         // meta info and job info not need save in log when cancel, we need to clean them here
         backupMeta = null;
@@ -1175,12 +1167,79 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         // Avoid loading expired meta.
         long expiredAt = createTime + timeoutMs;
         if (System.currentTimeMillis() >= expiredAt) {
+            cleanupLocalJobDir();
             return new Snapshot(label, null, null, expiredAt, commitSeq);
         }
 
-        File metaInfoFile = new File(localMetaInfoFilePath);
-        File jobInfoFile = new File(localJobInfoFilePath);
-        return new Snapshot(label, metaInfoFile, jobInfoFile, expiredAt, commitSeq);
+        try {
+            byte[] meta = Files.readAllBytes(Paths.get(localMetaInfoFilePath));
+            byte[] jobInfo = Files.readAllBytes(Paths.get(localJobInfoFilePath));
+            return new Snapshot(label, meta, jobInfo, expiredAt, commitSeq);
+        } catch (IOException e) {
+            LOG.warn("failed to read local snapshot files. {}", this, e);
+            return null;
+        }
+    }
+
+    synchronized void cleanupLocalJobDirIfNecessary(long nowMs) {
+        if (repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
+            if (isDone()) {
+                cleanupLocalJobDir();
+            }
+            return;
+        }
+
+        if (isCancelled() || (isFinished() && nowMs >= createTime + timeoutMs)) {
+            cleanupLocalJobDir();
+        }
+    }
+
+    synchronized void cleanupLocalJobDirAfterRemoved() {
+        if (isDone()) {
+            cleanupLocalJobDir();
+        }
+    }
+
+    private void cleanupLocalJobDir() {
+        Path jobDirPath = getLocalJobDirPathForCleanup();
+        if (jobDirPath == null) {
+            return;
+        }
+        Path normalizedJobDirPath = jobDirPath.toAbsolutePath().normalize();
+        if (!isValidLocalJobDirForCleanup(normalizedJobDirPath)) {
+            LOG.warn("skip cleaning invalid backup job dir: {}. {}", normalizedJobDirPath, this);
+            return;
+        }
+        try {
+            File jobDir = normalizedJobDirPath.toFile();
+            if (jobDir.exists()) {
+                try (Stream<Path> paths = Files.walk(normalizedJobDirPath)) {
+                    paths.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+                }
+                LOG.info("cleaned backup job dir: {}. {}", normalizedJobDirPath, this);
+            }
+            localJobDirPath = null;
+        } catch (Exception e) {
+            LOG.warn("failed to clean the backup job dir: {}. {}", normalizedJobDirPath, this, e);
+        }
+    }
+
+    private Path getLocalJobDirPathForCleanup() {
+        if (localJobDirPath != null) {
+            return localJobDirPath;
+        }
+        if (localMetaInfoFilePath != null) {
+            return Paths.get(localMetaInfoFilePath).getParent();
+        }
+        if (localJobInfoFilePath != null) {
+            return Paths.get(localJobInfoFilePath).getParent();
+        }
+        return null;
+    }
+
+    private boolean isValidLocalJobDirForCleanup(Path jobDirPath) {
+        Path backupRootDir = BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize();
+        return jobDirPath.startsWith(backupRootDir) && !jobDirPath.equals(backupRootDir);
     }
 
     public synchronized List<String> getInfo() {

@@ -354,6 +354,7 @@ public class BackupJobTest {
         Assert.assertTrue(metaInfo.exists());
         File jobInfo = new File(job.getLocalJobInfoFilePath());
         Assert.assertTrue(jobInfo.exists());
+        File localJobDir = jobInfo.getParentFile();
 
         BackupMeta restoreMetaInfo = null;
         BackupJobInfo restoreJobInfo = null;
@@ -383,6 +384,7 @@ public class BackupJobTest {
         job.run();
         Assert.assertEquals(Status.OK, job.getStatus());
         Assert.assertEquals(BackupJobState.FINISHED, job.getState());
+        Assert.assertFalse(localJobDir.exists());
     }
 
     @Test
@@ -409,6 +411,98 @@ public class BackupJobTest {
         Assert.assertNotNull(copied);
         Assert.assertFalse(copied.dynamicPartitionExists());
         Assert.assertTrue(copied.getTableProperty().hasInvalidDynamicPartition());
+    }
+
+    @Test
+    public void testCleanupFinishedRemoteBackupJobDirFromPersistedFilePaths() throws IOException {
+        File localJobDir = createLocalJobDir("remote_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-10-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        Deencapsulation.setField(job, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(job, "localJobDirPath", null);
+        Deencapsulation.setField(job, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(job, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        job.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+
+        Assert.assertFalse(localJobDir.exists());
+    }
+
+    @Test
+    public void testCleanupLocalSnapshotJobDirOnlyAfterExpired() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-11-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(createTime + 999);
+        Assert.assertTrue(localJobDir.exists());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(createTime + 1000);
+        Assert.assertFalse(localJobDir.exists());
+    }
+
+    @Test
+    public void testLocalSnapshotDataRemainsReadableAfterJobDirCleanup() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_read_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-12-00-00");
+        byte[] metaBytes = new byte[] {1, 2, 3};
+        byte[] jobInfoBytes = new byte[] {4, 5, 6};
+        Files.write(metaInfo.toPath(), metaBytes);
+        Files.write(jobInfo.toPath(), jobInfoBytes);
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        Snapshot snapshot = localSnapshotJob.getSnapshot();
+        localSnapshotJob.cleanupLocalJobDirAfterRemoved();
+
+        Assert.assertFalse(localJobDir.exists());
+        Assert.assertArrayEquals(metaBytes, snapshot.getMeta());
+        Assert.assertArrayEquals(jobInfoBytes, snapshot.getJobInfo());
+    }
+
+    @Test
+    public void testCleanupCancelledLocalSnapshotJobDirFromPersistedFilePaths() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_cancel_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-13-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.CANCELLED);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+
+        Assert.assertFalse(localJobDir.exists());
     }
 
     /**
@@ -649,5 +743,11 @@ public class BackupJobTest {
         // 3. delete files
         in.close();
         Files.delete(path);
+    }
+
+    private File createLocalJobDir(String name) throws IOException {
+        Path jobDirPath = BackupHandler.BACKUP_ROOT_DIR.resolve(name + "_" + id.getAndIncrement());
+        Files.createDirectories(jobDirPath);
+        return jobDirPath.toFile();
     }
 }
