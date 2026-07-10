@@ -1326,15 +1326,22 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         try {
             File jobDir = normalizedJobDirPath.toFile();
             if (jobDir.exists()) {
-                try (Stream<Path> paths = Files.walk(normalizedJobDirPath)) {
-                    paths.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
-                }
+                deleteLocalJobDir(normalizedJobDirPath);
                 LOG.info("cleaned backup job dir: {}. {}", normalizedJobDirPath, this);
             }
             localJobDirPath = null;
             localJobDirCleaned = true;
         } catch (Exception e) {
             LOG.warn("failed to clean the backup job dir: {}. {}", normalizedJobDirPath, this, e);
+        }
+    }
+
+    void deleteLocalJobDir(Path jobDirPath) throws IOException {
+        try (Stream<Path> paths = Files.walk(jobDirPath)) {
+            List<Path> pathsToDelete = paths.sorted(Comparator.reverseOrder()).collect(Collectors.toList());
+            for (Path path : pathsToDelete) {
+                Files.deleteIfExists(path);
+            }
         }
     }
 

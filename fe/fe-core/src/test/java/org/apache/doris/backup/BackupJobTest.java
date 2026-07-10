@@ -613,6 +613,41 @@ public class BackupJobTest {
     }
 
     @Test
+    public void testCleanupRetriesAfterDeleteFailure() throws IOException {
+        boolean[] failDelete = {true};
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0) {
+            @Override
+            void deleteLocalJobDir(Path jobDirPath) throws IOException {
+                if (failDelete[0]) {
+                    failDelete[0] = false;
+                    throw new IOException("injected delete failure");
+                }
+                super.deleteLocalJobDir(jobDirPath);
+            }
+        };
+        File localJobDir = createLocalJobDir("local_snapshot_delete_retry");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-10-10-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.CANCELLED);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+        Assert.assertTrue(localJobDir.exists());
+        Assert.assertFalse(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+        Assert.assertFalse(localJobDir.exists());
+        Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+    }
+
+    @Test
     public void testLocalSnapshotIoFailurePropagatesAsIOException() throws IOException {
         BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
