@@ -36,6 +36,7 @@ import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.View;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.common.GZIPUtils;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.TimeUtils;
@@ -1158,8 +1159,16 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         return commitSeq;
     }
 
-    // read meta and job info bytes from disk, and return the snapshot
-    public synchronized Snapshot getSnapshot() {
+    /**
+     * Materialize a local snapshot for getSnapshot RPC under the job lock.
+     *
+     * <p>Checks original file sizes before any full read. For uncompressed requests
+     * that exceed the thrift ~2GB limit, returns sizes only (no file content).
+     * For compressed requests, stream-compresses from files so uncompressed
+     * byte[] are never fully loaded into heap. Returned Snapshot holds all data
+     * needed by the RPC so the job dir can be cleaned up afterwards.
+     */
+    public synchronized Snapshot getSnapshot(boolean enableCompress) {
         if (state != BackupJobState.FINISHED || repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
             return null;
         }
@@ -1168,13 +1177,32 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         long expiredAt = createTime + timeoutMs;
         if (System.currentTimeMillis() >= expiredAt) {
             cleanupLocalJobDir();
-            return new Snapshot(label, null, null, expiredAt, commitSeq);
+            return new Snapshot(label, null, null, 0, 0, false, expiredAt, commitSeq);
         }
 
         try {
-            byte[] meta = Files.readAllBytes(Paths.get(localMetaInfoFilePath));
-            byte[] jobInfo = Files.readAllBytes(Paths.get(localJobInfoFilePath));
-            return new Snapshot(label, meta, jobInfo, expiredAt, commitSeq);
+            Path metaPath = Paths.get(localMetaInfoFilePath);
+            Path jobInfoPath = Paths.get(localJobInfoFilePath);
+            long metaSize = Files.size(metaPath);
+            long jobInfoSize = Files.size(jobInfoPath);
+
+            // Uncompressed thrift payload cannot exceed Integer.MAX_VALUE (~2GB).
+            // Reject before reading so FE heap is not blown by large local snapshots.
+            if (!enableCompress && metaSize + jobInfoSize >= Integer.MAX_VALUE) {
+                return new Snapshot(label, null, null, metaSize, jobInfoSize, false, expiredAt, commitSeq);
+            }
+
+            byte[] meta;
+            byte[] jobInfo;
+            if (enableCompress) {
+                // Stream compress from files (8KB buffer); do not load full raw content first.
+                meta = GZIPUtils.compress(metaPath.toFile());
+                jobInfo = GZIPUtils.compress(jobInfoPath.toFile());
+            } else {
+                meta = Files.readAllBytes(metaPath);
+                jobInfo = Files.readAllBytes(jobInfoPath);
+            }
+            return new Snapshot(label, meta, jobInfo, metaSize, jobInfoSize, enableCompress, expiredAt, commitSeq);
         } catch (IOException e) {
             LOG.warn("failed to read local snapshot files. {}", this, e);
             return null;

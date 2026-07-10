@@ -974,7 +974,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
     }
 
-    public Snapshot getSnapshot(String labelName) {
+    public Snapshot getSnapshot(String labelName, boolean enableCompress) {
         BackupJob backupJob;
         localSnapshotsLock.readLock().lock();
         try {
@@ -987,7 +987,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             return null;
         }
 
-        return backupJob.getSnapshot();
+        return backupJob.getSnapshot(enableCompress);
     }
 
     public static BackupHandler read(DataInput in) throws IOException {
