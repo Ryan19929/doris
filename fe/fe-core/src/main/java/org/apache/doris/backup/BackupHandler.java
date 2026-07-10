@@ -974,7 +974,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
     }
 
-    public Snapshot getSnapshot(String labelName, boolean enableCompress) {
+    public Snapshot getSnapshot(String labelName, boolean enableCompress) throws IOException {
         BackupJob backupJob;
         localSnapshotsLock.readLock().lock();
         try {

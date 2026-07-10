@@ -132,6 +132,14 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     private String localMetaInfoFilePath = null;
     @SerializedName("jifp")
     private String localJobInfoFilePath = null;
+    /**
+     * Coordinates local staging-dir lifetime with getSnapshot materialization.
+     * Separate from the job state monitor so heavy IO does not block BackupJob.run().
+     */
+    private final Object localJobDirLock = new Object();
+    private int localJobDirReaders = 0;
+    private boolean localJobDirCleanupPending = false;
+    private boolean localJobDirCleaned = false;
     // backup properties && table commit seq with table id
     @SerializedName("prop")
     private Map<String, String> properties = Maps.newHashMap();
@@ -1160,52 +1168,85 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     }
 
     /**
-     * Materialize a local snapshot for getSnapshot RPC under the job lock.
+     * Materialize a local snapshot for getSnapshot RPC.
      *
-     * <p>Checks original file sizes before any full read. For uncompressed requests
-     * that exceed the thrift ~2GB limit, returns sizes only (no file content).
-     * For compressed requests, stream-compresses from files so uncompressed
-     * byte[] are never fully loaded into heap. Returned Snapshot holds all data
-     * needed by the RPC so the job dir can be cleaned up afterwards.
+     * <p>Job state is checked under the job monitor only briefly. File lifetime is
+     * protected by a separate reader refcount so heavy IO/compression does not block
+     * {@link #run()} / other jobs on the backup daemon. Uncompressed payloads that
+     * exceed the thrift ~2GB limit are rejected before reading content. Compressed
+     * payloads are stream-compressed with an output size bound. IO failures propagate
+     * as {@link IOException} (not "snapshot not exist").
      */
-    public synchronized Snapshot getSnapshot(boolean enableCompress) {
-        if (state != BackupJobState.FINISHED || repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
+    public Snapshot getSnapshot(boolean enableCompress) throws IOException {
+        final String metaPathStr;
+        final String jobInfoPathStr;
+        final long expiredAt;
+        final long commitSeqSnapshot;
+        final String snapshotLabel;
+
+        synchronized (this) {
+            if (state != BackupJobState.FINISHED || repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
+                return null;
+            }
+
+            // Avoid loading expired meta.
+            expiredAt = createTime + timeoutMs;
+            if (System.currentTimeMillis() >= expiredAt) {
+                cleanupLocalJobDir();
+                return new Snapshot(label, null, null, 0, 0, false, expiredAt, commitSeq);
+            }
+            metaPathStr = localMetaInfoFilePath;
+            jobInfoPathStr = localJobInfoFilePath;
+            commitSeqSnapshot = commitSeq;
+            snapshotLabel = label;
+        }
+
+        if (metaPathStr == null || jobInfoPathStr == null) {
+            return null;
+        }
+        if (!acquireLocalJobDirRead()) {
+            // Dir already cleaned or never created.
             return null;
         }
 
-        // Avoid loading expired meta.
-        long expiredAt = createTime + timeoutMs;
-        if (System.currentTimeMillis() >= expiredAt) {
-            cleanupLocalJobDir();
-            return new Snapshot(label, null, null, 0, 0, false, expiredAt, commitSeq);
-        }
-
         try {
-            Path metaPath = Paths.get(localMetaInfoFilePath);
-            Path jobInfoPath = Paths.get(localJobInfoFilePath);
+            Path metaPath = Paths.get(metaPathStr);
+            Path jobInfoPath = Paths.get(jobInfoPathStr);
             long metaSize = Files.size(metaPath);
             long jobInfoSize = Files.size(jobInfoPath);
 
             // Uncompressed thrift payload cannot exceed Integer.MAX_VALUE (~2GB).
             // Reject before reading so FE heap is not blown by large local snapshots.
             if (!enableCompress && metaSize + jobInfoSize >= Integer.MAX_VALUE) {
-                return new Snapshot(label, null, null, metaSize, jobInfoSize, false, expiredAt, commitSeq);
+                return new Snapshot(snapshotLabel, null, null, metaSize, jobInfoSize, false, expiredAt,
+                        commitSeqSnapshot);
             }
 
             byte[] meta;
             byte[] jobInfo;
             if (enableCompress) {
-                // Stream compress from files (8KB buffer); do not load full raw content first.
-                meta = GZIPUtils.compress(metaPath.toFile());
-                jobInfo = GZIPUtils.compress(jobInfoPath.toFile());
+                // Stream compress with a hard cap so low-compressibility data cannot
+                // grow an unbounded ByteArrayOutputStream on the FE heap.
+                meta = GZIPUtils.compress(metaPath.toFile(), Integer.MAX_VALUE);
+                int remaining = Integer.MAX_VALUE - meta.length;
+                if (remaining <= 0) {
+                    throw new IOException(String.format(
+                            "Compressed snapshot meta alone is too large (%d bytes >= 2GB).", meta.length));
+                }
+                jobInfo = GZIPUtils.compress(jobInfoPath.toFile(), remaining);
+                if ((long) meta.length + jobInfo.length >= Integer.MAX_VALUE) {
+                    throw new IOException(String.format(
+                            "Compressed snapshot is too large (%d bytes >= 2GB).",
+                            (long) meta.length + jobInfo.length));
+                }
             } else {
                 meta = Files.readAllBytes(metaPath);
                 jobInfo = Files.readAllBytes(jobInfoPath);
             }
-            return new Snapshot(label, meta, jobInfo, metaSize, jobInfoSize, enableCompress, expiredAt, commitSeq);
-        } catch (IOException e) {
-            LOG.warn("failed to read local snapshot files. {}", this, e);
-            return null;
+            return new Snapshot(snapshotLabel, meta, jobInfo, metaSize, jobInfoSize, enableCompress, expiredAt,
+                    commitSeqSnapshot);
+        } finally {
+            releaseLocalJobDirRead();
         }
     }
 
@@ -1228,9 +1269,53 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         }
     }
 
+    /**
+     * Delete local staging dir when no getSnapshot reader is active; otherwise defer
+     * until the last reader releases. Must not run heavy IO while holding the job monitor
+     * for longer than the brief synchronized callers already do — deletion itself uses
+     * {@link #localJobDirLock} only.
+     */
     private void cleanupLocalJobDir() {
+        synchronized (localJobDirLock) {
+            if (localJobDirCleaned) {
+                return;
+            }
+            if (localJobDirReaders > 0) {
+                localJobDirCleanupPending = true;
+                return;
+            }
+            cleanupLocalJobDirUnderLock();
+        }
+    }
+
+    private boolean acquireLocalJobDirRead() {
+        synchronized (localJobDirLock) {
+            if (localJobDirCleaned) {
+                return false;
+            }
+            if (getLocalJobDirPathForCleanup() == null) {
+                return false;
+            }
+            localJobDirReaders++;
+            return true;
+        }
+    }
+
+    private void releaseLocalJobDirRead() {
+        synchronized (localJobDirLock) {
+            localJobDirReaders--;
+            if (localJobDirReaders == 0 && localJobDirCleanupPending) {
+                cleanupLocalJobDirUnderLock();
+            }
+        }
+    }
+
+    /** Caller must hold {@link #localJobDirLock}. */
+    private void cleanupLocalJobDirUnderLock() {
+        localJobDirCleanupPending = false;
         Path jobDirPath = getLocalJobDirPathForCleanup();
         if (jobDirPath == null) {
+            localJobDirCleaned = true;
             return;
         }
         Path normalizedJobDirPath = jobDirPath.toAbsolutePath().normalize();
@@ -1247,6 +1332,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 LOG.info("cleaned backup job dir: {}. {}", normalizedJobDirPath, this);
             }
             localJobDirPath = null;
+            localJobDirCleaned = true;
         } catch (Exception e) {
             LOG.warn("failed to clean the backup job dir: {}. {}", normalizedJobDirPath, this, e);
         }

@@ -3134,7 +3134,8 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         TGetSnapshotResult result = new TGetSnapshotResult();
         result.setStatus(new TStatus(TStatusCode.OK));
         boolean enableCompress = request.isEnableCompress();
-        // Materialize (or size-check) under BackupJob lock; do not re-read files after return.
+        // Materialize (or size-check) with file refcount; IOException propagates as INTERNAL_ERROR.
+        // Do not re-read files after return.
         Snapshot snapshot = Env.getCurrentEnv().getBackupHandler().getSnapshot(label, enableCompress);
         if (snapshot == null) {
             result.getStatus().setStatusCode(TStatusCode.SNAPSHOT_NOT_EXIST);

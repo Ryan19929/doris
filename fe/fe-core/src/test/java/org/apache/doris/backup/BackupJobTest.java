@@ -576,11 +576,12 @@ public class BackupJobTest {
     }
 
     /**
-     * getSnapshot holds the job lock while materializing; concurrent cleanup must wait
-     * until materialization finishes so the response is not corrupted by mid-read deletion.
+     * Active getSnapshot readers pin the staging dir via refcount; cleanup is deferred
+     * until the last reader releases, so mid-read deletion cannot corrupt materialization.
+     * Job state monitor is not required for this coordination.
      */
     @Test
-    public void testLocalSnapshotCleanupWaitsForGetSnapshotMaterialization() throws Exception {
+    public void testLocalSnapshotCleanupDefersWhileGetSnapshotReaderPinned() throws Exception {
         BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
@@ -599,48 +600,82 @@ public class BackupJobTest {
         Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
         Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
 
-        java.util.concurrent.CountDownLatch cleanupStarted = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.CountDownLatch snapshotDone = new java.util.concurrent.CountDownLatch(1);
-        java.util.concurrent.atomic.AtomicReference<Snapshot> snapshotRef =
-                new java.util.concurrent.atomic.AtomicReference<>();
-        java.util.concurrent.atomic.AtomicReference<Throwable> errorRef =
-                new java.util.concurrent.atomic.AtomicReference<>();
+        // Simulate an in-flight getSnapshot reader pin.
+        Deencapsulation.setField(localSnapshotJob, "localJobDirReaders", 1);
+        localSnapshotJob.cleanupLocalJobDirAfterRemoved();
+        Assert.assertTrue("cleanup must defer while a reader is pinned", localJobDir.exists());
+        Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleanupPending"));
 
-        Thread reader = new Thread(() -> {
-            try {
-                // Hold the job lock briefly so cleanup is forced to wait on the same monitor.
-                synchronized (localSnapshotJob) {
-                    cleanupStarted.countDown();
-                    Thread.sleep(200);
-                    snapshotRef.set(localSnapshotJob.getSnapshot(false));
-                }
-                snapshotDone.countDown();
-            } catch (Throwable t) {
-                errorRef.set(t);
-                snapshotDone.countDown();
-            }
-        });
-        Thread cleaner = new Thread(() -> {
-            try {
-                Assert.assertTrue(cleanupStarted.await(5, java.util.concurrent.TimeUnit.SECONDS));
-                localSnapshotJob.cleanupLocalJobDirAfterRemoved();
-            } catch (Throwable t) {
-                errorRef.set(t);
-            }
-        });
-
-        reader.start();
-        cleaner.start();
-        Assert.assertTrue(snapshotDone.await(10, java.util.concurrent.TimeUnit.SECONDS));
-        reader.join(5000);
-        cleaner.join(5000);
-
-        Assert.assertNull(errorRef.get());
-        Snapshot snapshot = snapshotRef.get();
-        Assert.assertNotNull(snapshot);
-        Assert.assertArrayEquals(metaBytes, snapshot.getMeta());
-        Assert.assertArrayEquals(jobInfoBytes, snapshot.getJobInfo());
+        // Release the pin (readers 1 -> 0); deferred cleanup should run.
+        Deencapsulation.invoke(localSnapshotJob, "releaseLocalJobDirRead");
         Assert.assertFalse(localJobDir.exists());
+        Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+    }
+
+    @Test
+    public void testLocalSnapshotIoFailurePropagatesAsIOException() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_io_fail");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-17-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        Assert.assertTrue(metaInfo.delete());
+        try {
+            localSnapshotJob.getSnapshot(false);
+            Assert.fail("expected IOException when meta file is missing");
+        } catch (IOException e) {
+            // Must not be swallowed as null / SNAPSHOT_NOT_EXIST.
+            Assert.assertNotNull(e.getMessage());
+        }
+        // Failed materialization still releases the pin so later cleanup can proceed.
+        localSnapshotJob.cleanupLocalJobDirAfterRemoved();
+        Assert.assertFalse(localJobDir.exists());
+    }
+
+    @Test
+    public void testLocalSnapshotCompressHonorsOutputSizeLimit() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_compress_limit");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-18-00-00");
+        byte[] lowCompress = new byte[128 * 1024];
+        new java.util.Random(1).nextBytes(lowCompress);
+        Files.write(metaInfo.toPath(), lowCompress);
+        Files.write(jobInfo.toPath(), new byte[] {1, 2, 3});
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        // Directly exercise bounded compress used by getSnapshot(true).
+        try {
+            GZIPUtils.compress(metaInfo, 64);
+            Assert.fail("expected compressed size limit to fail on low-compressibility data");
+        } catch (IOException e) {
+            Assert.assertTrue(e.getMessage().contains("compressed size exceeds limit"));
+        }
+
+        // Normal compress path still works with full limit.
+        Snapshot snapshot = localSnapshotJob.getSnapshot(true);
+        Assert.assertNotNull(snapshot);
+        Assert.assertTrue(snapshot.isCompressed());
+        Assert.assertArrayEquals(lowCompress, GZIPUtils.decompress(snapshot.getMeta()));
     }
 
     @Test
