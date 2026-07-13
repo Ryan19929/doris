@@ -1178,11 +1178,13 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
      * as {@link IOException} (not "snapshot not exist").
      */
     public Snapshot getSnapshot(boolean enableCompress) throws IOException {
-        final String metaPathStr;
-        final String jobInfoPathStr;
-        final long expiredAt;
-        final long commitSeqSnapshot;
-        final String snapshotLabel;
+        String metaPathStr = null;
+        String jobInfoPathStr = null;
+        long expiredAt = 0;
+        long commitSeqSnapshot = 0;
+        String snapshotLabel = null;
+        Snapshot expiredSnapshot = null;
+        boolean pinned = false;
 
         synchronized (this) {
             if (state != BackupJobState.FINISHED || repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
@@ -1192,21 +1194,26 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             // Avoid loading expired meta.
             expiredAt = createTime + timeoutMs;
             if (System.currentTimeMillis() >= expiredAt) {
-                cleanupLocalJobDir();
-                return new Snapshot(label, null, null, 0, 0, false, expiredAt, commitSeq);
+                expiredSnapshot = new Snapshot(label, null, null, 0, 0, false, expiredAt, commitSeq);
+            } else {
+                metaPathStr = localMetaInfoFilePath;
+                jobInfoPathStr = localJobInfoFilePath;
+                if (metaPathStr == null || jobInfoPathStr == null) {
+                    return null;
+                }
+                if (!acquireLocalJobDirRead()) {
+                    // Dir already cleaned or never created.
+                    return null;
+                }
+                pinned = true;
+                commitSeqSnapshot = commitSeq;
+                snapshotLabel = label;
             }
-            metaPathStr = localMetaInfoFilePath;
-            jobInfoPathStr = localJobInfoFilePath;
-            commitSeqSnapshot = commitSeq;
-            snapshotLabel = label;
         }
 
-        if (metaPathStr == null || jobInfoPathStr == null) {
-            return null;
-        }
-        if (!acquireLocalJobDirRead()) {
-            // Dir already cleaned or never created.
-            return null;
+        if (expiredSnapshot != null) {
+            cleanupLocalJobDir();
+            return expiredSnapshot;
         }
 
         try {
@@ -1246,25 +1253,37 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             return new Snapshot(snapshotLabel, meta, jobInfo, metaSize, jobInfoSize, enableCompress, expiredAt,
                     commitSeqSnapshot);
         } finally {
-            releaseLocalJobDirRead();
+            if (pinned) {
+                releaseLocalJobDirRead();
+            }
         }
     }
 
-    synchronized void cleanupLocalJobDirIfNecessary(long nowMs) {
-        if (repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
-            if (isDone()) {
-                cleanupLocalJobDir();
+    void cleanupLocalJobDirIfNecessary(long nowMs) {
+        boolean shouldCleanup;
+        synchronized (this) {
+            if (repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
+                shouldCleanup = isDone();
+            } else {
+                shouldCleanup = isCancelled() || (isFinished() && nowMs >= createTime + timeoutMs);
             }
-            return;
         }
-
-        if (isCancelled() || (isFinished() && nowMs >= createTime + timeoutMs)) {
+        if (shouldCleanup) {
             cleanupLocalJobDir();
         }
     }
 
-    synchronized void cleanupLocalJobDirAfterRemoved() {
-        if (isDone()) {
+    /**
+     * Clean up local staging dir after this job is evicted from the per-db deque.
+     * Local snapshot lifetime is bounded by both {@link #timeoutMs} and
+     * {@code max_backup_restore_job_num_per_db} queue eviction.
+     */
+    void cleanupLocalJobDirAfterRemoved() {
+        boolean shouldCleanup;
+        synchronized (this) {
+            shouldCleanup = isDone();
+        }
+        if (shouldCleanup) {
             cleanupLocalJobDir();
         }
     }
