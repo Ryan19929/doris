@@ -32,6 +32,7 @@ import org.apache.doris.catalog.TableProperty;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.GZIPUtils;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.common.util.UnitTestUtil;
@@ -68,6 +69,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -354,6 +356,7 @@ public class BackupJobTest {
         Assert.assertTrue(metaInfo.exists());
         File jobInfo = new File(job.getLocalJobInfoFilePath());
         Assert.assertTrue(jobInfo.exists());
+        File localJobDir = jobInfo.getParentFile();
 
         BackupMeta restoreMetaInfo = null;
         BackupJobInfo restoreJobInfo = null;
@@ -383,6 +386,7 @@ public class BackupJobTest {
         job.run();
         Assert.assertEquals(Status.OK, job.getStatus());
         Assert.assertEquals(BackupJobState.FINISHED, job.getState());
+        Assert.assertFalse(localJobDir.exists());
     }
 
     @Test
@@ -409,6 +413,325 @@ public class BackupJobTest {
         Assert.assertNotNull(copied);
         Assert.assertFalse(copied.dynamicPartitionExists());
         Assert.assertTrue(copied.getTableProperty().hasInvalidDynamicPartition());
+    }
+
+    @Test
+    public void testCleanupFinishedRemoteBackupJobDirFromPersistedFilePaths() throws IOException {
+        File localJobDir = createLocalJobDir("remote_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-10-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        Deencapsulation.setField(job, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(job, "localJobDirPath", null);
+        Deencapsulation.setField(job, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(job, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        job.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+
+        Assert.assertFalse(localJobDir.exists());
+    }
+
+    @Test
+    public void testCleanupLocalSnapshotJobDirOnlyAfterExpired() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-11-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(createTime + 999);
+        Assert.assertTrue(localJobDir.exists());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(createTime + 1000);
+        Assert.assertFalse(localJobDir.exists());
+    }
+
+    @Test
+    public void testLocalSnapshotDataRemainsReadableAfterJobDirCleanup() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_read_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-12-00-00");
+        byte[] metaBytes = new byte[] {1, 2, 3};
+        byte[] jobInfoBytes = new byte[] {4, 5, 6};
+        Files.write(metaInfo.toPath(), metaBytes);
+        Files.write(jobInfo.toPath(), jobInfoBytes);
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        Snapshot snapshot = localSnapshotJob.getSnapshot(false);
+        localSnapshotJob.cleanupLocalJobDirAfterRemoved();
+
+        Assert.assertFalse(localJobDir.exists());
+        Assert.assertFalse(snapshot.isCompressed());
+        Assert.assertEquals(metaBytes.length, snapshot.getMetaSize());
+        Assert.assertEquals(jobInfoBytes.length, snapshot.getJobInfoSize());
+        Assert.assertArrayEquals(metaBytes, snapshot.getMeta());
+        Assert.assertArrayEquals(jobInfoBytes, snapshot.getJobInfo());
+    }
+
+    /**
+     * Oversized local snapshot must not be fully read into FE heap when compression is off.
+     * Sparse files provide a logical size &gt;= Integer.MAX_VALUE without allocating disk/RAM.
+     */
+    @Test
+    public void testLocalSnapshotOversizedWithoutCompressDoesNotReadFiles() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_oversized");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-14-00-00");
+
+        long metaLogicalSize = (long) Integer.MAX_VALUE - 100L;
+        long jobInfoLogicalSize = 100L;
+        createSparseFile(metaInfo, metaLogicalSize);
+        createSparseFile(jobInfo, jobInfoLogicalSize);
+        Assert.assertEquals(metaLogicalSize, metaInfo.length());
+        Assert.assertEquals(jobInfoLogicalSize, jobInfo.length());
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        Snapshot snapshot = localSnapshotJob.getSnapshot(false);
+
+        Assert.assertNotNull(snapshot);
+        Assert.assertFalse(snapshot.isExpired());
+        Assert.assertFalse(snapshot.isCompressed());
+        Assert.assertEquals(metaLogicalSize, snapshot.getMetaSize());
+        Assert.assertEquals(jobInfoLogicalSize, snapshot.getJobInfoSize());
+        Assert.assertTrue(snapshot.getMetaSize() + snapshot.getJobInfoSize() >= Integer.MAX_VALUE);
+        // Content must not be materialized for oversized uncompressed responses.
+        Assert.assertNull(snapshot.getMeta());
+        Assert.assertNull(snapshot.getJobInfo());
+        // Job dir must still exist; size guard rejected before any cleanup side-effect.
+        Assert.assertTrue(localJobDir.exists());
+    }
+
+    @Test
+    public void testLocalSnapshotCompressStreamsFilesAndSurvivesCleanup() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_compress");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-15-00-00");
+        // Slightly compressible payload; enough bytes to exercise streaming path.
+        byte[] metaBytes = new byte[64 * 1024];
+        byte[] jobInfoBytes = new byte[32 * 1024];
+        for (int i = 0; i < metaBytes.length; i++) {
+            metaBytes[i] = (byte) (i % 7);
+        }
+        for (int i = 0; i < jobInfoBytes.length; i++) {
+            jobInfoBytes[i] = (byte) (i % 11);
+        }
+        Files.write(metaInfo.toPath(), metaBytes);
+        Files.write(jobInfo.toPath(), jobInfoBytes);
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        Snapshot snapshot = localSnapshotJob.getSnapshot(true);
+        Assert.assertNotNull(snapshot);
+        Assert.assertTrue(snapshot.isCompressed());
+        Assert.assertEquals(metaBytes.length, snapshot.getMetaSize());
+        Assert.assertEquals(jobInfoBytes.length, snapshot.getJobInfoSize());
+        Assert.assertTrue(GZIPUtils.isGZIPCompressed(snapshot.getMeta()));
+        Assert.assertTrue(GZIPUtils.isGZIPCompressed(snapshot.getJobInfo()));
+        Assert.assertArrayEquals(metaBytes, GZIPUtils.decompress(snapshot.getMeta()));
+        Assert.assertArrayEquals(jobInfoBytes, GZIPUtils.decompress(snapshot.getJobInfo()));
+
+        localSnapshotJob.cleanupLocalJobDirAfterRemoved();
+        Assert.assertFalse(localJobDir.exists());
+        // Materialized compressed payload remains usable after job dir is deleted.
+        Assert.assertArrayEquals(metaBytes, GZIPUtils.decompress(snapshot.getMeta()));
+        Assert.assertArrayEquals(jobInfoBytes, GZIPUtils.decompress(snapshot.getJobInfo()));
+    }
+
+    /**
+     * Active getSnapshot readers pin the staging dir via refcount; cleanup is deferred
+     * until the last reader releases, so mid-read deletion cannot corrupt materialization.
+     * Job state monitor is not required for this coordination.
+     */
+    @Test
+    public void testLocalSnapshotCleanupDefersWhileGetSnapshotReaderPinned() throws Exception {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_lock");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-16-00-00");
+        byte[] metaBytes = new byte[] {10, 20, 30, 40};
+        byte[] jobInfoBytes = new byte[] {50, 60, 70};
+        Files.write(metaInfo.toPath(), metaBytes);
+        Files.write(jobInfo.toPath(), jobInfoBytes);
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        // Simulate an in-flight getSnapshot reader pin.
+        Deencapsulation.setField(localSnapshotJob, "localJobDirReaders", 1);
+        localSnapshotJob.cleanupLocalJobDirAfterRemoved();
+        Assert.assertTrue("cleanup must defer while a reader is pinned", localJobDir.exists());
+        Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleanupPending"));
+
+        // Release the pin (readers 1 -> 0); deferred cleanup should run.
+        Deencapsulation.invoke(localSnapshotJob, "releaseLocalJobDirRead");
+        Assert.assertFalse(localJobDir.exists());
+        Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+    }
+
+    @Test
+    public void testCleanupRetriesAfterDeleteFailure() throws IOException {
+        boolean[] failDelete = {true};
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0) {
+            @Override
+            void deleteLocalJobDir(Path jobDirPath) throws IOException {
+                if (failDelete[0]) {
+                    failDelete[0] = false;
+                    throw new IOException("injected delete failure");
+                }
+                super.deleteLocalJobDir(jobDirPath);
+            }
+        };
+        File localJobDir = createLocalJobDir("local_snapshot_delete_retry");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-10-10-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.CANCELLED);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+        Assert.assertTrue(localJobDir.exists());
+        Assert.assertFalse(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+        Assert.assertFalse(localJobDir.exists());
+        Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+    }
+
+    @Test
+    public void testLocalSnapshotIoFailurePropagatesAsIOException() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_io_fail");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-17-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        Assert.assertTrue(metaInfo.delete());
+        try {
+            localSnapshotJob.getSnapshot(false);
+            Assert.fail("expected IOException when meta file is missing");
+        } catch (IOException e) {
+            // Must not be swallowed as null / SNAPSHOT_NOT_EXIST.
+            Assert.assertNotNull(e.getMessage());
+        }
+        // Failed materialization still releases the pin so later cleanup can proceed.
+        localSnapshotJob.cleanupLocalJobDirAfterRemoved();
+        Assert.assertFalse(localJobDir.exists());
+    }
+
+    @Test
+    public void testLocalSnapshotCompressHonorsOutputSizeLimit() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_snapshot_compress_limit");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-18-00-00");
+        byte[] lowCompress = new byte[128 * 1024];
+        new java.util.Random(1).nextBytes(lowCompress);
+        Files.write(metaInfo.toPath(), lowCompress);
+        Files.write(jobInfo.toPath(), new byte[] {1, 2, 3});
+
+        long createTime = System.currentTimeMillis();
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(localSnapshotJob, "createTime", createTime);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        // Directly exercise bounded compress used by getSnapshot(true).
+        try {
+            GZIPUtils.compress(metaInfo, 64);
+            Assert.fail("expected compressed size limit to fail on low-compressibility data");
+        } catch (IOException e) {
+            Assert.assertTrue(e.getMessage().contains("compressed size exceeds limit"));
+        }
+
+        // Normal compress path still works with full limit.
+        Snapshot snapshot = localSnapshotJob.getSnapshot(true);
+        Assert.assertNotNull(snapshot);
+        Assert.assertTrue(snapshot.isCompressed());
+        Assert.assertArrayEquals(lowCompress, GZIPUtils.decompress(snapshot.getMeta()));
+    }
+
+    @Test
+    public void testCleanupCancelledLocalSnapshotJobDirFromPersistedFilePaths() throws IOException {
+        BackupJob localSnapshotJob = new BackupJob("local_label", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        File localJobDir = createLocalJobDir("local_cancel_cleanup");
+        File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-13-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        Deencapsulation.setField(localSnapshotJob, "state", BackupJobState.CANCELLED);
+        Deencapsulation.setField(localSnapshotJob, "localJobDirPath", null);
+        Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+
+        Assert.assertFalse(localJobDir.exists());
     }
 
     /**
@@ -649,5 +972,17 @@ public class BackupJobTest {
         // 3. delete files
         in.close();
         Files.delete(path);
+    }
+
+    private File createLocalJobDir(String name) throws IOException {
+        Path jobDirPath = BackupHandler.BACKUP_ROOT_DIR.resolve(name + "_" + id.getAndIncrement());
+        Files.createDirectories(jobDirPath);
+        return jobDirPath.toFile();
+    }
+
+    private void createSparseFile(File file, long logicalSize) throws IOException {
+        try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
+            raf.setLength(logicalSize);
+        }
     }
 }

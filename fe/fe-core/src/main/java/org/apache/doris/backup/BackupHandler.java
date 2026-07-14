@@ -203,6 +203,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             job.setEnv(env);
             job.run();
         }
+        cleanupBackupJobLocalJobDirs();
     }
 
     // handle create repository stmt
@@ -642,14 +643,14 @@ public class BackupHandler extends MasterDaemon implements Writable {
             return;
         }
 
-        List<String> removedLabels = Lists.newArrayList();
+        List<BackupJob> removedBackupJobs = Lists.newArrayList();
         jobLock.lock();
         try {
             Deque<AbstractJob> jobs = dbIdToBackupOrRestoreJobs.computeIfAbsent(dbId, k -> Lists.newLinkedList());
             while (jobs.size() >= Config.max_backup_restore_job_num_per_db) {
                 AbstractJob removedJob = jobs.removeFirst();
-                if (removedJob instanceof BackupJob && ((BackupJob) removedJob).isLocalSnapshot()) {
-                    removedLabels.add(removedJob.getLabel());
+                if (removedJob instanceof BackupJob) {
+                    removedBackupJobs.add((BackupJob) removedJob);
                 }
             }
             AbstractJob lastJob = jobs.peekLast();
@@ -671,8 +672,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
                 addSnapshot(backupJob.getLabel(), backupJob);
             }
         }
-        for (String label : removedLabels) {
-            removeSnapshot(label);
+        for (BackupJob removedBackupJob : removedBackupJobs) {
+            if (removedBackupJob.isLocalSnapshot()) {
+                removeSnapshot(removedBackupJob.getLabel());
+            }
+            removedBackupJob.cleanupLocalJobDirAfterRemoved();
         }
     }
 
@@ -683,6 +687,24 @@ public class BackupHandler extends MasterDaemon implements Writable {
                     .map(Deque::getLast).collect(Collectors.toList());
         } finally {
             jobLock.unlock();
+        }
+    }
+
+    private List<AbstractJob> getAllJobs() {
+        jobLock.lock();
+        try {
+            return dbIdToBackupOrRestoreJobs.values().stream().flatMap(Deque::stream).collect(Collectors.toList());
+        } finally {
+            jobLock.unlock();
+        }
+    }
+
+    private void cleanupBackupJobLocalJobDirs() {
+        long nowMs = System.currentTimeMillis();
+        for (AbstractJob job : getAllJobs()) {
+            if (job instanceof BackupJob) {
+                ((BackupJob) job).cleanupLocalJobDirIfNecessary(nowMs);
+            }
         }
     }
 
@@ -952,7 +974,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
     }
 
-    public Snapshot getSnapshot(String labelName) {
+    public Snapshot getSnapshot(String labelName, boolean enableCompress) throws IOException {
         BackupJob backupJob;
         localSnapshotsLock.readLock().lock();
         try {
@@ -965,7 +987,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             return null;
         }
 
-        return backupJob.getSnapshot();
+        return backupJob.getSnapshot(enableCompress);
     }
 
     public static BackupHandler read(DataInput in) throws IOException {
