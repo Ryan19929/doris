@@ -213,7 +213,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     Path buildLocalJobDirPath() {
         return BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize()
                 .resolve("repo__" + repoId)
-                .resolve("job__" + jobId + "__" + createTime)
+                .resolve(label + "__" + getCreateTimeString())
                 .normalize();
     }
 
@@ -241,23 +241,23 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         if (!Repository.FILE_META_INFO.equals(metaInfoPath.getFileName().toString())) {
             return false;
         }
-        if (jobDirPath.equals(buildLocalJobDirPath())) {
-            return getLocalJobInfoFileName().equals(jobInfoPath.getFileName().toString());
-        }
-
-        Path legacyRepoDir = BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize().resolve("repo__" + repoId);
-        String legacyDirPrefix = label + "__";
-        String legacyDirName = jobDirPath.getFileName().toString();
-        if (!legacyRepoDir.equals(jobDirPath.getParent()) || !legacyDirName.startsWith(legacyDirPrefix)) {
+        Path repoDir = BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize().resolve("repo__" + repoId);
+        String dirPrefix = label + "__";
+        String dirName = jobDirPath.getFileName().toString();
+        if (!repoDir.equals(jobDirPath.getParent()) || !dirName.startsWith(dirPrefix)) {
             return false;
         }
-        String legacyCreateTime = legacyDirName.substring(legacyDirPrefix.length());
-        return !legacyCreateTime.isEmpty()
-                && (Repository.PREFIX_JOB_INFO + legacyCreateTime).equals(jobInfoPath.getFileName().toString());
+        String createTimeString = dirName.substring(dirPrefix.length());
+        return !createTimeString.isEmpty()
+                && (Repository.PREFIX_JOB_INFO + createTimeString).equals(jobInfoPath.getFileName().toString());
     }
 
     private String getLocalJobInfoFileName() {
-        return Repository.PREFIX_JOB_INFO + createTime;
+        return Repository.PREFIX_JOB_INFO + getCreateTimeString();
+    }
+
+    private String getCreateTimeString() {
+        return TimeUtils.longToTimeString(createTime, TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
     }
 
     boolean hasLocalSnapshotFiles() {
@@ -1022,8 +1022,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     }
 
     private void saveMetaInfo(boolean replay) {
-        // The directory and file names use stable numeric job identity so replay and
-        // image loading cannot change them when the global time zone changes.
+        // Keep the legacy staging layout so older FEs can replay jobs during rolling upgrades.
         rebindLocalJobDirToCurrentFe();
 
         try {
@@ -1159,7 +1158,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         LOG.info("job is finished. {}", this);
 
         if (repoId == Repository.KEEP_ON_LOCAL_REPO_ID) {
-            env.getBackupHandler().addSnapshot(label, this);
+            env.getBackupHandler().addSnapshot(this);
             return;
         }
 

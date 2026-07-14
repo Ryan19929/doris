@@ -748,7 +748,8 @@ public class BackupJobTest {
         unexpiredLocalHandler.replayAddJob(unexpiredLocalFinishedJob);
 
         Assert.assertTrue(unexpiredLocalJobDir.exists());
-        Assert.assertNotNull(unexpiredLocalHandler.getSnapshot("unexpired_local_replay", false));
+        Assert.assertNotNull(unexpiredLocalHandler.getSnapshot(
+                unexpiredLocalDbId, "unexpired_local_replay", false));
     }
 
     @Test
@@ -795,53 +796,69 @@ public class BackupJobTest {
             loadedHandler.readFields(in);
         }
 
-        Assert.assertNull(loadedHandler.getSnapshot("missing_local_image", false));
+        Assert.assertNull(loadedHandler.getSnapshot(dbId, "missing_local_image", false));
     }
 
     @Test
-    public void testUnavailableLatestLocalSnapshotRemovesPreviousSnapshot() throws IOException {
+    public void testUnavailableLatestLocalSnapshotOnlyRemovesSameDatabase() throws IOException {
         String label = "reused_local_label";
+        long createTime = System.currentTimeMillis();
         BackupHandler handler = new BackupHandler(env);
         BackupJob previousJob = new BackupJob(label, dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
-        Deencapsulation.setField(previousJob, "jobId", 50001L);
+        Deencapsulation.setField(previousJob, "createTime", createTime);
         Deencapsulation.setField(previousJob, "state", BackupJobState.FINISHED);
         createLocalSnapshotFiles(previousJob);
         previousJob.rebindLocalJobDirToCurrentFe();
         Deencapsulation.invoke(handler, "addBackupOrRestoreJob", dbId, previousJob);
-        Assert.assertNotNull(handler.getSnapshot(label, false));
+        Assert.assertNotNull(handler.getSnapshot(dbId, label, false));
+
+        long otherDbId = dbId + 1;
+        BackupJob otherDbJob = new BackupJob(label, otherDbId, "other_db",
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 11);
+        // Keep this registry-scoping test independent of the legacy same-second staging collision.
+        Deencapsulation.setField(otherDbJob, "createTime", createTime + 2000);
+        Deencapsulation.setField(otherDbJob, "state", BackupJobState.FINISHED);
+        createLocalSnapshotFiles(otherDbJob);
+        otherDbJob.rebindLocalJobDirToCurrentFe();
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", otherDbId, otherDbJob);
+        Assert.assertEquals(0, handler.getSnapshot(dbId, label, false).getCommitSeq());
+        Assert.assertEquals(11, handler.getSnapshot(otherDbId, label, false).getCommitSeq());
 
         BackupJob latestJob = new BackupJob(label, dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
-        Deencapsulation.setField(latestJob, "jobId", 50002L);
+        Deencapsulation.setField(latestJob, "createTime", createTime + 1000);
         Deencapsulation.setField(latestJob, "state", BackupJobState.FINISHED);
         latestJob.rebindLocalJobDirToCurrentFe();
         Assert.assertNotEquals(previousJob.buildLocalJobDirPath(), latestJob.buildLocalJobDirPath());
         Assert.assertFalse(Files.exists(latestJob.buildLocalJobDirPath()));
         Deencapsulation.invoke(handler, "addBackupOrRestoreJob", dbId, latestJob);
 
-        Assert.assertNull(handler.getSnapshot(label, false));
+        Assert.assertNull(handler.getSnapshot(dbId, label, false));
+        Assert.assertEquals(11, handler.getSnapshot(otherDbId, label, false).getCommitSeq());
     }
 
     @Test
-    public void testLocalJobDirPathIsIndependentOfTimeZone() {
+    public void testLocalJobDirUsesLegacyFormat() {
         String originalTimeZone = VariableMgr.getDefaultSessionVariable().getTimeZone();
         try {
             VariableMgr.getDefaultSessionVariable().setTimeZone("Asia/Shanghai");
-            BackupJob localJob = new BackupJob("time_zone_independent", dbId, UnitTestUtil.DB_NAME,
+            BackupJob localJob = new BackupJob("legacy_staging", dbId, UnitTestUtil.DB_NAME,
                     Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                     env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
-            Path originalPath = localJob.buildLocalJobDirPath();
-            localJob.rebindLocalJobDirToCurrentFe();
-            String originalJobInfoPath = localJob.getLocalJobInfoFilePath();
+            String createTimeStr = TimeUtils.longToTimeString(localJob.getCreateTime(),
+                    TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
+            Path expectedPath = BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize()
+                    .resolve("repo__" + Repository.KEEP_ON_LOCAL_REPO_ID)
+                    .resolve(localJob.getLabel() + "__" + createTimeStr);
 
-            VariableMgr.getDefaultSessionVariable().setTimeZone("UTC");
-
-            Assert.assertEquals(originalPath, localJob.buildLocalJobDirPath());
+            Assert.assertEquals(expectedPath, localJob.buildLocalJobDirPath());
             localJob.rebindLocalJobDirToCurrentFe();
-            Assert.assertEquals(originalJobInfoPath, localJob.getLocalJobInfoFilePath());
+            Assert.assertEquals(expectedPath.resolve(Repository.PREFIX_JOB_INFO + createTimeStr).toString(),
+                    localJob.getLocalJobInfoFilePath());
         } finally {
             VariableMgr.getDefaultSessionVariable().setTimeZone(originalTimeZone);
         }
@@ -903,7 +920,8 @@ public class BackupJobTest {
 
             replayHandler.replayAddJob(finishedJob);
             Assert.assertTrue("checkpoint replay must not delete serving FE files", marker.exists());
-            Map<String, BackupJob> localSnapshots = Deencapsulation.getField(replayHandler, "localSnapshots");
+            Map<Long, Map<String, BackupJob>> localSnapshots =
+                    Deencapsulation.getField(replayHandler, "localSnapshots");
             Assert.assertTrue("checkpoint replay must not register runtime-only snapshots", localSnapshots.isEmpty());
 
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -1269,9 +1287,11 @@ public class BackupJobTest {
 
     private File createLocalSnapshotFiles(BackupJob backupJob) throws IOException {
         Path jobDirPath = backupJob.buildLocalJobDirPath();
+        String createTimeStr = TimeUtils.longToTimeString(backupJob.getCreateTime(),
+                TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
         Files.createDirectories(jobDirPath);
         Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.FILE_META_INFO)).toFile().exists());
-        Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.PREFIX_JOB_INFO + backupJob.getCreateTime()))
+        Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.PREFIX_JOB_INFO + createTimeStr))
                 .toFile().exists());
         return jobDirPath.toFile();
     }

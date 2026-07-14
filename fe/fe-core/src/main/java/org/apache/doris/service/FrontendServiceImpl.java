@@ -3131,12 +3131,13 @@ public class FrontendServiceImpl implements FrontendService.Iface {
 
         // Step 3: get snapshot
         String label = request.getLabelName();
+        Database db = Env.getCurrentInternalCatalog().getDbOrAnalysisException(request.getDb());
         TGetSnapshotResult result = new TGetSnapshotResult();
         result.setStatus(new TStatus(TStatusCode.OK));
         boolean enableCompress = request.isEnableCompress();
         // Materialize (or size-check) with file refcount; IOException propagates as INTERNAL_ERROR.
         // Do not re-read files after return.
-        Snapshot snapshot = Env.getCurrentEnv().getBackupHandler().getSnapshot(label, enableCompress);
+        Snapshot snapshot = Env.getCurrentEnv().getBackupHandler().getSnapshot(db.getId(), label, enableCompress);
         if (snapshot == null) {
             result.getStatus().setStatusCode(TStatusCode.SNAPSHOT_NOT_EXIST);
             result.getStatus().addToErrorMsgs(String.format("snapshot %s not exist", label));

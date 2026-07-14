@@ -112,10 +112,10 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     private Env env;
 
-    // map to store backup info, key is label name, value is the BackupJob
+    // map to store backup info, first key is db id and second key is label name
     // this map not present in persist && only in fe memory
-    // one table only keep one snapshot info, only keep last
-    private final Map<String, BackupJob> localSnapshots = new HashMap<>();
+    // one database only keeps the latest snapshot for each label
+    private final Map<Long, Map<String, BackupJob>> localSnapshots = new HashMap<>();
     private ReadWriteLock localSnapshotsLock = new ReentrantReadWriteLock();
 
     public BackupHandler() {
@@ -673,7 +673,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
         for (BackupJob removedBackupJob : removedBackupJobs) {
             if (removedBackupJob.isLocalSnapshot()) {
-                removeSnapshot(removedBackupJob.getLabel(), removedBackupJob);
+                removeSnapshot(removedBackupJob);
             }
             removedBackupJob.cleanupLocalJobDirAfterRemoved();
         }
@@ -683,11 +683,12 @@ public class BackupHandler extends MasterDaemon implements Writable {
             if (backupJob.isLocalSnapshot()) {
                 // The latest terminal job for a label supersedes any older local snapshot,
                 // even when its files are unavailable on this FE.
-                removeSnapshot(backupJob.getLabel());
+                removeSnapshot(backupJob.getDbId(), backupJob.getLabel());
                 if (backupJob.hasLocalSnapshotFiles()) {
-                    addSnapshot(backupJob.getLabel(), backupJob);
+                    addSnapshot(backupJob);
                 } else {
-                    LOG.warn("skip unavailable local snapshot {} on this FE", backupJob.getLabel());
+                    LOG.warn("skip unavailable local snapshot {} in db {} on this FE",
+                            backupJob.getLabel(), backupJob.getDbId());
                 }
             }
         }
@@ -974,45 +975,60 @@ public class BackupHandler extends MasterDaemon implements Writable {
         return false;
     }
 
-    public void addSnapshot(String labelName, BackupJob backupJob) {
+    public void addSnapshot(BackupJob backupJob) {
         assert backupJob.isFinished();
 
-        LOG.info("add snapshot {} to local repo", labelName);
+        long dbId = backupJob.getDbId();
+        String labelName = backupJob.getLabel();
+        LOG.info("add snapshot {} in db {} to local repo", labelName, dbId);
         localSnapshotsLock.writeLock().lock();
         try {
-            localSnapshots.put(labelName, backupJob);
+            localSnapshots.computeIfAbsent(dbId, id -> new HashMap<>()).put(labelName, backupJob);
         } finally {
             localSnapshotsLock.writeLock().unlock();
         }
     }
 
-    public void removeSnapshot(String labelName) {
-        LOG.info("remove snapshot {} from local repo", labelName);
+    public void removeSnapshot(long dbId, String labelName) {
+        LOG.info("remove snapshot {} in db {} from local repo", labelName, dbId);
         localSnapshotsLock.writeLock().lock();
         try {
-            localSnapshots.remove(labelName);
-        } finally {
-            localSnapshotsLock.writeLock().unlock();
-        }
-    }
-
-    private void removeSnapshot(String labelName, BackupJob backupJob) {
-        localSnapshotsLock.writeLock().lock();
-        try {
-            if (localSnapshots.get(labelName) == backupJob) {
-                LOG.info("remove snapshot {} from local repo", labelName);
-                localSnapshots.remove(labelName);
+            Map<String, BackupJob> dbSnapshots = localSnapshots.get(dbId);
+            if (dbSnapshots != null) {
+                dbSnapshots.remove(labelName);
+                if (dbSnapshots.isEmpty()) {
+                    localSnapshots.remove(dbId);
+                }
             }
         } finally {
             localSnapshotsLock.writeLock().unlock();
         }
     }
 
-    public Snapshot getSnapshot(String labelName, boolean enableCompress) throws IOException {
+    private void removeSnapshot(BackupJob backupJob) {
+        long dbId = backupJob.getDbId();
+        String labelName = backupJob.getLabel();
+        localSnapshotsLock.writeLock().lock();
+        try {
+            Map<String, BackupJob> dbSnapshots = localSnapshots.get(dbId);
+            if (dbSnapshots != null && dbSnapshots.get(labelName) == backupJob) {
+                LOG.info("remove snapshot {} in db {} from local repo", labelName, dbId);
+                dbSnapshots.remove(labelName);
+                if (dbSnapshots.isEmpty()) {
+                    localSnapshots.remove(dbId);
+                }
+            }
+        } finally {
+            localSnapshotsLock.writeLock().unlock();
+        }
+    }
+
+    public Snapshot getSnapshot(long dbId, String labelName, boolean enableCompress) throws IOException {
         BackupJob backupJob;
         localSnapshotsLock.readLock().lock();
         try {
-            backupJob = localSnapshots.get(labelName);
+            Map<String, BackupJob> dbSnapshots = localSnapshots.get(dbId);
+            backupJob = dbSnapshots == null ? null : dbSnapshots.get(labelName);
         } finally {
             localSnapshotsLock.readLock().unlock();
         }
