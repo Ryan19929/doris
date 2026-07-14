@@ -72,6 +72,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
@@ -191,6 +192,49 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
     public String getLocalMetaInfoFilePath() {
         return localMetaInfoFilePath;
+    }
+
+    /**
+     * Rebind host-local staging paths after loading a job from cluster-wide journal or image data.
+     * Persisted paths may belong to another FE, while all local file IO must use this FE's tmp dir.
+     */
+    void rebindLocalJobDirToCurrentFe() {
+        Path jobDirPath = buildLocalJobDirPath();
+        String createTimeStr = getCreateTimeString();
+        synchronized (localJobDirLock) {
+            localJobDirPath = jobDirPath;
+            localMetaInfoFilePath = jobDirPath.resolve(Repository.FILE_META_INFO).toString();
+            localJobInfoFilePath = jobDirPath.resolve(Repository.PREFIX_JOB_INFO + createTimeStr).toString();
+        }
+    }
+
+    Path buildLocalJobDirPath() {
+        return BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize()
+                .resolve("repo__" + repoId)
+                .resolve(label + "__" + getCreateTimeString())
+                .normalize();
+    }
+
+    boolean hasLocalSnapshotFiles() {
+        Path metaInfoPath;
+        Path jobInfoPath;
+        synchronized (localJobDirLock) {
+            if (localMetaInfoFilePath == null || localJobInfoFilePath == null) {
+                return false;
+            }
+            metaInfoPath = Paths.get(localMetaInfoFilePath).toAbsolutePath().normalize();
+            jobInfoPath = Paths.get(localJobInfoFilePath).toAbsolutePath().normalize();
+        }
+        Path jobDirPath = metaInfoPath.getParent();
+        return jobDirPath != null
+                && jobDirPath.equals(jobInfoPath.getParent())
+                && isValidLocalJobDirForCleanup(jobDirPath)
+                && Files.isRegularFile(metaInfoPath, LinkOption.NOFOLLOW_LINKS)
+                && Files.isRegularFile(jobInfoPath, LinkOption.NOFOLLOW_LINKS);
+    }
+
+    private String getCreateTimeString() {
+        return TimeUtils.longToTimeString(createTime, TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
     }
 
     public BackupContent getContent() {
@@ -937,12 +981,10 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     }
 
     private void saveMetaInfo(boolean replay) {
-        String createTimeStr = TimeUtils.longToTimeString(createTime,
-                TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
+        String createTimeStr = getCreateTimeString();
         // local job dir: backup/repo__repo_id/label__createtime/
         // Add repo_id to isolate jobs from different repos.
-        localJobDirPath = Paths.get(BackupHandler.BACKUP_ROOT_DIR.toString(),
-                                    "repo__" + repoId, label + "__" + createTimeStr).normalize();
+        rebindLocalJobDirToCurrentFe();
 
         try {
             // 1. create local job dir of this backup job

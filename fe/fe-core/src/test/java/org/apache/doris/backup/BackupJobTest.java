@@ -691,21 +691,23 @@ public class BackupJobTest {
                 env, repoId, 0);
         remoteHandler.replayAddJob(remotePendingJob);
 
-        File remoteJobDir = createLocalJobDir("remote_replay_finished");
-        File remoteMetaInfo = new File(remoteJobDir, Repository.FILE_META_INFO);
-        File remoteJobInfo = new File(remoteJobDir, Repository.PREFIX_JOB_INFO + "2026-07-14-10-00-00");
-        Assert.assertTrue(remoteMetaInfo.createNewFile());
-        Assert.assertTrue(remoteJobInfo.createNewFile());
         BackupJob remoteFinishedJob = new BackupJob("remote_replay", dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, repoId, 0);
         Deencapsulation.setField(remoteFinishedJob, "state", BackupJobState.FINISHED);
-        Deencapsulation.setField(remoteFinishedJob, "localMetaInfoFilePath", remoteMetaInfo.getAbsolutePath());
-        Deencapsulation.setField(remoteFinishedJob, "localJobInfoFilePath", remoteJobInfo.getAbsolutePath());
+        File remoteJobDir = createLocalSnapshotFiles(remoteFinishedJob);
+        File foreignRemoteJobDir = createLocalJobDir("foreign_fe_remote_replay");
+        File foreignMetaInfo = new File(foreignRemoteJobDir, Repository.FILE_META_INFO);
+        File foreignJobInfo = new File(foreignRemoteJobDir, Repository.PREFIX_JOB_INFO + "foreign");
+        Assert.assertTrue(foreignMetaInfo.createNewFile());
+        Assert.assertTrue(foreignJobInfo.createNewFile());
+        Deencapsulation.setField(remoteFinishedJob, "localMetaInfoFilePath", foreignMetaInfo.getAbsolutePath());
+        Deencapsulation.setField(remoteFinishedJob, "localJobInfoFilePath", foreignJobInfo.getAbsolutePath());
 
         remoteHandler.replayAddJob(remoteFinishedJob);
 
         Assert.assertFalse(remoteJobDir.exists());
+        Assert.assertTrue("replay must not clean another FE's persisted path", foreignRemoteJobDir.exists());
         Assert.assertNull(remoteFinishedJob.getLocalMetaInfoFilePath());
         Assert.assertNull(remoteFinishedJob.getLocalJobInfoFilePath());
 
@@ -716,21 +718,13 @@ public class BackupJobTest {
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
         expiredLocalHandler.replayAddJob(expiredLocalPendingJob);
 
-        File expiredLocalJobDir = createLocalJobDir("expired_local_replay_finished");
-        File expiredLocalMetaInfo = new File(expiredLocalJobDir, Repository.FILE_META_INFO);
-        File expiredLocalJobInfo = new File(expiredLocalJobDir,
-                Repository.PREFIX_JOB_INFO + "2026-07-14-10-00-01");
-        Assert.assertTrue(expiredLocalMetaInfo.createNewFile());
-        Assert.assertTrue(expiredLocalJobInfo.createNewFile());
         BackupJob expiredLocalFinishedJob = new BackupJob("expired_local_replay", localDbId,
                 UnitTestUtil.DB_NAME, Lists.newArrayList(), 1, BackupStmt.BackupContent.ALL,
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
         Deencapsulation.setField(expiredLocalFinishedJob, "state", BackupJobState.FINISHED);
         Deencapsulation.setField(expiredLocalFinishedJob, "createTime", System.currentTimeMillis() - 1000);
-        Deencapsulation.setField(expiredLocalFinishedJob, "localMetaInfoFilePath",
-                expiredLocalMetaInfo.getAbsolutePath());
-        Deencapsulation.setField(expiredLocalFinishedJob, "localJobInfoFilePath",
-                expiredLocalJobInfo.getAbsolutePath());
+        File expiredLocalJobDir = createLocalSnapshotFiles(expiredLocalFinishedJob);
+        setForeignLocalSnapshotPaths(expiredLocalFinishedJob);
 
         expiredLocalHandler.replayAddJob(expiredLocalFinishedJob);
 
@@ -743,41 +737,28 @@ public class BackupJobTest {
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
         unexpiredLocalHandler.replayAddJob(unexpiredLocalPendingJob);
 
-        File unexpiredLocalJobDir = createLocalJobDir("unexpired_local_replay_finished");
-        File unexpiredLocalMetaInfo = new File(unexpiredLocalJobDir, Repository.FILE_META_INFO);
-        File unexpiredLocalJobInfo = new File(unexpiredLocalJobDir,
-                Repository.PREFIX_JOB_INFO + "2026-07-14-10-00-02");
-        Assert.assertTrue(unexpiredLocalMetaInfo.createNewFile());
-        Assert.assertTrue(unexpiredLocalJobInfo.createNewFile());
         BackupJob unexpiredLocalFinishedJob = new BackupJob("unexpired_local_replay", unexpiredLocalDbId,
                 UnitTestUtil.DB_NAME, Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
         Deencapsulation.setField(unexpiredLocalFinishedJob, "state", BackupJobState.FINISHED);
-        Deencapsulation.setField(unexpiredLocalFinishedJob, "localMetaInfoFilePath",
-                unexpiredLocalMetaInfo.getAbsolutePath());
-        Deencapsulation.setField(unexpiredLocalFinishedJob, "localJobInfoFilePath",
-                unexpiredLocalJobInfo.getAbsolutePath());
+        File unexpiredLocalJobDir = createLocalSnapshotFiles(unexpiredLocalFinishedJob);
+        setForeignLocalSnapshotPaths(unexpiredLocalFinishedJob);
 
         unexpiredLocalHandler.replayAddJob(unexpiredLocalFinishedJob);
 
         Assert.assertTrue(unexpiredLocalJobDir.exists());
+        Assert.assertNotNull(unexpiredLocalHandler.getSnapshot("unexpired_local_replay", false));
     }
 
     @Test
-    public void testImageLoadCleansFinishedRemoteJobDir() throws IOException {
+    public void testImageLoadRebindsAndCleansFinishedRemoteJobDir() throws IOException {
         BackupHandler serializedHandler = new BackupHandler(env);
-        File remoteJobDir = createLocalJobDir("image_remote_finished");
-        File metaInfo = new File(remoteJobDir, Repository.FILE_META_INFO);
-        File jobInfo = new File(remoteJobDir, Repository.PREFIX_JOB_INFO + "2026-07-14-11-00-00");
-        Assert.assertTrue(metaInfo.createNewFile());
-        Assert.assertTrue(jobInfo.createNewFile());
-
         BackupJob remoteFinishedJob = new BackupJob("image_remote", dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, repoId, 0);
         Deencapsulation.setField(remoteFinishedJob, "state", BackupJobState.FINISHED);
-        Deencapsulation.setField(remoteFinishedJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
-        Deencapsulation.setField(remoteFinishedJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+        File remoteJobDir = createLocalSnapshotFiles(remoteFinishedJob);
+        setForeignLocalSnapshotPaths(remoteFinishedJob);
         Deencapsulation.invoke(serializedHandler, "addBackupOrRestoreJob", dbId, remoteFinishedJob);
 
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
@@ -791,6 +772,85 @@ public class BackupJobTest {
         }
 
         Assert.assertFalse(remoteJobDir.exists());
+    }
+
+    @Test
+    public void testImageLoadDoesNotRegisterUnavailableLocalSnapshot() throws IOException {
+        BackupHandler serializedHandler = new BackupHandler(env);
+        BackupJob localFinishedJob = new BackupJob("missing_local_image", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        Deencapsulation.setField(localFinishedJob, "state", BackupJobState.FINISHED);
+        setForeignLocalSnapshotPaths(localFinishedJob);
+        Deencapsulation.invoke(serializedHandler, "addBackupOrRestoreJob", dbId, localFinishedJob);
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(bytes)) {
+            serializedHandler.write(out);
+        }
+
+        BackupHandler loadedHandler = new BackupHandler();
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            loadedHandler.readFields(in);
+        }
+
+        Assert.assertNull(loadedHandler.getSnapshot("missing_local_image", false));
+    }
+
+    @Test
+    public void testCheckpointHandlerDoesNotTouchServingFeLocalJobDir() throws Exception {
+        Field checkpointThreadIdField = Env.class.getDeclaredField("checkpointThreadId");
+        checkpointThreadIdField.setAccessible(true);
+        long checkpointThreadId = checkpointThreadIdField.getLong(null);
+        checkpointThreadIdField.setLong(null, Thread.currentThread().getId());
+        try {
+            File markerDir = createLocalJobDir("checkpoint_handler_marker");
+            File marker = new File(markerDir, "serving_fe_marker");
+            Assert.assertTrue(marker.createNewFile());
+
+            BackupHandler replayHandler = new BackupHandler(env);
+            BackupJob pendingJob = new BackupJob("checkpoint_handler", dbId, UnitTestUtil.DB_NAME,
+                    Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                    env, repoId, 0);
+            replayHandler.replayAddJob(pendingJob);
+            BackupJob finishedJob = new BackupJob("checkpoint_handler", dbId, UnitTestUtil.DB_NAME,
+                    Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                    env, repoId, 0);
+            Deencapsulation.setField(finishedJob, "state", BackupJobState.FINISHED);
+            Deencapsulation.setField(finishedJob, "localMetaInfoFilePath",
+                    new File(markerDir, Repository.FILE_META_INFO).getAbsolutePath());
+            Deencapsulation.setField(finishedJob, "localJobInfoFilePath",
+                    new File(markerDir, Repository.PREFIX_JOB_INFO + "checkpoint").getAbsolutePath());
+
+            replayHandler.replayAddJob(finishedJob);
+            Assert.assertTrue("checkpoint replay must not delete serving FE files", marker.exists());
+
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream out = new DataOutputStream(bytes)) {
+                replayHandler.write(out);
+            }
+            BackupHandler loadedHandler = new BackupHandler();
+            try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+                loadedHandler.readFields(in);
+            }
+            Assert.assertTrue("checkpoint image load must not delete serving FE files", marker.exists());
+
+            int previousMaxJobNum = Config.max_backup_restore_job_num_per_db;
+            try {
+                Config.max_backup_restore_job_num_per_db = 1;
+                BackupHandler evictionHandler = new BackupHandler(env);
+                Deencapsulation.invoke(evictionHandler, "addBackupOrRestoreJob", dbId, finishedJob);
+                BackupJob replacementJob = new BackupJob("checkpoint_replacement", dbId, UnitTestUtil.DB_NAME,
+                        Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                        env, repoId, 0);
+                Deencapsulation.invoke(evictionHandler, "addBackupOrRestoreJob", dbId, replacementJob);
+                Assert.assertTrue("checkpoint queue eviction must not delete serving FE files", marker.exists());
+            } finally {
+                Config.max_backup_restore_job_num_per_db = previousMaxJobNum;
+            }
+        } finally {
+            checkpointThreadIdField.setLong(null, checkpointThreadId);
+        }
     }
 
     @Test
@@ -1124,6 +1184,22 @@ public class BackupJobTest {
         Path jobDirPath = BackupHandler.BACKUP_ROOT_DIR.resolve(name + "_" + id.getAndIncrement());
         Files.createDirectories(jobDirPath);
         return jobDirPath.toFile();
+    }
+
+    private File createLocalSnapshotFiles(BackupJob backupJob) throws IOException {
+        Path jobDirPath = backupJob.buildLocalJobDirPath();
+        Files.createDirectories(jobDirPath);
+        Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.FILE_META_INFO)).toFile().exists());
+        String createTimeStr = TimeUtils.longToTimeString(backupJob.getCreateTime(),
+                TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
+        Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.PREFIX_JOB_INFO + createTimeStr))
+                .toFile().exists());
+        return jobDirPath.toFile();
+    }
+
+    private void setForeignLocalSnapshotPaths(BackupJob backupJob) {
+        Deencapsulation.setField(backupJob, "localMetaInfoFilePath", "/foreign-fe/tmp/backup/__meta");
+        Deencapsulation.setField(backupJob, "localJobInfoFilePath", "/foreign-fe/tmp/backup/__job_info");
     }
 
     private void createSparseFile(File file, long logicalSize) throws IOException {

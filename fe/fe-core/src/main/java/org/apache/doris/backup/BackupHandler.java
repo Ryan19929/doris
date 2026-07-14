@@ -665,18 +665,25 @@ public class BackupHandler extends MasterDaemon implements Writable {
             jobLock.unlock();
         }
 
+        boolean checkpointThread = Env.isCheckpointThread();
         if (job.isFinished() && job instanceof BackupJob) {
-            // Save snapshot to local repo, when reload backupHandler from image.
+            // A local snapshot is FE-local. Only expose it on a serving FE that has both files.
+            // The checkpoint handler only needs an in-memory copy to produce the image.
             BackupJob backupJob = (BackupJob) job;
-            if (backupJob.isLocalSnapshot()) {
+            if (backupJob.isLocalSnapshot()
+                    && (checkpointThread || backupJob.hasLocalSnapshotFiles())) {
                 addSnapshot(backupJob.getLabel(), backupJob);
+            } else if (backupJob.isLocalSnapshot() && !checkpointThread) {
+                LOG.warn("skip unavailable local snapshot {} on this FE", backupJob.getLabel());
             }
         }
         for (BackupJob removedBackupJob : removedBackupJobs) {
             if (removedBackupJob.isLocalSnapshot()) {
                 removeSnapshot(removedBackupJob.getLabel());
             }
-            removedBackupJob.cleanupLocalJobDirAfterRemoved();
+            if (!checkpointThread) {
+                removedBackupJob.cleanupLocalJobDirAfterRemoved();
+            }
         }
     }
 
@@ -909,6 +916,12 @@ public class BackupHandler extends MasterDaemon implements Writable {
     public void replayAddJob(AbstractJob job) {
         LOG.info("replay backup/restore job: {}", job);
 
+        boolean checkpointThread = Env.isCheckpointThread();
+        if (job instanceof BackupJob && !checkpointThread) {
+            // Journal paths may have been produced by another FE.
+            ((BackupJob) job).rebindLocalJobDirToCurrentFe();
+        }
+
         if (job.isCancelled()) {
             AbstractJob existingJob = getCurrentJob(job.getDbId());
             if (existingJob == null || existingJob.isDone()) {
@@ -933,7 +946,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         addBackupOrRestoreJob(job.getDbId(), job);
-        if (job instanceof BackupJob) {
+        if (job instanceof BackupJob && !checkpointThread) {
             ((BackupJob) job).cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
         }
     }
@@ -1014,11 +1027,18 @@ public class BackupHandler extends MasterDaemon implements Writable {
     public void readFields(DataInput in) throws IOException {
         repoMgr = RepositoryMgr.read(in);
 
+        boolean checkpointThread = Env.isCheckpointThread();
         int size = in.readInt();
         for (int i = 0; i < size; i++) {
             AbstractJob job = AbstractJob.read(in);
+            if (job instanceof BackupJob && !checkpointThread) {
+                // Image paths may have been produced by another FE.
+                ((BackupJob) job).rebindLocalJobDirToCurrentFe();
+            }
             addBackupOrRestoreJob(job.getDbId(), job);
         }
-        cleanupBackupJobLocalJobDirs();
+        if (!checkpointThread) {
+            cleanupBackupJobLocalJobDirs();
+        }
     }
 }
