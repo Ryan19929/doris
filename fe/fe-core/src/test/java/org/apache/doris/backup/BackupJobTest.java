@@ -41,6 +41,7 @@ import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.property.storage.BrokerProperties;
 import org.apache.doris.fs.FileSystemFactory;
 import org.apache.doris.persist.EditLog;
+import org.apache.doris.qe.VariableMgr;
 import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskExecutor;
@@ -798,6 +799,80 @@ public class BackupJobTest {
     }
 
     @Test
+    public void testUnavailableLatestLocalSnapshotRemovesPreviousSnapshot() throws IOException {
+        String label = "reused_local_label";
+        BackupHandler handler = new BackupHandler(env);
+        BackupJob previousJob = new BackupJob(label, dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        Deencapsulation.setField(previousJob, "state", BackupJobState.FINISHED);
+        createLocalSnapshotFiles(previousJob);
+        previousJob.rebindLocalJobDirToCurrentFe();
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", dbId, previousJob);
+        Assert.assertNotNull(handler.getSnapshot(label, false));
+
+        BackupJob latestJob = new BackupJob(label, dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        Deencapsulation.setField(latestJob, "state", BackupJobState.FINISHED);
+        latestJob.rebindLocalJobDirToCurrentFe();
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", dbId, latestJob);
+
+        Assert.assertNull(handler.getSnapshot(label, false));
+    }
+
+    @Test
+    public void testLocalJobDirPathIsIndependentOfTimeZone() {
+        String originalTimeZone = VariableMgr.getDefaultSessionVariable().getTimeZone();
+        try {
+            VariableMgr.getDefaultSessionVariable().setTimeZone("Asia/Shanghai");
+            BackupJob localJob = new BackupJob("time_zone_independent", dbId, UnitTestUtil.DB_NAME,
+                    Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                    env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+            Path originalPath = localJob.buildLocalJobDirPath();
+            localJob.rebindLocalJobDirToCurrentFe();
+            String originalJobInfoPath = localJob.getLocalJobInfoFilePath();
+
+            VariableMgr.getDefaultSessionVariable().setTimeZone("UTC");
+
+            Assert.assertEquals(originalPath, localJob.buildLocalJobDirPath());
+            localJob.rebindLocalJobDirToCurrentFe();
+            Assert.assertEquals(originalJobInfoPath, localJob.getLocalJobInfoFilePath());
+        } finally {
+            VariableMgr.getDefaultSessionVariable().setTimeZone(originalTimeZone);
+        }
+    }
+
+    @Test
+    public void testRebindRetainsExistingLegacyLocalJobDir() throws IOException {
+        String originalTimeZone = VariableMgr.getDefaultSessionVariable().getTimeZone();
+        try {
+            VariableMgr.getDefaultSessionVariable().setTimeZone("Asia/Shanghai");
+            BackupJob legacyJob = new BackupJob("legacy_time_zone", dbId, UnitTestUtil.DB_NAME,
+                    Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                    env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+            String createTimeStr = TimeUtils.longToTimeString(legacyJob.getCreateTime(),
+                    TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
+            Path legacyJobDir = BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize()
+                    .resolve("repo__" + Repository.KEEP_ON_LOCAL_REPO_ID)
+                    .resolve(legacyJob.getLabel() + "__" + createTimeStr);
+            Files.createDirectories(legacyJobDir);
+            Path legacyMetaInfo = Files.createFile(legacyJobDir.resolve(Repository.FILE_META_INFO));
+            Path legacyJobInfo = Files.createFile(legacyJobDir.resolve(Repository.PREFIX_JOB_INFO + createTimeStr));
+            Deencapsulation.setField(legacyJob, "localMetaInfoFilePath", legacyMetaInfo.toString());
+            Deencapsulation.setField(legacyJob, "localJobInfoFilePath", legacyJobInfo.toString());
+
+            VariableMgr.getDefaultSessionVariable().setTimeZone("UTC");
+            legacyJob.rebindLocalJobDirToCurrentFe();
+
+            Assert.assertEquals(legacyMetaInfo.toString(), legacyJob.getLocalMetaInfoFilePath());
+            Assert.assertEquals(legacyJobInfo.toString(), legacyJob.getLocalJobInfoFilePath());
+        } finally {
+            VariableMgr.getDefaultSessionVariable().setTimeZone(originalTimeZone);
+        }
+    }
+
+    @Test
     public void testCheckpointHandlerDoesNotTouchServingFeLocalJobDir() throws Exception {
         Field checkpointThreadIdField = Env.class.getDeclaredField("checkpointThreadId");
         checkpointThreadIdField.setAccessible(true);
@@ -824,6 +899,8 @@ public class BackupJobTest {
 
             replayHandler.replayAddJob(finishedJob);
             Assert.assertTrue("checkpoint replay must not delete serving FE files", marker.exists());
+            Map<String, BackupJob> localSnapshots = Deencapsulation.getField(replayHandler, "localSnapshots");
+            Assert.assertTrue("checkpoint replay must not register runtime-only snapshots", localSnapshots.isEmpty());
 
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             try (DataOutputStream out = new DataOutputStream(bytes)) {
@@ -1190,9 +1267,7 @@ public class BackupJobTest {
         Path jobDirPath = backupJob.buildLocalJobDirPath();
         Files.createDirectories(jobDirPath);
         Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.FILE_META_INFO)).toFile().exists());
-        String createTimeStr = TimeUtils.longToTimeString(backupJob.getCreateTime(),
-                TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
-        Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.PREFIX_JOB_INFO + createTimeStr))
+        Assert.assertTrue(Files.createFile(jobDirPath.resolve(Repository.PREFIX_JOB_INFO + backupJob.getCreateTime()))
                 .toFile().exists());
         return jobDirPath.toFile();
     }

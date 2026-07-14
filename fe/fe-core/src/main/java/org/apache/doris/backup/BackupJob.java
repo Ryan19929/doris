@@ -199,20 +199,65 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
      * Persisted paths may belong to another FE, while all local file IO must use this FE's tmp dir.
      */
     void rebindLocalJobDirToCurrentFe() {
-        Path jobDirPath = buildLocalJobDirPath();
-        String createTimeStr = getCreateTimeString();
         synchronized (localJobDirLock) {
+            if (useExistingLocalJobDirIfPresent()) {
+                return;
+            }
+            Path jobDirPath = buildLocalJobDirPath();
             localJobDirPath = jobDirPath;
             localMetaInfoFilePath = jobDirPath.resolve(Repository.FILE_META_INFO).toString();
-            localJobInfoFilePath = jobDirPath.resolve(Repository.PREFIX_JOB_INFO + createTimeStr).toString();
+            localJobInfoFilePath = jobDirPath.resolve(getLocalJobInfoFileName()).toString();
         }
     }
 
     Path buildLocalJobDirPath() {
         return BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize()
                 .resolve("repo__" + repoId)
-                .resolve(label + "__" + getCreateTimeString())
+                .resolve("job__" + jobId + "__" + createTime)
                 .normalize();
+    }
+
+    /** Caller must hold {@link #localJobDirLock}. */
+    private boolean useExistingLocalJobDirIfPresent() {
+        if (localMetaInfoFilePath == null || localJobInfoFilePath == null) {
+            return false;
+        }
+        Path metaInfoPath = Paths.get(localMetaInfoFilePath).toAbsolutePath().normalize();
+        Path jobInfoPath = Paths.get(localJobInfoFilePath).toAbsolutePath().normalize();
+        Path jobDirPath = metaInfoPath.getParent();
+        if (jobDirPath == null || !jobDirPath.equals(jobInfoPath.getParent())
+                || !isValidLocalJobDirForCleanup(jobDirPath)
+                || !isExpectedLocalJobDir(metaInfoPath, jobInfoPath, jobDirPath)
+                || !Files.isDirectory(jobDirPath, LinkOption.NOFOLLOW_LINKS)) {
+            return false;
+        }
+        localJobDirPath = jobDirPath;
+        localMetaInfoFilePath = metaInfoPath.toString();
+        localJobInfoFilePath = jobInfoPath.toString();
+        return true;
+    }
+
+    private boolean isExpectedLocalJobDir(Path metaInfoPath, Path jobInfoPath, Path jobDirPath) {
+        if (!Repository.FILE_META_INFO.equals(metaInfoPath.getFileName().toString())) {
+            return false;
+        }
+        if (jobDirPath.equals(buildLocalJobDirPath())) {
+            return getLocalJobInfoFileName().equals(jobInfoPath.getFileName().toString());
+        }
+
+        Path legacyRepoDir = BackupHandler.BACKUP_ROOT_DIR.toAbsolutePath().normalize().resolve("repo__" + repoId);
+        String legacyDirPrefix = label + "__";
+        String legacyDirName = jobDirPath.getFileName().toString();
+        if (!legacyRepoDir.equals(jobDirPath.getParent()) || !legacyDirName.startsWith(legacyDirPrefix)) {
+            return false;
+        }
+        String legacyCreateTime = legacyDirName.substring(legacyDirPrefix.length());
+        return !legacyCreateTime.isEmpty()
+                && (Repository.PREFIX_JOB_INFO + legacyCreateTime).equals(jobInfoPath.getFileName().toString());
+    }
+
+    private String getLocalJobInfoFileName() {
+        return Repository.PREFIX_JOB_INFO + createTime;
     }
 
     boolean hasLocalSnapshotFiles() {
@@ -231,10 +276,6 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 && isValidLocalJobDirForCleanup(jobDirPath)
                 && Files.isRegularFile(metaInfoPath, LinkOption.NOFOLLOW_LINKS)
                 && Files.isRegularFile(jobInfoPath, LinkOption.NOFOLLOW_LINKS);
-    }
-
-    private String getCreateTimeString() {
-        return TimeUtils.longToTimeString(createTime, TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
     }
 
     public BackupContent getContent() {
@@ -981,9 +1022,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     }
 
     private void saveMetaInfo(boolean replay) {
-        String createTimeStr = getCreateTimeString();
-        // local job dir: backup/repo__repo_id/label__createtime/
-        // Add repo_id to isolate jobs from different repos.
+        // The directory and file names use stable numeric job identity so replay and
+        // image loading cannot change them when the global time zone changes.
         rebindLocalJobDirToCurrentFe();
 
         try {
@@ -1043,7 +1083,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
             }
-            File jobInfoFile = new File(jobDir, Repository.PREFIX_JOB_INFO + createTimeStr);
+            File jobInfoFile = new File(jobDir, getLocalJobInfoFileName());
             if (!jobInfoFile.createNewFile()) {
                 status = new Status(ErrCode.COMMON_ERROR, "Failed to create job info file: " + jobInfoFile.toString());
                 return;

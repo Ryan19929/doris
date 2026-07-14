@@ -666,23 +666,29 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         boolean checkpointThread = Env.isCheckpointThread();
-        if (job.isFinished() && job instanceof BackupJob) {
-            // A local snapshot is FE-local. Only expose it on a serving FE that has both files.
-            // The checkpoint handler only needs an in-memory copy to produce the image.
-            BackupJob backupJob = (BackupJob) job;
-            if (backupJob.isLocalSnapshot()
-                    && (checkpointThread || backupJob.hasLocalSnapshotFiles())) {
-                addSnapshot(backupJob.getLabel(), backupJob);
-            } else if (backupJob.isLocalSnapshot() && !checkpointThread) {
-                LOG.warn("skip unavailable local snapshot {} on this FE", backupJob.getLabel());
-            }
+        if (checkpointThread) {
+            // localSnapshots is runtime-only and is not written to the image. The checkpoint
+            // handler must not inspect, register, or clean serving-FE local snapshot files.
+            return;
         }
         for (BackupJob removedBackupJob : removedBackupJobs) {
             if (removedBackupJob.isLocalSnapshot()) {
-                removeSnapshot(removedBackupJob.getLabel());
+                removeSnapshot(removedBackupJob.getLabel(), removedBackupJob);
             }
-            if (!checkpointThread) {
-                removedBackupJob.cleanupLocalJobDirAfterRemoved();
+            removedBackupJob.cleanupLocalJobDirAfterRemoved();
+        }
+        if (job.isFinished() && job instanceof BackupJob) {
+            // A local snapshot is FE-local. Only expose it on a serving FE that has both files.
+            BackupJob backupJob = (BackupJob) job;
+            if (backupJob.isLocalSnapshot()) {
+                // The latest terminal job for a label supersedes any older local snapshot,
+                // even when its files are unavailable on this FE.
+                removeSnapshot(backupJob.getLabel());
+                if (backupJob.hasLocalSnapshotFiles()) {
+                    addSnapshot(backupJob.getLabel(), backupJob);
+                } else {
+                    LOG.warn("skip unavailable local snapshot {} on this FE", backupJob.getLabel());
+                }
             }
         }
     }
@@ -985,6 +991,18 @@ public class BackupHandler extends MasterDaemon implements Writable {
         localSnapshotsLock.writeLock().lock();
         try {
             localSnapshots.remove(labelName);
+        } finally {
+            localSnapshotsLock.writeLock().unlock();
+        }
+    }
+
+    private void removeSnapshot(String labelName, BackupJob backupJob) {
+        localSnapshotsLock.writeLock().lock();
+        try {
+            if (localSnapshots.get(labelName) == backupJob) {
+                LOG.info("remove snapshot {} from local repo", labelName);
+                localSnapshots.remove(labelName);
+            }
         } finally {
             localSnapshotsLock.writeLock().unlock();
         }
