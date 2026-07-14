@@ -805,6 +805,7 @@ public class BackupJobTest {
         BackupJob previousJob = new BackupJob(label, dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        Deencapsulation.setField(previousJob, "jobId", 50001L);
         Deencapsulation.setField(previousJob, "state", BackupJobState.FINISHED);
         createLocalSnapshotFiles(previousJob);
         previousJob.rebindLocalJobDirToCurrentFe();
@@ -814,8 +815,11 @@ public class BackupJobTest {
         BackupJob latestJob = new BackupJob(label, dbId, UnitTestUtil.DB_NAME,
                 Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
                 env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        Deencapsulation.setField(latestJob, "jobId", 50002L);
         Deencapsulation.setField(latestJob, "state", BackupJobState.FINISHED);
         latestJob.rebindLocalJobDirToCurrentFe();
+        Assert.assertNotEquals(previousJob.buildLocalJobDirPath(), latestJob.buildLocalJobDirPath());
+        Assert.assertFalse(Files.exists(latestJob.buildLocalJobDirPath()));
         Deencapsulation.invoke(handler, "addBackupOrRestoreJob", dbId, latestJob);
 
         Assert.assertNull(handler.getSnapshot(label, false));
