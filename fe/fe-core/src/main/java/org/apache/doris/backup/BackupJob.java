@@ -412,7 +412,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
     @Override
     public synchronized void replayRun() {
-        if (state == BackupJobState.SAVE_META) {
+        // Checkpoint replay only reconstructs in-memory state for the image. Materializing
+        // files there would recreate already-cleaned dirs in the serving FE's shared tmp dir.
+        if (state == BackupJobState.SAVE_META && !Env.isCheckpointThread()) {
             saveMetaInfo(true);
         }
     }
@@ -1349,6 +1351,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 LOG.info("cleaned backup job dir: {}. {}", normalizedJobDirPath, this);
             }
             localJobDirPath = null;
+            localMetaInfoFilePath = null;
+            localJobInfoFilePath = null;
             localJobDirCleaned = true;
         } catch (Exception e) {
             LOG.warn("failed to clean the backup job dir: {}. {}", normalizedJobDirPath, this, e);

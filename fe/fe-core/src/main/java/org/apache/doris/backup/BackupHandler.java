@@ -933,6 +933,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         addBackupOrRestoreJob(job.getDbId(), job);
+        if (job instanceof BackupJob) {
+            ((BackupJob) job).cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
+        }
     }
 
     public boolean report(TTaskType type, long jobId, long taskId, int finishedNum, int totalNum) {
@@ -1016,5 +1019,6 @@ public class BackupHandler extends MasterDaemon implements Writable {
             AbstractJob job = AbstractJob.read(in);
             addBackupOrRestoreJob(job.getDbId(), job);
         }
+        cleanupBackupJobLocalJobDirs();
     }
 }
