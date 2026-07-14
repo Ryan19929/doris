@@ -35,6 +35,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.GZIPUtils;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.common.util.UnitTestUtil;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.property.storage.BrokerProperties;
@@ -65,11 +66,14 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.lang.reflect.Field;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -641,10 +645,152 @@ public class BackupJobTest {
         localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
         Assert.assertTrue(localJobDir.exists());
         Assert.assertFalse(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+        Assert.assertEquals(metaInfo.getAbsolutePath(), localSnapshotJob.getLocalMetaInfoFilePath());
+        Assert.assertEquals(jobInfo.getAbsolutePath(), localSnapshotJob.getLocalJobInfoFilePath());
 
         localSnapshotJob.cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
         Assert.assertFalse(localJobDir.exists());
         Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+        Assert.assertNull(localSnapshotJob.getLocalMetaInfoFilePath());
+        Assert.assertNull(localSnapshotJob.getLocalJobInfoFilePath());
+    }
+
+    @Test
+    public void testCheckpointReplayDoesNotMaterializeLocalJobDir() throws Exception {
+        BackupJob replayJob = new BackupJob("checkpoint_replay", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, repoId, 0);
+        Deencapsulation.setField(replayJob, "state", BackupJobState.SAVE_META);
+
+        String createTimeStr = TimeUtils.longToTimeString(replayJob.getCreateTime(),
+                TimeUtils.getDatetimeFormatWithHyphenWithTimeZone());
+        Path jobDir = BackupHandler.BACKUP_ROOT_DIR.resolve("repo__" + repoId)
+                .resolve("checkpoint_replay__" + createTimeStr);
+        Files.createDirectories(jobDir);
+        Path marker = jobDir.resolve("checkpoint_marker");
+        Files.createFile(marker);
+
+        Field checkpointThreadIdField = Env.class.getDeclaredField("checkpointThreadId");
+        checkpointThreadIdField.setAccessible(true);
+        long checkpointThreadId = checkpointThreadIdField.getLong(null);
+        checkpointThreadIdField.setLong(null, Thread.currentThread().getId());
+        try {
+            replayJob.replayRun();
+        } finally {
+            checkpointThreadIdField.setLong(null, checkpointThreadId);
+        }
+
+        Assert.assertTrue("checkpoint replay must not replace serving FE staging files", Files.exists(marker));
+    }
+
+    @Test
+    public void testReplayTerminalJobCleanupPolicy() throws IOException {
+        BackupHandler remoteHandler = new BackupHandler(env);
+        BackupJob remotePendingJob = new BackupJob("remote_replay", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, repoId, 0);
+        remoteHandler.replayAddJob(remotePendingJob);
+
+        File remoteJobDir = createLocalJobDir("remote_replay_finished");
+        File remoteMetaInfo = new File(remoteJobDir, Repository.FILE_META_INFO);
+        File remoteJobInfo = new File(remoteJobDir, Repository.PREFIX_JOB_INFO + "2026-07-14-10-00-00");
+        Assert.assertTrue(remoteMetaInfo.createNewFile());
+        Assert.assertTrue(remoteJobInfo.createNewFile());
+        BackupJob remoteFinishedJob = new BackupJob("remote_replay", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, repoId, 0);
+        Deencapsulation.setField(remoteFinishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(remoteFinishedJob, "localMetaInfoFilePath", remoteMetaInfo.getAbsolutePath());
+        Deencapsulation.setField(remoteFinishedJob, "localJobInfoFilePath", remoteJobInfo.getAbsolutePath());
+
+        remoteHandler.replayAddJob(remoteFinishedJob);
+
+        Assert.assertFalse(remoteJobDir.exists());
+        Assert.assertNull(remoteFinishedJob.getLocalMetaInfoFilePath());
+        Assert.assertNull(remoteFinishedJob.getLocalJobInfoFilePath());
+
+        long localDbId = dbId + 1;
+        BackupHandler expiredLocalHandler = new BackupHandler(env);
+        BackupJob expiredLocalPendingJob = new BackupJob("expired_local_replay", localDbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        expiredLocalHandler.replayAddJob(expiredLocalPendingJob);
+
+        File expiredLocalJobDir = createLocalJobDir("expired_local_replay_finished");
+        File expiredLocalMetaInfo = new File(expiredLocalJobDir, Repository.FILE_META_INFO);
+        File expiredLocalJobInfo = new File(expiredLocalJobDir,
+                Repository.PREFIX_JOB_INFO + "2026-07-14-10-00-01");
+        Assert.assertTrue(expiredLocalMetaInfo.createNewFile());
+        Assert.assertTrue(expiredLocalJobInfo.createNewFile());
+        BackupJob expiredLocalFinishedJob = new BackupJob("expired_local_replay", localDbId,
+                UnitTestUtil.DB_NAME, Lists.newArrayList(), 1, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        Deencapsulation.setField(expiredLocalFinishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(expiredLocalFinishedJob, "createTime", System.currentTimeMillis() - 1000);
+        Deencapsulation.setField(expiredLocalFinishedJob, "localMetaInfoFilePath",
+                expiredLocalMetaInfo.getAbsolutePath());
+        Deencapsulation.setField(expiredLocalFinishedJob, "localJobInfoFilePath",
+                expiredLocalJobInfo.getAbsolutePath());
+
+        expiredLocalHandler.replayAddJob(expiredLocalFinishedJob);
+
+        Assert.assertFalse(expiredLocalJobDir.exists());
+
+        long unexpiredLocalDbId = dbId + 2;
+        BackupHandler unexpiredLocalHandler = new BackupHandler(env);
+        BackupJob unexpiredLocalPendingJob = new BackupJob("unexpired_local_replay", unexpiredLocalDbId,
+                UnitTestUtil.DB_NAME, Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        unexpiredLocalHandler.replayAddJob(unexpiredLocalPendingJob);
+
+        File unexpiredLocalJobDir = createLocalJobDir("unexpired_local_replay_finished");
+        File unexpiredLocalMetaInfo = new File(unexpiredLocalJobDir, Repository.FILE_META_INFO);
+        File unexpiredLocalJobInfo = new File(unexpiredLocalJobDir,
+                Repository.PREFIX_JOB_INFO + "2026-07-14-10-00-02");
+        Assert.assertTrue(unexpiredLocalMetaInfo.createNewFile());
+        Assert.assertTrue(unexpiredLocalJobInfo.createNewFile());
+        BackupJob unexpiredLocalFinishedJob = new BackupJob("unexpired_local_replay", unexpiredLocalDbId,
+                UnitTestUtil.DB_NAME, Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+        Deencapsulation.setField(unexpiredLocalFinishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(unexpiredLocalFinishedJob, "localMetaInfoFilePath",
+                unexpiredLocalMetaInfo.getAbsolutePath());
+        Deencapsulation.setField(unexpiredLocalFinishedJob, "localJobInfoFilePath",
+                unexpiredLocalJobInfo.getAbsolutePath());
+
+        unexpiredLocalHandler.replayAddJob(unexpiredLocalFinishedJob);
+
+        Assert.assertTrue(unexpiredLocalJobDir.exists());
+    }
+
+    @Test
+    public void testImageLoadCleansFinishedRemoteJobDir() throws IOException {
+        BackupHandler serializedHandler = new BackupHandler(env);
+        File remoteJobDir = createLocalJobDir("image_remote_finished");
+        File metaInfo = new File(remoteJobDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(remoteJobDir, Repository.PREFIX_JOB_INFO + "2026-07-14-11-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+
+        BackupJob remoteFinishedJob = new BackupJob("image_remote", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 3600 * 1000, BackupStmt.BackupContent.ALL,
+                env, repoId, 0);
+        Deencapsulation.setField(remoteFinishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(remoteFinishedJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(remoteFinishedJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+        Deencapsulation.invoke(serializedHandler, "addBackupOrRestoreJob", dbId, remoteFinishedJob);
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(bytes)) {
+            serializedHandler.write(out);
+        }
+
+        BackupHandler loadedHandler = new BackupHandler();
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            loadedHandler.readFields(in);
+        }
+
+        Assert.assertFalse(remoteJobDir.exists());
     }
 
     @Test
