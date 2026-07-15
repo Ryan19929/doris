@@ -393,7 +393,8 @@ public class BackupJobTest {
         Assert.assertEquals(BackupJobState.FINISHED, job.getState());
         Assert.assertTrue(localJobDir.exists());
 
-        job.cleanupLocalJobDirIfNecessary(job.getCreateTime() + job.getTimeoutMs());
+        // BackupHandler invokes cleanup after job.run() in the same daemon cycle.
+        job.cleanupLocalJobDirIfNecessary(job.getCreateTime());
         Assert.assertFalse(localJobDir.exists());
     }
 
@@ -424,7 +425,7 @@ public class BackupJobTest {
     }
 
     @Test
-    public void testCleanupFinishedRemoteBackupJobDirOnlyAfterExpired() throws IOException {
+    public void testCleanupFinishedRemoteBackupJobDirImmediately() throws IOException {
         File localJobDir = createLocalJobDir("remote_cleanup");
         File metaInfo = new File(localJobDir, Repository.FILE_META_INFO);
         File jobInfo = new File(localJobDir, Repository.PREFIX_JOB_INFO + "2026-07-09-10-00-00");
@@ -439,10 +440,7 @@ public class BackupJobTest {
         Deencapsulation.setField(job, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
         Deencapsulation.setField(job, "localJobInfoFilePath", jobInfo.getAbsolutePath());
 
-        job.cleanupLocalJobDirIfNecessary(createTime + 999);
-        Assert.assertTrue(localJobDir.exists());
-
-        job.cleanupLocalJobDirIfNecessary(createTime + 1000);
+        job.cleanupLocalJobDirIfNecessary(createTime);
         Assert.assertFalse(localJobDir.exists());
     }
 

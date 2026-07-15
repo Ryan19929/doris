@@ -1256,10 +1256,15 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         }
     }
 
+    /**
+     * Remote staging files have no value after the terminal state is durable, while a
+     * local snapshot must remain available until its configured expiration time.
+     */
     void cleanupLocalJobDirIfNecessary(long nowMs) {
         boolean shouldCleanup;
         synchronized (this) {
-            shouldCleanup = isDone() && nowMs >= createTime + timeoutMs;
+            shouldCleanup = isDone() && (repoId != Repository.KEEP_ON_LOCAL_REPO_ID
+                    || nowMs >= createTime + timeoutMs);
         }
         if (shouldCleanup) {
             cleanupLocalJobDir();
