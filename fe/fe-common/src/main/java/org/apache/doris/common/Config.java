@@ -1599,6 +1599,13 @@ public class Config extends ConfigBase {
     public static int max_backup_restore_job_num_per_db = 10;
 
     /**
+     * Keep an unreferenced backup staging directory for this many seconds before deleting it.
+     * Orphan cleanup is disabled when this value is not positive.
+     */
+    @ConfField(mutable = true, masterOnly = false)
+    public static int backup_orphan_dir_keep_max_second = 2 * 24 * 3600;
+
+    /**
      * A internal config, to reduce backup/restore job json serialization memory by streaming.
      */
     @ConfField(mutable = true, masterOnly = false, description = {

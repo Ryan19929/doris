@@ -73,6 +73,8 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Deque;
@@ -87,6 +89,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class BackupHandler extends MasterDaemon implements Writable {
     private static final Logger LOG = LogManager.getLogger(BackupHandler.class);
@@ -104,6 +107,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
     // If the last job is finished, user can get the job info from repository. If the last job is cancelled,
     // user can get the error message before submitting the next one.
     private final Map<Long, Deque<AbstractJob>> dbIdToBackupOrRestoreJobs = new HashMap<>();
+    // Evicted terminal jobs remain here until their staging directories are cleaned.
+    // Protected by jobLock and not persisted.
+    private final Deque<BackupJob> pendingCleanupJobs = new LinkedList<>();
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
@@ -112,10 +118,10 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     private Env env;
 
-    // map to store backup info, first key is db id and second key is label name
+    // map to store backup info, key is label name, value is the BackupJob
     // this map not present in persist && only in fe memory
-    // one database only keeps the latest snapshot for each label
-    private final Map<Long, Map<String, BackupJob>> localSnapshots = new HashMap<>();
+    // one table only keep one snapshot info, only keep last
+    private final Map<String, BackupJob> localSnapshots = new HashMap<>();
     private ReadWriteLock localSnapshotsLock = new ReentrantReadWriteLock();
 
     public BackupHandler() {
@@ -203,7 +209,10 @@ public class BackupHandler extends MasterDaemon implements Writable {
             job.setEnv(env);
             job.run();
         }
-        cleanupBackupJobLocalJobDirs();
+        long nowMs = System.currentTimeMillis();
+        cleanupBackupJobLocalJobDirs(nowMs);
+        cleanupPendingBackupJobLocalJobDirs();
+        cleanupOrphanBackupJobLocalJobDirs(nowMs);
     }
 
     // handle create repository stmt
@@ -661,35 +670,28 @@ public class BackupHandler extends MasterDaemon implements Writable {
                 jobs.removeLast();
             }
             jobs.addLast(job);
+
+            if (!Env.isCheckpointThread()) {
+                for (BackupJob removedBackupJob : removedBackupJobs) {
+                    if (removedBackupJob.isDone()) {
+                        pendingCleanupJobs.addLast(removedBackupJob);
+                    }
+                }
+            }
         } finally {
             jobLock.unlock();
         }
 
-        boolean checkpointThread = Env.isCheckpointThread();
-        if (checkpointThread) {
-            // localSnapshots is runtime-only and is not written to the image. The checkpoint
-            // handler must not inspect, register, or clean serving-FE local snapshot files.
-            return;
+        if (job.isFinished() && job instanceof BackupJob) {
+            // Save snapshot to local repo, when reload backupHandler from image.
+            BackupJob backupJob = (BackupJob) job;
+            if (backupJob.isLocalSnapshot()) {
+                addSnapshot(backupJob.getLabel(), backupJob);
+            }
         }
         for (BackupJob removedBackupJob : removedBackupJobs) {
             if (removedBackupJob.isLocalSnapshot()) {
-                removeSnapshot(removedBackupJob);
-            }
-            removedBackupJob.cleanupLocalJobDirAfterRemoved();
-        }
-        if (job.isFinished() && job instanceof BackupJob) {
-            // A local snapshot is FE-local. Only expose it on a serving FE that has both files.
-            BackupJob backupJob = (BackupJob) job;
-            if (backupJob.isLocalSnapshot()) {
-                // The latest terminal job for a label supersedes any older local snapshot,
-                // even when its files are unavailable on this FE.
-                removeSnapshot(backupJob.getDbId(), backupJob.getLabel());
-                if (backupJob.hasLocalSnapshotFiles()) {
-                    addSnapshot(backupJob);
-                } else {
-                    LOG.warn("skip unavailable local snapshot {} in db {} on this FE",
-                            backupJob.getLabel(), backupJob.getDbId());
-                }
+                removeSnapshot(removedBackupJob.getLabel());
             }
         }
     }
@@ -713,12 +715,118 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
     }
 
-    private void cleanupBackupJobLocalJobDirs() {
-        long nowMs = System.currentTimeMillis();
+    private void cleanupBackupJobLocalJobDirs(long nowMs) {
         for (AbstractJob job : getAllJobs()) {
             if (job instanceof BackupJob) {
                 ((BackupJob) job).cleanupLocalJobDirIfNecessary(nowMs);
             }
+        }
+    }
+
+    private void cleanupPendingBackupJobLocalJobDirs() {
+        List<BackupJob> pendingJobs;
+        jobLock.lock();
+        try {
+            pendingJobs = Lists.newArrayList(pendingCleanupJobs);
+        } finally {
+            jobLock.unlock();
+        }
+
+        for (BackupJob pendingJob : pendingJobs) {
+            if (pendingJob.cleanupLocalJobDirAfterRemoved()) {
+                jobLock.lock();
+                try {
+                    pendingCleanupJobs.removeFirstOccurrence(pendingJob);
+                } finally {
+                    jobLock.unlock();
+                }
+            }
+        }
+    }
+
+    private void cleanupOrphanBackupJobLocalJobDirs(long nowMs) {
+        Path backupRootDir = BACKUP_ROOT_DIR.toAbsolutePath().normalize();
+        if (!Files.isDirectory(backupRootDir, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        if (Config.backup_orphan_dir_keep_max_second <= 0) {
+            LOG.warn("skip orphan backup staging directory cleanup because "
+                    + "backup_orphan_dir_keep_max_second is not positive: {}",
+                    Config.backup_orphan_dir_keep_max_second);
+            return;
+        }
+
+        Set<Path> referencedJobDirs = getReferencedBackupJobDirs(backupRootDir);
+        long orphanExpireBeforeMs = nowMs
+                - TimeUnit.SECONDS.toMillis(Config.backup_orphan_dir_keep_max_second);
+        try {
+            for (Path repoDir : listChildDirectories(backupRootDir)) {
+                if (!repoDir.getFileName().toString().startsWith("repo__")) {
+                    continue;
+                }
+                cleanupOrphanJobDirsInRepo(repoDir, referencedJobDirs, orphanExpireBeforeMs);
+            }
+        } catch (IOException e) {
+            LOG.warn("failed to scan backup root dir for orphan staging directories: {}", backupRootDir, e);
+        }
+    }
+
+    private Set<Path> getReferencedBackupJobDirs(Path backupRootDir) {
+        List<BackupJob> backupJobs = Lists.newArrayList();
+        jobLock.lock();
+        try {
+            for (Deque<AbstractJob> jobs : dbIdToBackupOrRestoreJobs.values()) {
+                for (AbstractJob job : jobs) {
+                    if (job instanceof BackupJob) {
+                        backupJobs.add((BackupJob) job);
+                    }
+                }
+            }
+            backupJobs.addAll(pendingCleanupJobs);
+        } finally {
+            jobLock.unlock();
+        }
+
+        Set<Path> referencedJobDirs = Sets.newHashSet();
+        for (BackupJob backupJob : backupJobs) {
+            Path jobDir = backupJob.getLocalJobDirPath();
+            if (jobDir != null && jobDir.startsWith(backupRootDir) && !jobDir.equals(backupRootDir)) {
+                referencedJobDirs.add(jobDir);
+            }
+        }
+        return referencedJobDirs;
+    }
+
+    private void cleanupOrphanJobDirsInRepo(Path repoDir, Set<Path> referencedJobDirs,
+                                            long orphanExpireBeforeMs) {
+        List<Path> jobDirs;
+        try {
+            jobDirs = listChildDirectories(repoDir);
+        } catch (IOException e) {
+            LOG.warn("failed to scan backup repo dir for orphan staging directories: {}", repoDir, e);
+            return;
+        }
+
+        for (Path jobDir : jobDirs) {
+            try {
+                Path normalizedJobDir = jobDir.toAbsolutePath().normalize();
+                if (referencedJobDirs.contains(normalizedJobDir)
+                        || Files.getLastModifiedTime(normalizedJobDir, LinkOption.NOFOLLOW_LINKS).toMillis()
+                                > orphanExpireBeforeMs) {
+                    continue;
+                }
+                BackupJob.deleteLocalJobDirRecursively(normalizedJobDir);
+                LOG.info("cleaned orphan backup job dir: {}", normalizedJobDir);
+            } catch (IOException e) {
+                LOG.warn("failed to clean orphan backup job dir: {}", jobDir, e);
+            }
+        }
+    }
+
+    private List<Path> listChildDirectories(Path parentDir) throws IOException {
+        try (Stream<Path> paths = Files.list(parentDir)) {
+            return paths.filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS))
+                    .collect(Collectors.toList());
         }
     }
 
@@ -923,12 +1031,6 @@ public class BackupHandler extends MasterDaemon implements Writable {
     public void replayAddJob(AbstractJob job) {
         LOG.info("replay backup/restore job: {}", job);
 
-        boolean checkpointThread = Env.isCheckpointThread();
-        if (job instanceof BackupJob && !checkpointThread) {
-            // Journal paths may have been produced by another FE.
-            ((BackupJob) job).rebindLocalJobDirToCurrentFe();
-        }
-
         if (job.isCancelled()) {
             AbstractJob existingJob = getCurrentJob(job.getDbId());
             if (existingJob == null || existingJob.isDone()) {
@@ -953,9 +1055,6 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         addBackupOrRestoreJob(job.getDbId(), job);
-        if (job instanceof BackupJob && !checkpointThread) {
-            ((BackupJob) job).cleanupLocalJobDirIfNecessary(System.currentTimeMillis());
-        }
     }
 
     public boolean report(TTaskType type, long jobId, long taskId, int finishedNum, int totalNum) {
@@ -975,60 +1074,33 @@ public class BackupHandler extends MasterDaemon implements Writable {
         return false;
     }
 
-    public void addSnapshot(BackupJob backupJob) {
+    public void addSnapshot(String labelName, BackupJob backupJob) {
         assert backupJob.isFinished();
 
-        long dbId = backupJob.getDbId();
-        String labelName = backupJob.getLabel();
-        LOG.info("add snapshot {} in db {} to local repo", labelName, dbId);
+        LOG.info("add snapshot {} to local repo", labelName);
         localSnapshotsLock.writeLock().lock();
         try {
-            localSnapshots.computeIfAbsent(dbId, id -> new HashMap<>()).put(labelName, backupJob);
+            localSnapshots.put(labelName, backupJob);
         } finally {
             localSnapshotsLock.writeLock().unlock();
         }
     }
 
-    public void removeSnapshot(long dbId, String labelName) {
-        LOG.info("remove snapshot {} in db {} from local repo", labelName, dbId);
+    public void removeSnapshot(String labelName) {
+        LOG.info("remove snapshot {} from local repo", labelName);
         localSnapshotsLock.writeLock().lock();
         try {
-            Map<String, BackupJob> dbSnapshots = localSnapshots.get(dbId);
-            if (dbSnapshots != null) {
-                dbSnapshots.remove(labelName);
-                if (dbSnapshots.isEmpty()) {
-                    localSnapshots.remove(dbId);
-                }
-            }
+            localSnapshots.remove(labelName);
         } finally {
             localSnapshotsLock.writeLock().unlock();
         }
     }
 
-    private void removeSnapshot(BackupJob backupJob) {
-        long dbId = backupJob.getDbId();
-        String labelName = backupJob.getLabel();
-        localSnapshotsLock.writeLock().lock();
-        try {
-            Map<String, BackupJob> dbSnapshots = localSnapshots.get(dbId);
-            if (dbSnapshots != null && dbSnapshots.get(labelName) == backupJob) {
-                LOG.info("remove snapshot {} in db {} from local repo", labelName, dbId);
-                dbSnapshots.remove(labelName);
-                if (dbSnapshots.isEmpty()) {
-                    localSnapshots.remove(dbId);
-                }
-            }
-        } finally {
-            localSnapshotsLock.writeLock().unlock();
-        }
-    }
-
-    public Snapshot getSnapshot(long dbId, String labelName, boolean enableCompress) throws IOException {
+    public Snapshot getSnapshot(String labelName, boolean enableCompress) throws IOException {
         BackupJob backupJob;
         localSnapshotsLock.readLock().lock();
         try {
-            Map<String, BackupJob> dbSnapshots = localSnapshots.get(dbId);
-            backupJob = dbSnapshots == null ? null : dbSnapshots.get(labelName);
+            backupJob = localSnapshots.get(labelName);
         } finally {
             localSnapshotsLock.readLock().unlock();
         }
@@ -1061,18 +1133,10 @@ public class BackupHandler extends MasterDaemon implements Writable {
     public void readFields(DataInput in) throws IOException {
         repoMgr = RepositoryMgr.read(in);
 
-        boolean checkpointThread = Env.isCheckpointThread();
         int size = in.readInt();
         for (int i = 0; i < size; i++) {
             AbstractJob job = AbstractJob.read(in);
-            if (job instanceof BackupJob && !checkpointThread) {
-                // Image paths may have been produced by another FE.
-                ((BackupJob) job).rebindLocalJobDirToCurrentFe();
-            }
             addBackupOrRestoreJob(job.getDbId(), job);
-        }
-        if (!checkpointThread) {
-            cleanupBackupJobLocalJobDirs();
         }
     }
 }
