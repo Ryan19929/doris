@@ -588,8 +588,8 @@ public class BackupJobTest {
 
     /**
      * Active getSnapshot readers pin the staging dir via refcount; cleanup is deferred
-     * until the last reader releases, so mid-read deletion cannot corrupt materialization.
-     * Job state monitor is not required for this coordination.
+     * to a later handler cleanup cycle after the last reader releases, so neither
+     * mid-read deletion nor directory IO on the RPC thread can occur.
      */
     @Test
     public void testLocalSnapshotCleanupDefersWhileGetSnapshotReaderPinned() throws Exception {
@@ -615,10 +615,14 @@ public class BackupJobTest {
         Deencapsulation.setField(localSnapshotJob, "localJobDirReaders", 1);
         localSnapshotJob.cleanupLocalJobDirAfterRemoved();
         Assert.assertTrue("cleanup must defer while a reader is pinned", localJobDir.exists());
-        Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleanupPending"));
 
-        // Release the pin (readers 1 -> 0); deferred cleanup should run.
+        // Release the pin (readers 1 -> 0); the RPC reader must not run directory IO.
         Deencapsulation.invoke(localSnapshotJob, "releaseLocalJobDirRead");
+        Assert.assertTrue(localJobDir.exists());
+        Assert.assertFalse(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
+
+        // A later backup handler cleanup cycle performs the deferred deletion.
+        Assert.assertTrue(localSnapshotJob.cleanupLocalJobDirAfterRemoved());
         Assert.assertFalse(localJobDir.exists());
         Assert.assertTrue(Deencapsulation.getField(localSnapshotJob, "localJobDirCleaned"));
     }
@@ -744,10 +748,7 @@ public class BackupJobTest {
         Deencapsulation.setField(localSnapshotJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
         Deencapsulation.setField(localSnapshotJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
 
-        localSnapshotJob.cleanupLocalJobDirIfNecessary(createTime + 999);
-        Assert.assertTrue(localJobDir.exists());
-
-        localSnapshotJob.cleanupLocalJobDirIfNecessary(createTime + 1000);
+        localSnapshotJob.cleanupLocalJobDirIfNecessary(createTime);
         Assert.assertFalse(localJobDir.exists());
     }
 
@@ -808,8 +809,9 @@ public class BackupJobTest {
             Assert.assertEquals(1, pendingCleanupJobs.size());
 
             Deencapsulation.invoke(evictedJob, "releaseLocalJobDirRead");
-            Assert.assertFalse(localJobDir.exists());
+            Assert.assertTrue(localJobDir.exists());
             Deencapsulation.invoke(backupHandler, "cleanupPendingBackupJobLocalJobDirs");
+            Assert.assertFalse(localJobDir.exists());
             Assert.assertTrue(pendingCleanupJobs.isEmpty());
         } finally {
             Config.max_backup_restore_job_num_per_db = oldMaxJobNum;
@@ -898,6 +900,34 @@ public class BackupJobTest {
             }
             Files.deleteIfExists(externalDir);
             Config.backup_orphan_dir_keep_max_second = oldOrphanKeepSecond;
+        }
+    }
+
+    @Test
+    public void testOrphanJobDirCleanupUsesIndependentInterval() throws Exception {
+        long oldCleanupIntervalSecond = Config.backup_orphan_dir_cleanup_interval_second;
+        Config.backup_orphan_dir_cleanup_interval_second = 3600;
+        try {
+            long nowMs = System.currentTimeMillis();
+
+            File firstOldOrphanDir = createRepoJobDir(repoId, "first_interval_orphan");
+            Files.setLastModifiedTime(firstOldOrphanDir.toPath(),
+                    FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+            Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirsIfNecessary", nowMs);
+            Assert.assertFalse(firstOldOrphanDir.exists());
+
+            File secondOldOrphanDir = createRepoJobDir(repoId, "second_interval_orphan");
+            Files.setLastModifiedTime(secondOldOrphanDir.toPath(),
+                    FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+            Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirsIfNecessary",
+                    nowMs + Config.backup_handler_update_interval_millis);
+            Assert.assertTrue(secondOldOrphanDir.exists());
+
+            Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirsIfNecessary",
+                    nowMs + TimeUnit.HOURS.toMillis(1));
+            Assert.assertFalse(secondOldOrphanDir.exists());
+        } finally {
+            Config.backup_orphan_dir_cleanup_interval_second = oldCleanupIntervalSecond;
         }
     }
 
