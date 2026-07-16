@@ -689,7 +689,7 @@ public class GsonUtils {
     public static final Gson GSON = GSON_BUILDER.create();
 
     /**
-     * Deep copies a value through one segmented UTF-8 JSON buffer. The caller controls
+     * Deep copies a value through one spillable UTF-8 JSON buffer. The caller controls
      * whether streaming polymorphic adapters are active through the corresponding config.
      */
     public static <T> T deepCopyViaJsonStream(Object source, Class<T> type, int metaVersion) {
@@ -698,10 +698,11 @@ public class GsonUtils {
         copyContext.setMetaVersion(metaVersion);
         copyContext.setThreadLocalInfo();
         try {
-            LengthPrefixedJsonStream.JsonBuffer buffer = LengthPrefixedJsonStream.serialize(source, GSON);
-            return LengthPrefixedJsonStream.read(buffer, type, GSON);
+            try (LengthPrefixedJsonStream.JsonBuffer buffer = LengthPrefixedJsonStream.serialize(source, GSON)) {
+                return LengthPrefixedJsonStream.read(buffer, type, GSON);
+            }
         } catch (Exception e) {
-            LOG.warn("failed to copy object via segmented JSON stream", e);
+            LOG.warn("failed to copy object via spillable JSON stream", e);
             return null;
         } finally {
             if (previousContext == null) {
