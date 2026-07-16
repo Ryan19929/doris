@@ -228,7 +228,7 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 - 将 `Table`、`OlapTable`、`BackupMeta`、`BackupJobInfo` 和相关读写路径迁移到 streaming helper。
 - 用流式 JSON deep copy 替换 `OlapTable.selectiveCopy()` 中的完整 DOM/String deep copy。
 - 复用 PR 1 的 Replica 剥离，不再次引入同名配置或重复实现。
-- 与 PR 4 已合入的 `AbstractJob` 读写逻辑统一，避免并行存在多套 mode scope。
+- 复用 PR 4 的 config-driven adapter dispatch，避免并行存在多套 mode scope。
 
 ### 持久化测试
 
@@ -306,6 +306,12 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
    - 不改变 JSON schema。
 
 配置设计必须明确 writer、reader、Master、Follower、Observer 和 checkpoint 线程的行为。如果配置只控制 writer，reader 应自动兼容两种输出；如果配置同时控制 reader，则所有 FE 节点都必须具备一致且可操作的回退方式。
+
+RestoreJob 接入不使用仅包围 `AbstractJob.read()` 的 ThreadLocal scope。checkpoint/image 可以经过
+`AbstractJob.read()`，但 editlog replay 还会直接经过 `BackupJob.read()`、`RestoreJob.read()`；仅在
+`AbstractJob` 建立 scope 会漏掉 follower replay。PR 4 由同一个内部 FE config 直接驱动外层多态
+adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 legacy delegate，保证开关能作为
+真实的 reader/writer 故障回退，而不只是内存 A/B 开关。
 
 建议首次合入 streaming 路径时默认关闭，完成一轮兼容性和压力验证后由 PR 6 单独开启。若 reviewer 不接受默认关闭的 dormant path，则 PR 3—5 必须在默认开启前完成 PR 6 的全部验收项目。
 
