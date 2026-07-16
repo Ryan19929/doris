@@ -17,6 +17,9 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.common.Config;
+import org.apache.doris.persist.gson.GsonUtils;
+
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -26,6 +29,8 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 
 public class BackupJobInfoTest {
 
@@ -161,5 +166,32 @@ public class BackupJobInfoTest {
 
         Assert.assertEquals(1, jobInfo.newBackupObjects.views.size());
         Assert.assertEquals("view1", jobInfo.newBackupObjects.views.get(0).name);
+    }
+
+    @Test
+    public void testStreamingUtf8FileAndLegacyRollback() throws Exception {
+        BackupJobInfo jobInfo = BackupJobInfo.fromFile(fileName);
+        jobInfo.name = "快照-東京";
+        File streamingFile = new File("job_info_streaming.txt");
+        File legacyFile = new File("job_info_legacy.txt");
+        boolean savedStreaming = Config.enable_table_meta_streaming_json;
+        try {
+            Config.enable_table_meta_streaming_json = true;
+            jobInfo.writeToFile(streamingFile);
+            Assert.assertArrayEquals(GsonUtils.GSON.toJson(jobInfo).getBytes(StandardCharsets.UTF_8),
+                    Files.readAllBytes(streamingFile.toPath()));
+
+            Config.enable_table_meta_streaming_json = false;
+            Assert.assertEquals("快照-東京", BackupJobInfo.fromFile(streamingFile.getPath()).name);
+            jobInfo.name = "legacy-ascii";
+            jobInfo.writeToFile(legacyFile);
+
+            Config.enable_table_meta_streaming_json = true;
+            Assert.assertEquals("legacy-ascii", BackupJobInfo.fromFile(legacyFile.getPath()).name);
+        } finally {
+            Config.enable_table_meta_streaming_json = savedStreaming;
+            Files.deleteIfExists(streamingFile.toPath());
+            Files.deleteIfExists(legacyFile.toPath());
+        }
     }
 }
