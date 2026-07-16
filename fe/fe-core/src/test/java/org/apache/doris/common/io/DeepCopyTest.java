@@ -23,6 +23,10 @@ import org.apache.doris.persist.TableInfo;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+
 public class DeepCopyTest {
 
     @Test
@@ -32,5 +36,28 @@ public class DeepCopyTest {
         Assert.assertEquals(1, copied.getDbId());
         Assert.assertEquals(2, copied.getTableId());
         Assert.assertEquals("newTbl", copied.getNewTableName());
+    }
+
+    @Test
+    public void testReadOutOfMemoryIsPropagated() {
+        OutOfMemoryError expected = ReadOutOfMemoryWritable.READ_FAILURE;
+
+        OutOfMemoryError actual = Assert.assertThrows(OutOfMemoryError.class,
+                () -> DeepCopy.copy(new ReadOutOfMemoryWritable(), ReadOutOfMemoryWritable.class,
+                        FeConstants.meta_version));
+
+        Assert.assertSame(expected, actual);
+    }
+
+    public static class ReadOutOfMemoryWritable implements Writable {
+        private static final OutOfMemoryError READ_FAILURE = new OutOfMemoryError("expected read failure");
+
+        @Override
+        public void write(DataOutput out) throws IOException {
+        }
+
+        public static ReadOutOfMemoryWritable read(DataInput in) {
+            throw READ_FAILURE;
+        }
     }
 }

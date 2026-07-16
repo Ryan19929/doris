@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.io.DataInput;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /*
@@ -54,6 +55,12 @@ public class DeepCopy {
                 T result = (T) readMethod.invoke(orig, in);
                 return result;
             }
+        } catch (InvocationTargetException e) {
+            if (e.getCause() instanceof Error) {
+                throw (Error) e.getCause();
+            }
+            LOG.warn("failed to copy object.", e);
+            return null;
         } catch (Exception e) {
             LOG.warn("failed to copy object.", e);
             return null;
