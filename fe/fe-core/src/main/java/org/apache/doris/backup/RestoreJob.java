@@ -102,6 +102,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Table.Cell;
+import com.google.gson.annotations.JsonAdapter;
 import com.google.gson.annotations.SerializedName;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
@@ -196,9 +197,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // save all restored partitions' version info which are already exist in catalog
     // table id -> partition id -> (version, version hash)
     @SerializedName("rvi")
+    @JsonAdapter(RestoreJobTableTypeAdapterFactory.class)
     private com.google.common.collect.Table<Long, Long, Long> restoredVersionInfo = HashBasedTable.create();
     // tablet id->(be id -> snapshot info)
     @SerializedName("si")
+    @JsonAdapter(RestoreJobTableTypeAdapterFactory.class)
     protected com.google.common.collect.Table<Long, Long, SnapshotInfo> snapshotInfos = HashBasedTable.create();
 
     private List<ColocatePersistInfo> colocatePersistInfos = Lists.newArrayList();

@@ -600,6 +600,7 @@ public class GsonUtils {
     private static RuntimeTypeAdapterFactory<org.apache.doris.backup.AbstractJob>
             jobBackupTypeAdapterFactory
                     = RuntimeTypeAdapterFactory.of(org.apache.doris.backup.AbstractJob.class, "clazz")
+                    .withStreamingDispatch(() -> Config.enable_backup_restore_job_streaming_json)
                     .registerSubtype(BackupJob.class, BackupJob.class.getSimpleName())
                     .registerSubtype(RestoreJob.class, RestoreJob.class.getSimpleName())
                     .registerSubtype(CloudRestoreJob.class, CloudRestoreJob.class.getSimpleName());
