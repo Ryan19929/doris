@@ -396,6 +396,8 @@ under the License.
         <arrow.vector.classifier>shade-format-flatbuffers</arrow.vector.classifier>
         <flatbuffers.version>1.12.0</flatbuffers.version>
         <jacoco.version>0.8.10</jacoco.version>
+        <fe.ut.max.heap>1024m</fe.ut.max.heap>
+        <fe.ut.extra.jvm.args></fe.ut.extra.jvm.args>
         <argLine></argLine>
         <trino.version>435</trino.version>
         <nimbusds.version>10.0.1</nimbusds.version>

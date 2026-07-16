@@ -843,7 +843,10 @@ under the License.
                     <reuseForks>false</reuseForks>
                     <useFile>false</useFile>
                     <argLine>
-                        -Xmx1024m --add-reads=org.apache.arrow.flight.core=ALL-UNNAMED --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED @{argLine}
+                        -Xmx${fe.ut.max.heap} ${fe.ut.extra.jvm.args}
+                        --add-reads=org.apache.arrow.flight.core=ALL-UNNAMED
+                        --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED
+                        @{argLine}
                     </argLine>
                 </configuration>
             </plugin>
