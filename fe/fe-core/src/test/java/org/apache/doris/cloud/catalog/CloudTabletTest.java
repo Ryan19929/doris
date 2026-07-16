@@ -25,7 +25,7 @@ import org.junit.jupiter.api.Test;
 public class CloudTabletTest {
 
     @Test
-    public void testClearReplicasRemovesCloudReplica() {
+    public void testClearReplicasForBackupRemovesCloudReplica() {
         CloudTablet tablet = new CloudTablet(10001L);
         CloudReplica replica = new CloudReplica(20001L, -1L, Replica.ReplicaState.NORMAL, 1L, 0,
                 30001L, 40001L, 50001L, 60001L, 0L);
@@ -34,7 +34,7 @@ public class CloudTabletTest {
         Assertions.assertSame(replica, tablet.getCloudReplica());
         Assertions.assertEquals(1, tablet.getReplicas().size());
 
-        tablet.clearReplicas();
+        tablet.clearReplicasForBackup();
 
         Assertions.assertNull(tablet.getCloudReplica());
         Assertions.assertTrue(tablet.getReplicas().isEmpty());
