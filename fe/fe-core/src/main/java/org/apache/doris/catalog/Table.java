@@ -23,6 +23,7 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.io.LengthPrefixedJsonStream;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.lock.MonitoredReentrantLock;
@@ -464,6 +465,9 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
     }
 
     public static Table read(DataInput in) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            return LengthPrefixedJsonStream.read(in, Table.class, GsonUtils.GSON);
+        }
         return GsonUtils.GSON.fromJson(Text.readString(in), Table.class);
     }
 
@@ -484,6 +488,10 @@ public abstract class Table extends MetaObject implements Writable, TableIf, Gso
 
     @Override
     public void write(DataOutput out) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            LengthPrefixedJsonStream.write(out, this, GsonUtils.GSON);
+            return;
+        }
         Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 

@@ -50,6 +50,7 @@ import org.apache.doris.common.GlobRegexUtil;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.DeepCopy;
+import org.apache.doris.common.io.LengthPrefixedJsonStream;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.Util;
@@ -2060,6 +2061,10 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
 
     @Override
     public void write(DataOutput out) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            LengthPrefixedJsonStream.write(out, this, GsonUtils.GSON);
+            return;
+        }
         Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 
@@ -2127,7 +2132,9 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     }
 
     public OlapTable selectiveCopy(Collection<String> reservedPartitions, IndexExtState extState, boolean isForBackup) {
-        OlapTable copied = DeepCopy.copy(this, OlapTable.class, FeConstants.meta_version);
+        OlapTable copied = Config.enable_table_meta_streaming_json
+                ? GsonUtils.deepCopyViaJsonStream(this, OlapTable.class, FeConstants.meta_version)
+                : DeepCopy.copy(this, OlapTable.class, FeConstants.meta_version);
         if (copied == null) {
             LOG.warn("failed to copy olap table: " + getName());
             return null;
@@ -2203,6 +2210,9 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
     }
 
     public static OlapTable read(DataInput in) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            return LengthPrefixedJsonStream.read(in, OlapTable.class, GsonUtils.GSON);
+        }
         return GsonUtils.GSON.fromJson(Text.readString(in), OlapTable.class);
     }
 

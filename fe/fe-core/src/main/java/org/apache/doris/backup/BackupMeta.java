@@ -19,6 +19,8 @@ package org.apache.doris.backup;
 
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.common.Config;
+import org.apache.doris.common.io.LengthPrefixedJsonStream;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.meta.MetaContext;
@@ -102,6 +104,7 @@ public class BackupMeta implements Writable, GsonPostProcessable {
     }
 
     public static BackupMeta fromInputStream(InputStream stream, int metaVersion) throws IOException {
+        MetaContext previousContext = MetaContext.get();
         MetaContext metaContext = new MetaContext();
         metaContext.setMetaVersion(metaVersion);
         metaContext.setThreadLocalInfo();
@@ -109,7 +112,11 @@ public class BackupMeta implements Writable, GsonPostProcessable {
             BackupMeta backupMeta = BackupMeta.read(dis);
             return backupMeta;
         } finally {
-            MetaContext.remove();
+            if (previousContext == null) {
+                MetaContext.remove();
+            } else {
+                previousContext.setThreadLocalInfo();
+            }
         }
     }
 
@@ -124,12 +131,19 @@ public class BackupMeta implements Writable, GsonPostProcessable {
     }
 
     public static BackupMeta read(DataInput in) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            return LengthPrefixedJsonStream.read(in, BackupMeta.class, GsonUtils.GSON);
+        }
         String json = Text.readString(in);
         return GsonUtils.GSON.fromJson(json, BackupMeta.class);
     }
 
     @Override
     public void write(DataOutput out) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            LengthPrefixedJsonStream.write(out, this, GsonUtils.GSON);
+            return;
+        }
         Text.writeString(out, GsonUtils.GSON.toJson(this));
     }
 
