@@ -57,6 +57,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 import java.util.Deque;
 import java.util.LinkedList;
 import java.util.List;
@@ -280,6 +281,21 @@ public class BackupRestoreJobStreamingJsonConfigTest {
             }
         }
         Assert.assertArrayEquals(legacyCloud, streamingCloud);
+    }
+
+    @Test
+    public void testTenByteNonMarkerPayloadIsReplayedAndDoesNotConsumeNextField() throws Exception {
+        byte[] json = "\"12345678\"".getBytes(StandardCharsets.UTF_8);
+        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID.length(), json.length);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream output = new DataOutputStream(bytes);
+        output.writeInt(json.length);
+        output.write(json);
+        output.writeLong(987654321L);
+
+        DataInputStream input = dataInput(bytes.toByteArray());
+        Assert.assertEquals("12345678", AbstractJob.readStreamingJob(input, String.class));
+        Assert.assertEquals(987654321L, input.readLong());
     }
 
     @Test
