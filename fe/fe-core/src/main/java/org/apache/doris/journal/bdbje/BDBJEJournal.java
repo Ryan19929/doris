@@ -21,6 +21,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.LogUtils;
+import org.apache.doris.common.io.CountingDataOutputStream;
 import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.NetUtils;
@@ -58,6 +59,7 @@ import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -75,6 +77,7 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
     private static final int OUTPUT_BUFFER_INIT_SIZE = 128;
     private static final int RETRY_TIME = 3;
     private static final long RECOVERY_JOURNAL_ID_UNSET = -1L;
+    private static final long MAX_JOURNAL_SIZE_BYTES = 1L << 30;
 
     private String environmentPath = null;
     private String selfNodeName;
@@ -801,24 +804,26 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
 
     @Override
     public boolean exceedMaxJournalSize(short op, Writable writable) throws IOException {
+        return exceedMaxJournalSize(op, writable, MAX_JOURNAL_SIZE_BYTES);
+    }
+
+    static boolean exceedMaxJournalSize(short op, Writable writable, long maxJournalSize) throws IOException {
+        long journalSize = countJournalSize(op, writable);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("opCode = {}, journal size = {}", op, journalSize);
+        }
+        return journalSize > maxJournalSize;
+    }
+
+    static long countJournalSize(short op, Writable writable) throws IOException {
         JournalEntity entity = new JournalEntity();
         entity.setOpCode(op);
         entity.setData(writable);
 
-        DataOutputBuffer buffer = new DataOutputBuffer(OUTPUT_BUFFER_INIT_SIZE);
-        entity.write(buffer);
-
-        DatabaseEntry theData = new DatabaseEntry(buffer.getData());
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug("opCode = {}, journal size = {}", op, theData.getSize());
+        try (CountingDataOutputStream countingStream =
+                new CountingDataOutputStream(OutputStream.nullOutputStream())) {
+            entity.write(countingStream);
+            return countingStream.getCount();
         }
-
-        // 1GB
-        if (theData.getSize() > (1 << 30)) {
-            return true;
-        }
-
-        return false;
     }
 }
