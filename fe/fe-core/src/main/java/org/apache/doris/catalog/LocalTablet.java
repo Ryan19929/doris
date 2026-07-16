@@ -273,7 +273,7 @@ public class LocalTablet extends Tablet {
     }
 
     @Override
-    public void clearReplicas() {
+    public void clearReplicasForBackup() {
         replicas = new ArrayList<>();
     }
 

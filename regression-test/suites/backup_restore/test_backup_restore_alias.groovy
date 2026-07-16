@@ -26,6 +26,7 @@ suite("test_backup_restore_alias", "backup_restore") {
     syncer.createS3Repository(repoName)
 
     sql "CREATE DATABASE IF NOT EXISTS ${dbName}"
+    sql "DROP TABLE IF EXISTS ${dbName}.${aliasName}"
     sql "DROP TABLE IF EXISTS ${dbName}.${tableName}"
     sql """
         CREATE TABLE ${dbName}.${tableName} (
@@ -48,19 +49,22 @@ suite("test_backup_restore_alias", "backup_restore") {
     assertEquals(result.size(), values.size());
 
     String snapshotName = "test_backup_restore_snapshot"
-    sql """
-        BACKUP SNAPSHOT ${dbName}.${snapshotName}
-        TO `${repoName}`
-        ON (${tableName})
-    """
+    def snapshot = null
+    setFeConfigTemporary([backup_meta_reserve_replica_info: false]) {
+        sql """
+            BACKUP SNAPSHOT ${dbName}.${snapshotName}
+            TO `${repoName}`
+            ON (${tableName})
+        """
 
-    syncer.waitSnapshotFinish(dbName)
+        syncer.waitSnapshotFinish(dbName)
 
-    def snapshot = syncer.getSnapshotTimestamp(repoName, snapshotName)
-    assertTrue(snapshot != null)
+        snapshot = syncer.getSnapshotTimestamp(repoName, snapshotName)
+        assertTrue(snapshot != null)
+    }
 
     sql "INSERT INTO ${dbName}.${tableName} VALUES (20, 21), (123, 341)"
-    qt_select "SELECT * FROM ${dbName}.${tableName} ORDER BY id"
+    order_qt_select "SELECT * FROM ${dbName}.${tableName}"
 
     sql """
         RESTORE SNAPSHOT ${dbName}.${snapshotName}
@@ -75,11 +79,8 @@ suite("test_backup_restore_alias", "backup_restore") {
 
     syncer.waitAllRestoreFinish(dbName)
 
-    qt_select "SELECT * FROM ${dbName}.${tableName} ORDER BY id"
-    qt_select "SELECT * FROM ${dbName}.${aliasName} ORDER BY id"
+    order_qt_select "SELECT * FROM ${dbName}.${tableName}"
+    order_qt_select "SELECT * FROM ${dbName}.${aliasName}"
 
-    sql "DROP TABLE ${dbName}.${tableName} FORCE"
-    sql "DROP DATABASE ${dbName} FORCE"
     sql "DROP REPOSITORY `${repoName}`"
 }
-
