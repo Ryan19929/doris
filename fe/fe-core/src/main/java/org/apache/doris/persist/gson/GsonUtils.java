@@ -466,7 +466,9 @@ public class GsonUtils {
                     PluginDrivenExternalDatabase.class, "JdbcExternalDatabase");
 
     private static RuntimeTypeAdapterFactory<TableIf> tblTypeAdapterFactory = RuntimeTypeAdapterFactory.of(
-                    TableIf.class, "clazz").registerSubtype(ExternalTable.class, ExternalTable.class.getSimpleName())
+                    TableIf.class, "clazz")
+            .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
+            .registerSubtype(ExternalTable.class, ExternalTable.class.getSimpleName())
             .registerSubtype(OlapTable.class, OlapTable.class.getSimpleName())
             .registerSubtype(HMSExternalTable.class, HMSExternalTable.class.getSimpleName())
             .registerSubtype(IcebergExternalTable.class, IcebergExternalTable.class.getSimpleName())
@@ -522,6 +524,7 @@ public class GsonUtils {
     // runtime adapter for class "CloudReplica".
     private static RuntimeTypeAdapterFactory<Replica> replicaTypeAdapterFactory = RuntimeTypeAdapterFactory
             .of(Replica.class, "clazz")
+            .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
             .registerSubtype(LocalReplica.class, LocalReplica.class.getSimpleName())
             .registerSubtype(CloudReplica.class, CloudReplica.class.getSimpleName());
 
@@ -530,6 +533,7 @@ public class GsonUtils {
     static {
         tabletTypeAdapterFactory = RuntimeTypeAdapterFactory
                 .of(Tablet.class, "clazz")
+                .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
                 .registerSubtype(LocalTablet.class, LocalTablet.class.getSimpleName())
                 .registerSubtype(CloudTablet.class, CloudTablet.class.getSimpleName());
         if (Config.isNotCloudMode()) {
@@ -549,6 +553,7 @@ public class GsonUtils {
     // runtime adapter for class "CloudPartition".
     private static RuntimeTypeAdapterFactory<Partition> partitionTypeAdapterFactory = RuntimeTypeAdapterFactory
             .of(Partition.class, "clazz")
+            .withStreamingDispatch(() -> Config.enable_table_meta_streaming_json)
             .registerDefaultSubtype(Partition.class)
             .registerSubtype(Partition.class, Partition.class.getSimpleName())
             .registerSubtype(CloudPartition.class, CloudPartition.class.getSimpleName());
