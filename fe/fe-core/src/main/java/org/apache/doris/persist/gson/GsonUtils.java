@@ -137,6 +137,7 @@ import org.apache.doris.cloud.datasource.CloudInternalCatalog;
 import org.apache.doris.cloud.load.CloudBrokerLoadJob;
 import org.apache.doris.cloud.load.CopyJob;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.io.LengthPrefixedJsonStream;
 import org.apache.doris.common.util.RangeUtils;
 import org.apache.doris.datasource.CatalogIf;
 import org.apache.doris.datasource.ExternalDatabase;
@@ -208,6 +209,7 @@ import org.apache.doris.load.routineload.kafka.KafkaRoutineLoadJob;
 import org.apache.doris.load.routineload.kinesis.KinesisDataSourceProperties;
 import org.apache.doris.load.routineload.kinesis.KinesisProgress;
 import org.apache.doris.load.routineload.kinesis.KinesisRoutineLoadJob;
+import org.apache.doris.meta.MetaContext;
 import org.apache.doris.mtmv.MTMVMaxTimestampSnapshot;
 import org.apache.doris.mtmv.MTMVSnapshotIdSnapshot;
 import org.apache.doris.mtmv.MTMVSnapshotIf;
@@ -240,6 +242,8 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.ReflectionAccessFilter;
 import com.google.gson.ToNumberPolicy;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -259,6 +263,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * See the following "GuavaTableAdapter" and "GuavaMultimapAdapter" for example.
  */
 public class GsonUtils {
+    private static final Logger LOG = LogManager.getLogger(GsonUtils.class);
 
     // runtime adapter for class "Type"
     private static RuntimeTypeAdapterFactory<org.apache.doris.catalog.Type> columnTypeAdapterFactory
@@ -661,6 +666,30 @@ public class GsonUtils {
 
     // this instance is thread-safe.
     public static final Gson GSON = GSON_BUILDER.create();
+
+    /**
+     * Deep copies a value through one segmented UTF-8 JSON buffer. The caller controls
+     * whether streaming polymorphic adapters are active through the corresponding config.
+     */
+    public static <T> T deepCopyViaJsonStream(Object source, Class<T> type, int metaVersion) {
+        MetaContext previousContext = MetaContext.get();
+        MetaContext copyContext = new MetaContext();
+        copyContext.setMetaVersion(metaVersion);
+        copyContext.setThreadLocalInfo();
+        try {
+            LengthPrefixedJsonStream.JsonBuffer buffer = LengthPrefixedJsonStream.serialize(source, GSON);
+            return LengthPrefixedJsonStream.read(buffer, type, GSON);
+        } catch (Exception e) {
+            LOG.warn("failed to copy object via segmented JSON stream", e);
+            return null;
+        } finally {
+            if (previousContext == null) {
+                MetaContext.remove();
+            } else {
+                previousContext.setThreadLocalInfo();
+            }
+        }
+    }
 
     // ATTN: the order between creating GSON and GSON_PRETTY_PRINTING is very important.
     private static final GsonBuilder GSON_BUILDER_PRETTY_PRINTING = GSON_BUILDER.setPrettyPrinting();

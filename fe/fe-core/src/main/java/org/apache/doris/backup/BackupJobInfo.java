@@ -49,11 +49,13 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.File;
-import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -679,6 +681,11 @@ public class BackupJobInfo implements GsonPostProcessable {
     }
 
     public static BackupJobInfo fromFile(String path) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            try (InputStream inputStream = Files.newInputStream(Paths.get(path))) {
+                return fromInputStream(inputStream);
+            }
+        }
         byte[] bytes = Files.readAllBytes(Paths.get(path));
         String json = new String(bytes, StandardCharsets.UTF_8);
         return genFromJson(json);
@@ -750,12 +757,24 @@ public class BackupJobInfo implements GsonPostProcessable {
     }
 
     public static BackupJobInfo fromInputStream(InputStream inputStream) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            try (InputStreamReader reader = new InputStreamReader(inputStream, StandardCharsets.UTF_8)) {
+                return GsonUtils.GSON.fromJson(reader, BackupJobInfo.class);
+            }
+        }
         try (InputStreamReader reader = new InputStreamReader(inputStream)) {
             return GsonUtils.GSON.fromJson(reader, BackupJobInfo.class);
         }
     }
 
-    public void writeToFile(File jobInfoFile) throws FileNotFoundException {
+    public void writeToFile(File jobInfoFile) throws IOException {
+        if (Config.enable_table_meta_streaming_json) {
+            try (Writer writer = new OutputStreamWriter(
+                    new FileOutputStream(jobInfoFile), StandardCharsets.UTF_8)) {
+                GsonUtils.GSON.toJson(this, writer);
+            }
+            return;
+        }
         PrintWriter printWriter = new PrintWriter(jobInfoFile);
         try {
             printWriter.print(toJson(false));
