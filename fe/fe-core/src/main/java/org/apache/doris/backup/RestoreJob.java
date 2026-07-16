@@ -2804,6 +2804,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public static RestoreJob read(DataInput in) throws IOException {
+        if (Config.enable_backup_restore_job_streaming_json) {
+            return AbstractJob.readStreamingJob(in, RestoreJob.class);
+        }
         String json = Text.readString(in);
         if (AbstractJob.COMPRESSED_JOB_ID.equals(json)) {
             return GsonUtilsBase.fromJsonCompressed(in, RestoreJob.class, GsonUtils.GSON);
