@@ -20,6 +20,7 @@ package org.apache.doris.backup;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.io.LengthPrefixedJsonStream;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -28,9 +29,13 @@ import org.apache.doris.persist.gson.GsonUtilsBase;
 import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
 
+import java.io.ByteArrayInputStream;
 import java.io.DataInput;
+import java.io.DataInputStream;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.Map;
 
@@ -43,6 +48,7 @@ import java.util.Map;
  */
 public abstract class AbstractJob implements Writable {
     public static final String COMPRESSED_JOB_ID = "COMPRESSED";
+    private static final byte[] COMPRESSED_JOB_BYTES = COMPRESSED_JOB_ID.getBytes(StandardCharsets.UTF_8);
 
     public enum JobType {
         BACKUP, RESTORE, BACKUP_COMPRESSED, RESTORE_COMPRESSED
@@ -173,12 +179,29 @@ public abstract class AbstractJob implements Writable {
     public abstract Status updateRepo(Repository repo);
 
     public static AbstractJob read(DataInput in) throws IOException {
+        if (Config.enable_backup_restore_job_streaming_json) {
+            return readStreamingJob(in, AbstractJob.class);
+        }
         String json = Text.readString(in);
         if (COMPRESSED_JOB_ID.equals(json)) {
             return GsonUtilsBase.fromJsonCompressed(in, AbstractJob.class, GsonUtils.GSON);
         } else {
             return GsonUtils.GSON.fromJson(json, AbstractJob.class);
         }
+    }
+
+    static <T> T readStreamingJob(DataInput in, Class<T> type) throws IOException {
+        int length = LengthPrefixedJsonStream.readLength(in);
+        if (length == COMPRESSED_JOB_BYTES.length) {
+            byte[] markerCandidate = new byte[length];
+            in.readFully(markerCandidate);
+            if (Arrays.equals(markerCandidate, COMPRESSED_JOB_BYTES)) {
+                return GsonUtilsBase.fromJsonCompressed(in, type, GsonUtils.GSON);
+            }
+            DataInputStream replay = new DataInputStream(new ByteArrayInputStream(markerCandidate));
+            return LengthPrefixedJsonStream.read(replay, length, type, GsonUtils.GSON);
+        }
+        return LengthPrefixedJsonStream.read(in, length, type, GsonUtils.GSON);
     }
 
     @Override
@@ -202,7 +225,11 @@ public abstract class AbstractJob implements Writable {
             Text.writeString(out, COMPRESSED_JOB_ID);
             GsonUtilsBase.toJsonCompressed(out, this, GsonUtils.GSON);
         } else {
-            Text.writeString(out, GsonUtils.GSON.toJson(this));
+            if (Config.enable_backup_restore_job_streaming_json) {
+                LengthPrefixedJsonStream.write(out, this, GsonUtils.GSON);
+            } else {
+                Text.writeString(out, GsonUtils.GSON.toJson(this));
+            }
         }
     }
 

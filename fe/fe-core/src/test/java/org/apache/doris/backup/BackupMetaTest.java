@@ -87,13 +87,14 @@ public class BackupMetaTest {
     @Test
     public void testStreamingCopyRestoresPreviousMetaContext() {
         boolean savedStreaming = Config.enable_table_meta_streaming_json;
+        OlapTable table = createTable(false);
         MetaContext previousContext = MetaContext.get();
         MetaContext expectedContext = new MetaContext();
         expectedContext.setMetaVersion(FeConstants.meta_version);
         expectedContext.setThreadLocalInfo();
         try {
             Config.enable_table_meta_streaming_json = true;
-            Assert.assertNotNull(createTable(false).selectiveCopy(null, IndexExtState.VISIBLE, true));
+            Assert.assertNotNull(table.selectiveCopy(null, IndexExtState.VISIBLE, true));
             Assert.assertSame(expectedContext, MetaContext.get());
         } finally {
             Config.enable_table_meta_streaming_json = savedStreaming;

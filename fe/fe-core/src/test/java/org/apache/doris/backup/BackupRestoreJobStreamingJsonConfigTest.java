@@ -17,12 +17,12 @@
 
 package org.apache.doris.backup;
 
-import org.apache.doris.analysis.BackupStmt;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.cloud.backup.CloudRestoreJob;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.journal.JournalEntity;
+import org.apache.doris.nereids.trees.plans.commands.BackupCommand;
 import org.apache.doris.nereids.trees.plans.commands.RestoreCommand;
 import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -47,6 +47,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 
 public class BackupRestoreJobStreamingJsonConfigTest {
     private boolean savedStreamingConfig;
@@ -113,7 +114,7 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         assertLargeFields(restoreJob, RestoreJob.read(dataInput(streamingRestore)));
 
         BackupJob backupJob = new BackupJob("compressed_backup", 1L, "db", Lists.newArrayList(), 1000L,
-                BackupStmt.BackupContent.ALL, null, 2L, 9L);
+                BackupCommand.BackupContent.ALL, null, 2L, 9L);
         Config.backup_job_compressed_serialization = true;
         byte[] legacyBackup = writeJob(backupJob, false);
         Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyBackup));
@@ -128,7 +129,7 @@ public class BackupRestoreJobStreamingJsonConfigTest {
     @Test
     public void testBackupAndCloudRestoreSubtypeCompatibility() throws Exception {
         BackupJob backupJob = new BackupJob("backup", 1L, "db", Lists.newArrayList(), 1000L,
-                BackupStmt.BackupContent.ALL, null, 2L, 9L);
+                BackupCommand.BackupContent.ALL, null, 2L, 9L);
         byte[] legacyBackup = writeJob(backupJob, false);
         Config.enable_backup_restore_job_streaming_json = true;
         BackupJob streamingReadBackup = BackupJob.read(dataInput(legacyBackup));
@@ -162,6 +163,21 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         Assert.assertEquals("vault_a", getField(legacyReadCloud, "storageVaultName"));
         assertSnapshotInfos(cloudJob.snapshotInfos, legacyReadCloud.snapshotInfos);
         Assert.assertArrayEquals(legacyCloud, streamingCloud);
+    }
+
+    @Test
+    public void testTenByteNonMarkerPayloadIsReplayedAndDoesNotConsumeNextField() throws Exception {
+        byte[] json = "\"12345678\"".getBytes(StandardCharsets.UTF_8);
+        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID.length(), json.length);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream output = new DataOutputStream(bytes);
+        output.writeInt(json.length);
+        output.write(json);
+        output.writeLong(987654321L);
+
+        DataInputStream input = dataInput(bytes.toByteArray());
+        Assert.assertEquals("12345678", AbstractJob.readStreamingJob(input, String.class));
+        Assert.assertEquals(987654321L, input.readLong());
     }
 
     @Test
@@ -234,7 +250,9 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         Assert.assertEquals(expected.getState(), actual.getState());
         Assert.assertEquals(expected.isBeingSynced(), actual.isBeingSynced());
         assertSnapshotInfos(expected.snapshotInfos, actual.snapshotInfos);
-        Assert.assertEquals(getField(expected, "restoredVersionInfo"), getField(actual, "restoredVersionInfo"));
+        Table<Long, Long, Long> expectedVersionInfo = getField(expected, "restoredVersionInfo");
+        Table<Long, Long, Long> actualVersionInfo = getField(actual, "restoredVersionInfo");
+        Assert.assertEquals(expectedVersionInfo, actualVersionInfo);
     }
 
     private static void assertSnapshotInfos(Table<Long, Long, SnapshotInfo> expected,
