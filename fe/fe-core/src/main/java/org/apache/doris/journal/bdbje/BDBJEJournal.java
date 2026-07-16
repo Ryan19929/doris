@@ -24,6 +24,7 @@ import org.apache.doris.common.LogUtils;
 import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.common.util.NetUtils;
+import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.journal.Journal;
 import org.apache.doris.journal.JournalBatch;
 import org.apache.doris.journal.JournalCursor;
@@ -677,7 +678,8 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                 if (!Env.isCheckpointThread()) {
                     // Because Doris FE can not rollback its edit log, so it should restart and replay the new master's
                     // edit log.
-                    if (rollbackEx.getEarliestTransactionId() != 0) {
+                    if (Env.getCurrentEnv().getFeType() == FrontendNodeType.OBSERVER
+                            || rollbackEx.getEarliestTransactionId() != 0) {
                         LOG.error("Catch rollback log exception and it may have replayed outdated "
                                 + "logs, so exec System.exit(-1).", rollbackEx);
                         System.exit(-1);

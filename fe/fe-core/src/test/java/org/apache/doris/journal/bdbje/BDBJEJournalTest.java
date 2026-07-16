@@ -21,6 +21,8 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.journal.JournalBatch;
 import org.apache.doris.journal.JournalCursor;
 import org.apache.doris.journal.JournalEntity;
@@ -30,6 +32,7 @@ import org.apache.doris.system.SystemInfoService.HostInfo;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.sleepycat.je.rep.ReplicatedEnvironment;
+import com.sleepycat.je.rep.RollbackException;
 import mockit.Mock;
 import mockit.MockUp;
 import org.apache.commons.io.FileUtils;
@@ -50,6 +53,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use uppercase
     private static final Logger LOG = LogManager.getLogger(BDBJEJournalTest.class);
@@ -336,5 +343,51 @@ public class BDBJEJournalTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use
         Assertions.assertEquals(11, journalId);
 
         journal.close();
+    }
+
+    @RepeatedTest(1)
+    public void testObserverExitOnRollbackWithZeroEarliestTransactionId() {
+        AtomicInteger exitStatus = new AtomicInteger();
+        new MockUp<Env>() {
+            @Mock
+            public String getBdbDir() {
+                return "";
+            }
+
+            @Mock
+            public HostInfo getSelfNode() {
+                return new HostInfo("127.0.0.1", 9010);
+            }
+
+            @Mock
+            public FrontendNodeType getFeType() {
+                return FrontendNodeType.OBSERVER;
+            }
+
+            @Mock
+            public boolean isCheckpointThread() {
+                return false;
+            }
+        };
+        new MockUp<System>() {
+            @Mock
+            public void exit(int status) {
+                exitStatus.set(status);
+                throw new ExitException();
+            }
+        };
+
+        RollbackException rollbackEx = mock(RollbackException.class);
+        when(rollbackEx.getEarliestTransactionId()).thenReturn(0L);
+        BDBEnvironment bdbEnvironment = mock(BDBEnvironment.class);
+        when(bdbEnvironment.getDatabaseNames()).thenThrow(rollbackEx);
+        BDBJEJournal journal = new BDBJEJournal("observer");
+        Deencapsulation.setField(journal, "bdbEnvironment", bdbEnvironment);
+
+        Assertions.assertThrows(ExitException.class, journal::getDatabaseNames);
+        Assertions.assertEquals(-1, exitStatus.get());
+    }
+
+    private static class ExitException extends RuntimeException {
     }
 }
