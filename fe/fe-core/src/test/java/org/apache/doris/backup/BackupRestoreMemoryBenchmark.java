@@ -53,8 +53,10 @@ import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryMXBean;
+import java.lang.ref.Reference;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -95,6 +97,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@code doris.benchmark.read_job_streaming} for mixed writer/reader compatibility measurements. Use
  * {@code -Dfe.ut.extra.jvm.args=...} for optional JVM flags such as JFR recording; this is composed with the
  * JaCoCo late-replacement {@code argLine} instead of replacing it.</p>
+ *
+ * <p>{@code peak_heap_bytes} is sampled every 10 ms while the operation runs, so it is an approximate peak and
+ * may miss short-lived allocation spikes. The GC collection count and time metrics bracket only the operation.
+ * After the operation returns, the benchmark performs a full GC while keeping its result reachable and reports
+ * {@code retained_after_gc_bytes}; this estimates the live result graph rather than transient peak allocation.
+ * The elapsed time excludes result verification and both the retained-heap GC and its measurement.</p>
  */
 public class BackupRestoreMemoryBenchmark {
     private static final String RESULT_PREFIX = "BACKUP_RESTORE_MEMORY_BENCHMARK_RESULT=";
@@ -375,6 +383,7 @@ public class BackupRestoreMemoryBenchmark {
         forceFullGc();
         long baselineHeap = usedHeap();
         metrics.put("baseline_heap_bytes", baselineHeap);
+        GcSnapshot gcBefore = gcSnapshot();
         HeapPeakSampler heapSampler = new HeapPeakSampler();
         long startNanos = System.nanoTime();
         T result;
@@ -387,6 +396,7 @@ public class BackupRestoreMemoryBenchmark {
             try {
                 heapSampler.close();
             } catch (OutOfMemoryError samplerOutOfMemory) {
+                samplerOutOfMemory.addSuppressed(e);
                 throw samplerOutOfMemory;
             } catch (Throwable closeFailure) {
                 e.addSuppressed(closeFailure);
@@ -396,9 +406,21 @@ public class BackupRestoreMemoryBenchmark {
         long elapsedMillis = elapsedMillis(startNanos);
         heapSampler.close();
         long peakHeap = heapSampler.peakBytes();
+        GcSnapshot gcAfter = gcSnapshot();
+        forceFullGc();
+        long retainedHeap = usedHeap();
+        Reference.reachabilityFence(result);
         metrics.put("stage_elapsed_ms", elapsedMillis);
         metrics.put("peak_heap_bytes", peakHeap);
         metrics.put("peak_heap_delta_bytes", Math.max(0L, peakHeap - baselineHeap));
+        metrics.put("gc_collection_count_before", gcBefore.collectionCount);
+        metrics.put("gc_collection_time_ms_before", gcBefore.collectionTimeMillis);
+        metrics.put("gc_collection_count_after", gcAfter.collectionCount);
+        metrics.put("gc_collection_time_ms_after", gcAfter.collectionTimeMillis);
+        metrics.put("gc_collection_count_delta", gcAfter.collectionCount - gcBefore.collectionCount);
+        metrics.put("gc_collection_time_ms_delta", gcAfter.collectionTimeMillis - gcBefore.collectionTimeMillis);
+        metrics.put("retained_after_gc_bytes", retainedHeap);
+        metrics.put("retained_delta_bytes", retainedHeap - baselineHeap);
         return result;
     }
 
@@ -513,6 +535,22 @@ public class BackupRestoreMemoryBenchmark {
 
     private static long usedHeap() {
         return ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+    }
+
+    private static GcSnapshot gcSnapshot() {
+        long collectionCount = 0L;
+        long collectionTimeMillis = 0L;
+        for (GarbageCollectorMXBean collector : ManagementFactory.getGarbageCollectorMXBeans()) {
+            long collectorCount = collector.getCollectionCount();
+            long collectorTimeMillis = collector.getCollectionTime();
+            if (collectorCount >= 0L) {
+                collectionCount += collectorCount;
+            }
+            if (collectorTimeMillis >= 0L) {
+                collectionTimeMillis += collectorTimeMillis;
+            }
+        }
+        return new GcSnapshot(collectionCount, collectionTimeMillis);
     }
 
     private static long elapsedMillis(long startNanos) {
@@ -674,6 +712,16 @@ public class BackupRestoreMemoryBenchmark {
     @FunctionalInterface
     private interface CheckedSupplier<T> {
         T get() throws Throwable;
+    }
+
+    private static final class GcSnapshot {
+        private final long collectionCount;
+        private final long collectionTimeMillis;
+
+        private GcSnapshot(long collectionCount, long collectionTimeMillis) {
+            this.collectionCount = collectionCount;
+            this.collectionTimeMillis = collectionTimeMillis;
+        }
     }
 
     private static final class HeapPeakSampler implements AutoCloseable {
