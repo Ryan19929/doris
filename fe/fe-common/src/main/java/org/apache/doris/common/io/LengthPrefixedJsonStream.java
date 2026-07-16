@@ -17,6 +17,7 @@
 
 package org.apache.doris.common.io;
 
+import com.google.common.io.FileBackedOutputStream;
 import com.google.gson.Gson;
 import com.google.gson.JsonIOException;
 
@@ -34,26 +35,39 @@ import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CharsetEncoder;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * Reads and writes the four-byte-length-prefixed UTF-8 JSON format used by {@link Text}.
  *
- * <p>Writing serializes once into fixed-size byte segments so the length is known before
- * the destination is touched. Reading exposes only the declared payload to Gson and does
- * not allocate a contiguous byte array proportional to the payload size.</p>
+ * <p>Writing serializes once into a spillable buffer so the length is known before the
+ * destination is touched. Small payloads stay in memory and larger payloads spill to a
+ * temporary file. Reading exposes only the declared payload to Gson and does not allocate
+ * a contiguous byte array proportional to the payload size.</p>
  */
 public final class LengthPrefixedJsonStream {
-    private static final int SEGMENT_SIZE = 64 * 1024;
+    // Keep routine metadata in memory while bounding large backup payloads well below FE heap sizes.
+    private static final int DEFAULT_MEMORY_THRESHOLD_BYTES = 8 * 1024 * 1024;
+    private static final int COPY_BUFFER_SIZE = 64 * 1024;
 
     private LengthPrefixedJsonStream() {
     }
 
     public static void write(DataOutput out, Object value, Gson gson) throws IOException {
-        JsonBuffer buffer = serialize(value, gson);
-        out.writeInt(buffer.size());
-        buffer.writeTo(out);
+        write(out, value, gson, Integer.MAX_VALUE, DEFAULT_MEMORY_THRESHOLD_BYTES);
+    }
+
+    static void write(DataOutput out, Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes)
+            throws IOException {
+        write(out, value, gson, maxPayloadBytes, memoryThresholdBytes,
+                new FileBackedBufferStore(memoryThresholdBytes));
+    }
+
+    static void write(DataOutput out, Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes,
+            BufferStore store) throws IOException {
+        try (JsonBuffer buffer = serialize(value, gson, maxPayloadBytes, memoryThresholdBytes, store)) {
+            out.writeInt(buffer.size());
+            buffer.writeTo(out);
+        }
     }
 
     public static JsonBuffer serialize(Object value, Gson gson) throws IOException {
@@ -61,18 +75,39 @@ public final class LengthPrefixedJsonStream {
     }
 
     static JsonBuffer serialize(Object value, Gson gson, long maxPayloadBytes) throws IOException {
-        SegmentedOutputStream output = new SegmentedOutputStream(maxPayloadBytes);
+        return serialize(value, gson, maxPayloadBytes, DEFAULT_MEMORY_THRESHOLD_BYTES);
+    }
+
+    static JsonBuffer serialize(Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes)
+            throws IOException {
+        return serialize(value, gson, maxPayloadBytes, memoryThresholdBytes,
+                new FileBackedBufferStore(memoryThresholdBytes));
+    }
+
+    static JsonBuffer serialize(Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes,
+            BufferStore store) throws IOException {
+        SpillableOutputStream output = new SpillableOutputStream(
+                maxPayloadBytes, memoryThresholdBytes, store);
         CharsetEncoder encoder = StandardCharsets.UTF_8.newEncoder()
                 .onMalformedInput(CodingErrorAction.REPLACE)
                 .onUnmappableCharacter(CodingErrorAction.REPLACE);
-        try (Writer writer = new OutputStreamWriter(output, encoder)) {
-            try {
-                gson.toJson(value, writer);
-            } catch (JsonIOException e) {
-                throw unwrapIoException(e);
+        try {
+            try (Writer writer = new OutputStreamWriter(output, encoder)) {
+                try {
+                    gson.toJson(value, writer);
+                } catch (JsonIOException e) {
+                    throw unwrapIoException(e);
+                }
             }
+            return output.toBuffer();
+        } catch (IOException | RuntimeException | Error failure) {
+            try {
+                output.reset();
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
         }
-        return output.toBuffer();
     }
 
     public static int readLength(DataInput in) throws IOException {
@@ -126,15 +161,16 @@ public final class LengthPrefixedJsonStream {
         throw exception;
     }
 
-    public static final class JsonBuffer {
-        private final List<byte[]> segments;
-        private final int lastSegmentSize;
+    public static final class JsonBuffer implements AutoCloseable {
+        private final BufferStore buffer;
         private final int size;
+        private final boolean spilled;
+        private boolean closed;
 
-        private JsonBuffer(List<byte[]> segments, int lastSegmentSize, int size) {
-            this.segments = segments;
-            this.lastSegmentSize = lastSegmentSize;
+        private JsonBuffer(BufferStore buffer, int size, boolean spilled) {
+            this.buffer = buffer;
             this.size = size;
+            this.spilled = spilled;
         }
 
         public int size() {
@@ -142,125 +178,161 @@ public final class LengthPrefixedJsonStream {
         }
 
         public void writeTo(DataOutput out) throws IOException {
-            for (int i = 0; i < segments.size(); i++) {
-                int length = i == segments.size() - 1 ? lastSegmentSize : segments.get(i).length;
-                out.write(segments.get(i), 0, length);
+            ensureOpen();
+            byte[] bytes = new byte[COPY_BUFFER_SIZE];
+            try (InputStream input = buffer.openInputStream()) {
+                int read;
+                while ((read = input.read(bytes)) != -1) {
+                    out.write(bytes, 0, read);
+                }
             }
         }
 
-        private Reader newReader() {
+        private Reader newReader() throws IOException {
+            ensureOpen();
             CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
                     .onMalformedInput(CodingErrorAction.REPLACE)
                     .onUnmappableCharacter(CodingErrorAction.REPLACE);
-            return new InputStreamReader(new SegmentedInputStream(segments, lastSegmentSize), decoder);
+            return new InputStreamReader(buffer.openInputStream(), decoder);
+        }
+
+        boolean isSpilled() {
+            return spilled;
+        }
+
+        private void ensureOpen() throws IOException {
+            if (closed) {
+                throw new IOException("JSON buffer is closed");
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (!closed) {
+                buffer.reset();
+                closed = true;
+            }
         }
     }
 
-    private static final class SegmentedOutputStream extends OutputStream {
-        private final List<byte[]> segments = new ArrayList<>();
+    private static final class SpillableOutputStream extends OutputStream {
+        private final BufferStore buffer;
         private final long maxPayloadBytes;
-        private byte[] current;
-        private int currentPosition;
+        private final int memoryThresholdBytes;
         private long size;
+        private boolean spilled;
 
-        private SegmentedOutputStream(long maxPayloadBytes) {
+        private SpillableOutputStream(long maxPayloadBytes, int memoryThresholdBytes, BufferStore buffer) {
+            if (maxPayloadBytes < 0 || maxPayloadBytes > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("maxPayloadBytes must be between 0 and "
+                        + Integer.MAX_VALUE + ": " + maxPayloadBytes);
+            }
+            if (memoryThresholdBytes < 0) {
+                throw new IllegalArgumentException("memoryThresholdBytes must be non-negative: "
+                        + memoryThresholdBytes);
+            }
             this.maxPayloadBytes = maxPayloadBytes;
+            this.memoryThresholdBytes = memoryThresholdBytes;
+            this.buffer = buffer;
         }
 
         @Override
         public void write(int value) throws IOException {
-            ensureCapacity(1);
-            current[currentPosition++] = (byte) value;
+            ensureWithinLimit(1);
+            buffer.write(value);
             size++;
+            updateSpilled();
         }
 
         @Override
         public void write(byte[] bytes, int offset, int length) throws IOException {
-            if (length < 0 || offset < 0 || offset + length > bytes.length) {
+            if (offset < 0 || length < 0 || length > bytes.length - offset) {
                 throw new IndexOutOfBoundsException();
             }
             ensureWithinLimit(length);
-            int remaining = length;
-            int sourceOffset = offset;
-            while (remaining > 0) {
-                ensureSegment();
-                int copied = Math.min(remaining, current.length - currentPosition);
-                System.arraycopy(bytes, sourceOffset, current, currentPosition, copied);
-                currentPosition += copied;
-                sourceOffset += copied;
-                remaining -= copied;
-                size += copied;
-            }
-        }
-
-        private void ensureCapacity(int additionalBytes) throws IOException {
-            ensureWithinLimit(additionalBytes);
-            ensureSegment();
+            buffer.write(bytes, offset, length);
+            size += length;
+            updateSpilled();
         }
 
         private void ensureWithinLimit(int additionalBytes) throws IOException {
-            if (size + additionalBytes > maxPayloadBytes) {
+            if (additionalBytes > maxPayloadBytes - size) {
                 throw new IOException("JSON payload exceeds maximum length " + maxPayloadBytes);
             }
         }
 
-        private void ensureSegment() {
-            if (current == null || currentPosition == current.length) {
-                current = new byte[SEGMENT_SIZE];
-                segments.add(current);
-                currentPosition = 0;
-            }
+        private void updateSpilled() {
+            spilled |= size > memoryThresholdBytes;
         }
 
         private JsonBuffer toBuffer() {
-            return new JsonBuffer(segments, currentPosition, (int) size);
+            return new JsonBuffer(buffer, (int) size, spilled);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            buffer.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            buffer.close();
+        }
+
+        private void reset() throws IOException {
+            buffer.reset();
         }
     }
 
-    private static final class SegmentedInputStream extends InputStream {
-        private final List<byte[]> segments;
-        private final int lastSegmentSize;
-        private int segmentIndex;
-        private int segmentPosition;
+    interface BufferStore {
+        void write(int value) throws IOException;
 
-        private SegmentedInputStream(List<byte[]> segments, int lastSegmentSize) {
-            this.segments = segments;
-            this.lastSegmentSize = lastSegmentSize;
+        void write(byte[] bytes, int offset, int length) throws IOException;
+
+        void flush() throws IOException;
+
+        void close() throws IOException;
+
+        void reset() throws IOException;
+
+        InputStream openInputStream() throws IOException;
+    }
+
+    private static final class FileBackedBufferStore implements BufferStore {
+        private final FileBackedOutputStream buffer;
+
+        private FileBackedBufferStore(int memoryThresholdBytes) {
+            buffer = new FileBackedOutputStream(memoryThresholdBytes);
         }
 
         @Override
-        public int read() {
-            if (!advance()) {
-                return -1;
-            }
-            return segments.get(segmentIndex)[segmentPosition++] & 0xff;
+        public void write(int value) throws IOException {
+            buffer.write(value);
         }
 
         @Override
-        public int read(byte[] bytes, int offset, int length) {
-            if (length == 0) {
-                return 0;
-            }
-            if (!advance()) {
-                return -1;
-            }
-            int segmentLength = segmentLength();
-            int copied = Math.min(length, segmentLength - segmentPosition);
-            System.arraycopy(segments.get(segmentIndex), segmentPosition, bytes, offset, copied);
-            segmentPosition += copied;
-            return copied;
+        public void write(byte[] bytes, int offset, int length) throws IOException {
+            buffer.write(bytes, offset, length);
         }
 
-        private boolean advance() {
-            while (segmentIndex < segments.size() && segmentPosition == segmentLength()) {
-                segmentIndex++;
-                segmentPosition = 0;
-            }
-            return segmentIndex < segments.size();
+        @Override
+        public void flush() throws IOException {
+            buffer.flush();
         }
 
-        private int segmentLength() {
-            return segmentIndex == segments.size() - 1 ? lastSegmentSize : segments.get(segmentIndex).length;
+        @Override
+        public void close() throws IOException {
+            buffer.close();
+        }
+
+        @Override
+        public void reset() throws IOException {
+            buffer.reset();
+        }
+
+        @Override
+        public InputStream openInputStream() throws IOException {
+            return buffer.asByteSource().openStream();
         }
     }
 

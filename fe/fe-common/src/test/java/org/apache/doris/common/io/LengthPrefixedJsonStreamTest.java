@@ -34,6 +34,7 @@ import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 
@@ -132,9 +133,10 @@ class LengthPrefixedJsonStreamTest {
         char[] chars = new char[256 * 1024];
         Arrays.fill(chars, '中');
         Value value = new Value(new String(chars), 13);
-        LengthPrefixedJsonStream.JsonBuffer buffer = LengthPrefixedJsonStream.serialize(value, GSON);
-        Assertions.assertTrue(buffer.size() > 64 * 1024);
-        Assertions.assertEquals(value, LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+        try (LengthPrefixedJsonStream.JsonBuffer buffer = LengthPrefixedJsonStream.serialize(value, GSON)) {
+            Assertions.assertTrue(buffer.size() > 64 * 1024);
+            Assertions.assertEquals(value, LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+        }
 
         ByteArrayOutputStream destination = new ByteArrayOutputStream();
         Assertions.assertThrows(IOException.class, () -> {
@@ -155,6 +157,115 @@ class LengthPrefixedJsonStreamTest {
         Assertions.assertThrows(IOException.class,
                 () -> LengthPrefixedJsonStream.write(new DataOutputStream(destination), value, failingGson));
         Assertions.assertEquals(0, destination.size());
+    }
+
+    @Test
+    void spillsAtLowThresholdAndReleasesBufferAfterRoundTrip() throws Exception {
+        Value value = new Value("spill-" + "备份".repeat(1024), 19);
+        ByteArrayOutputStream legacyBytes = new ByteArrayOutputStream();
+        Text.writeString(new DataOutputStream(legacyBytes), GSON.toJson(value));
+
+        LengthPrefixedJsonStream.JsonBuffer buffer =
+                LengthPrefixedJsonStream.serialize(value, GSON, Integer.MAX_VALUE, 32);
+        Assertions.assertTrue(buffer.isSpilled());
+        try {
+            ByteArrayOutputStream streamingBytes = new ByteArrayOutputStream();
+            DataOutputStream output = new DataOutputStream(streamingBytes);
+            output.writeInt(buffer.size());
+            buffer.writeTo(output);
+            Assertions.assertArrayEquals(legacyBytes.toByteArray(), streamingBytes.toByteArray());
+            Assertions.assertEquals(value, LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+        } finally {
+            buffer.close();
+        }
+
+        Assertions.assertThrows(IOException.class,
+                () -> buffer.writeTo(new DataOutputStream(new ByteArrayOutputStream())));
+        Assertions.assertThrows(IOException.class,
+                () -> LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+    }
+
+    @Test
+    void resetsSpillAfterSerializationAndDestinationFailures() throws Exception {
+        IOException serializationFailure = new IOException("expected serialization failure");
+        TrackingBufferStore serializationStore = new TrackingBufferStore();
+        Gson failingGson = new GsonBuilder().registerTypeAdapter(Value.class, new TypeAdapter<Value>() {
+            @Override
+            public void write(JsonWriter out, Value ignored) throws IOException {
+                out.beginObject();
+                out.name("text").value("x".repeat(4096));
+                out.flush();
+                throw serializationFailure;
+            }
+
+            @Override
+            public Value read(JsonReader in) {
+                throw new UnsupportedOperationException();
+            }
+        }).create();
+
+        IOException actualSerializationFailure = Assertions.assertThrows(IOException.class,
+                () -> LengthPrefixedJsonStream.serialize(
+                        new Value("ignored", 1), failingGson, Integer.MAX_VALUE, 32, serializationStore));
+        Assertions.assertSame(serializationFailure, actualSerializationFailure);
+        Assertions.assertEquals(1, serializationStore.resetCount);
+        Assertions.assertEquals(0, serializationStore.size());
+
+        IOException destinationFailure = new IOException("expected destination failure");
+        TrackingBufferStore destinationStore = new TrackingBufferStore();
+        DataOutputStream failingDestination = new DataOutputStream(new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw destinationFailure;
+            }
+
+            @Override
+            public void write(byte[] bytes, int offset, int length) throws IOException {
+                throw destinationFailure;
+            }
+        });
+        IOException actualDestinationFailure = Assertions.assertThrows(IOException.class,
+                () -> LengthPrefixedJsonStream.write(failingDestination,
+                        new Value("y".repeat(4096), 2), GSON, Integer.MAX_VALUE, 32, destinationStore));
+        Assertions.assertSame(destinationFailure, actualDestinationFailure);
+        Assertions.assertEquals(1, destinationStore.resetCount);
+        Assertions.assertEquals(0, destinationStore.size());
+    }
+
+    @Test
+    void preservesPrimaryFailureWhenSpillCleanupFails() throws Exception {
+        IOException cleanupFailure = new IOException("expected cleanup failure");
+        TrackingBufferStore store = new TrackingBufferStore(cleanupFailure);
+        LengthPrefixedJsonStream.JsonBuffer buffer = LengthPrefixedJsonStream.serialize(
+                new Value("z".repeat(4096), 3), GSON, Integer.MAX_VALUE, 32, store);
+        IOException primaryFailure = new IOException("primary failure");
+        IOException actual = Assertions.assertThrows(IOException.class, () -> {
+            try (LengthPrefixedJsonStream.JsonBuffer ignored = buffer) {
+                throw primaryFailure;
+            }
+        });
+        Assertions.assertSame(primaryFailure, actual);
+        Assertions.assertArrayEquals(new Throwable[] {cleanupFailure}, actual.getSuppressed());
+    }
+
+    @Test
+    void enforcesPayloadLimitAfterSpilling() throws Exception {
+        Value value = new Value("limit-" + "x".repeat(4096), 23);
+        int payloadSize = GSON.toJson(value).getBytes(StandardCharsets.UTF_8).length;
+        try (LengthPrefixedJsonStream.JsonBuffer buffer =
+                     LengthPrefixedJsonStream.serialize(value, GSON, payloadSize, 32)) {
+            Assertions.assertEquals(payloadSize, buffer.size());
+            Assertions.assertTrue(buffer.isSpilled());
+        }
+        Assertions.assertThrows(IOException.class,
+                () -> LengthPrefixedJsonStream.serialize(value, GSON, payloadSize - 1L, 32));
+
+        TrackingBufferStore limitedStore = new TrackingBufferStore();
+        Assertions.assertThrows(IOException.class,
+                () -> LengthPrefixedJsonStream.serialize(
+                        value, GSON, payloadSize - 1L, 32, limitedStore));
+        Assertions.assertEquals(1, limitedStore.resetCount);
+        Assertions.assertEquals(0, limitedStore.size());
     }
 
     private static DataInputStream dataInputWithLength(int length) throws IOException {
@@ -290,6 +401,56 @@ class LengthPrefixedJsonStreamTest {
                 return 0;
             }
             return delegate.read(bytes, offset, length);
+        }
+    }
+
+    private static class TrackingBufferStore implements LengthPrefixedJsonStream.BufferStore {
+        private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        private final IOException resetFailure;
+        private int resetCount;
+
+        private TrackingBufferStore() {
+            this(null);
+        }
+
+        private TrackingBufferStore(IOException resetFailure) {
+            this.resetFailure = resetFailure;
+        }
+
+        @Override
+        public void write(int value) {
+            bytes.write(value);
+        }
+
+        @Override
+        public void write(byte[] source, int offset, int length) {
+            bytes.write(source, offset, length);
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public void close() {
+        }
+
+        @Override
+        public void reset() throws IOException {
+            resetCount++;
+            if (resetFailure != null) {
+                throw resetFailure;
+            }
+            bytes.reset();
+        }
+
+        @Override
+        public InputStream openInputStream() {
+            return new ByteArrayInputStream(bytes.toByteArray());
+        }
+
+        private int size() {
+            return bytes.size();
         }
     }
 }
