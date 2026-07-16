@@ -1670,6 +1670,17 @@ public class Config extends ConfigBase {
     public static volatile boolean enable_backup_restore_job_streaming_json = false;
 
     /**
+     * An internal runtime switch for catalog table metadata streaming JSON dispatch and I/O.
+     * Disable it to use the legacy tree adapters and Text/String persistence path.
+     */
+    @ConfField(mutable = true, masterOnly = false, description = {
+            "是否启用 catalog table 元数据的流式 JSON 序列化，用于降低备份元数据的 FE 内存峰值",
+            "Whether to enable catalog table metadata streaming JSON to reduce FE heap peak during backup"
+    })
+    // Config updates and metadata serialization/replay run on different threads.
+    public static volatile boolean enable_table_meta_streaming_json = false;
+
+    /**
      * A internal config, to reduce the restore job size during serialization by compress.
      *
      * WARNING: Once this option is enabled and a restore is performed, the FE version cannot be rolled back.
