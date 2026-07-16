@@ -65,6 +65,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Manually invoked backup metadata memory benchmark.
@@ -249,7 +250,7 @@ public class BackupRestoreMemoryBenchmark {
         OlapTable copiedTable = measure(metrics,
                 () -> sourceTable.selectiveCopy(null, IndexExtState.VISIBLE, true));
 
-        Assert.assertNotNull(copiedTable);
+        Assert.assertNotNull("selectiveCopy returned null without propagating its failure", copiedTable);
         Assert.assertEquals(tabletCount, countTablets(copiedTable));
         Assert.assertEquals(expectedReplicas, countReplicas(copiedTable));
         Assert.assertEquals((long) tabletCount * replicaCount, countReplicas(sourceTable));
@@ -385,6 +386,8 @@ public class BackupRestoreMemoryBenchmark {
         } catch (Throwable e) {
             try {
                 heapSampler.close();
+            } catch (OutOfMemoryError samplerOutOfMemory) {
+                throw samplerOutOfMemory;
             } catch (Throwable closeFailure) {
                 e.addSuppressed(closeFailure);
             }
@@ -676,6 +679,7 @@ public class BackupRestoreMemoryBenchmark {
     private static final class HeapPeakSampler implements AutoCloseable {
         private final MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
         private final AtomicLong peak = new AtomicLong(memory.getHeapMemoryUsage().getUsed());
+        private final AtomicReference<OutOfMemoryError> outOfMemory = new AtomicReference<>();
         private final Thread sampler;
         private volatile boolean running = true;
 
@@ -686,16 +690,17 @@ public class BackupRestoreMemoryBenchmark {
         }
 
         private void sampleUntilClosed() {
-            while (running) {
-                peak.accumulateAndGet(memory.getHeapMemoryUsage().getUsed(), Math::max);
-                try {
+            try {
+                while (running) {
+                    peak.accumulateAndGet(memory.getHeapMemoryUsage().getUsed(), Math::max);
                     Thread.sleep(10L);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
                 }
+                peak.accumulateAndGet(memory.getHeapMemoryUsage().getUsed(), Math::max);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (OutOfMemoryError e) {
+                outOfMemory.compareAndSet(null, e);
             }
-            peak.accumulateAndGet(memory.getHeapMemoryUsage().getUsed(), Math::max);
         }
 
         private long peakBytes() {
@@ -711,6 +716,10 @@ public class BackupRestoreMemoryBenchmark {
         public void close() throws InterruptedException {
             running = false;
             sampler.join();
+            OutOfMemoryError samplerOutOfMemory = outOfMemory.get();
+            if (samplerOutOfMemory != null) {
+                throw samplerOutOfMemory;
+            }
         }
     }
 }
