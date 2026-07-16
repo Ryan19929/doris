@@ -41,6 +41,7 @@ import org.apache.doris.cloud.catalog.CloudReplica;
 import org.apache.doris.cloud.catalog.CloudTablet;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.meta.MetaContext;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TStorageType;
 
@@ -66,15 +67,41 @@ public class BackupMetaTest {
     @Test
     public void testReplicaReservationRoundTripForLocalAndCloudTablets() throws Exception {
         boolean savedConfig = Config.backup_meta_reserve_replica_info;
+        boolean savedStreaming = Config.enable_table_meta_streaming_json;
         try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS)) {
             mockedEnv.when(Env::getCurrentEnvJournalVersion).thenReturn(FeConstants.meta_version);
 
-            verifyRoundTrip(false, false);
-            verifyRoundTrip(false, true);
-            verifyRoundTrip(true, false);
-            verifyRoundTrip(true, true);
+            for (boolean streaming : new boolean[] {false, true}) {
+                Config.enable_table_meta_streaming_json = streaming;
+                verifyRoundTrip(false, false);
+                verifyRoundTrip(false, true);
+                verifyRoundTrip(true, false);
+                verifyRoundTrip(true, true);
+            }
         } finally {
             Config.backup_meta_reserve_replica_info = savedConfig;
+            Config.enable_table_meta_streaming_json = savedStreaming;
+        }
+    }
+
+    @Test
+    public void testStreamingCopyRestoresPreviousMetaContext() {
+        boolean savedStreaming = Config.enable_table_meta_streaming_json;
+        MetaContext previousContext = MetaContext.get();
+        MetaContext expectedContext = new MetaContext();
+        expectedContext.setMetaVersion(FeConstants.meta_version);
+        expectedContext.setThreadLocalInfo();
+        try {
+            Config.enable_table_meta_streaming_json = true;
+            Assert.assertNotNull(createTable(false).selectiveCopy(null, IndexExtState.VISIBLE, true));
+            Assert.assertSame(expectedContext, MetaContext.get());
+        } finally {
+            Config.enable_table_meta_streaming_json = savedStreaming;
+            if (previousContext == null) {
+                MetaContext.remove();
+            } else {
+                previousContext.setThreadLocalInfo();
+            }
         }
     }
 
@@ -89,12 +116,13 @@ public class BackupMetaTest {
 
         BackupMeta backupMeta = new BackupMeta(
                 Collections.singletonList(backupTable), Collections.emptyList());
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (DataOutputStream output = new DataOutputStream(bytes)) {
-            backupMeta.write(output);
-        }
+        byte[] legacyBytes = serialize(backupMeta, false);
+        byte[] streamingBytes = serialize(backupMeta, true);
+        Assert.assertArrayEquals(legacyBytes, streamingBytes);
 
-        BackupMeta restoredMeta = BackupMeta.fromBytes(bytes.toByteArray(), FeConstants.meta_version);
+        BackupMeta restoredMeta = BackupMeta.fromBytes(
+                Config.enable_table_meta_streaming_json ? legacyBytes : streamingBytes,
+                FeConstants.meta_version);
         Table restoredTableByName = restoredMeta.getTable(TABLE_NAME);
         Assert.assertSame(restoredTableByName, restoredMeta.getTable(TABLE_ID));
         Assert.assertTrue(restoredTableByName instanceof OlapTable);
@@ -113,6 +141,20 @@ public class BackupMetaTest {
         }
 
         Assert.assertEquals(1, sourceTablet.getReplicas().size());
+    }
+
+    private byte[] serialize(BackupMeta backupMeta, boolean streaming) throws Exception {
+        boolean savedStreaming = Config.enable_table_meta_streaming_json;
+        try {
+            Config.enable_table_meta_streaming_json = streaming;
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream output = new DataOutputStream(bytes)) {
+                backupMeta.write(output);
+            }
+            return bytes.toByteArray();
+        } finally {
+            Config.enable_table_meta_streaming_json = savedStreaming;
+        }
     }
 
     private OlapTable createTable(boolean cloudTablet) {

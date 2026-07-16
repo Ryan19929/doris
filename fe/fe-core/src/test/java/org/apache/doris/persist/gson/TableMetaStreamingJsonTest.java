@@ -45,6 +45,11 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -80,6 +85,27 @@ class TableMetaStreamingJsonTest {
             Assertions.assertInstanceOf(LocalTablet.class, tablet);
             Assertions.assertInstanceOf(LocalReplica.class, tablet.getReplicas().get(0));
         }
+    }
+
+    @Test
+    void tableAndOlapTableIoAreByteIdenticalAndCrossReadable() throws Exception {
+        OlapTable table = createLocalTable();
+        byte[] legacy = writeTable(table, false);
+        byte[] streaming = writeTable(table, true);
+        Assertions.assertArrayEquals(legacy, streaming);
+        Config.enable_table_meta_streaming_json = true;
+        Assertions.assertInstanceOf(OlapTable.class, Table.read(
+                new DataInputStream(new ByteArrayInputStream(legacy))));
+        Config.enable_table_meta_streaming_json = false;
+        Assertions.assertInstanceOf(OlapTable.class, Table.read(
+                new DataInputStream(new ByteArrayInputStream(streaming))));
+
+        Config.enable_table_meta_streaming_json = true;
+        Assertions.assertEquals(table.getId(), OlapTable.read(
+                new DataInputStream(new ByteArrayInputStream(legacy))).getId());
+        Config.enable_table_meta_streaming_json = false;
+        Assertions.assertEquals(table.getId(), OlapTable.read(
+                new DataInputStream(new ByteArrayInputStream(streaming))).getId());
     }
 
     @Test
@@ -129,6 +155,15 @@ class TableMetaStreamingJsonTest {
     private static String toJson(Object value, Class<?> declaredType, boolean streaming) {
         Config.enable_table_meta_streaming_json = streaming;
         return GsonUtils.GSON.toJson(value, declaredType);
+    }
+
+    private static byte[] writeTable(OlapTable table, boolean streaming) throws IOException {
+        Config.enable_table_meta_streaming_json = streaming;
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (DataOutputStream output = new DataOutputStream(bytes)) {
+            table.write(output);
+        }
+        return bytes.toByteArray();
     }
 
     private static OlapTable createLocalTable() {
