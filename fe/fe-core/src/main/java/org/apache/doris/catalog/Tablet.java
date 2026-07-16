@@ -156,7 +156,7 @@ public abstract class Tablet {
     }
 
     // Only for detached backup table copies; must NOT be called on live catalog tablets.
-    public abstract void clearReplicas();
+    public abstract void clearReplicasForBackup();
 
     public abstract List<Replica> getReplicas();
 

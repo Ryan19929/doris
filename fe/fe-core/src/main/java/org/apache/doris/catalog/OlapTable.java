@@ -2164,7 +2164,7 @@ public class OlapTable extends Table implements MTMVRelatedTableIf, GsonPostProc
                 idx.setState(IndexState.NORMAL);
                 for (Tablet tablet : idx.getTablets()) {
                     if (isForBackup && !Config.backup_meta_reserve_replica_info) {
-                        tablet.clearReplicas();
+                        tablet.clearReplicasForBackup();
                     } else {
                         for (Replica replica : tablet.getReplicas()) {
                             replica.setState(ReplicaState.NORMAL);
