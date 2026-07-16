@@ -230,6 +230,20 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 - 复用 PR 1 的 Replica 剥离，不再次引入同名配置或重复实现。
 - 复用 PR 4 的 config-driven adapter dispatch，避免并行存在多套 mode scope。
 
+### PR 内部提交顺序
+
+PR 5 保持为一个上游 PR，但拆成四个可独立 review/revert 的 commit：
+
+1. length-prefixed UTF-8 JSON helper 与隔离单测。
+2. Table/Partition/Tablet/Replica 多态 streaming dispatch。
+3. BackupMeta、Table、OlapTable selective copy、BackupJobInfo 调用点迁移。
+4. AbstractJob、BackupJob、RestoreJob 三类 image/editlog 读写入口迁移。
+
+长度前缀 writer 只序列化一次到 segmented UTF-8 buffer，随后写入 4-byte length 和各 segment；
+不能用“先计数、再序列化”的双遍方案，因为 job 在两次遍历之间可能变化。reader 使用只覆盖声明
+length 的 bounded `DataInput` stream，不为整个 payload 分配连续 `byte[]`，并明确处理负 length、截断
+和尾随内容。关闭配置时，各生产调用点必须走原 `Text`/String/`DeepCopy` legacy 路径。
+
 ### 持久化测试
 
 - [ ] Table/OlapTable 旧写新读、新写旧读。
