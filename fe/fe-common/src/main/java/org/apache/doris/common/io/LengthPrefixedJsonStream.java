@@ -17,10 +17,13 @@
 
 package org.apache.doris.common.io;
 
-import com.google.common.io.FileBackedOutputStream;
+import org.apache.doris.common.Config;
+
 import com.google.gson.Gson;
 import com.google.gson.JsonIOException;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.EOFException;
@@ -31,23 +34,34 @@ import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.io.Writer;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CharsetEncoder;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.EnumSet;
+import java.util.UUID;
 
 /**
  * Reads and writes the four-byte-length-prefixed UTF-8 JSON format used by {@link Text}.
  *
  * <p>Writing serializes once into a spillable buffer so the length is known before the
  * destination is touched. Small payloads stay in memory and larger payloads spill to a
- * temporary file. Reading exposes only the declared payload to Gson and does not allocate
- * a contiguous byte array proportional to the payload size.</p>
+ * delete-on-close channel under {@code Config.tmp_dir/backup_restore_json_spill}. Reading
+ * exposes only the declared payload to Gson and does not allocate a contiguous byte array
+ * proportional to the payload size.</p>
  */
 public final class LengthPrefixedJsonStream {
     // Keep routine metadata in memory while bounding large backup payloads well below FE heap sizes.
     private static final int DEFAULT_MEMORY_THRESHOLD_BYTES = 8 * 1024 * 1024;
     private static final int COPY_BUFFER_SIZE = 64 * 1024;
+    private static final String SPILL_DIRECTORY_NAME = "backup_restore_json_spill";
+    private static final String SPILL_FILE_PREFIX = "backup_restore_json_";
 
     private LengthPrefixedJsonStream() {
     }
@@ -59,7 +73,7 @@ public final class LengthPrefixedJsonStream {
     static void write(DataOutput out, Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes)
             throws IOException {
         write(out, value, gson, maxPayloadBytes, memoryThresholdBytes,
-                new FileBackedBufferStore(memoryThresholdBytes));
+                new DeleteOnCloseBufferStore(memoryThresholdBytes));
     }
 
     static void write(DataOutput out, Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes,
@@ -81,7 +95,7 @@ public final class LengthPrefixedJsonStream {
     static JsonBuffer serialize(Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes)
             throws IOException {
         return serialize(value, gson, maxPayloadBytes, memoryThresholdBytes,
-                new FileBackedBufferStore(memoryThresholdBytes));
+                new DeleteOnCloseBufferStore(memoryThresholdBytes));
     }
 
     static JsonBuffer serialize(Object value, Gson gson, long maxPayloadBytes, int memoryThresholdBytes,
@@ -298,41 +312,188 @@ public final class LengthPrefixedJsonStream {
         InputStream openInputStream() throws IOException;
     }
 
-    private static final class FileBackedBufferStore implements BufferStore {
-        private final FileBackedOutputStream buffer;
+    static Path spillDirectory() {
+        return Paths.get(Config.tmp_dir, SPILL_DIRECTORY_NAME);
+    }
 
-        private FileBackedBufferStore(int memoryThresholdBytes) {
-            buffer = new FileBackedOutputStream(memoryThresholdBytes);
+    private static final class DeleteOnCloseBufferStore implements BufferStore {
+        private final int memoryThresholdBytes;
+        private final ByteBuffer singleByte = ByteBuffer.allocate(1);
+        private MemoryBuffer memory = new MemoryBuffer();
+        private FileChannel spillChannel;
+        private long size;
+        private boolean writeClosed;
+        private boolean reset;
+
+        private DeleteOnCloseBufferStore(int memoryThresholdBytes) {
+            this.memoryThresholdBytes = memoryThresholdBytes;
         }
 
         @Override
         public void write(int value) throws IOException {
-            buffer.write(value);
+            ensureWritable();
+            spillIfNeeded(1);
+            if (spillChannel == null) {
+                memory.write(value);
+            } else {
+                singleByte.clear();
+                singleByte.put((byte) value).flip();
+                writeFully(spillChannel, singleByte, size);
+            }
+            size++;
         }
 
         @Override
         public void write(byte[] bytes, int offset, int length) throws IOException {
-            buffer.write(bytes, offset, length);
+            ensureWritable();
+            spillIfNeeded(length);
+            if (spillChannel == null) {
+                memory.write(bytes, offset, length);
+            } else {
+                writeFully(spillChannel, ByteBuffer.wrap(bytes, offset, length), size);
+            }
+            size += length;
+        }
+
+        private void spillIfNeeded(int additionalBytes) throws IOException {
+            if (spillChannel != null || additionalBytes <= memoryThresholdBytes - size) {
+                return;
+            }
+            FileChannel newChannel = openSpillChannel();
+            try {
+                writeFully(newChannel, ByteBuffer.wrap(memory.buffer(), 0, memory.size()), 0L);
+            } catch (IOException | RuntimeException | Error failure) {
+                try {
+                    newChannel.close();
+                } catch (IOException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                throw failure;
+            }
+            spillChannel = newChannel;
+            memory = null;
+        }
+
+        private FileChannel openSpillChannel() throws IOException {
+            Path directory = spillDirectory();
+            Files.createDirectories(directory);
+            Path path = directory.resolve(SPILL_FILE_PREFIX + UUID.randomUUID() + ".tmp");
+            return FileChannel.open(path, EnumSet.of(
+                    StandardOpenOption.CREATE_NEW,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.DELETE_ON_CLOSE));
+        }
+
+        private static void writeFully(FileChannel channel, ByteBuffer bytes, long position) throws IOException {
+            long nextPosition = position;
+            while (bytes.hasRemaining()) {
+                nextPosition += channel.write(bytes, nextPosition);
+            }
+        }
+
+        private void ensureWritable() throws IOException {
+            if (writeClosed || reset) {
+                throw new IOException("JSON spill buffer is closed");
+            }
         }
 
         @Override
         public void flush() throws IOException {
-            buffer.flush();
+            ensureWritable();
         }
 
         @Override
-        public void close() throws IOException {
-            buffer.close();
+        public void close() {
+            writeClosed = true;
         }
 
         @Override
         public void reset() throws IOException {
-            buffer.reset();
+            if (reset) {
+                return;
+            }
+            reset = true;
+            writeClosed = true;
+            memory = null;
+            if (spillChannel != null) {
+                FileChannel channel = spillChannel;
+                spillChannel = null;
+                channel.close();
+            }
         }
 
         @Override
         public InputStream openInputStream() throws IOException {
-            return buffer.asByteSource().openStream();
+            if (!writeClosed || reset) {
+                throw new IOException("JSON spill buffer is not readable");
+            }
+            if (spillChannel == null) {
+                return memory.openInputStream();
+            }
+            return new PositionalFileChannelInputStream(spillChannel, size);
+        }
+    }
+
+    private static final class MemoryBuffer extends ByteArrayOutputStream {
+        private byte[] buffer() {
+            return buf;
+        }
+
+        private InputStream openInputStream() {
+            return new ByteArrayInputStream(buf, 0, count);
+        }
+    }
+
+    private static final class PositionalFileChannelInputStream extends InputStream {
+        private final FileChannel channel;
+        private final long size;
+        private final byte[] singleByte = new byte[1];
+        private long position;
+        private boolean closed;
+
+        private PositionalFileChannelInputStream(FileChannel channel, long size) {
+            this.channel = channel;
+            this.size = size;
+        }
+
+        @Override
+        public int read() throws IOException {
+            int read = read(singleByte, 0, 1);
+            return read < 0 ? -1 : singleByte[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] bytes, int offset, int length) throws IOException {
+            if (offset < 0 || length < 0 || length > bytes.length - offset) {
+                throw new IndexOutOfBoundsException();
+            }
+            if (closed) {
+                throw new IOException("JSON spill input is closed");
+            }
+            if (length == 0) {
+                return 0;
+            }
+            if (position == size) {
+                return -1;
+            }
+            int requested = (int) Math.min(length, size - position);
+            ByteBuffer destination = ByteBuffer.wrap(bytes, offset, requested);
+            int read;
+            do {
+                read = channel.read(destination, position);
+            } while (read == 0);
+            if (read < 0) {
+                throw new EOFException("truncated JSON spill file with " + (size - position)
+                        + " bytes remaining");
+            }
+            position += read;
+            return read;
+        }
+
+        @Override
+        public void close() {
+            closed = true;
         }
     }
 
