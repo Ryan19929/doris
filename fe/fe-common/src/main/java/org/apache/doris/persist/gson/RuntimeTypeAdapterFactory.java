@@ -197,6 +197,15 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
             ThreadLocal.withInitial(ReaderWrapperPool::new);
     private static final AtomicLong WRITER_WRAPPER_CONSTRUCTIONS = new AtomicLong();
     private static final AtomicLong READER_WRAPPER_CONSTRUCTIONS = new AtomicLong();
+    private static final AtomicLong OPTIONAL_STREAM_SETTING_CAPABILITY_PROBES = new AtomicLong();
+    private static final StreamSettingCopier WRITER_FORMATTING_STYLE_COPIER = createOptionalStreamSettingCopier(
+            JsonWriter.class, "getFormattingStyle", "setFormattingStyle");
+    private static final StreamSettingCopier WRITER_STRICTNESS_COPIER = createOptionalStreamSettingCopier(
+            JsonWriter.class, "getStrictness", "setStrictness");
+    private static final StreamSettingCopier READER_STRICTNESS_COPIER = createOptionalStreamSettingCopier(
+            JsonReader.class, "getStrictness", "setStrictness");
+    private static final StreamSettingCopier READER_NESTING_LIMIT_COPIER = createOptionalStreamSettingCopier(
+            JsonReader.class, "getNestingLimit", "setNestingLimit");
 
     private final Class<?> baseType;
     private final String typeFieldName;
@@ -222,6 +231,10 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         return READER_WRAPPER_CONSTRUCTIONS.get();
     }
 
+    static long optionalStreamSettingCapabilityProbesForTest() {
+        return OPTIONAL_STREAM_SETTING_CAPABILITY_PROBES.get();
+    }
+
     static int writerWrapperPoolSizeForTest() {
         return WRITER_WRAPPER_POOL.get().size();
     }
@@ -234,17 +247,28 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         return WRITER_WRAPPER_POOL.get().retainsPayload() || READER_WRAPPER_POOL.get().retainsPayload();
     }
 
-    private static void copyOptionalStreamSetting(Object source, Object target, String getterName,
+    private static StreamSettingCopier createOptionalStreamSettingCopier(Class<?> streamClass, String getterName,
             String setterName) {
+        OPTIONAL_STREAM_SETTING_CAPABILITY_PROBES.incrementAndGet();
         try {
-            Method getter = source.getClass().getMethod(getterName);
-            Method setter = target.getClass().getMethod(setterName, getter.getReturnType());
-            setter.invoke(target, getter.invoke(source));
+            Method getter = streamClass.getMethod(getterName);
+            Method setter = streamClass.getMethod(setterName, getter.getReturnType());
+            return (source, target) -> {
+                try {
+                    setter.invoke(target, getter.invoke(source));
+                } catch (ReflectiveOperationException e) {
+                    throw new AssertionError("failed to copy Gson stream setting " + getterName, e);
+                }
+            };
         } catch (NoSuchMethodException e) {
             // The setting was added by a newer Gson release and is not present in the current runtime.
-        } catch (ReflectiveOperationException e) {
-            throw new AssertionError("failed to copy Gson stream setting " + getterName, e);
+            return (source, target) -> {
+            };
         }
+    }
+
+    private interface StreamSettingCopier {
+        void copy(Object source, Object target);
     }
 
     private RuntimeTypeAdapterFactory(Class<?> baseType, String typeFieldName, boolean maintainType) {
@@ -688,8 +712,8 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
             setHtmlSafe(delegate.isHtmlSafe());
             setSerializeNulls(delegate.getSerializeNulls());
             // Gson 2.11+ adds final stream configuration methods which cannot be overridden.
-            copyOptionalStreamSetting(delegate, this, "getFormattingStyle", "setFormattingStyle");
-            copyOptionalStreamSetting(delegate, this, "getStrictness", "setStrictness");
+            WRITER_FORMATTING_STYLE_COPIER.copy(delegate, this);
+            WRITER_STRICTNESS_COPIER.copy(delegate, this);
         }
 
         private void release() {
@@ -885,8 +909,8 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
             depth = 0;
             setLenient(delegate.isLenient());
             // Gson 2.11+ adds final stream configuration methods which cannot be overridden.
-            copyOptionalStreamSetting(delegate, this, "getStrictness", "setStrictness");
-            copyOptionalStreamSetting(delegate, this, "getNestingLimit", "setNestingLimit");
+            READER_STRICTNESS_COPIER.copy(delegate, this);
+            READER_NESTING_LIMIT_COPIER.copy(delegate, this);
         }
 
         private void release() {
