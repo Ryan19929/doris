@@ -58,6 +58,9 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         savedStreamingConfig = Config.enable_backup_restore_job_streaming_json;
         savedBackupCompressionConfig = Config.backup_job_compressed_serialization;
         savedRestoreCompressionConfig = Config.restore_job_compressed_serialization;
+        Config.enable_backup_restore_job_streaming_json = false;
+        Config.backup_job_compressed_serialization = false;
+        Config.restore_job_compressed_serialization = false;
     }
 
     @After
@@ -68,35 +71,29 @@ public class BackupRestoreJobStreamingJsonConfigTest {
     }
 
     @Test
-    public void testRestoreJobCanonicalBytesAndCrossModeReads() throws Exception {
-        RestoreJob pendingJob = newRestoreJob("pending", 7);
-        assertCanonicalBytesAndCrossModeReads(pendingJob);
-
-        RestoreJob snapshottingJob = newRestoreJob("snapshotting", 1024);
-        setField(snapshottingJob, "state", RestoreJob.RestoreJobState.SNAPSHOTING);
-        setField(snapshottingJob, "showState", RestoreJob.RestoreJobState.SNAPSHOTING);
-        assertCanonicalBytesAndCrossModeReads(snapshottingJob);
-
-        RestoreJob finishedJob = newRestoreJob("finished", 7);
-        setField(finishedJob, "state", RestoreJob.RestoreJobState.FINISHED);
-        setField(finishedJob, "showState", RestoreJob.RestoreJobState.FINISHED);
-        assertCanonicalBytesAndCrossModeReads(finishedJob);
+    public void testRestoreJobCanonicalBytesAndAllStateModeReads() throws Exception {
+        for (RestoreJob.RestoreJobState state : RestoreJob.RestoreJobState.values()) {
+            int cellCount = isLargeMappingState(state) ? 1024 : 7;
+            RestoreJob job = newRestoreJob(state.name(), cellCount);
+            setField(job, "state", state);
+            setField(job, "showState", state);
+            assertCanonicalBytesAndAllModeReads(job);
+        }
     }
 
     @Test
-    public void testActualJournalReplayPathCrossMode() throws Exception {
+    public void testJournalEntityReadFieldsCompatibilityMatrix() throws Exception {
         RestoreJob job = newRestoreJob("journal", 128);
         setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
         setField(job, "showState", RestoreJob.RestoreJobState.DOWNLOADING);
 
         byte[] legacyJournal = writeJournal(job, false);
-        RestoreJob streamingRead = readRestoreJournal(legacyJournal, true);
-        assertLargeFields(job, streamingRead);
-
         byte[] streamingJournal = writeJournal(job, true);
-        RestoreJob legacyRead = readRestoreJournal(streamingJournal, false);
-        assertLargeFields(job, legacyRead);
         Assert.assertArrayEquals(legacyJournal, streamingJournal);
+        for (byte[] journal : new byte[][] {legacyJournal, streamingJournal}) {
+            assertLargeFields(job, readRestoreJournal(journal, false));
+            assertLargeFields(job, readRestoreJournal(journal, true));
+        }
     }
 
     @Test
@@ -123,6 +120,17 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         byte[] streamingBackup = writeJob(backupJob, true);
         Config.enable_backup_restore_job_streaming_json = false;
         Assert.assertEquals(backupJob.getLabel(), AbstractJob.read(dataInput(streamingBackup)).getLabel());
+
+        CloudRestoreJob cloudJob = newCloudRestoreJob();
+        byte[] legacyCloud = writeJob(cloudJob, false);
+        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyCloud));
+        Config.enable_backup_restore_job_streaming_json = true;
+        assertCloudRestoreJob(cloudJob, (CloudRestoreJob) AbstractJob.read(dataInput(legacyCloud)));
+
+        byte[] streamingCloud = writeJob(cloudJob, true);
+        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(streamingCloud));
+        Config.enable_backup_restore_job_streaming_json = false;
+        assertCloudRestoreJob(cloudJob, (CloudRestoreJob) RestoreJob.read(dataInput(streamingCloud)));
     }
 
     @Test
@@ -130,37 +138,26 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         BackupJob backupJob = new BackupJob("backup", 1L, "db", Lists.newArrayList(), 1000L,
                 BackupStmt.BackupContent.ALL, null, 2L, 9L);
         byte[] legacyBackup = writeJob(backupJob, false);
-        Config.enable_backup_restore_job_streaming_json = true;
-        BackupJob streamingReadBackup = BackupJob.read(dataInput(legacyBackup));
-        Assert.assertEquals(backupJob.getLabel(), streamingReadBackup.getLabel());
-
         byte[] streamingBackup = writeJob(backupJob, true);
-        Config.enable_backup_restore_job_streaming_json = false;
-        AbstractJob legacyReadBackup = AbstractJob.read(dataInput(streamingBackup));
-        Assert.assertTrue(legacyReadBackup instanceof BackupJob);
+        for (byte[] bytes : new byte[][] {legacyBackup, streamingBackup}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                AbstractJob readBackup = AbstractJob.read(dataInput(bytes));
+                Assert.assertTrue(readBackup instanceof BackupJob);
+                Assert.assertEquals(backupJob.getLabel(), readBackup.getLabel());
+            }
+        }
         Assert.assertArrayEquals(legacyBackup, streamingBackup);
 
-        CloudRestoreJob cloudJob = new CloudRestoreJob(AbstractJob.JobType.RESTORE);
-        setField(cloudJob, "label", "cloud_restore");
-        setField(cloudJob, "state", RestoreJob.RestoreJobState.SNAPSHOTING);
-        setField(cloudJob, "showState", RestoreJob.RestoreJobState.SNAPSHOTING);
-        setField(cloudJob, "storageVaultName", "vault_a");
-        cloudJob.properties.put(RestoreCommand.PROP_STORAGE_VAULT_NAME, "vault_a");
-        cloudJob.snapshotInfos.put(100L, 200L,
-                new SnapshotInfo(1L, 2L, 3L, 4L, 100L, 200L, 5, "/cloud",
-                        Lists.newArrayList("cloud.dat")));
+        CloudRestoreJob cloudJob = newCloudRestoreJob();
         byte[] legacyCloud = writeJob(cloudJob, false);
-        Config.enable_backup_restore_job_streaming_json = true;
-        CloudRestoreJob streamingReadCloud = (CloudRestoreJob) AbstractJob.read(dataInput(legacyCloud));
-        Assert.assertEquals("cloud_restore", streamingReadCloud.getLabel());
-        Assert.assertEquals("vault_a", getField(streamingReadCloud, "storageVaultName"));
-        assertSnapshotInfos(cloudJob.snapshotInfos, streamingReadCloud.snapshotInfos);
-
         byte[] streamingCloud = writeJob(cloudJob, true);
-        Config.enable_backup_restore_job_streaming_json = false;
-        CloudRestoreJob legacyReadCloud = (CloudRestoreJob) RestoreJob.read(dataInput(streamingCloud));
-        Assert.assertEquals("vault_a", getField(legacyReadCloud, "storageVaultName"));
-        assertSnapshotInfos(cloudJob.snapshotInfos, legacyReadCloud.snapshotInfos);
+        for (byte[] bytes : new byte[][] {legacyCloud, streamingCloud}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                assertCloudRestoreJob(cloudJob, (CloudRestoreJob) RestoreJob.read(dataInput(bytes)));
+            }
+        }
         Assert.assertArrayEquals(legacyCloud, streamingCloud);
     }
 
@@ -193,21 +190,28 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         Assert.assertEquals(2, legacyAdapter.writeCount);
     }
 
-    private static void assertCanonicalBytesAndCrossModeReads(RestoreJob job) throws Exception {
+    private static void assertCanonicalBytesAndAllModeReads(RestoreJob job) throws Exception {
         String legacyJson = toJson(job, false);
         String streamingJson = toJson(job, true);
         Assert.assertEquals(legacyJson, streamingJson);
 
         byte[] legacyBytes = writeJob(job, false);
-        Config.enable_backup_restore_job_streaming_json = true;
-        RestoreJob streamingRead = (RestoreJob) AbstractJob.read(dataInput(legacyBytes));
-        assertLargeFields(job, streamingRead);
-
         byte[] streamingBytes = writeJob(job, true);
-        Config.enable_backup_restore_job_streaming_json = false;
-        RestoreJob legacyRead = RestoreJob.read(dataInput(streamingBytes));
-        assertLargeFields(job, legacyRead);
         Assert.assertArrayEquals(legacyBytes, streamingBytes);
+        for (byte[] bytes : new byte[][] {legacyBytes, streamingBytes}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                assertLargeFields(job, (RestoreJob) AbstractJob.read(dataInput(bytes)));
+            }
+        }
+    }
+
+    private static boolean isLargeMappingState(RestoreJob.RestoreJobState state) {
+        return state == RestoreJob.RestoreJobState.SNAPSHOTING
+                || state == RestoreJob.RestoreJobState.DOWNLOAD
+                || state == RestoreJob.RestoreJobState.DOWNLOADING
+                || state == RestoreJob.RestoreJobState.COMMIT
+                || state == RestoreJob.RestoreJobState.COMMITTING;
     }
 
     private static RestoreJob newRestoreJob(String label, int cellCount) throws Exception {
@@ -230,11 +234,31 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         return job;
     }
 
+    private static CloudRestoreJob newCloudRestoreJob() throws Exception {
+        CloudRestoreJob cloudJob = new CloudRestoreJob(AbstractJob.JobType.RESTORE);
+        setField(cloudJob, "label", "cloud_restore");
+        setField(cloudJob, "state", RestoreJob.RestoreJobState.SNAPSHOTING);
+        setField(cloudJob, "showState", RestoreJob.RestoreJobState.SNAPSHOTING);
+        setField(cloudJob, "storageVaultName", "vault_a");
+        cloudJob.properties.put(RestoreCommand.PROP_STORAGE_VAULT_NAME, "vault_a");
+        cloudJob.snapshotInfos.put(100L, 200L,
+                new SnapshotInfo(1L, 2L, 3L, 4L, 100L, 200L, 5, "/cloud",
+                        Lists.newArrayList("cloud.dat")));
+        return cloudJob;
+    }
+
     private static void assertLargeFields(RestoreJob expected, RestoreJob actual) throws Exception {
         Assert.assertEquals(expected.getState(), actual.getState());
+        Assert.assertEquals(getField(expected, "showState"), getField(actual, "showState"));
         Assert.assertEquals(expected.isBeingSynced(), actual.isBeingSynced());
         assertSnapshotInfos(expected.snapshotInfos, actual.snapshotInfos);
         Assert.assertEquals(getField(expected, "restoredVersionInfo"), getField(actual, "restoredVersionInfo"));
+    }
+
+    private static void assertCloudRestoreJob(CloudRestoreJob expected, CloudRestoreJob actual) throws Exception {
+        Assert.assertEquals(expected.getLabel(), actual.getLabel());
+        Assert.assertEquals(getField(expected, "storageVaultName"), getField(actual, "storageVaultName"));
+        assertLargeFields(expected, actual);
     }
 
     private static void assertSnapshotInfos(Table<Long, Long, SnapshotInfo> expected,
