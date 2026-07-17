@@ -17,6 +17,8 @@
 
 package org.apache.doris.common.io;
 
+import org.apache.doris.common.Config;
+
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
@@ -25,6 +27,7 @@ import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -36,7 +39,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.stream.Stream;
 
 class LengthPrefixedJsonStreamTest {
     private static final Gson GSON = new Gson();
@@ -160,29 +166,61 @@ class LengthPrefixedJsonStreamTest {
     }
 
     @Test
-    void spillsAtLowThresholdAndReleasesBufferAfterRoundTrip() throws Exception {
-        Value value = new Value("spill-" + "备份".repeat(1024), 19);
-        ByteArrayOutputStream legacyBytes = new ByteArrayOutputStream();
-        Text.writeString(new DataOutputStream(legacyBytes), GSON.toJson(value));
-
-        LengthPrefixedJsonStream.JsonBuffer buffer =
-                LengthPrefixedJsonStream.serialize(value, GSON, Integer.MAX_VALUE, 32);
-        Assertions.assertTrue(buffer.isSpilled());
+    void spillsInDorisTempDirectoryAndReleasesBufferAfterRoundTrip(@TempDir Path tempDirectory)
+            throws Exception {
+        String previousTmpDirectory = Config.tmp_dir;
+        Config.tmp_dir = tempDirectory.toString();
         try {
-            ByteArrayOutputStream streamingBytes = new ByteArrayOutputStream();
-            DataOutputStream output = new DataOutputStream(streamingBytes);
-            output.writeInt(buffer.size());
-            buffer.writeTo(output);
-            Assertions.assertArrayEquals(legacyBytes.toByteArray(), streamingBytes.toByteArray());
-            Assertions.assertEquals(value, LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
-        } finally {
-            buffer.close();
-        }
+            Value value = new Value("spill-" + "备份".repeat(1024), 19);
+            ByteArrayOutputStream legacyBytes = new ByteArrayOutputStream();
+            Text.writeString(new DataOutputStream(legacyBytes), GSON.toJson(value));
 
-        Assertions.assertThrows(IOException.class,
-                () -> buffer.writeTo(new DataOutputStream(new ByteArrayOutputStream())));
-        Assertions.assertThrows(IOException.class,
-                () -> LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+            Path spillDirectory = LengthPrefixedJsonStream.spillDirectory();
+            LengthPrefixedJsonStream.JsonBuffer buffer =
+                    LengthPrefixedJsonStream.serialize(value, GSON, Integer.MAX_VALUE, 32);
+            Assertions.assertTrue(buffer.isSpilled());
+            Assertions.assertEquals(tempDirectory.resolve("backup_restore_json_spill"), spillDirectory);
+            Assertions.assertTrue(Files.isDirectory(spillDirectory));
+            assertDirectoryEmpty(spillDirectory);
+            try {
+                ByteArrayOutputStream streamingBytes = new ByteArrayOutputStream();
+                DataOutputStream output = new DataOutputStream(streamingBytes);
+                output.writeInt(buffer.size());
+                buffer.writeTo(output);
+                Assertions.assertArrayEquals(legacyBytes.toByteArray(), streamingBytes.toByteArray());
+                Assertions.assertEquals(value, LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+                Assertions.assertEquals(value, LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+            } finally {
+                buffer.close();
+            }
+            assertDirectoryEmpty(spillDirectory);
+
+            Assertions.assertThrows(IOException.class,
+                    () -> buffer.writeTo(new DataOutputStream(new ByteArrayOutputStream())));
+            Assertions.assertThrows(IOException.class,
+                    () -> LengthPrefixedJsonStream.read(buffer, Value.class, GSON));
+
+            Gson failingGson = new GsonBuilder().registerTypeAdapter(Value.class, new TypeAdapter<Value>() {
+                @Override
+                public void write(JsonWriter out, Value ignored) throws IOException {
+                    out.beginObject();
+                    out.name("text").value("failure-" + "x".repeat(4096));
+                    out.flush();
+                    throw new IOException("expected spill serialization failure");
+                }
+
+                @Override
+                public Value read(JsonReader in) {
+                    throw new UnsupportedOperationException();
+                }
+            }).create();
+            Assertions.assertThrows(IOException.class,
+                    () -> LengthPrefixedJsonStream.serialize(
+                            new Value("ignored", 1), failingGson, Integer.MAX_VALUE, 32));
+            assertDirectoryEmpty(spillDirectory);
+        } finally {
+            Config.tmp_dir = previousTmpDirectory;
+        }
     }
 
     @Test
@@ -249,23 +287,36 @@ class LengthPrefixedJsonStreamTest {
     }
 
     @Test
-    void enforcesPayloadLimitAfterSpilling() throws Exception {
-        Value value = new Value("limit-" + "x".repeat(4096), 23);
-        int payloadSize = GSON.toJson(value).getBytes(StandardCharsets.UTF_8).length;
-        try (LengthPrefixedJsonStream.JsonBuffer buffer =
-                     LengthPrefixedJsonStream.serialize(value, GSON, payloadSize, 32)) {
-            Assertions.assertEquals(payloadSize, buffer.size());
-            Assertions.assertTrue(buffer.isSpilled());
-        }
-        Assertions.assertThrows(IOException.class,
-                () -> LengthPrefixedJsonStream.serialize(value, GSON, payloadSize - 1L, 32));
+    void enforcesPayloadLimitAfterSpilling(@TempDir Path tempDirectory) throws Exception {
+        String previousTmpDirectory = Config.tmp_dir;
+        Config.tmp_dir = tempDirectory.toString();
+        try {
+            Value value = new Value("limit-" + "x".repeat(4096), 23);
+            int payloadSize = GSON.toJson(value).getBytes(StandardCharsets.UTF_8).length;
+            try (LengthPrefixedJsonStream.JsonBuffer buffer =
+                         LengthPrefixedJsonStream.serialize(value, GSON, payloadSize, 32)) {
+                Assertions.assertEquals(payloadSize, buffer.size());
+                Assertions.assertTrue(buffer.isSpilled());
+            }
+            Assertions.assertThrows(IOException.class,
+                    () -> LengthPrefixedJsonStream.serialize(value, GSON, payloadSize - 1L, 32));
+            assertDirectoryEmpty(LengthPrefixedJsonStream.spillDirectory());
 
-        TrackingBufferStore limitedStore = new TrackingBufferStore();
-        Assertions.assertThrows(IOException.class,
-                () -> LengthPrefixedJsonStream.serialize(
-                        value, GSON, payloadSize - 1L, 32, limitedStore));
-        Assertions.assertEquals(1, limitedStore.resetCount);
-        Assertions.assertEquals(0, limitedStore.size());
+            TrackingBufferStore limitedStore = new TrackingBufferStore();
+            Assertions.assertThrows(IOException.class,
+                    () -> LengthPrefixedJsonStream.serialize(
+                            value, GSON, payloadSize - 1L, 32, limitedStore));
+            Assertions.assertEquals(1, limitedStore.resetCount);
+            Assertions.assertEquals(0, limitedStore.size());
+        } finally {
+            Config.tmp_dir = previousTmpDirectory;
+        }
+    }
+
+    private static void assertDirectoryEmpty(Path directory) throws IOException {
+        try (Stream<Path> entries = Files.list(directory)) {
+            Assertions.assertEquals(0L, entries.count());
+        }
     }
 
     private static DataInputStream dataInputWithLength(int length) throws IOException {
