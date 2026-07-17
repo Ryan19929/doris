@@ -224,6 +224,21 @@ class LengthPrefixedJsonStreamTest {
     }
 
     @Test
+    void propagatesSpillDirectoryFailure(@TempDir Path tempDirectory) throws Exception {
+        String previousTmpDirectory = Config.tmp_dir;
+        Path regularFile = tempDirectory.resolve("not-a-directory");
+        Files.write(regularFile, new byte[] {1});
+        Config.tmp_dir = regularFile.toString();
+        try {
+            Value value = new Value("spill-" + "x".repeat(4096), 29);
+            Assertions.assertThrows(IOException.class,
+                    () -> LengthPrefixedJsonStream.serialize(value, GSON, Integer.MAX_VALUE, 32));
+        } finally {
+            Config.tmp_dir = previousTmpDirectory;
+        }
+    }
+
+    @Test
     void resetsSpillAfterSerializationAndDestinationFailures() throws Exception {
         IOException serializationFailure = new IOException("expected serialization failure");
         TrackingBufferStore serializationStore = new TrackingBufferStore();
