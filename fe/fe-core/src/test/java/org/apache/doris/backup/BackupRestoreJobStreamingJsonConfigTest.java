@@ -17,12 +17,12 @@
 
 package org.apache.doris.backup;
 
-import org.apache.doris.analysis.BackupStmt;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.cloud.backup.CloudRestoreJob;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.journal.JournalEntity;
+import org.apache.doris.nereids.trees.plans.commands.BackupCommand;
 import org.apache.doris.nereids.trees.plans.commands.RestoreCommand;
 import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -110,7 +110,7 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         assertLargeFields(restoreJob, RestoreJob.read(dataInput(streamingRestore)));
 
         BackupJob backupJob = new BackupJob("compressed_backup", 1L, "db", Lists.newArrayList(), 1000L,
-                BackupStmt.BackupContent.ALL, null, 2L, 9L);
+                BackupCommand.BackupContent.ALL, null, 2L, 9L);
         Config.backup_job_compressed_serialization = true;
         byte[] legacyBackup = writeJob(backupJob, false);
         Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyBackup));
@@ -136,7 +136,7 @@ public class BackupRestoreJobStreamingJsonConfigTest {
     @Test
     public void testBackupAndCloudRestoreSubtypeCompatibility() throws Exception {
         BackupJob backupJob = new BackupJob("backup", 1L, "db", Lists.newArrayList(), 1000L,
-                BackupStmt.BackupContent.ALL, null, 2L, 9L);
+                BackupCommand.BackupContent.ALL, null, 2L, 9L);
         byte[] legacyBackup = writeJob(backupJob, false);
         byte[] streamingBackup = writeJob(backupJob, true);
         for (byte[] bytes : new byte[][] {legacyBackup, streamingBackup}) {
