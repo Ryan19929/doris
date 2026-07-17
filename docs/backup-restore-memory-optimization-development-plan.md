@@ -2,16 +2,23 @@
 
 ## 文档状态
 
-- 状态：Draft
+- 状态：执行中（本地实现与定向验证阶段，尚未满足提交上游或合入条件）
 - 目标分支：Apache Doris `master`
 - 相关实现：
   - HYDCP/hy-doris#49：RestoreJob Guava Table/Multimap 流式 JSON 序列化
   - HYDCP/hy-doris#63：BackupMeta/Table 流式 JSON、Replica 剥离及 journal size 计数优化
   - apache/doris#65321：从 BackupMeta 剥离无用 Replica
-- 本地参考分支：
-  - `codex/backup-strip-replica-info`
-  - `fix-gson-streaming-table-multimap`
-  - `codex/review-pr-63`
+- 本地实现分支（均未合入 `master`）：
+  - PR 1：`codex/backup-strip-replica-info` @ `04cb7272895`
+  - PR 2：`codex/backup-journal-size-counting` @ `c9b930bcfec`
+  - PR 3：`codex/streaming-gson-foundation` @ `7c92546e7ac`
+  - PR 4：`codex/restore-job-streaming` @ `c1840fd2ff3`
+  - PR 5：`codex/backup-meta-streaming` @ `2d0a750a0d2`
+  - 验证分支：`codex/backup-memory-benchmark` @ `8b26e597d7c`
+
+PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
+`master`。验证分支包含 benchmark、OOM 传播修复和 spillable buffer 设计修正，需完成远端
+复测后再回迁到对应生产分支。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
@@ -48,14 +55,14 @@
 
 ## 总体拆分
 
-| 顺序 | PR | 主要内容 | 依赖 |
-| --- | --- | --- | --- |
-| 1 | Replica 剥离 | 修复并完善 apache/doris#65321 | 无 |
-| 2 | Journal size 计数 | 使用计数流替代完整缓冲 | 无 |
-| 3 | Streaming Gson 基础设施 | Guava 与多态 TypeAdapter 的流式实现 | 无 |
-| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 |
-| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 |
-| 6 | 默认开启与最终验证 | 根据兼容性和压力测试结果开启默认配置 | PR 1—5 |
+| 顺序 | PR | 主要内容 | 依赖 | 当前状态 |
+| --- | --- | --- | --- | --- |
+| 1 | Replica 剥离 | 修复并完善 apache/doris#65321 | 无 | 本地实现分支完成；完整门禁未完成 |
+| 2 | Journal size 计数 | 使用计数流替代完整缓冲 | 无 | 本地实现完成；定向 FE UT 2/2 通过 |
+| 3 | Streaming Gson 基础设施 | Guava 与多态 TypeAdapter 的流式实现 | 无 | 本地实现分支完成；完整兼容矩阵未完成 |
+| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 | 本地实现分支完成；Restore E2E/重启未完成 |
+| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 | 本地实现与 spill 修正完成；远端复测中 |
+| 6 | 默认开启与最终验证 | 根据兼容性和压力测试结果开启默认配置 | PR 1—5 | 未开始 |
 
 PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5，避免多个 PR 同时修改 `GsonUtils`、`RuntimeTypeAdapterFactory` 和 `AbstractJob`。
 
@@ -118,10 +125,11 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 
 ### 测试
 
-- [ ] 同一 `JournalEntity` 在旧缓冲实现和计数实现下得到完全相同的大小。
-- [ ] 覆盖小于、等于和大于 1 GB 限制的边界。
-- [ ] 覆盖 Writable 写入异常。
-- [ ] 验证 size check 不再保留与实体大小相同的 byte buffer。
+- [x] 同一 `JournalEntity` 在旧缓冲实现和计数实现下得到完全相同的大小。
+- [x] 覆盖小于、等于和大于 1 GB 限制的边界。
+- [x] 覆盖 Writable 写入异常。
+- [x] 实现不再创建 `DataOutputBuffer`，计数结果写入 null sink。
+- [ ] 记录旧缓冲与计数流的实际 heap/allocation 对比。
 
 ### 合入门槛
 
@@ -239,12 +247,22 @@ PR 5 保持为一个上游 PR，但拆成四个可独立 review/revert 的 commi
 3. BackupMeta、Table、OlapTable selective copy、BackupJobInfo 调用点迁移。
 4. AbstractJob、BackupJob、RestoreJob 三类 image/editlog 读写入口迁移。
 
-长度前缀 writer 只序列化一次到 segmented UTF-8 buffer，随后写入 4-byte length 和各 segment；
-不能用“先计数、再序列化”的双遍方案，因为 job 在两次遍历之间可能变化。reader 使用只覆盖声明
-length 的 bounded `DataInput` stream，不为整个 payload 分配连续 `byte[]`，并明确处理负 length、截断
-和尾随内容。关闭配置时，各生产调用点必须走原 `Text`/String/`DeepCopy` legacy 路径。
+长度前缀 writer 只序列化一次到 spillable UTF-8 buffer：默认最多在堆中保留 8 MiB，超过阈值
+后写入临时文件；长度确定后再写 4-byte length 并回放 payload。不能用“先计数、再序列化”的
+双遍方案，因为 job 在两次遍历之间可能变化。reader 使用只覆盖声明 length 的 bounded
+`DataInput` stream，不为整个 payload 分配连续 `byte[]`，并明确处理负 length、截断和尾随内容。
+关闭配置时，各生产调用点必须走原 `Text`/String/`DeepCopy` legacy 路径。
+
+原始 64 KiB segmented buffer 只限制单块数组大小，仍在堆中保留整份 JSON，不能称为真正的
+bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验证分支已改为 spillable buffer；
+该修正必须通过远端 FE UT、容量复测和临时文件清理验证后才能回迁 PR 5。
 
 ### 持久化测试
+
+- [x] 定向 FE UT（spill 修正前）：31/31 通过。
+- [x] spillable helper 单测：11/11 通过，覆盖强制 spill、原始字节一致、round-trip、payload
+  上限、close 后失败、序列化/目标写入失败清理、不可用临时目录及 suppressed cleanup 异常。
+- [x] spill 修正后的 FE 定向测试、Checkstyle 与 20 万 tablet 五阶段复测。
 
 - [ ] Table/OlapTable 旧写新读、新写旧读。
 - [ ] BackupMeta 文件旧写新读、新写旧读。
@@ -295,6 +313,79 @@ length 的 bounded `DataInput` stream，不为整个 payload 分配连续 `byte[
 
 推荐使用固定 JVM 参数和 JFR/async-profiler allocation 结果，并在每次测试前完成同样的 warm-up。PR 中必须同时提供 before/after，而不能只给优化后的数据。
 
+### 当前执行结果（2026-07-16）
+
+- `ba63859065a` 下，20 万 tablets × 3 replicas、`full_streaming`、每阶段独立 JVM、
+  `-Xms2g/-Xmx2g` 的 `selective_copy`、`backup_meta_write`、`backup_meta_read`、
+  `journal_write`、`journal_replay` 均完成。该结果仅证明容量快速基准可运行，不代表优化前后收益。
+- `legacy` 和 `strip_replicas` 的 `selective_copy` 均在 2 GiB 下 OOM，证明 Replica 在完整
+  `DeepCopy` 后再清除不能解决 copy 瞬时峰值；streaming deep copy 才越过该阶段容量门槛。
+- 初始对照中，整份 segmented JSON 仍驻留堆内，部分 streaming writer 的 sampled heap peak
+  高于 legacy。该结果阻止 PR 5 按原设计进入 `master`，并促成 `7ea1088deaa` 的 spillable
+  buffer 修正。
+- `DeepCopy.copy()` 会吞掉由反射包装的 `OutOfMemoryError` 并返回 `null`；验证分支
+  `6ffd6ff6b89` 已改为原样传播 `Error`。远端 `DeepCopyTest` 2/2 通过，20 万 legacy case
+  能输出结构化 `status=oom` 后以 OOME 失败。
+- 当前远端机器同时运行其他 FE/BE 进程，单次 10 ms heap sampler 和耗时数据会受 GC/调度影响。
+  在获得隔离资源、至少三次 fork 中位数和 JFR allocation 数据前，不使用这些数字声明性能比例。
+- 未完成：spill 修正后 before/after 矩阵、RestoreJob 大对象 benchmark、200 万压力基准、真实
+  BACKUP/RESTORE E2E、FE 重启和多 FE replay。
+
+正式 Maven heap 参数为 `-Dfe.ut.max.heap=2g`，固定初始堆可额外使用
+`-Dfe.ut.extra.jvm.args=-Xms2g`；不能再使用 `-DargLine` 覆盖 fe-core 的默认 heap。
+
+### Wrapper 复用与受控 spill 复测（2026-07-17）
+
+验证分支在 `ef668e62d5b`（每个对象新建 reader/writer wrapper）和
+`a40946deb14c`（wrapper pool + Doris 临时目录 spill）之间执行同口径对照。数据规模为
+20 万 tablets × 3 replicas，`full_streaming`，每个阶段使用独立 JVM 和
+`-Xms2g/-Xmx2g`。reader 两个阶段各运行 3 次并取 sampled heap peak 中位数；其余阶段目前
+只有单次结果，因此不能用来声明稳定的性能比例。
+
+| 阶段 | 优化前 peak delta | 优化后 peak delta | 变化 | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `selective_copy` | 1,382,918,656 | 1,361,285,632 | -1.56% | 容量通过；峰值小幅下降 |
+| `backup_meta_write` | 1,316,725,552 | 1,316,084,512 | -0.05% | 峰值基本不变 |
+| `backup_meta_read`（3 次中位数） | 1,287,651,328 | 1,170,210,816 | -9.12% | reader wrapper 复用有效 |
+| `journal_write` | 1,316,256,064 | 1,315,268,896 | -0.08% | 峰值基本不变 |
+| `journal_replay`（3 次中位数） | 1,287,651,328 | 1,288,699,904 | +0.08% | 峰值不变，仍有其他主导内存 |
+
+- 五个阶段均在 2 GiB heap 下通过；BackupMeta 与 journal payload 分别保持 19,802,039 和
+  19,802,331 bytes，说明 wrapper 复用与 spill 路径没有改变持久化字节规模。
+- 大集合单测中连续处理 2,000 个多态对象，每个方向只构造 1 个 wrapper；另有嵌套深度上限
+  64、异常恢复、释放强引用和 8 线程隔离测试。
+- spill 文件位于 `Config.tmp_dir/backup_restore_json_spill`，使用单次 UUID `CREATE_NEW` 和
+  `DELETE_ON_CLOSE` channel。Linux OpenJDK 17 探针确认打开、回放、关闭期间目录均无可见残留；
+  200k 五阶段运行结束后 Java tmp 和 Doris spill 文件计数均为 0。
+- 合并后的定向测试在目标机通过：`fe-common` 25/25、`fe-core` 16/16，完整 25 模块 reactor
+  `BUILD SUCCESS`，Checkstyle 0 violations；补充临时目录失败测试后 spill suite 为 11/11。
+- 本机 `run-fe-ut.sh` 因该 worktree 缺少 `thirdparty/installed/bin/protoc` 未能启动；同一测试已在
+  用户提供的 Linux 目标机用预编译 thirdparty 完成。该环境问题不计为代码失败。
+- `journal_replay` 没有从 wrapper pool 获得峰值收益，后续必须用 JFR allocation/class histogram
+  继续定位，不能把问题 2 标记为完全解决。
+
+### Branch 3.1 参考基线（2026-07-17）
+
+在 `branch-3.1-backup-mem` @ `b8c24f5404e` 上，通过未 push 的纯测试分支
+`codex/branch31-memory-benchmark` 移植同一 benchmark。测试规模仍为 20 万 tablets × 3 replicas、
+`full_streaming`、每阶段独立 JVM、`-Xms2g/-Xmx2g`。五阶段各执行一次，均为 JUnit 1/1、
+返回码 0：
+
+| 阶段 | peak delta | retained delta | elapsed | payload |
+| --- | ---: | ---: | ---: | ---: |
+| `selective_copy` | 1,446,544,544 | 109,967,704 | 16,319 ms | - |
+| `backup_meta_write` | 948,333,360 | 17,707,160 | 4,398 ms | 23,602,277 |
+| `backup_meta_read` | 766,509,056 | 92,259,440 | 1,090 ms | 23,602,277 |
+| `journal_write` | 1,013,149,376 | 17,739,096 | 4,390 ms | 23,602,569 |
+| `journal_replay` | 766,509,056 | 92,259,520 | 1,260 ms | 23,602,569 |
+
+Branch 3.1 的 `RuntimeTypeAdapterFactory` 仍能看到逐对象创建
+`TypeFieldInjectingJsonWriter`/`EnteredObjectJsonReader` 的代码，因此分配放大逻辑存在；但本次容量
+测试证明它没有在该分支的 200k×3 场景下造成 2 GiB OOM。Branch 3.1 与 master 的对象模型、
+Gson 版本、payload 大小和测试图构造 API 不同，不能把两组绝对峰值直接作为性能优劣比较。
+要量化 branch 3.1 上 wrapper pool 的净收益，仍需把 pool 单独移植后做同分支 A/B 和 allocation
+profile。
+
 ### 验收基线
 
 - Replica 剥离后的 BackupJob/BackupMeta payload 应显著小于旧格式；历史参考值为 119 MB → 23 MB。
@@ -338,7 +429,10 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 | 运行时配置在不同 FE 上不一致 | checkpoint/replay 使用不同路径 | 明确 writer/reader 语义并测试多 FE |
 | 清理 Replica 误作用于 live tablet | catalog 数据损坏 | 仅操作 detached copy，使用专用 API 命名 |
 | Backup 与 Restore 同时修改 AbstractJob | PR 冲突或出现两套逻辑 | 严格按照 PR 3 → 4 → 5 顺序合入 |
-| 大对象测试只验证功能未验证峰值 | OOM 问题未真正解决 | 固定 `-Xmx`、记录 allocation 和峰值 heap |
+| 大对象测试只验证功能未验证峰值 | OOM 问题未真正解决 | 固定 `-Xmx`、记录 allocation、GC 后 retained heap 和容量阈值 |
+| segmented buffer 保留整份 JSON | writer 仍按 payload 大小占用堆 | 超过 8 MiB spill 到临时文件，并验证清理与磁盘失败语义 |
+| spill 临时文件因进程硬退出残留 | FE 临时目录被长期占用 | 使用 `DELETE_ON_CLOSE` channel；继续在 E2E/硬退出测试中验证目标文件系统语义 |
+| benchmark 与其他服务共享主机 | 耗时和 sampled heap 数据失真 | 容量测试可先执行；性能比例必须在隔离环境重复并取中位数 |
 | CI 环境不支持特定命令 | 用例确定性失败 | 按 suite 能力放置测试，Cloud 只保留可执行路径 |
 
 ## 执行顺序与跟踪
@@ -352,31 +446,33 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 
 ### 阶段 B：独立低风险优化
 
-- [ ] 完成 PR 2 实现和边界测试。
+- [x] 完成 PR 2 实现和边界测试（定向 FE UT 2/2）。
 - [ ] 记录旧缓冲与计数流的内存对比。
 - [ ] 合入后确认无 journal 相关回归。
 
 ### 阶段 C：流式基础设施
 
-- [ ] 从 `fix-gson-streaming-table-multimap` 提取 master 适配后的通用实现。
+- [x] 提取并完成 master 适配后的通用实现分支。
 - [ ] 完成 PR 3 全部兼容性测试。
 - [ ] 合入后再创建 Restore/Backup 业务 PR。
 
 ### 阶段 D：Restore
 
-- [ ] 完成 PR 4。
+- [x] 完成 PR 4 本地实现分支。
 - [ ] 验证 RestoreJob replay 和中途重启。
 - [ ] 提供大 RestoreJob before/after 数据。
 
 ### 阶段 E：Backup
 
-- [ ] 从 `codex/review-pr-63` 中去除已由 PR 1、2、3、4 覆盖的代码。
-- [ ] 完成 PR 5 流式 deep copy 和持久化迁移。
+- [x] 从组合实现中拆出 PR 1、2、3、4 的独立职责。
+- [x] 完成 PR 5 流式 deep copy、持久化迁移与 spillable buffer 本地实现。
 - [ ] 完成 BACKUP/RESTORE/restart 端到端验证。
 
 ### 阶段 F：默认开启
 
-- [ ] 完成 20 万 tablet 快速基准。
+- [x] 完成 20 万 tablet `full_streaming` 五阶段单次容量快速基准。
+- [x] 完成 wrapper 复用前后 reader/replay 三次 fork 对照和 spill 残留验证。
+- [ ] 完成 spill 修正后的 20 万 before/after 重复基准与 JFR allocation 分析。
 - [ ] 完成 200 万 tablet 压力基准。
 - [ ] 完成多 FE replay 和回退演练。
 - [ ] 提交 PR 6 或在 reviewer 同意后确认默认开启。
