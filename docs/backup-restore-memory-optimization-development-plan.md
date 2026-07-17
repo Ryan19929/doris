@@ -14,7 +14,7 @@
   - PR 3：`codex/streaming-gson-foundation` @ `7c92546e7ac`
   - PR 4：`codex/restore-job-streaming` @ `c1840fd2ff3`
   - PR 5：`codex/backup-meta-streaming` @ `2d0a750a0d2`
-  - 验证分支：`codex/backup-memory-benchmark` @ `8b26e597d7c`
+  - 验证分支：`codex/backup-memory-benchmark` @ `8b830a04599`
 
 PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
 `master`。验证分支包含 benchmark、OOM 传播修复和 spillable buffer 设计修正，需完成远端
@@ -361,8 +361,39 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
   `BUILD SUCCESS`，Checkstyle 0 violations；补充临时目录失败测试后 spill suite 为 11/11。
 - 本机 `run-fe-ut.sh` 因该 worktree 缺少 `thirdparty/installed/bin/protoc` 未能启动；同一测试已在
   用户提供的 Linux 目标机用预编译 thirdparty 完成。该环境问题不计为代码失败。
-- `journal_replay` 没有从 wrapper pool 获得峰值收益，后续必须用 JFR allocation/class histogram
-  继续定位，不能把问题 2 标记为完全解决。
+- 单独加入 wrapper pool 时，`journal_replay` 没有获得峰值收益。随后 JFR 定位到每次 wrapper
+  acquire 仍反射探测 Gson 可选设置并创建 `NoSuchMethodException`；该问题已由
+  `8b830a04599` 修复，完整结果见下一节。
+
+### Journal replay JFR 根因与修复（2026-07-17）
+
+为严格隔离变量，JFR 对比使用相同的 200k×3、2 GiB、`journal_replay` case：
+
+| 版本 | 变更 | peak delta | elapsed | 测量区间 GC | JFR sampled allocation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `ef668e62d5b` | pool 前 | 1,286,602,752 | 6,015 ms | 1 | 1.783 GiB |
+| `a582951621c` | 仅 wrapper pool | 1,288,699,904 | 6,349 ms | 1 | 1.335 GiB |
+| `8b830a04599` | pool + capability probe cache | 152,043,520 | 745 ms | 0 | 0.140 GiB |
+
+JFR 证明这是两个叠加的逐对象分配问题：
+
+1. pool 前，`EnteredObjectJsonReader` 每次调用 `JsonReader` 构造器；其内部数组相关采样分配约
+   1,013.4 MiB。加入 pool 后该调用栈消失。
+2. pool 后，每次 acquire 仍通过 `Class.getMethod()` 探测 Gson 2.10 不存在的
+   `getStrictness`/`getNestingLimit` 等方法。失败反射生成的
+   `NoSuchMethodException → Throwable.fillInStackTrace` 占采样分配约 1,080.9 MiB（79.06%），
+   抵消了 wrapper pool 的峰值收益。
+3. `8b830a04599` 将四项可选能力在类初始化时各探测一次；不存在时缓存 no-op copier，存在时
+   缓存 Method，实际调用异常仍转为 `AssertionError`。修复后的主要分配只剩字段名 String、
+   `LocalTablet`、集合和 `MaterializedIndex.gsonPostProcess()` 所需 HashMap 节点。
+
+修复前两个版本都把固定 1.2 GiB G1 Eden 填满并触发一次 young GC，因此 10 ms heap sampler
+得到几乎相同峰值；修复后测量区间分配低于 Eden 水位，不再触发 GC。无 JFR 的三个独立 fork
+进一步复现：peak delta 为 152,043,520 / 153,092,096 / 152,043,520 bytes，elapsed 为
+696 / 655 / 733 ms，三次 GC delta 均为 0，临时文件残留为 0。
+
+定向单测验证 2,000 个对象写入/读取前后 capability probe 总数始终为 4；
+`RuntimeTypeAdapterFactoryStreamingTest` 11/11、Checkstyle 0 violations。
 
 ### Branch 3.1 参考基线（2026-07-17）
 
@@ -472,6 +503,7 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 
 - [x] 完成 20 万 tablet `full_streaming` 五阶段单次容量快速基准。
 - [x] 完成 wrapper 复用前后 reader/replay 三次 fork 对照和 spill 残留验证。
+- [x] 完成 `journal_replay` JFR allocation 根因分析、修复及三次复测。
 - [ ] 完成 spill 修正后的 20 万 before/after 重复基准与 JFR allocation 分析。
 - [ ] 完成 200 万 tablet 压力基准。
 - [ ] 完成多 FE replay 和回退演练。
