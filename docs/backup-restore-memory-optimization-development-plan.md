@@ -18,8 +18,8 @@
 
 PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
 `master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和受控 spill
-已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；真实集群 E2E、
-多 FE replay 和 200 万压力验证仍未完成。
+已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；单 FE/单 BE 的
+真实 BACKUP/RESTORE E2E 已完成，重启恢复、多 FE replay 和 200 万压力验证仍未完成。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
@@ -61,8 +61,8 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 | 1 | Replica 剥离 | 修复并完善 apache/doris#65321 | 无 | 本地实现分支完成；完整门禁未完成 |
 | 2 | Journal size 计数 | 使用计数流替代完整缓冲 | 无 | 本地实现完成；定向 FE UT 2/2 通过 |
 | 3 | Streaming Gson 基础设施 | Guava 与多态 TypeAdapter 的流式实现 | 无 | 兼容矩阵 20/20 通过；FE 全量门禁未完成 |
-| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 | 9 状态兼容矩阵 5/5 通过；Restore E2E/重启未完成 |
-| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 | 兼容矩阵 16/16、spill helper 11/11 通过；E2E 未完成 |
+| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 | 9 状态兼容矩阵 5/5、单 FE E2E 通过；重启未完成 |
+| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 | 兼容矩阵 16/16、spill helper 11/11、单 FE E2E 通过 |
 | 6 | 默认开启与最终验证 | 根据兼容性和压力测试结果开启默认配置 | PR 1—5 | 未开始 |
 
 PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5，避免多个 PR 同时修改 `GsonUtils`、`RuntimeTypeAdapterFactory` 和 `AbstractJob`。
@@ -343,8 +343,8 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
   能输出结构化 `status=oom` 后以 OOME 失败。
 - 当前远端机器同时运行其他 FE/BE 进程，单次 10 ms heap sampler 和耗时数据会受 GC/调度影响。
   在获得隔离资源、至少三次 fork 中位数和 JFR allocation 数据前，不使用这些数字声明性能比例。
-- 未完成：spill 修正后 before/after 矩阵、RestoreJob 大对象 benchmark、200 万压力基准、真实
-  BACKUP/RESTORE E2E、FE 重启和多 FE replay。
+- 未完成：spill 修正后 before/after 矩阵、RestoreJob 大对象 benchmark、200 万压力基准、
+  FE 重启和多 FE replay。
 
 正式 Maven heap 参数为 `-Dfe.ut.max.heap=2g`，固定初始堆可额外使用
 `-Dfe.ut.extra.jvm.args=-Xms2g`；不能再使用 `-DargLine` 覆盖 fe-core 的默认 heap。
@@ -409,6 +409,25 @@ JFR 证明这是两个叠加的逐对象分配问题：
 
 定向单测验证 2,000 个对象写入/读取前后 capability probe 总数始终为 4；
 `RuntimeTypeAdapterFactoryStreamingTest` 11/11、Checkstyle 0 violations。
+
+### 真实集群 MinIO E2E（2026-07-17）
+
+在 `codex/backup-memory-benchmark` @ `8b830a04599` 上使用 no-AVX2 ASAN 构建，部署一个 FE、
+一个 BE，并以独立 MinIO bucket 作为 S3 repository。通过仓库标准脚本
+`./run-regression-test.sh --run -d backup_restore -s <suite>` 执行三轮真实 E2E，共 4 个 suite，
+failed/fatal/skipped 均为 0：
+
+- `test_backup_restore` 与匹配到的 `test_backup_connectivity_failed`：repository 创建成功，
+  BACKUP 完整经过 `PENDING` 至 `FINISHED`，RESTORE 完整经过 `PENDING` 至 `FINISHED`，恢复后
+  查询结果一致；临时表 backup 分支也通过。
+- `test_backup_restore_partition`：备份 `p1`—`p6`，随后分两轮恢复 `p1`—`p3`、`p4`—`p6`，
+  两轮均到达 `FINISHED`，排序查询结果正确。
+- `test_backup_restore_mv`：恢复后的 `DESC ALL` 保留 rollup 索引，`EXPLAIN` 显示 CBO 成功选择
+  恢复后的物化视图。
+
+实验结束后 FE、BE 与 MinIO 均存活，日志扫描未发现 ASAN 或运行时 fatal。该结果证明普通表、
+分区元数据和 rollup/MV 元数据在真实 S3-compatible 存储路径下可备份、恢复和查询；它不替代
+进行中的 RestoreJob 中途重启、journal replay、checkpoint、多 FE 和 200 万 tablet 容量验证。
 
 ### Branch 3.1 参考基线（2026-07-17）
 
@@ -514,7 +533,8 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 - [x] 从组合实现中拆出 PR 1、2、3、4 的独立职责。
 - [x] 完成 PR 5 流式 deep copy、持久化迁移与 spillable buffer 本地实现。
 - [x] 完成 Table/BackupMeta/BackupJobInfo/job 压缩路径兼容矩阵（16/16）。
-- [ ] 完成 BACKUP/RESTORE/restart 端到端验证。
+- [x] 完成单 FE/单 BE 的普通表、分区表、MV/rollup BACKUP/RESTORE 端到端验证。
+- [ ] 完成 RestoreJob 中途重启、journal replay 和 checkpoint 验证。
 
 ### 阶段 F：默认开启
 
