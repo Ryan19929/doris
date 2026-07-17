@@ -114,7 +114,7 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
     }
 
     @Test
-    public void testTreeAndStreamingAreByteCompatibleAndCrossReadable() {
+    public void testTreeAndStreamingCompatibilityMatrix() {
         AtomicBoolean streaming = new AtomicBoolean(false);
         Gson gson = newGson(newFactory(streaming));
         Circle circle = buildCircle();
@@ -125,42 +125,58 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
 
         Assert.assertEquals(treeJson, streamingJson);
         Assert.assertTrue(streamingJson.startsWith("{\"clazz\":\"Circle\","));
-
-        Circle fromTree = (Circle) gson.fromJson(treeJson, Shape.class);
-        Assert.assertEquals(circle.table, fromTree.table);
-        Assert.assertTrue(fromTree.inner instanceof Rectangle);
-
-        streaming.set(false);
-        Circle fromStreaming = (Circle) gson.fromJson(streamingJson, Shape.class);
-        Assert.assertEquals(circle.table, fromStreaming.table);
-        Assert.assertTrue(fromStreaming.inner instanceof Rectangle);
+        assertCircleEquals(circle, readCircle(gson, streaming, false, treeJson));
+        assertCircleEquals(circle, readCircle(gson, streaming, true, treeJson));
+        assertCircleEquals(circle, readCircle(gson, streaming, false, streamingJson));
+        assertCircleEquals(circle, readCircle(gson, streaming, true, streamingJson));
     }
 
     @Test
-    public void testStreamingReadsTypeFieldAfterPayloadFields() {
+    public void testStreamingReadsTypeFieldFirstMiddleAndLast() {
         AtomicBoolean streaming = new AtomicBoolean(true);
         Gson gson = newGson(newFactory(streaming));
 
-        Shape shape = gson.fromJson("{\"w\":7,\"clazz\":\"Rectangle\",\"h\":8}", Shape.class);
-
-        Assert.assertTrue(shape instanceof Rectangle);
-        Assert.assertEquals(7, ((Rectangle) shape).width);
-        Assert.assertEquals(8, ((Rectangle) shape).height);
+        String[] payloads = {
+                "{\"clazz\":\"Rectangle\",\"w\":7,\"h\":8}",
+                "{\"w\":7,\"clazz\":\"Rectangle\",\"h\":8}",
+                "{\"w\":7,\"h\":8,\"clazz\":\"Rectangle\"}"
+        };
+        for (String payload : payloads) {
+            Shape shape = gson.fromJson(payload, Shape.class);
+            Assert.assertTrue(shape instanceof Rectangle);
+            Assert.assertEquals(7, ((Rectangle) shape).width);
+            Assert.assertEquals(8, ((Rectangle) shape).height);
+        }
     }
 
     @Test
     public void testStreamingReplaysLegacyPayloadWithDefaultSubtype() {
-        AtomicBoolean streaming = new AtomicBoolean(true);
+        AtomicBoolean streaming = new AtomicBoolean(false);
         RuntimeTypeAdapterFactory<Shape> factory = newFactory(streaming).registerDefaultSubtype(Circle.class);
         Gson gson = newGson(factory);
 
-        Circle circle = (Circle) gson.fromJson("{\"n\":\"legacy\",\"r\":2.5}", Shape.class);
-        Circle empty = (Circle) gson.fromJson("{}", Shape.class);
+        for (boolean streamingEnabled : new boolean[] {false, true}) {
+            streaming.set(streamingEnabled);
+            Circle circle = (Circle) gson.fromJson("{\"n\":\"legacy\",\"r\":2.5}", Shape.class);
+            Circle empty = (Circle) gson.fromJson("{}", Shape.class);
 
-        Assert.assertEquals("legacy", circle.name);
-        Assert.assertEquals(2.5, circle.radius, 0.0);
-        Assert.assertNull(empty.name);
-        Assert.assertEquals(0.0, empty.radius, 0.0);
+            Assert.assertEquals("legacy", circle.name);
+            Assert.assertEquals(2.5, circle.radius, 0.0);
+            Assert.assertNull(empty.name);
+            Assert.assertEquals(0.0, empty.radius, 0.0);
+        }
+    }
+
+    @Test
+    public void testMissingTypeWithoutDefaultFailsInBothModes() {
+        AtomicBoolean streaming = new AtomicBoolean(false);
+        Gson gson = newGson(newFactory(streaming));
+
+        for (boolean streamingEnabled : new boolean[] {false, true}) {
+            streaming.set(streamingEnabled);
+            assertJsonFailure(gson, "{\"n\":\"legacy\"}", "does not define a field named clazz");
+            assertJsonFailure(gson, "{}", "does not define a field named clazz");
+        }
     }
 
     @Test
@@ -198,6 +214,15 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
 
         assertJsonFailure(gson, "{\"clazz\":\"Circle\",\"n\":\"truncated", "Unterminated string");
         assertJsonFailure(gson, "{\"n\":\"truncated\",\"clazz\":", "End of input");
+    }
+
+    @Test
+    public void testStreamingRejectsIncorrectFieldTypes() {
+        AtomicBoolean streaming = new AtomicBoolean(true);
+        Gson gson = newGson(newFactory(streaming));
+
+        assertJsonFailure(gson, "{\"clazz\":true,\"n\":\"x\"}", "Expected a string");
+        assertJsonFailure(gson, "{\"clazz\":\"Circle\",\"inner\":17}", "Not a JSON Object");
     }
 
     @Test
@@ -330,5 +355,21 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
         } catch (JsonParseException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
         }
+    }
+
+    private static Circle readCircle(Gson gson, AtomicBoolean streaming, boolean streamingEnabled, String json) {
+        streaming.set(streamingEnabled);
+        return (Circle) gson.fromJson(json, Shape.class);
+    }
+
+    private static void assertCircleEquals(Circle expected, Circle actual) {
+        Assert.assertEquals(expected.name, actual.name);
+        Assert.assertEquals(expected.radius, actual.radius, 0.0);
+        Assert.assertEquals(expected.tags, actual.tags);
+        Assert.assertEquals(expected.attrs, actual.attrs);
+        Assert.assertEquals(expected.table, actual.table);
+        Assert.assertTrue(actual.inner instanceof Rectangle);
+        Assert.assertEquals(((Rectangle) expected.inner).width, ((Rectangle) actual.inner).width);
+        Assert.assertEquals(((Rectangle) expected.inner).height, ((Rectangle) actual.inner).height);
     }
 }

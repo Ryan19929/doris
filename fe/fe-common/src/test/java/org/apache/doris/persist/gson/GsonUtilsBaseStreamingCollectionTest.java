@@ -28,14 +28,16 @@ import com.google.common.collect.Multimap;
 import com.google.common.collect.Table;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.google.gson.JsonParseException;
+import com.google.gson.annotations.SerializedName;
 import com.google.gson.reflect.TypeToken;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.Type;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 public class GsonUtilsBaseStreamingCollectionTest {
     private static final Gson TREE_GSON = new GsonBuilder()
@@ -59,6 +61,7 @@ public class GsonUtilsBaseStreamingCollectionTest {
         Assert.assertEquals(
                 "{\"clazz\":\"HashBasedTable\",\"rowKeys\":[1],\"columnKeys\":[\"c1\"],\"cells\":[0,0,10]}",
                 STREAMING_GSON.toJson(simpleTable, simpleTableType));
+        assertFourWayCompatibility(simpleTable, simpleTableType);
 
         Type tableType = new TypeToken<Table<Long, String, Map<Long, Long>>>() {
         }.getType();
@@ -70,15 +73,14 @@ public class GsonUtilsBaseStreamingCollectionTest {
         String streamingJson = STREAMING_GSON.toJson(table, tableType);
 
         Assert.assertEquals(treeJson, streamingJson);
+        Assert.assertEquals(table, TREE_GSON.fromJson(treeJson, tableType));
         Assert.assertEquals(table, STREAMING_GSON.fromJson(treeJson, tableType));
         Assert.assertEquals(table, TREE_GSON.fromJson(streamingJson, tableType));
+        Assert.assertEquals(table, STREAMING_GSON.fromJson(streamingJson, tableType));
 
         Table<Long, String, Map<Long, Long>> empty = HashBasedTable.create();
-        Assert.assertEquals(TREE_GSON.toJson(empty, tableType), STREAMING_GSON.toJson(empty, tableType));
-        Assert.assertTrue(((Table<?, ?, ?>) STREAMING_GSON.fromJson(
-                STREAMING_GSON.toJson(empty, tableType), tableType)).isEmpty());
-        Assert.assertEquals("null", STREAMING_GSON.toJson(null, tableType));
-        Assert.assertNull(STREAMING_GSON.fromJson("null", tableType));
+        assertFourWayCompatibility(empty, tableType);
+        assertFourWayCompatibility(null, tableType);
     }
 
     @Test
@@ -101,16 +103,47 @@ public class GsonUtilsBaseStreamingCollectionTest {
             String treeJson = TREE_GSON.toJson(multimap, multimapType);
             String streamingJson = STREAMING_GSON.toJson(multimap, multimapType);
             Assert.assertEquals(multimap.getClass().getSimpleName(), treeJson, streamingJson);
+            Assert.assertEquals(multimap, TREE_GSON.fromJson(treeJson, multimapType));
             Assert.assertEquals(multimap, STREAMING_GSON.fromJson(treeJson, multimapType));
             Assert.assertEquals(multimap, TREE_GSON.fromJson(streamingJson, multimapType));
+            Assert.assertEquals(multimap, STREAMING_GSON.fromJson(streamingJson, multimapType));
         }
 
+        Multimap<Long, String> singleton = ArrayListMultimap.create();
+        singleton.put(9L, "only");
+        assertFourWayCompatibility(singleton, multimapType);
+
         Multimap<Long, String> empty = ArrayListMultimap.create();
-        Assert.assertEquals(TREE_GSON.toJson(empty, multimapType), STREAMING_GSON.toJson(empty, multimapType));
-        Assert.assertTrue(((Multimap<?, ?>) STREAMING_GSON.fromJson(
-                STREAMING_GSON.toJson(empty, multimapType), multimapType)).isEmpty());
-        Assert.assertEquals("null", STREAMING_GSON.toJson(null, multimapType));
-        Assert.assertNull(STREAMING_GSON.fromJson("null", multimapType));
+        assertFourWayCompatibility(empty, multimapType);
+        assertFourWayCompatibility(null, multimapType);
+    }
+
+    @Test
+    public void testLargeTableWithNestedGenericValuesCompatibility() {
+        Type tableType = new TypeToken<Table<ComplexKey, Integer, List<Map<String, Long>>>>() {
+        }.getType();
+        Table<ComplexKey, Integer, List<Map<String, Long>>> table = HashBasedTable.create();
+        for (int i = 0; i < 2000; i++) {
+            Map<String, Long> value = new LinkedHashMap<>();
+            value.put("value", (long) i);
+            table.put(new ComplexKey(i, "row-" + i), i % 17, Lists.newArrayList(value));
+        }
+
+        assertFourWayCompatibility(table, tableType);
+    }
+
+    @Test
+    public void testLargeMultimapWithComplexKeysAndNestedValuesCompatibility() {
+        Type multimapType = new TypeToken<Multimap<ComplexKey, List<Map<String, Long>>>>() {
+        }.getType();
+        Multimap<ComplexKey, List<Map<String, Long>>> multimap = ArrayListMultimap.create();
+        for (int i = 0; i < 2000; i++) {
+            Map<String, Long> value = new LinkedHashMap<>();
+            value.put("value", (long) i);
+            multimap.put(new ComplexKey(i % 31, "key-" + i % 31), Lists.newArrayList(value));
+        }
+
+        assertFourWayCompatibility(multimap, multimapType);
     }
 
     @Test
@@ -139,22 +172,87 @@ public class GsonUtilsBaseStreamingCollectionTest {
         Type tableType = new TypeToken<Table<Long, String, Long>>() {
         }.getType();
         assertJsonFailure("{\"clazz\":\"UnknownTable\",\"rowKeys\":[],\"columnKeys\":[],\"cells\":[]}",
-                tableType);
+                tableType, "unknown guava table class: UnknownTable");
         assertJsonFailure("{\"clazz\":\"HashBasedTable\",\"rowKeys\":[1],\"columnKeys\":[\"c\"],\"cells\":[0,0",
-                tableType);
+                tableType, "End of input");
 
         Type multimapType = new TypeToken<Multimap<Long, String>>() {
         }.getType();
-        assertJsonFailure("{\"clazz\":\"UnknownMultimap\",\"map\":{}}", multimapType);
-        assertJsonFailure("{\"clazz\":\"ArrayListMultimap\",\"map\":{\"1\":[\"v\"]}", multimapType);
+        assertJsonFailure("{\"clazz\":\"UnknownMultimap\",\"map\":{}}", multimapType,
+                "unknown guava multi map class: UnknownMultimap");
+        assertJsonFailure("{\"clazz\":\"ArrayListMultimap\",\"map\":{\"1\":[\"v\"]}", multimapType,
+                "End of input");
     }
 
-    private static void assertJsonFailure(String json, Type type) {
+    @Test
+    public void testStreamingCollectionsRejectMissingDuplicateAndIncorrectFields() {
+        Type tableType = new TypeToken<Table<Long, String, Long>>() {
+        }.getType();
+        assertJsonFailure("{\"rowKeys\":[],\"columnKeys\":[],\"cells\":[]}", tableType,
+                "missing json field: clazz");
+        assertJsonFailure("{\"clazz\":\"HashBasedTable\",\"clazz\":\"HashBasedTable\","
+                + "\"rowKeys\":[],\"columnKeys\":[],\"cells\":[]}", tableType,
+                "duplicate json field: clazz");
+        assertJsonFailure("{\"clazz\":\"HashBasedTable\",\"rowKeys\":{},"
+                + "\"columnKeys\":[],\"cells\":[]}", tableType, "Expected BEGIN_ARRAY");
+        assertJsonFailure("{\"clazz\":\"HashBasedTable\",\"rowKeys\":[1],"
+                + "\"columnKeys\":[\"c\"],\"cells\":[\"bad\",0,1]}", tableType,
+                "For input string");
+
+        Type multimapType = new TypeToken<Multimap<Long, String>>() {
+        }.getType();
+        assertJsonFailure("{\"clazz\":\"ArrayListMultimap\"}", multimapType,
+                "missing json field: map");
+        assertJsonFailure("{\"clazz\":\"ArrayListMultimap\",\"map\":{},\"map\":{}}",
+                multimapType, "duplicate json field: map");
+        assertJsonFailure("{\"clazz\":true,\"map\":{}}", multimapType, "Expected a string");
+    }
+
+    private static void assertJsonFailure(String json, Type type, String expectedMessage) {
         try {
             STREAMING_GSON.fromJson(json, type);
-            Assert.fail("expected JsonParseException");
-        } catch (JsonParseException | IllegalStateException | IndexOutOfBoundsException e) {
-            // Expected: malformed persistence payloads must fail instead of being partially accepted.
+            Assert.fail("expected JSON failure");
+        } catch (RuntimeException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains(expectedMessage));
+        }
+    }
+
+    private static <T> void assertFourWayCompatibility(T value, Type type) {
+        String treeJson = TREE_GSON.toJson(value, type);
+        String streamingJson = STREAMING_GSON.toJson(value, type);
+        Assert.assertEquals(treeJson, streamingJson);
+        Assert.assertEquals(value, TREE_GSON.fromJson(treeJson, type));
+        Assert.assertEquals(value, STREAMING_GSON.fromJson(treeJson, type));
+        Assert.assertEquals(value, TREE_GSON.fromJson(streamingJson, type));
+        Assert.assertEquals(value, STREAMING_GSON.fromJson(streamingJson, type));
+    }
+
+    private static class ComplexKey {
+        @SerializedName("id")
+        private final int id;
+        @SerializedName("name")
+        private final String name;
+
+        private ComplexKey(int id, String name) {
+            this.id = id;
+            this.name = name;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof ComplexKey)) {
+                return false;
+            }
+            ComplexKey that = (ComplexKey) other;
+            return id == that.id && Objects.equals(name, that.name);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(id, name);
         }
     }
 }
