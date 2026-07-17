@@ -168,40 +168,48 @@ public class BackupRestoreJobStreamingJsonConfigTest {
     }
 
     @Test
-    public void testCompressedJobsCrossMode() throws Exception {
+    public void testCompressedJobsCompatibilityMatrix() throws Exception {
         RestoreJob restoreJob = newRestoreJob("compressed_restore", 128);
         Config.restore_job_compressed_serialization = true;
         byte[] legacyRestore = writeJob(restoreJob, false);
-        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyRestore));
-        Config.enable_backup_restore_job_streaming_json = true;
-        assertLargeFields(restoreJob, (RestoreJob) AbstractJob.read(dataInput(legacyRestore)));
-
         byte[] streamingRestore = writeJob(restoreJob, true);
-        Config.enable_backup_restore_job_streaming_json = false;
-        assertLargeFields(restoreJob, RestoreJob.read(dataInput(streamingRestore)));
+        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyRestore));
+        Assert.assertArrayEquals(legacyRestore, streamingRestore);
+        for (byte[] bytes : new byte[][] {legacyRestore, streamingRestore}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                assertLargeFields(restoreJob, (RestoreJob) AbstractJob.read(dataInput(bytes)));
+                assertLargeFields(restoreJob, RestoreJob.read(dataInput(bytes)));
+            }
+        }
 
         BackupJob backupJob = new BackupJob("compressed_backup", 1L, "db", Lists.newArrayList(), 1000L,
                 BackupCommand.BackupContent.ALL, null, 2L, 9L);
         Config.backup_job_compressed_serialization = true;
         byte[] legacyBackup = writeJob(backupJob, false);
-        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyBackup));
-        Config.enable_backup_restore_job_streaming_json = true;
-        Assert.assertEquals(backupJob.getLabel(), BackupJob.read(dataInput(legacyBackup)).getLabel());
-
         byte[] streamingBackup = writeJob(backupJob, true);
-        Config.enable_backup_restore_job_streaming_json = false;
-        Assert.assertEquals(backupJob.getLabel(), AbstractJob.read(dataInput(streamingBackup)).getLabel());
+        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyBackup));
+        Assert.assertArrayEquals(legacyBackup, streamingBackup);
+        for (byte[] bytes : new byte[][] {legacyBackup, streamingBackup}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                Assert.assertEquals(backupJob.getLabel(), AbstractJob.read(dataInput(bytes)).getLabel());
+                Assert.assertEquals(backupJob.getLabel(), BackupJob.read(dataInput(bytes)).getLabel());
+            }
+        }
 
         CloudRestoreJob cloudJob = newCloudRestoreJob();
         byte[] legacyCloud = writeJob(cloudJob, false);
-        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyCloud));
-        Config.enable_backup_restore_job_streaming_json = true;
-        assertCloudRestoreJob(cloudJob, (CloudRestoreJob) AbstractJob.read(dataInput(legacyCloud)));
-
         byte[] streamingCloud = writeJob(cloudJob, true);
-        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(streamingCloud));
-        Config.enable_backup_restore_job_streaming_json = false;
-        assertCloudRestoreJob(cloudJob, (CloudRestoreJob) RestoreJob.read(dataInput(streamingCloud)));
+        Assert.assertEquals(AbstractJob.COMPRESSED_JOB_ID, readFirstString(legacyCloud));
+        Assert.assertArrayEquals(legacyCloud, streamingCloud);
+        for (byte[] bytes : new byte[][] {legacyCloud, streamingCloud}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                assertCloudRestoreJob(cloudJob, (CloudRestoreJob) AbstractJob.read(dataInput(bytes)));
+                assertCloudRestoreJob(cloudJob, (CloudRestoreJob) RestoreJob.read(dataInput(bytes)));
+            }
+        }
     }
 
     @Test
