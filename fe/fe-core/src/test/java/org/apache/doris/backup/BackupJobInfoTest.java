@@ -169,25 +169,37 @@ public class BackupJobInfoTest {
     }
 
     @Test
-    public void testStreamingUtf8FileAndLegacyRollback() throws Exception {
+    public void testFileCompatibilityMatrixAndStreamingUtf8() throws Exception {
         BackupJobInfo jobInfo = BackupJobInfo.fromFile(fileName);
-        jobInfo.name = "快照-東京";
+        jobInfo.name = "byte-identical-ascii";
         File streamingFile = new File("job_info_streaming.txt");
         File legacyFile = new File("job_info_legacy.txt");
         boolean savedStreaming = Config.enable_table_meta_streaming_json;
         try {
             Config.enable_table_meta_streaming_json = true;
             jobInfo.writeToFile(streamingFile);
-            Assert.assertArrayEquals(GsonUtils.GSON.toJson(jobInfo).getBytes(StandardCharsets.UTF_8),
-                    Files.readAllBytes(streamingFile.toPath()));
-
             Config.enable_table_meta_streaming_json = false;
-            Assert.assertEquals("快照-東京", BackupJobInfo.fromFile(streamingFile.getPath()).name);
-            jobInfo.name = "legacy-ascii";
             jobInfo.writeToFile(legacyFile);
 
+            byte[] canonical = GsonUtils.GSON.toJson(jobInfo).getBytes(StandardCharsets.UTF_8);
+            Assert.assertArrayEquals(canonical, Files.readAllBytes(streamingFile.toPath()));
+            Assert.assertArrayEquals(canonical, Files.readAllBytes(legacyFile.toPath()));
+            for (File file : new File[] {legacyFile, streamingFile}) {
+                for (boolean streamingRead : new boolean[] {false, true}) {
+                    Config.enable_table_meta_streaming_json = streamingRead;
+                    Assert.assertEquals("byte-identical-ascii", BackupJobInfo.fromFile(file.getPath()).name);
+                }
+            }
+
+            jobInfo.name = "快照-東京";
             Config.enable_table_meta_streaming_json = true;
-            Assert.assertEquals("legacy-ascii", BackupJobInfo.fromFile(legacyFile.getPath()).name);
+            jobInfo.writeToFile(streamingFile);
+            Assert.assertArrayEquals(GsonUtils.GSON.toJson(jobInfo).getBytes(StandardCharsets.UTF_8),
+                    Files.readAllBytes(streamingFile.toPath()));
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_table_meta_streaming_json = streamingRead;
+                Assert.assertEquals("快照-東京", BackupJobInfo.fromFile(streamingFile.getPath()).name);
+            }
         } finally {
             Config.enable_table_meta_streaming_json = savedStreaming;
             Files.deleteIfExists(streamingFile.toPath());

@@ -68,7 +68,7 @@ class TableMetaStreamingJsonTest {
     }
 
     @Test
-    void localTableIsByteIdenticalAndCrossReadable() {
+    void localTableCompatibilityMatrix() {
         OlapTable table = createLocalTable();
         String legacy = toJson(table, Table.class, false);
         String streaming = toJson(table, Table.class, true);
@@ -78,38 +78,34 @@ class TableMetaStreamingJsonTest {
         Assertions.assertTrue(streaming.contains("\"clazz\":\"LocalTablet\""));
         Assertions.assertTrue(streaming.contains("\"clazz\":\"LocalReplica\""));
 
-        for (boolean enabled : new boolean[] {false, true}) {
-            Config.enable_table_meta_streaming_json = enabled;
-            OlapTable restored = (OlapTable) GsonUtils.GSON.fromJson(streaming, Table.class);
-            Tablet tablet = restored.getPartition("p1").getBaseIndex().getTablets().get(0);
-            Assertions.assertInstanceOf(LocalTablet.class, tablet);
-            Assertions.assertInstanceOf(LocalReplica.class, tablet.getReplicas().get(0));
+        for (String json : new String[] {legacy, streaming}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_table_meta_streaming_json = streamingRead;
+                OlapTable restored = (OlapTable) GsonUtils.GSON.fromJson(json, Table.class);
+                Tablet tablet = restored.getPartition("p1").getBaseIndex().getTablets().get(0);
+                Assertions.assertInstanceOf(LocalTablet.class, tablet);
+                Assertions.assertInstanceOf(LocalReplica.class, tablet.getReplicas().get(0));
+            }
         }
     }
 
     @Test
-    void tableAndOlapTableIoAreByteIdenticalAndCrossReadable() throws Exception {
+    void tableAndOlapTableIoCompatibilityMatrix() throws Exception {
         OlapTable table = createLocalTable();
         byte[] legacy = writeTable(table, false);
         byte[] streaming = writeTable(table, true);
         Assertions.assertArrayEquals(legacy, streaming);
-        Config.enable_table_meta_streaming_json = true;
-        Assertions.assertInstanceOf(OlapTable.class, Table.read(
-                new DataInputStream(new ByteArrayInputStream(legacy))));
-        Config.enable_table_meta_streaming_json = false;
-        Assertions.assertInstanceOf(OlapTable.class, Table.read(
-                new DataInputStream(new ByteArrayInputStream(streaming))));
-
-        Config.enable_table_meta_streaming_json = true;
-        Assertions.assertEquals(table.getId(), OlapTable.read(
-                new DataInputStream(new ByteArrayInputStream(legacy))).getId());
-        Config.enable_table_meta_streaming_json = false;
-        Assertions.assertEquals(table.getId(), OlapTable.read(
-                new DataInputStream(new ByteArrayInputStream(streaming))).getId());
+        for (byte[] bytes : new byte[][] {legacy, streaming}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_table_meta_streaming_json = streamingRead;
+                Assertions.assertInstanceOf(OlapTable.class, Table.read(dataInput(bytes)));
+                Assertions.assertEquals(table.getId(), OlapTable.read(dataInput(bytes)).getId());
+            }
+        }
     }
 
     @Test
-    void explicitCloudSubtypesAreByteIdenticalAndCrossReadable() {
+    void explicitCloudSubtypesCompatibilityMatrix() {
         assertSubtype(new CloudTablet(10), Tablet.class, CloudTablet.class, "CloudTablet");
         CloudReplica replica = new CloudReplica(11, -1L, Replica.ReplicaState.NORMAL, 1, 0,
                 1, 2, 3, 4, 0);
@@ -146,9 +142,11 @@ class TableMetaStreamingJsonTest {
         String streaming = toJson(value, declaredType, true);
         Assertions.assertEquals(legacy, streaming);
         Assertions.assertTrue(streaming.startsWith("{\"clazz\":\"" + label + "\","));
-        for (boolean enabled : new boolean[] {false, true}) {
-            Config.enable_table_meta_streaming_json = enabled;
-            Assertions.assertInstanceOf(expectedType, GsonUtils.GSON.fromJson(streaming, declaredType));
+        for (String json : new String[] {legacy, streaming}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_table_meta_streaming_json = streamingRead;
+                Assertions.assertInstanceOf(expectedType, GsonUtils.GSON.fromJson(json, declaredType));
+            }
         }
     }
 
@@ -164,6 +162,10 @@ class TableMetaStreamingJsonTest {
             table.write(output);
         }
         return bytes.toByteArray();
+    }
+
+    private static DataInputStream dataInput(byte[] bytes) {
+        return new DataInputStream(new ByteArrayInputStream(bytes));
     }
 
     private static OlapTable createLocalTable() {

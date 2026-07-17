@@ -71,13 +71,10 @@ public class BackupMetaTest {
         try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class, Mockito.CALLS_REAL_METHODS)) {
             mockedEnv.when(Env::getCurrentEnvJournalVersion).thenReturn(FeConstants.meta_version);
 
-            for (boolean streaming : new boolean[] {false, true}) {
-                Config.enable_table_meta_streaming_json = streaming;
-                verifyRoundTrip(false, false);
-                verifyRoundTrip(false, true);
-                verifyRoundTrip(true, false);
-                verifyRoundTrip(true, true);
-            }
+            verifyRoundTrip(false, false);
+            verifyRoundTrip(false, true);
+            verifyRoundTrip(true, false);
+            verifyRoundTrip(true, true);
         } finally {
             Config.backup_meta_reserve_replica_info = savedConfig;
             Config.enable_table_meta_streaming_json = savedStreaming;
@@ -121,9 +118,18 @@ public class BackupMetaTest {
         byte[] streamingBytes = serialize(backupMeta, true);
         Assert.assertArrayEquals(legacyBytes, streamingBytes);
 
-        BackupMeta restoredMeta = BackupMeta.fromBytes(
-                Config.enable_table_meta_streaming_json ? legacyBytes : streamingBytes,
-                FeConstants.meta_version);
+        for (byte[] bytes : new byte[][] {legacyBytes, streamingBytes}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_table_meta_streaming_json = streamingRead;
+                assertRestoredMeta(BackupMeta.fromBytes(bytes, FeConstants.meta_version),
+                        cloudTablet, reserveReplica);
+            }
+        }
+
+        Assert.assertEquals(1, sourceTablet.getReplicas().size());
+    }
+
+    private void assertRestoredMeta(BackupMeta restoredMeta, boolean cloudTablet, boolean reserveReplica) {
         Table restoredTableByName = restoredMeta.getTable(TABLE_NAME);
         Assert.assertSame(restoredTableByName, restoredMeta.getTable(TABLE_ID));
         Assert.assertTrue(restoredTableByName instanceof OlapTable);
@@ -140,8 +146,6 @@ public class BackupMetaTest {
             Assert.assertEquals(cloudTablet, restoredReplica instanceof CloudReplica);
             Assert.assertEquals(!cloudTablet, restoredReplica instanceof LocalReplica);
         }
-
-        Assert.assertEquals(1, sourceTablet.getReplicas().size());
     }
 
     private byte[] serialize(BackupMeta backupMeta, boolean streaming) throws Exception {
