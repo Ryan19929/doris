@@ -226,15 +226,21 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
         }
 
         RuntimeTypeAdapterFactory.resetStreamingWrapperCountersForTest();
+        long capabilityProbes = RuntimeTypeAdapterFactory.optionalStreamSettingCapabilityProbesForTest();
+        Assert.assertEquals(4, capabilityProbes);
         String json = gson.toJson(shapes, SHAPE_LIST_TYPE);
         Assert.assertEquals(1, RuntimeTypeAdapterFactory.writerWrapperConstructionsForTest());
         Assert.assertEquals(1, RuntimeTypeAdapterFactory.writerWrapperPoolSizeForTest());
+        Assert.assertEquals(capabilityProbes,
+                RuntimeTypeAdapterFactory.optionalStreamSettingCapabilityProbesForTest());
         Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
 
         List<Shape> restored = gson.fromJson(json, SHAPE_LIST_TYPE);
         Assert.assertEquals(shapes.size(), restored.size());
         Assert.assertEquals(1, RuntimeTypeAdapterFactory.readerWrapperConstructionsForTest());
         Assert.assertEquals(1, RuntimeTypeAdapterFactory.readerWrapperPoolSizeForTest());
+        Assert.assertEquals(capabilityProbes,
+                RuntimeTypeAdapterFactory.optionalStreamSettingCapabilityProbesForTest());
         Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
     }
 
