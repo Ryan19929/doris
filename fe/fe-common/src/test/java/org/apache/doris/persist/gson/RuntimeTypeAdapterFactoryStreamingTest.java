@@ -25,14 +25,25 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParseException;
 import com.google.gson.annotations.SerializedName;
+import com.google.gson.reflect.TypeToken;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.lang.reflect.Type;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class RuntimeTypeAdapterFactoryStreamingTest {
+    private static final Type SHAPE_LIST_TYPE = new TypeToken<List<Shape>>() { }.getType();
+
     public abstract static class Shape {
         @SerializedName("n")
         public String name;
@@ -95,6 +106,11 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
         circle.table.put(1L, 2L, "v12");
         circle.table.put(1L, 3L, "v13");
         return circle;
+    }
+
+    @After
+    public void clearStreamingWrapperPools() {
+        RuntimeTypeAdapterFactory.resetStreamingWrapperCountersForTest();
     }
 
     @Test
@@ -194,6 +210,110 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
             Assert.fail("expected JsonParseException");
         } catch (JsonParseException e) {
             Assert.assertTrue(e.getMessage(), e.getMessage().contains("already defines a field named clazz"));
+        }
+    }
+
+    @Test
+    public void testLargeCollectionReusesOneWrapperPerDirection() {
+        AtomicBoolean streaming = new AtomicBoolean(true);
+        Gson gson = newGson(newFactory(streaming));
+        List<Shape> shapes = new ArrayList<>();
+        for (int i = 0; i < 2000; i++) {
+            Rectangle rectangle = new Rectangle();
+            rectangle.width = i;
+            rectangle.height = i + 1;
+            shapes.add(rectangle);
+        }
+
+        RuntimeTypeAdapterFactory.resetStreamingWrapperCountersForTest();
+        String json = gson.toJson(shapes, SHAPE_LIST_TYPE);
+        Assert.assertEquals(1, RuntimeTypeAdapterFactory.writerWrapperConstructionsForTest());
+        Assert.assertEquals(1, RuntimeTypeAdapterFactory.writerWrapperPoolSizeForTest());
+        Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
+
+        List<Shape> restored = gson.fromJson(json, SHAPE_LIST_TYPE);
+        Assert.assertEquals(shapes.size(), restored.size());
+        Assert.assertEquals(1, RuntimeTypeAdapterFactory.readerWrapperConstructionsForTest());
+        Assert.assertEquals(1, RuntimeTypeAdapterFactory.readerWrapperPoolSizeForTest());
+        Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
+    }
+
+    @Test
+    public void testNestedWrappersAreBoundedByPoolLimit() {
+        AtomicBoolean streaming = new AtomicBoolean(true);
+        Gson gson = newGson(newFactory(streaming));
+        Circle root = new Circle();
+        Circle current = root;
+        for (int i = 0; i < 80; i++) {
+            Circle nested = new Circle();
+            current.inner = nested;
+            current = nested;
+        }
+        Rectangle leaf = new Rectangle();
+        leaf.width = 7;
+        current.inner = leaf;
+
+        RuntimeTypeAdapterFactory.resetStreamingWrapperCountersForTest();
+        String json = gson.toJson(root, Shape.class);
+        Assert.assertEquals(64, RuntimeTypeAdapterFactory.writerWrapperPoolSizeForTest());
+        Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
+
+        Shape restored = gson.fromJson(json, Shape.class);
+        Assert.assertTrue(restored instanceof Circle);
+        Assert.assertEquals(64, RuntimeTypeAdapterFactory.readerWrapperPoolSizeForTest());
+        Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
+    }
+
+    @Test
+    public void testExceptionReleasesWrapperForNextOperation() {
+        AtomicBoolean streaming = new AtomicBoolean(true);
+        Gson gson = newGson(newFactory(streaming));
+
+        assertJsonFailure(gson, "{\"clazz\":\"Circle\",\"clazz\":\"Rectangle\"}", "duplicate fields");
+        Circle restored = (Circle) gson.fromJson(gson.toJson(buildCircle(), Shape.class), Shape.class);
+        Assert.assertTrue(restored.inner instanceof Rectangle);
+        Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
+
+        try {
+            gson.toJson(new ConflictingShape(), Shape.class);
+            Assert.fail("expected JsonParseException");
+        } catch (JsonParseException e) {
+            Assert.assertTrue(e.getMessage(), e.getMessage().contains("already defines a field named clazz"));
+        }
+        Assert.assertTrue(gson.toJson(buildCircle(), Shape.class).startsWith("{\"clazz\":\"Circle\","));
+        Assert.assertFalse(RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest());
+    }
+
+    @Test
+    public void testStreamingWrapperPoolsAreThreadIsolated() throws Exception {
+        AtomicBoolean streaming = new AtomicBoolean(true);
+        Gson gson = newGson(newFactory(streaming));
+        int threadCount = 8;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<Boolean>> futures = new ArrayList<>();
+        for (int thread = 0; thread < threadCount; thread++) {
+            futures.add(executor.submit(() -> {
+                start.await();
+                for (int iteration = 0; iteration < 50; iteration++) {
+                    Circle circle = buildCircle();
+                    String json = gson.toJson(circle, Shape.class);
+                    Circle restored = (Circle) gson.fromJson(json, Shape.class);
+                    if (!(restored.inner instanceof Rectangle) || !circle.table.equals(restored.table)) {
+                        return false;
+                    }
+                }
+                return !RuntimeTypeAdapterFactory.streamingWrapperPoolRetainsPayloadForTest();
+            }));
+        }
+        start.countDown();
+        try {
+            for (Future<Boolean> future : futures) {
+                Assert.assertTrue(future.get(30, TimeUnit.SECONDS));
+            }
+        } finally {
+            executor.shutdownNow();
+            Assert.assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
         }
     }
 
