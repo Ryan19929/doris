@@ -11,14 +11,15 @@
 - 本地实现分支（均未合入 `master`）：
   - PR 1：`codex/backup-strip-replica-info` @ `04cb7272895`
   - PR 2：`codex/backup-journal-size-counting` @ `c9b930bcfec`
-  - PR 3：`codex/streaming-gson-foundation` @ `7c92546e7ac`
-  - PR 4：`codex/restore-job-streaming` @ `c1840fd2ff3`
-  - PR 5：`codex/backup-meta-streaming` @ `2d0a750a0d2`
+  - PR 3：`codex/streaming-gson-foundation` @ `46d6fa0aae4`
+  - PR 4：`codex/restore-job-streaming` @ `7ad57e168b0`
+  - PR 5：`codex/backup-meta-streaming` @ `02a5d1017a7`
   - 验证分支：`codex/backup-memory-benchmark` @ `8b830a04599`
 
 PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
-`master`。验证分支包含 benchmark、OOM 传播修复和 spillable buffer 设计修正，需完成远端
-复测后再回迁到对应生产分支。
+`master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和受控 spill
+已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；真实集群 E2E、
+多 FE replay 和 200 万压力验证仍未完成。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
@@ -59,9 +60,9 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 | --- | --- | --- | --- | --- |
 | 1 | Replica 剥离 | 修复并完善 apache/doris#65321 | 无 | 本地实现分支完成；完整门禁未完成 |
 | 2 | Journal size 计数 | 使用计数流替代完整缓冲 | 无 | 本地实现完成；定向 FE UT 2/2 通过 |
-| 3 | Streaming Gson 基础设施 | Guava 与多态 TypeAdapter 的流式实现 | 无 | 本地实现分支完成；完整兼容矩阵未完成 |
-| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 | 本地实现分支完成；Restore E2E/重启未完成 |
-| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 | 本地实现与 spill 修正完成；远端复测中 |
+| 3 | Streaming Gson 基础设施 | Guava 与多态 TypeAdapter 的流式实现 | 无 | 兼容矩阵 20/20 通过；FE 全量门禁未完成 |
+| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 | 9 状态兼容矩阵 5/5 通过；Restore E2E/重启未完成 |
+| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 | 兼容矩阵 16/16、spill helper 11/11 通过；E2E 未完成 |
 | 6 | 默认开启与最终验证 | 根据兼容性和压力测试结果开启默认配置 | PR 1—5 | 未开始 |
 
 PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5，避免多个 PR 同时修改 `GsonUtils`、`RuntimeTypeAdapterFactory` 和 `AbstractJob`。
@@ -159,16 +160,16 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 
 ### 测试矩阵
 
-- [ ] tree writer → tree reader。
-- [ ] tree writer → streaming reader。
-- [ ] streaming writer → tree reader。
-- [ ] streaming writer → streaming reader。
-- [ ] null、empty、单元素和大规模 Table/Multimap。
-- [ ] 嵌套泛型和不同 key/value 类型。
-- [ ] type 字段在首位、中间和末尾。
-- [ ] legacy payload 缺少 type 字段。
-- [ ] 未知 type、重复 type、截断 JSON 和错误字段类型明确失败。
-- [ ] `GsonSerializationTest` 覆盖 master 注册的所有相关适配器。
+- [x] tree writer → tree reader。
+- [x] tree writer → streaming reader。
+- [x] streaming writer → tree reader。
+- [x] streaming writer → streaming reader。
+- [x] null、empty、单元素和大规模 Table/Multimap。
+- [x] 嵌套泛型和不同 key/value 类型。
+- [x] type 字段在首位、中间和末尾。
+- [x] legacy payload 缺少 type 字段。
+- [x] 未知 type、重复 type、截断 JSON 和错误字段类型明确失败。
+- [x] `GsonSerializationTest` 覆盖 master 注册的所有相关适配器。
 
 ### 合入门槛
 
@@ -195,13 +196,14 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 
 ### Replay 与生命周期测试
 
-- [ ] PENDING 状态写入、读取和 replay。
-- [ ] SNAPSHOTING 状态写入、读取和 replay。
-- [ ] DOWNLOAD/SNAPSHOT/DOWNLOAD_FINISHED 等包含大映射的状态。
-- [ ] FINISHED/CANCELLED 终态 replay。
+- [x] PENDING、CREATING、SNAPSHOTING 状态四象限写入/读取。
+- [x] DOWNLOAD、DOWNLOADING、COMMIT、COMMITTING 大映射状态四象限写入/读取。
+- [x] FINISHED、CANCELLED 终态四象限写入/读取。
+- [x] `JournalEntity.readFields` 对 legacy/streaming 两种输出和两种 reader 配置兼容。
+- [ ] `EditLog.loadJournal`/`BackupHandler.replayAddJob` 真实 replay。
 - [ ] Master 写入后 Follower replay。
-- [ ] 配置开启写入后关闭配置读取。
-- [ ] 配置关闭写入后开启配置读取。
+- [x] 配置开启写入后关闭配置读取。
+- [x] 配置关闭写入后开启配置读取。
 - [ ] FE 重启后 RestoreJob 能继续运行或保持正确终态。
 
 ### 双向兼容矩阵
@@ -264,14 +266,27 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
   上限、close 后失败、序列化/目标写入失败清理、不可用临时目录及 suppressed cleanup 异常。
 - [x] spill 修正后的 FE 定向测试、Checkstyle 与 20 万 tablet 五阶段复测。
 
-- [ ] Table/OlapTable 旧写新读、新写旧读。
-- [ ] BackupMeta 文件旧写新读、新写旧读。
-- [ ] BackupJobInfo 文件内容及 UTF-8 行为不变。
+- [x] Table/OlapTable legacy/streaming writer × reader 四象限及原始字节一致。
+- [x] BackupMeta 文件 legacy/streaming writer × reader 四象限及原始字节一致。
+- [x] BackupJobInfo 文件四象限、原始字节及 UTF-8 行为不变。
 - [ ] BackupJob editlog write/read/replay。
 - [ ] image/checkpoint 中包含大型 OlapTable 时可正常生成和加载。
-- [ ] 默认 subtype 的 legacy Table/Partition/Tablet/Replica JSON 可读取。
-- [ ] Replica 剥离后的空 LocalTablet/CloudTablet 可被新旧 reader 读取。
+- [x] 默认 subtype、兼容 label 和非首位 type 的 legacy Table/Partition/Tablet/Replica JSON 可读取。
+- [x] Replica 剥离后的空 LocalTablet/CloudTablet 可被两种 reader 配置读取。
 - [ ] 部分分区、rollup、colocate、动态分区和 Cloud Tablet 元数据 round-trip。
+
+### 兼容矩阵验证记录（2026-07-17）
+
+- PR 3 `46d6fa0aae4`：`RuntimeTypeAdapterFactoryStreamingTest` 与
+  `GsonUtilsBaseStreamingCollectionTest` 共 20/20，通过四象限、2000 项复杂 Table/Multimap、
+  type 首/中/末、default subtype 和错误输入矩阵；Checkstyle 0。
+- PR 4 `7ad57e168b0`：Linux 官方 thirdparty、Maven 3.9.14、JDK 17 下
+  `BackupRestoreJobStreamingJsonConfigTest` 5/5，25-module reactor `BUILD SUCCESS`；覆盖全部
+  9 个 RestoreJob 状态、1024-cell 活跃状态、压缩 CloudRestoreJob 和 `JournalEntity.readFields`。
+- PR 5 `02a5d1017a7`：同一 Linux 环境运行 DeepCopy、TableMeta、Restore/Backup job、
+  BackupMeta、BackupJobInfo 五类测试共 16/16，25-module reactor `BUILD SUCCESS`；另有
+  `LengthPrefixedJsonStreamTest` 11/11。这里的 replay 证据只到 `JournalEntity.readFields`，不包含
+  `EditLog.loadJournal`、`BackupHandler`、Follower 或重启路径。
 
 ### 合入门槛
 
@@ -484,12 +499,13 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 ### 阶段 C：流式基础设施
 
 - [x] 提取并完成 master 适配后的通用实现分支。
-- [ ] 完成 PR 3 全部兼容性测试。
+- [x] 完成 PR 3 基础设施兼容矩阵（20/20）。
 - [ ] 合入后再创建 Restore/Backup 业务 PR。
 
 ### 阶段 D：Restore
 
 - [x] 完成 PR 4 本地实现分支。
+- [x] 完成全部状态与配置切换的单元兼容矩阵（5/5）。
 - [ ] 验证 RestoreJob replay 和中途重启。
 - [ ] 提供大 RestoreJob before/after 数据。
 
@@ -497,6 +513,7 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 
 - [x] 从组合实现中拆出 PR 1、2、3、4 的独立职责。
 - [x] 完成 PR 5 流式 deep copy、持久化迁移与 spillable buffer 本地实现。
+- [x] 完成 Table/BackupMeta/BackupJobInfo/job 压缩路径兼容矩阵（16/16）。
 - [ ] 完成 BACKUP/RESTORE/restart 端到端验证。
 
 ### 阶段 F：默认开启
