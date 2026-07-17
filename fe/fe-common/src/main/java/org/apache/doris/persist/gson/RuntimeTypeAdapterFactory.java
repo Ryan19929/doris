@@ -36,10 +36,13 @@ import com.google.gson.stream.JsonWriter;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -185,6 +188,16 @@ import java.util.function.BooleanSupplier;
  * </pre>
  */
 public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
+    // Pools are per thread and per root stream. Released wrappers clear every payload reference,
+    // the root stream is weakly referenced, and only the first 64 nesting levels remain cached.
+    private static final int MAX_POOLED_STREAM_WRAPPERS = 64;
+    private static final ThreadLocal<WriterWrapperPool> WRITER_WRAPPER_POOL =
+            ThreadLocal.withInitial(WriterWrapperPool::new);
+    private static final ThreadLocal<ReaderWrapperPool> READER_WRAPPER_POOL =
+            ThreadLocal.withInitial(ReaderWrapperPool::new);
+    private static final AtomicLong WRITER_WRAPPER_CONSTRUCTIONS = new AtomicLong();
+    private static final AtomicLong READER_WRAPPER_CONSTRUCTIONS = new AtomicLong();
+
     private final Class<?> baseType;
     private final String typeFieldName;
     private final Map<String, Class<?>> labelToSubtype = new LinkedHashMap<String, Class<?>>();
@@ -193,6 +206,33 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
     private final boolean maintainType;
     private Class<? extends T> defaultType = null;
     private BooleanSupplier streamingDispatchEnabled = () -> false;
+
+    static void resetStreamingWrapperCountersForTest() {
+        WRITER_WRAPPER_CONSTRUCTIONS.set(0);
+        READER_WRAPPER_CONSTRUCTIONS.set(0);
+        WRITER_WRAPPER_POOL.remove();
+        READER_WRAPPER_POOL.remove();
+    }
+
+    static long writerWrapperConstructionsForTest() {
+        return WRITER_WRAPPER_CONSTRUCTIONS.get();
+    }
+
+    static long readerWrapperConstructionsForTest() {
+        return READER_WRAPPER_CONSTRUCTIONS.get();
+    }
+
+    static int writerWrapperPoolSizeForTest() {
+        return WRITER_WRAPPER_POOL.get().size();
+    }
+
+    static int readerWrapperPoolSizeForTest() {
+        return READER_WRAPPER_POOL.get().size();
+    }
+
+    static boolean streamingWrapperPoolRetainsPayloadForTest() {
+        return WRITER_WRAPPER_POOL.get().retainsPayload() || READER_WRAPPER_POOL.get().retainsPayload();
+    }
 
     private static void copyOptionalStreamSetting(Object source, Object target, String getterName,
             String setterName) {
@@ -392,7 +432,13 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
                 }
                 String label = in.nextString();
                 TypeAdapter<R> delegate = delegateForLabel(label);
-                return delegate.read(new EnteredObjectJsonReader(in, typeFieldName, baseType));
+                ReaderWrapperPool pool = READER_WRAPPER_POOL.get();
+                EnteredObjectJsonReader wrapper = pool.acquire(in, typeFieldName, baseType);
+                try {
+                    return delegate.read(wrapper);
+                } finally {
+                    pool.release(wrapper);
+                }
             }
 
             private R readLegacyObject(JsonReader in, String firstName) throws IOException {
@@ -448,7 +494,13 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
                             "cannot serialize " + srcType.getName() + "; did you forget to register a subtype?");
                 }
                 if (streamingDispatchEnabled.getAsBoolean()) {
-                    delegate.write(new TypeFieldInjectingJsonWriter(out, typeFieldName, label, srcType), value);
+                    WriterWrapperPool pool = WRITER_WRAPPER_POOL.get();
+                    TypeFieldInjectingJsonWriter wrapper = pool.acquire(out, typeFieldName, label, srcType);
+                    try {
+                        delegate.write(wrapper, value);
+                    } finally {
+                        pool.release(wrapper);
+                    }
                     return;
                 }
                 JsonObject jsonObject = delegate.toJsonTree(value).getAsJsonObject();
@@ -474,6 +526,125 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         }.nullSafe();
     }
 
+    private static final class WriterWrapperPool {
+        private final ArrayList<TypeFieldInjectingJsonWriter> wrappers = new ArrayList<>();
+        private WeakReference<JsonWriter> rootWriter = new WeakReference<>(null);
+        private int activeDepth;
+
+        private TypeFieldInjectingJsonWriter acquire(JsonWriter delegate, String typeFieldName,
+                String label, Class<?> srcType) {
+            if (activeDepth == 0 && rootWriter.get() != delegate) {
+                wrappers.clear();
+                rootWriter = new WeakReference<>(delegate);
+            }
+            int acquisitionDepth = activeDepth;
+            TypeFieldInjectingJsonWriter wrapper;
+            if (acquisitionDepth < MAX_POOLED_STREAM_WRAPPERS) {
+                if (wrappers.size() == acquisitionDepth) {
+                    wrappers.add(new TypeFieldInjectingJsonWriter());
+                    WRITER_WRAPPER_CONSTRUCTIONS.incrementAndGet();
+                }
+                wrapper = wrappers.get(acquisitionDepth);
+            } else {
+                wrapper = new TypeFieldInjectingJsonWriter();
+                WRITER_WRAPPER_CONSTRUCTIONS.incrementAndGet();
+            }
+            try {
+                wrapper.acquire(delegate, typeFieldName, label, srcType, acquisitionDepth);
+                activeDepth++;
+                return wrapper;
+            } catch (RuntimeException | Error failure) {
+                wrapper.release();
+                throw failure;
+            }
+        }
+
+        private void release(TypeFieldInjectingJsonWriter wrapper) {
+            if (activeDepth == 0) {
+                throw new AssertionError("streaming writer wrapper pool is empty");
+            }
+            int releasedDepth = activeDepth - 1;
+            if (releasedDepth != wrapper.acquisitionDepth
+                    || (releasedDepth < MAX_POOLED_STREAM_WRAPPERS && wrappers.get(releasedDepth) != wrapper)) {
+                throw new AssertionError("streaming writer wrappers must be released in LIFO order");
+            }
+            wrapper.release();
+            activeDepth = releasedDepth;
+        }
+
+        private int size() {
+            return wrappers.size();
+        }
+
+        private boolean retainsPayload() {
+            for (TypeFieldInjectingJsonWriter wrapper : wrappers) {
+                if (wrapper.retainsPayload()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    private static final class ReaderWrapperPool {
+        private final ArrayList<EnteredObjectJsonReader> wrappers = new ArrayList<>();
+        private WeakReference<JsonReader> rootReader = new WeakReference<>(null);
+        private int activeDepth;
+
+        private EnteredObjectJsonReader acquire(JsonReader delegate, String typeFieldName, Class<?> baseType) {
+            if (activeDepth == 0 && rootReader.get() != delegate) {
+                wrappers.clear();
+                rootReader = new WeakReference<>(delegate);
+            }
+            int acquisitionDepth = activeDepth;
+            EnteredObjectJsonReader wrapper;
+            if (acquisitionDepth < MAX_POOLED_STREAM_WRAPPERS) {
+                if (wrappers.size() == acquisitionDepth) {
+                    wrappers.add(new EnteredObjectJsonReader());
+                    READER_WRAPPER_CONSTRUCTIONS.incrementAndGet();
+                }
+                wrapper = wrappers.get(acquisitionDepth);
+            } else {
+                wrapper = new EnteredObjectJsonReader();
+                READER_WRAPPER_CONSTRUCTIONS.incrementAndGet();
+            }
+            try {
+                wrapper.acquire(delegate, typeFieldName, baseType, acquisitionDepth);
+                activeDepth++;
+                return wrapper;
+            } catch (RuntimeException | Error failure) {
+                wrapper.release();
+                throw failure;
+            }
+        }
+
+        private void release(EnteredObjectJsonReader wrapper) {
+            if (activeDepth == 0) {
+                throw new AssertionError("streaming reader wrapper pool is empty");
+            }
+            int releasedDepth = activeDepth - 1;
+            if (releasedDepth != wrapper.acquisitionDepth
+                    || (releasedDepth < MAX_POOLED_STREAM_WRAPPERS && wrappers.get(releasedDepth) != wrapper)) {
+                throw new AssertionError("streaming reader wrappers must be released in LIFO order");
+            }
+            wrapper.release();
+            activeDepth = releasedDepth;
+        }
+
+        private int size() {
+            return wrappers.size();
+        }
+
+        private boolean retainsPayload() {
+            for (EnteredObjectJsonReader wrapper : wrappers) {
+                if (wrapper.retainsPayload()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     private static final class TypeFieldInjectingJsonWriter extends JsonWriter {
         private static final Writer UNUSED_WRITER = new Writer() {
             @Override
@@ -492,25 +663,47 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
             }
         };
 
-        private final JsonWriter delegate;
-        private final String typeFieldName;
-        private final String label;
-        private final Class<?> srcType;
-        private int depth = 0;
-        private boolean typeFieldWritten = false;
+        private JsonWriter delegate;
+        private String typeFieldName;
+        private String label;
+        private Class<?> srcType;
+        private int acquisitionDepth = -1;
+        private int depth;
+        private boolean typeFieldWritten;
 
-        TypeFieldInjectingJsonWriter(JsonWriter delegate, String typeFieldName, String label, Class<?> srcType) {
+        private TypeFieldInjectingJsonWriter() {
             super(UNUSED_WRITER);
+        }
+
+        private void acquire(JsonWriter delegate, String typeFieldName, String label, Class<?> srcType,
+                int acquisitionDepth) {
             this.delegate = delegate;
             this.typeFieldName = typeFieldName;
             this.label = label;
             this.srcType = srcType;
+            this.acquisitionDepth = acquisitionDepth;
+            depth = 0;
+            typeFieldWritten = false;
             setLenient(delegate.isLenient());
             setHtmlSafe(delegate.isHtmlSafe());
             setSerializeNulls(delegate.getSerializeNulls());
             // Gson 2.11+ adds final stream configuration methods which cannot be overridden.
             copyOptionalStreamSetting(delegate, this, "getFormattingStyle", "setFormattingStyle");
             copyOptionalStreamSetting(delegate, this, "getStrictness", "setStrictness");
+        }
+
+        private void release() {
+            delegate = null;
+            typeFieldName = null;
+            label = null;
+            srcType = null;
+            acquisitionDepth = -1;
+            depth = 0;
+            typeFieldWritten = false;
+        }
+
+        private boolean retainsPayload() {
+            return delegate != null || typeFieldName != null || label != null || srcType != null;
         }
 
         private void requireInsideObject() {
@@ -672,21 +865,41 @@ public final class RuntimeTypeAdapterFactory<T> implements TypeAdapterFactory {
         static void ensureInternalAccessHookInstalled() {
         }
 
-        private final JsonReader delegate;
-        private final String typeFieldName;
-        private final Class<?> baseType;
-        private boolean topObjectEntered = false;
-        private int depth = 0;
+        private JsonReader delegate;
+        private String typeFieldName;
+        private Class<?> baseType;
+        private int acquisitionDepth = -1;
+        private boolean topObjectEntered;
+        private int depth;
 
-        EnteredObjectJsonReader(JsonReader delegate, String typeFieldName, Class<?> baseType) {
+        private EnteredObjectJsonReader() {
             super(UNUSED_READER);
+        }
+
+        private void acquire(JsonReader delegate, String typeFieldName, Class<?> baseType, int acquisitionDepth) {
             this.delegate = delegate;
             this.typeFieldName = typeFieldName;
             this.baseType = baseType;
+            this.acquisitionDepth = acquisitionDepth;
+            topObjectEntered = false;
+            depth = 0;
             setLenient(delegate.isLenient());
             // Gson 2.11+ adds final stream configuration methods which cannot be overridden.
             copyOptionalStreamSetting(delegate, this, "getStrictness", "setStrictness");
             copyOptionalStreamSetting(delegate, this, "getNestingLimit", "setNestingLimit");
+        }
+
+        private void release() {
+            delegate = null;
+            typeFieldName = null;
+            baseType = null;
+            acquisitionDepth = -1;
+            topObjectEntered = false;
+            depth = 0;
+        }
+
+        private boolean retainsPayload() {
+            return delegate != null || typeFieldName != null || baseType != null;
         }
 
         @Override
