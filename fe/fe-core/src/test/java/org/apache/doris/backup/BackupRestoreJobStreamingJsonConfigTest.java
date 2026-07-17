@@ -249,15 +249,19 @@ public class BackupRestoreJobStreamingJsonConfigTest {
 
     private static void assertLargeFields(RestoreJob expected, RestoreJob actual) throws Exception {
         Assert.assertEquals(expected.getState(), actual.getState());
-        Assert.assertEquals(getField(expected, "showState"), getField(actual, "showState"));
+        Assert.assertEquals(expected.showState, actual.showState);
         Assert.assertEquals(expected.isBeingSynced(), actual.isBeingSynced());
         assertSnapshotInfos(expected.snapshotInfos, actual.snapshotInfos);
-        Assert.assertEquals(getField(expected, "restoredVersionInfo"), getField(actual, "restoredVersionInfo"));
+        Table<Long, Long, Long> expectedVersionInfo = getField(expected, "restoredVersionInfo");
+        Table<Long, Long, Long> actualVersionInfo = getField(actual, "restoredVersionInfo");
+        Assert.assertEquals(expectedVersionInfo, actualVersionInfo);
     }
 
     private static void assertCloudRestoreJob(CloudRestoreJob expected, CloudRestoreJob actual) throws Exception {
         Assert.assertEquals(expected.getLabel(), actual.getLabel());
-        Assert.assertEquals(getField(expected, "storageVaultName"), getField(actual, "storageVaultName"));
+        String expectedStorageVaultName = getField(expected, "storageVaultName");
+        String actualStorageVaultName = getField(actual, "storageVaultName");
+        Assert.assertEquals(expectedStorageVaultName, actualStorageVaultName);
         assertLargeFields(expected, actual);
     }
 
