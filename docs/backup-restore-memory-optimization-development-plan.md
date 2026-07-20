@@ -4,7 +4,7 @@
 
 - 状态：执行中（核心实现、兼容矩阵、四阶段中断重启、checkpoint/image 跨配置恢复、
   Follower/Observer replay、运行中角色切换、特殊元数据矩阵和 200 万压力测试已完成；
-  大 RestoreJob 三次独立 fork 对照已完成；其余 before/after 性能证据和上游门禁未完成）
+  20 万五阶段和大 RestoreJob 三次独立 fork 对照已完成；journal size counting 对照和上游门禁未完成）
 - 目标分支：Apache Doris `master`
 - 相关实现：
   - HYDCP/hy-doris#49：RestoreJob Guava Table/Multimap 流式 JSON 序列化
@@ -41,9 +41,9 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；co
 | Streaming 基础设施 | 已完成 | PR 3 兼容矩阵 20/20，通过 wrapper 复用和 Gson capability probe 缓存消除逐对象异常分配 |
 | RestoreJob | 状态矩阵、四阶段 restart、Follower/Observer replay 和 failover 已完成 | DOWNLOADING 停原 Leader 后 legacy Follower 接管至 FINISHED；旧 Leader 成功回归 |
 | BackupMeta/Table | 三阶段实现完成 | streaming deep copy/持久化、受控 spill、兼容性与异常清理；PR 5 矩阵 16/16、spill helper 11/11 |
-| 容量与性能 | 20 万快速基准、200 万压力矩阵和大 RestoreJob reader 对照完成 | 2 GiB 下 20 万七阶段、16 GiB 下 200 万七阶段均通过；60 万 snapshot mapping 的 streaming reader 峰值中位数较 legacy 低 80.17% |
+| 容量与性能 | 20 万重复矩阵、200 万压力矩阵和大 RestoreJob reader 对照完成 | 20 万五阶段三次 fork 的 peak delta 降低 5.78%—88.19%；60 万 snapshot mapping 的 streaming reader 峰值中位数较 legacy 低 80.17% |
 | 真实功能 | 单 FE/单 BE E2E、四阶段中断重启、checkpoint 跨配置恢复和特殊元数据矩阵完成 | Restore 均 FINISHED，数据校验不变；colocate/动态分区及 Replica true/false 通过，Cloud 子类型完成定向 UT |
-| 上游就绪度 | 尚未满足 | 缺少稳定 before/after、最新 master rebase 和完整 CI |
+| 上游就绪度 | 尚未满足 | 缺少 journal size counting 对照、最新 master rebase 和完整 CI |
 
 ### 相关 PR 状态
 
@@ -74,15 +74,16 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；co
    `reserve_replica=true/false`、`backup_meta_reserve_replica_info=true/false` 和 20 万 tablet
    BackupHandler checkpoint image。真实 CloudRestoreJob E2E 留待具备 MetaService 的 Cloud 环境执行。
 
-P0 正确性门禁和 200 万 tablet 容量门禁已完成，但在稳定 before/after、最新 master rebase 和完整 CI 通过前，
+P0 正确性门禁、200 万 tablet 容量门禁和核心 streaming before/after 已完成，但在 journal size
+counting 对照、最新 master rebase 和完整 CI 通过前，
 仍不默认开启 streaming，也不把 Cloud 子类型单元矩阵等同于真实 CloudRestoreJob E2E。
 
 ### P1：建立可用于上游评审的性能证据
 
 1. [已完成] 执行 200 万 tablets × 3 replicas 七阶段压力基准，16 GiB heap 下均无 OOM，
    fixture 与 spill 文件均无残留。
-2. 对 spill 修正后的 20 万 tablet before/after 矩阵进行多次独立 fork，报告中位数、GC、retained
-   heap 和 JFR allocation，而不是使用单次 sampled peak 声明比例。
+2. [已完成] 对 spill 修正后的 20 万 tablet before/after 五阶段矩阵各运行三次独立 fork，报告
+   sampled peak、耗时、GC 和 retained heap 中位数；`journal_replay` 另有 JFR allocation 归因。
 3. [已完成] 增加大 RestoreJob benchmark，覆盖 snapshot mapping 和 commit mapping 主导场景；
    reader 的 streaming/legacy 对照各运行三次独立 fork，并报告中位数。
 4. 补充 journal size counting 的旧缓冲/计数流 heap、allocation 和耗时对照。
@@ -442,34 +443,48 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
   能输出结构化 `status=oom` 后以 OOME 失败。
 - 当前远端机器同时运行其他 FE/BE 进程，单次 10 ms heap sampler 和耗时数据会受 GC/调度影响。
   在获得隔离资源、至少三次 fork 中位数和 JFR allocation 数据前，不使用这些数字声明性能比例。
-- 未完成：spill 修正后 20 万 before/after 重复矩阵、JFR allocation 和 journal size counting 对照。
+- 未完成：journal size counting 的旧缓冲/计数流对照。
 
 正式 Maven heap 参数为 `-Dfe.ut.max.heap=2g`，固定初始堆可额外使用
 `-Dfe.ut.extra.jvm.args=-Xms2g`；不能再使用 `-DargLine` 覆盖 fe-core 的默认 heap。
 
-### Wrapper 复用与受控 spill 复测（2026-07-17）
+### Wrapper 复用、capability probe 缓存与受控 spill 复测（2026-07-20）
 
-验证分支在 `ef668e62d5b`（每个对象新建 reader/writer wrapper）和
-`a40946deb14c`（wrapper pool + Doris 临时目录 spill）之间执行同口径对照。数据规模为
-20 万 tablets × 3 replicas，`full_streaming`，每个阶段使用独立 JVM 和
-`-Xms2g/-Xmx2g`。reader 两个阶段各运行 3 次并取 sampled heap peak 中位数；其余阶段目前
-只有单次结果，因此不能用来声明稳定的性能比例。
+验证分支在 `ef668e62d5b`（受控 spill 已存在，但每个对象新建 reader/writer wrapper）和
+`8b830a04599`（wrapper pool + capability probe cache + Doris 临时目录 spill）之间执行同口径
+对照。数据规模为 20 万 tablets × 3 replicas，`full_streaming`，每个阶段使用独立 JVM 和
+`-Xms2g/-Xmx2g`。五个阶段、两个版本各运行 3 次，共 30 个 benchmark JVM；下表均为中位数。
 
-| 阶段 | 优化前 peak delta | 优化后 peak delta | 变化 | 结论 |
-| --- | ---: | ---: | ---: | --- |
-| `selective_copy` | 1,382,918,656 | 1,361,285,632 | -1.56% | 容量通过；峰值小幅下降 |
-| `backup_meta_write` | 1,316,725,552 | 1,316,084,512 | -0.05% | 峰值基本不变 |
-| `backup_meta_read`（3 次中位数） | 1,287,651,328 | 1,170,210,816 | -9.12% | reader wrapper 复用有效 |
-| `journal_write` | 1,316,256,064 | 1,315,268,896 | -0.08% | 峰值基本不变 |
-| `journal_replay`（3 次中位数） | 1,287,651,328 | 1,288,699,904 | +0.08% | 峰值不变，仍有其他主导内存 |
+| 阶段 | 优化前 peak delta | 优化后 peak delta | peak 变化 | 优化前 elapsed | 优化后 elapsed | elapsed 变化 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `selective_copy` | 1,366,549,496 | 1,287,525,504 | -5.78% | 62,551 ms | 15,157 ms | -75.77% |
+| `backup_meta_write` | 1,316,712,808 | 841,793,024 | -36.07% | 9,367 ms | 3,239 ms | -65.42% |
+| `backup_meta_read` | 1,287,651,328 | 152,043,520 | -88.19% | 6,484 ms | 639 ms | -90.14% |
+| `journal_write` | 1,315,670,912 | 868,023,144 | -34.02% | 10,109 ms | 3,266 ms | -67.69% |
+| `journal_replay` | 1,286,602,752 | 153,092,096 | -88.10% | 7,039 ms | 706 ms | -89.97% |
+
+| 阶段 | 优化前 retained delta | 优化后 retained delta | 优化前 GC count/time | 优化后 GC count/time |
+| --- | ---: | ---: | ---: | ---: |
+| `selective_copy` | 54,259,976 | 54,336,776 | 16 / 344 ms | 7 / 116 ms |
+| `backup_meta_write` | 13,251,136 | 13,220,008 | 3 / 16 ms | 2 / 14 ms |
+| `backup_meta_read` | 41,208,024 | 41,069,936 | 1 / 25 ms | 0 / 0 ms |
+| `journal_write` | 13,232,728 | 13,242,024 | 3 / 17 ms | 2 / 13 ms |
+| `journal_replay` | 41,211,416 | 41,074,552 | 1 / 35 ms | 0 / 0 ms |
+
+两版本使用的五阶段 benchmark 代码没有差异；对照只改变 streaming 基础设施实现。测试仍在共享
+主机上顺序执行，elapsed 会受背景 CPU 调度影响，因此耗时比例作为实验室方向性证据，不作为
+生产 SLA。reader 的峰值和 GC 结论同时得到下一节独立 JFR allocation 归因支持；10 ms sampled
+peak 仍不是精确总分配量。
 
 - 五个阶段均在 2 GiB heap 下通过；BackupMeta 与 journal payload 分别保持 19,802,039 和
-  19,802,331 bytes，说明 wrapper 复用与 spill 路径没有改变持久化字节规模。
+  19,802,331 bytes，说明 wrapper 复用、capability probe 缓存与 spill 路径没有改变持久化字节规模。
+- 优化前后 retained delta 基本不变，说明最终 Table/BackupJob 对象图没有变化；主要收益来自减少
+  瞬时 wrapper、异常栈和中间对象。两个 reader 阶段测量区间 GC 均从 1 次降为 0。
 - 大集合单测中连续处理 2,000 个多态对象，每个方向只构造 1 个 wrapper；另有嵌套深度上限
   64、异常恢复、释放强引用和 8 线程隔离测试。
 - spill 文件位于 `Config.tmp_dir/backup_restore_json_spill`，使用单次 UUID `CREATE_NEW` 和
   `DELETE_ON_CLOSE` channel。Linux OpenJDK 17 探针确认打开、回放、关闭期间目录均无可见残留；
-  200k 五阶段运行结束后 Java tmp 和 Doris spill 文件计数均为 0。
+  本次 30 个 200k JVM 运行结束后 Java tmp 和 Doris spill 文件计数均为 0。
 - 合并后的定向测试在目标机通过：`fe-common` 25/25、`fe-core` 16/16，完整 25 模块 reactor
   `BUILD SUCCESS`，Checkstyle 0 violations；补充临时目录失败测试后 spill suite 为 11/11。
 - 本机 `run-fe-ut.sh` 因该 worktree 缺少 `thirdparty/installed/bin/protoc` 未能启动；同一测试已在
@@ -800,7 +815,8 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 - [x] 完成 wrapper 复用前后 reader/replay 三次 fork 对照和 spill 残留验证。
 - [x] 完成 `journal_replay` JFR allocation 根因分析、修复及三次复测。
 - [x] 完成大 RestoreJob streaming/legacy reader 三次独立 fork 对照。
-- [ ] 完成 spill 修正后的 20 万 before/after 重复基准与 JFR allocation 分析。
+- [x] 完成 spill 修正后的 20 万五阶段 before/after 三次重复基准，并结合 `journal_replay`
+  JFR allocation 分析。
 - [x] 完成 200 万 tablet 压力基准。
 - [x] 完成多 FE replay 和回退演练。
 - [ ] 提交 PR 6 或在 reviewer 同意后确认默认开启。
@@ -820,9 +836,9 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 ## 剩余预计周期
 
 截至 2026-07-20，在不计算 reviewer 等待和全量 CI 排队的情况下，剩余验证和上游整理预计需要
-2—4 个工作日：
+1.5—3 个工作日：
 
-- 20 万重复 before/after/JFR 和 journal size counting 对照：1—2 日。
+- journal size counting 的旧缓冲/计数流对照：0.5—1 日。
 - 如上游要求真实 CloudRestoreJob 证据，在具备 MetaService 的 Cloud 环境补测：0.5—1 日。
 - rebase、拆分 PR 自验证、PR 模板和 CI 问题整理：1—2 日。
 
