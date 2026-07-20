@@ -80,6 +80,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
@@ -138,7 +139,6 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
      */
     private final Object localJobDirLock = new Object();
     private int localJobDirReaders = 0;
-    private boolean localJobDirCleanupPending = false;
     private boolean localJobDirCleaned = false;
     // backup properties && table commit seq with table id
     @SerializedName("prop")
@@ -412,7 +412,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
     @Override
     public synchronized void replayRun() {
-        if (state == BackupJobState.SAVE_META) {
+        // Checkpoint replay only reconstructs state for the image. Writing staging files
+        // here recreates directories that were already cleaned by the serving FE.
+        if (state == BackupJobState.SAVE_META && !Env.isCheckpointThread()) {
             saveMetaInfo(true);
         }
     }
@@ -1078,8 +1080,6 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             env.getBackupHandler().addSnapshot(label, this);
             return;
         }
-
-        cleanupLocalJobDir();
     }
 
     private boolean uploadFile(String localFilePath, String remoteFilePath) {
@@ -1141,8 +1141,6 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             default:
                 break;
         }
-
-        cleanupLocalJobDir();
 
         // meta info and job info not need save in log when cancel, we need to clean them here
         backupMeta = null;
@@ -1212,7 +1210,6 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         }
 
         if (expiredSnapshot != null) {
-            cleanupLocalJobDir();
             return expiredSnapshot;
         }
 
@@ -1259,18 +1256,20 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         }
     }
 
-    void cleanupLocalJobDirIfNecessary(long nowMs) {
+    /**
+     * Cancelled and remote finished jobs have no staging value, while a local finished
+     * snapshot must remain available until its configured expiration time.
+     */
+    boolean cleanupLocalJobDirIfNecessary(long nowMs) {
         boolean shouldCleanup;
         synchronized (this) {
-            if (repoId != Repository.KEEP_ON_LOCAL_REPO_ID) {
-                shouldCleanup = isDone();
-            } else {
-                shouldCleanup = isCancelled() || (isFinished() && nowMs >= createTime + timeoutMs);
-            }
+            shouldCleanup = isCancelled() || (isFinished() && (repoId != Repository.KEEP_ON_LOCAL_REPO_ID
+                    || nowMs >= createTime + timeoutMs));
         }
         if (shouldCleanup) {
-            cleanupLocalJobDir();
+            return cleanupLocalJobDir();
         }
+        return true;
     }
 
     /**
@@ -1278,32 +1277,32 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
      * Local snapshot lifetime is bounded by both {@link #timeoutMs} and
      * {@code max_backup_restore_job_num_per_db} queue eviction.
      */
-    void cleanupLocalJobDirAfterRemoved() {
+    boolean cleanupLocalJobDirAfterRemoved() {
         boolean shouldCleanup;
         synchronized (this) {
             shouldCleanup = isDone();
         }
         if (shouldCleanup) {
-            cleanupLocalJobDir();
+            return cleanupLocalJobDir();
         }
+        return true;
     }
 
     /**
      * Delete local staging dir when no getSnapshot reader is active; otherwise defer
-     * until the last reader releases. Must not run heavy IO while holding the job monitor
-     * for longer than the brief synchronized callers already do — deletion itself uses
-     * {@link #localJobDirLock} only.
+     * until a later backup handler cleanup cycle after the last reader releases.
+     * Deletion uses {@link #localJobDirLock} only and never runs while holding the job
+     * monitor or on the getSnapshot RPC thread.
      */
-    private void cleanupLocalJobDir() {
+    private boolean cleanupLocalJobDir() {
         synchronized (localJobDirLock) {
             if (localJobDirCleaned) {
-                return;
+                return true;
             }
             if (localJobDirReaders > 0) {
-                localJobDirCleanupPending = true;
-                return;
+                return false;
             }
-            cleanupLocalJobDirUnderLock();
+            return cleanupLocalJobDirUnderLock();
         }
     }
 
@@ -1323,39 +1322,54 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     private void releaseLocalJobDirRead() {
         synchronized (localJobDirLock) {
             localJobDirReaders--;
-            if (localJobDirReaders == 0 && localJobDirCleanupPending) {
-                cleanupLocalJobDirUnderLock();
-            }
         }
     }
 
     /** Caller must hold {@link #localJobDirLock}. */
-    private void cleanupLocalJobDirUnderLock() {
-        localJobDirCleanupPending = false;
+    private boolean cleanupLocalJobDirUnderLock() {
         Path jobDirPath = getLocalJobDirPathForCleanup();
         if (jobDirPath == null) {
             localJobDirCleaned = true;
-            return;
+            return true;
         }
         Path normalizedJobDirPath = jobDirPath.toAbsolutePath().normalize();
         if (!isValidLocalJobDirForCleanup(normalizedJobDirPath)) {
             LOG.warn("skip cleaning invalid backup job dir: {}. {}", normalizedJobDirPath, this);
-            return;
+            localJobDirCleaned = true;
+            return true;
         }
+        long cleanupStartNanos = System.nanoTime();
         try {
             File jobDir = normalizedJobDirPath.toFile();
             if (jobDir.exists()) {
                 deleteLocalJobDir(normalizedJobDirPath);
-                LOG.info("cleaned backup job dir: {}. {}", normalizedJobDirPath, this);
+                LOG.info("cleaned backup job dir: {}, elapsed_ms={}. {}", normalizedJobDirPath,
+                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cleanupStartNanos), this);
             }
             localJobDirPath = null;
+            localMetaInfoFilePath = null;
+            localJobInfoFilePath = null;
             localJobDirCleaned = true;
+            return true;
         } catch (Exception e) {
-            LOG.warn("failed to clean the backup job dir: {}. {}", normalizedJobDirPath, this, e);
+            LOG.warn("failed to clean the backup job dir: {}, elapsed_ms={}. {}", normalizedJobDirPath,
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cleanupStartNanos), this, e);
+            return false;
+        }
+    }
+
+    Path getLocalJobDirPath() {
+        synchronized (localJobDirLock) {
+            Path jobDirPath = getLocalJobDirPathForCleanup();
+            return jobDirPath == null ? null : jobDirPath.toAbsolutePath().normalize();
         }
     }
 
     void deleteLocalJobDir(Path jobDirPath) throws IOException {
+        deleteLocalJobDirRecursively(jobDirPath);
+    }
+
+    static void deleteLocalJobDirRecursively(Path jobDirPath) throws IOException {
         try (Stream<Path> paths = Files.walk(jobDirPath)) {
             List<Path> pathsToDelete = paths.sorted(Comparator.reverseOrder()).collect(Collectors.toList());
             for (Path path : pathsToDelete) {

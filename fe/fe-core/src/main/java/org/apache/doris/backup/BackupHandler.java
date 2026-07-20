@@ -73,6 +73,8 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Deque;
@@ -87,6 +89,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class BackupHandler extends MasterDaemon implements Writable {
     private static final Logger LOG = LogManager.getLogger(BackupHandler.class);
@@ -104,6 +107,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
     // If the last job is finished, user can get the job info from repository. If the last job is cancelled,
     // user can get the error message before submitting the next one.
     private final Map<Long, Deque<AbstractJob>> dbIdToBackupOrRestoreJobs = new HashMap<>();
+    // Evicted terminal jobs remain here until their staging directories are cleaned.
+    // Protected by jobLock and not persisted.
+    private final Deque<BackupJob> pendingCleanupJobs = new LinkedList<>();
+    // Accessed only by the backup handler daemon thread.
+    private long lastOrphanJobDirCleanupTimeMs = 0;
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
@@ -203,7 +211,13 @@ public class BackupHandler extends MasterDaemon implements Writable {
             job.setEnv(env);
             job.run();
         }
-        cleanupBackupJobLocalJobDirs();
+        long nowMs = System.currentTimeMillis();
+        long cleanupStartNanos = System.nanoTime();
+        CleanupStats currentJobStats = cleanupBackupJobLocalJobDirs(nowMs);
+        CleanupStats pendingJobStats = cleanupPendingBackupJobLocalJobDirs();
+        CleanupStats orphanStats = cleanupOrphanBackupJobLocalJobDirsIfNecessary(nowMs);
+        long cleanupElapsedMs = elapsedMillis(cleanupStartNanos);
+        logCleanupStats(currentJobStats, pendingJobStats, orphanStats, cleanupElapsedMs);
     }
 
     // handle create repository stmt
@@ -661,6 +675,14 @@ public class BackupHandler extends MasterDaemon implements Writable {
                 jobs.removeLast();
             }
             jobs.addLast(job);
+
+            if (!Env.isCheckpointThread()) {
+                for (BackupJob removedBackupJob : removedBackupJobs) {
+                    if (removedBackupJob.isDone()) {
+                        pendingCleanupJobs.addLast(removedBackupJob);
+                    }
+                }
+            }
         } finally {
             jobLock.unlock();
         }
@@ -676,7 +698,6 @@ public class BackupHandler extends MasterDaemon implements Writable {
             if (removedBackupJob.isLocalSnapshot()) {
                 removeSnapshot(removedBackupJob.getLabel());
             }
-            removedBackupJob.cleanupLocalJobDirAfterRemoved();
         }
     }
 
@@ -699,12 +720,226 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
     }
 
-    private void cleanupBackupJobLocalJobDirs() {
-        long nowMs = System.currentTimeMillis();
+    private CleanupStats cleanupBackupJobLocalJobDirs(long nowMs) {
+        long startNanos = System.nanoTime();
+        CleanupStats stats = new CleanupStats(true);
         for (AbstractJob job : getAllJobs()) {
             if (job instanceof BackupJob) {
-                ((BackupJob) job).cleanupLocalJobDirIfNecessary(nowMs);
+                stats.itemsScanned++;
+                BackupJob backupJob = (BackupJob) job;
+                Path jobDirBeforeCleanup = backupJob.getLocalJobDirPath();
+                boolean cleanupCompleted = backupJob.cleanupLocalJobDirIfNecessary(nowMs);
+                if (jobDirBeforeCleanup != null && backupJob.getLocalJobDirPath() == null) {
+                    stats.directoriesCleaned++;
+                } else if (!cleanupCompleted) {
+                    stats.deferredOrFailed++;
+                }
             }
+        }
+        stats.elapsedMs = elapsedMillis(startNanos);
+        return stats;
+    }
+
+    private CleanupStats cleanupPendingBackupJobLocalJobDirs() {
+        long startNanos = System.nanoTime();
+        CleanupStats stats = new CleanupStats(true);
+        List<BackupJob> pendingJobs;
+        jobLock.lock();
+        try {
+            pendingJobs = Lists.newArrayList(pendingCleanupJobs);
+        } finally {
+            jobLock.unlock();
+        }
+
+        for (BackupJob pendingJob : pendingJobs) {
+            stats.itemsScanned++;
+            Path jobDirBeforeCleanup = pendingJob.getLocalJobDirPath();
+            if (pendingJob.cleanupLocalJobDirAfterRemoved()) {
+                if (jobDirBeforeCleanup != null && pendingJob.getLocalJobDirPath() == null) {
+                    stats.directoriesCleaned++;
+                }
+                jobLock.lock();
+                try {
+                    pendingCleanupJobs.removeFirstOccurrence(pendingJob);
+                } finally {
+                    jobLock.unlock();
+                }
+            } else {
+                stats.deferredOrFailed++;
+            }
+        }
+        jobLock.lock();
+        try {
+            stats.remainingItems = pendingCleanupJobs.size();
+        } finally {
+            jobLock.unlock();
+        }
+        stats.elapsedMs = elapsedMillis(startNanos);
+        return stats;
+    }
+
+    private CleanupStats cleanupOrphanBackupJobLocalJobDirsIfNecessary(long nowMs) {
+        long cleanupIntervalSecond = Config.backup_orphan_dir_cleanup_interval_second;
+        if (cleanupIntervalSecond <= 0) {
+            return CleanupStats.notRun();
+        }
+        long cleanupIntervalMs = TimeUnit.SECONDS.toMillis(cleanupIntervalSecond);
+        if (lastOrphanJobDirCleanupTimeMs != 0
+                && nowMs >= lastOrphanJobDirCleanupTimeMs
+                && nowMs - lastOrphanJobDirCleanupTimeMs < cleanupIntervalMs) {
+            return CleanupStats.notRun();
+        }
+        lastOrphanJobDirCleanupTimeMs = nowMs;
+        return cleanupOrphanBackupJobLocalJobDirs(nowMs);
+    }
+
+    private CleanupStats cleanupOrphanBackupJobLocalJobDirs(long nowMs) {
+        long startNanos = System.nanoTime();
+        CleanupStats stats = new CleanupStats(true);
+        Path backupRootDir = BACKUP_ROOT_DIR.toAbsolutePath().normalize();
+        if (!Files.isDirectory(backupRootDir, LinkOption.NOFOLLOW_LINKS)) {
+            stats.elapsedMs = elapsedMillis(startNanos);
+            return stats;
+        }
+        if (Config.backup_orphan_dir_keep_max_second <= 0) {
+            LOG.warn("skip orphan backup staging directory cleanup because "
+                    + "backup_orphan_dir_keep_max_second is not positive: {}",
+                    Config.backup_orphan_dir_keep_max_second);
+            stats.elapsedMs = elapsedMillis(startNanos);
+            return stats;
+        }
+
+        Set<Path> referencedJobDirs = getReferencedBackupJobDirs(backupRootDir);
+        long orphanExpireBeforeMs = nowMs
+                - TimeUnit.SECONDS.toMillis(Config.backup_orphan_dir_keep_max_second);
+        try {
+            for (Path repoDir : listChildDirectories(backupRootDir)) {
+                if (!repoDir.getFileName().toString().startsWith("repo__")) {
+                    continue;
+                }
+                stats.containersScanned++;
+                cleanupOrphanJobDirsInRepo(repoDir, referencedJobDirs, orphanExpireBeforeMs, stats);
+            }
+        } catch (IOException e) {
+            stats.failures++;
+            LOG.warn("failed to scan backup root dir for orphan staging directories: {}", backupRootDir, e);
+        }
+        stats.elapsedMs = elapsedMillis(startNanos);
+        return stats;
+    }
+
+    private Set<Path> getReferencedBackupJobDirs(Path backupRootDir) {
+        List<BackupJob> backupJobs = Lists.newArrayList();
+        jobLock.lock();
+        try {
+            for (Deque<AbstractJob> jobs : dbIdToBackupOrRestoreJobs.values()) {
+                for (AbstractJob job : jobs) {
+                    if (job instanceof BackupJob) {
+                        backupJobs.add((BackupJob) job);
+                    }
+                }
+            }
+            backupJobs.addAll(pendingCleanupJobs);
+        } finally {
+            jobLock.unlock();
+        }
+
+        Set<Path> referencedJobDirs = Sets.newHashSet();
+        for (BackupJob backupJob : backupJobs) {
+            Path jobDir = backupJob.getLocalJobDirPath();
+            if (jobDir != null && jobDir.startsWith(backupRootDir) && !jobDir.equals(backupRootDir)) {
+                referencedJobDirs.add(jobDir);
+            }
+        }
+        return referencedJobDirs;
+    }
+
+    private void cleanupOrphanJobDirsInRepo(Path repoDir, Set<Path> referencedJobDirs,
+                                            long orphanExpireBeforeMs, CleanupStats stats) {
+        List<Path> jobDirs;
+        try {
+            jobDirs = listChildDirectories(repoDir);
+        } catch (IOException e) {
+            stats.failures++;
+            LOG.warn("failed to scan backup repo dir for orphan staging directories: {}", repoDir, e);
+            return;
+        }
+
+        for (Path jobDir : jobDirs) {
+            stats.itemsScanned++;
+            long cleanupStartNanos = System.nanoTime();
+            try {
+                Path normalizedJobDir = jobDir.toAbsolutePath().normalize();
+                if (referencedJobDirs.contains(normalizedJobDir)
+                        || Files.getLastModifiedTime(normalizedJobDir, LinkOption.NOFOLLOW_LINKS).toMillis()
+                                > orphanExpireBeforeMs) {
+                    continue;
+                }
+                BackupJob.deleteLocalJobDirRecursively(normalizedJobDir);
+                stats.directoriesCleaned++;
+                LOG.info("cleaned orphan backup job dir: {}, elapsed_ms={}", normalizedJobDir,
+                        elapsedMillis(cleanupStartNanos));
+            } catch (IOException e) {
+                stats.failures++;
+                LOG.warn("failed to clean orphan backup job dir: {}, elapsed_ms={}", jobDir,
+                        elapsedMillis(cleanupStartNanos), e);
+            }
+        }
+    }
+
+    private void logCleanupStats(CleanupStats currentJobStats, CleanupStats pendingJobStats,
+                                 CleanupStats orphanStats, long totalElapsedMs) {
+        String message = "backup staging cleanup cycle finished: current_jobs_scanned={}, "
+                + "current_dirs_cleaned={}, current_deferred_or_failed={}, current_elapsed_ms={}, "
+                + "pending_jobs_scanned={}, pending_dirs_cleaned={}, pending_deferred_or_failed={}, "
+                + "pending_jobs_remaining={}, pending_elapsed_ms={}, orphan_ran={}, "
+                + "orphan_repo_dirs_scanned={}, orphan_job_dirs_scanned={}, orphan_dirs_cleaned={}, "
+                + "orphan_failures={}, orphan_elapsed_ms={}, total_elapsed_ms={}, daemon_interval_ms={}";
+        Object[] params = new Object[] {
+                currentJobStats.itemsScanned, currentJobStats.directoriesCleaned,
+                currentJobStats.deferredOrFailed, currentJobStats.elapsedMs,
+                pendingJobStats.itemsScanned, pendingJobStats.directoriesCleaned,
+                pendingJobStats.deferredOrFailed, pendingJobStats.remainingItems, pendingJobStats.elapsedMs,
+                orphanStats.ran, orphanStats.containersScanned, orphanStats.itemsScanned,
+                orphanStats.directoriesCleaned, orphanStats.failures, orphanStats.elapsedMs, totalElapsedMs,
+                Config.backup_handler_update_interval_millis
+        };
+        if (totalElapsedMs >= Config.backup_handler_update_interval_millis) {
+            LOG.warn(message, params);
+        } else if (currentJobStats.directoriesCleaned > 0 || pendingJobStats.itemsScanned > 0 || orphanStats.ran) {
+            LOG.info(message, params);
+        } else {
+            LOG.debug(message, params);
+        }
+    }
+
+    private static long elapsedMillis(long startNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+    }
+
+    private static class CleanupStats {
+        private final boolean ran;
+        private int containersScanned;
+        private int itemsScanned;
+        private int directoriesCleaned;
+        private int deferredOrFailed;
+        private int failures;
+        private int remainingItems;
+        private long elapsedMs;
+
+        private CleanupStats(boolean ran) {
+            this.ran = ran;
+        }
+
+        private static CleanupStats notRun() {
+            return new CleanupStats(false);
+        }
+    }
+
+    private List<Path> listChildDirectories(Path parentDir) throws IOException {
+        try (Stream<Path> paths = Files.list(parentDir)) {
+            return paths.filter(path -> Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS))
+                    .collect(Collectors.toList());
         }
     }
 
