@@ -62,7 +62,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -92,7 +94,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * </pre>
  *
  * <p>Run exactly one stage and scenario in each forked JVM. Valid stages are {@code selective_copy},
- * {@code backup_meta_write}, {@code backup_meta_read}, {@code journal_write}, and {@code journal_replay}.
+ * {@code backup_meta_write}, {@code backup_meta_read}, {@code journal_write}, {@code journal_replay},
+ * {@code handler_image_write}, and {@code handler_image_replay}.
  * Reader stages accept {@code doris.benchmark.read_table_streaming} and
  * {@code doris.benchmark.read_job_streaming} for mixed writer/reader compatibility measurements. Use
  * {@code -Dfe.ut.extra.jvm.args=...} for optional JVM flags such as JFR recording; this is composed with the
@@ -143,6 +146,7 @@ public class BackupRestoreMemoryBenchmark {
         Path tempDirectory = null;
         Path backupMetaFile = null;
         Path journalFile = null;
+        Path handlerImageFile = null;
         Map<String, Object> metrics = new LinkedHashMap<>();
         metrics.put("stage", stage.propertyValue);
         metrics.put("scenario", scenario.propertyValue);
@@ -163,6 +167,7 @@ public class BackupRestoreMemoryBenchmark {
             tempDirectory = Files.createTempDirectory("doris-backup-memory-benchmark-");
             backupMetaFile = tempDirectory.resolve("backup-meta.bin");
             journalFile = tempDirectory.resolve("backup-job.journal");
+            handlerImageFile = tempDirectory.resolve("backup-handler.image");
             outOfMemoryResult = buildMinimalFailureResult(
                     "oom", stage, scenario, tabletCount, replicaCount, maxHeap, tempDirectory.toString());
             Config.backup_meta_reserve_replica_info = scenario.reserveReplicas;
@@ -170,7 +175,7 @@ public class BackupRestoreMemoryBenchmark {
             Config.enable_backup_restore_job_streaming_json = scenario.jobStreaming;
             Config.backup_job_compressed_serialization = false;
             runStage(stage, scenario, tabletCount, replicaCount, readTableStreaming, readJobStreaming,
-                    backupMetaFile, journalFile, metrics);
+                    backupMetaFile, journalFile, handlerImageFile, metrics);
         } catch (OutOfMemoryError e) {
             failure = e;
             outOfMemory = true;
@@ -184,7 +189,7 @@ public class BackupRestoreMemoryBenchmark {
         }
 
         if (outOfMemory) {
-            cleanupAfterOutOfMemory(backupMetaFile, journalFile, tempDirectory);
+            cleanupAfterOutOfMemory(backupMetaFile, journalFile, handlerImageFile, tempDirectory);
         } else if (tempDirectory != null) {
             try {
                 deleteRecursively(tempDirectory);
@@ -221,7 +226,7 @@ public class BackupRestoreMemoryBenchmark {
 
     private static void runStage(Stage stage, Scenario scenario, int tabletCount, int replicaCount,
             boolean readTableStreaming, boolean readJobStreaming, Path backupMetaFile, Path journalFile,
-            Map<String, Object> metrics) throws Throwable {
+            Path handlerImageFile, Map<String, Object> metrics) throws Throwable {
         long expectedReplicas = scenario.reserveReplicas ? (long) tabletCount * replicaCount : 0L;
         switch (stage) {
             case SELECTIVE_COPY:
@@ -242,6 +247,14 @@ public class BackupRestoreMemoryBenchmark {
             case JOURNAL_REPLAY:
                 runJournalReplayStage(scenario, tabletCount, replicaCount, expectedReplicas,
                         readTableStreaming, readJobStreaming, journalFile, metrics);
+                return;
+            case HANDLER_IMAGE_WRITE:
+                runHandlerImageWriteStage(scenario, tabletCount, replicaCount, expectedReplicas,
+                        handlerImageFile, metrics);
+                return;
+            case HANDLER_IMAGE_REPLAY:
+                runHandlerImageReplayStage(scenario, tabletCount, replicaCount, expectedReplicas,
+                        readTableStreaming, readJobStreaming, handlerImageFile, metrics);
                 return;
             default:
                 throw new AssertionError("unhandled benchmark stage: " + stage);
@@ -331,6 +344,40 @@ public class BackupRestoreMemoryBenchmark {
         verifyBackupJob(restored, tabletCount, expectedReplicas);
     }
 
+    private static void runHandlerImageWriteStage(Scenario scenario, int tabletCount, int replicaCount,
+            long expectedReplicas, Path file, Map<String, Object> metrics) throws Throwable {
+        long setupStart = System.nanoTime();
+        BackupJob backupJob = createDetachedBackupJob(scenario, tabletCount, replicaCount, expectedReplicas);
+        BackupHandler handler = createBackupHandler(backupJob);
+        metrics.put("setup_ms", elapsedMillis(setupStart));
+
+        measure(metrics, () -> {
+            writeHandlerImage(file, handler);
+            return null;
+        });
+
+        metrics.put("payload_bytes", Files.size(file));
+        metrics.put("writer_table_streaming", scenario.tableStreaming);
+        metrics.put("writer_job_streaming", scenario.jobStreaming);
+    }
+
+    private static void runHandlerImageReplayStage(Scenario scenario, int tabletCount, int replicaCount,
+            long expectedReplicas, boolean readTableStreaming, boolean readJobStreaming, Path file,
+            Map<String, Object> metrics) throws Throwable {
+        long setupStart = System.nanoTime();
+        prepareHandlerImageFixture(scenario, tabletCount, replicaCount, expectedReplicas, file);
+        Config.enable_table_meta_streaming_json = readTableStreaming;
+        Config.enable_backup_restore_job_streaming_json = readJobStreaming;
+        metrics.put("setup_ms", elapsedMillis(setupStart));
+        metrics.put("payload_bytes", Files.size(file));
+        metrics.put("fixture_writer_table_streaming", true);
+        metrics.put("fixture_writer_job_streaming", true);
+
+        BackupHandler restored = measure(metrics, () -> readHandlerImage(file));
+
+        verifyBackupHandler(restored, tabletCount, expectedReplicas);
+    }
+
     private static BackupMeta createDetachedBackupMeta(Scenario scenario, int tabletCount, int replicaCount,
             long expectedReplicas) {
         OlapTable table = createTable(tabletCount, replicaCount, scenario.reserveReplicas);
@@ -373,6 +420,22 @@ public class BackupRestoreMemoryBenchmark {
             Config.enable_table_meta_streaming_json = true;
             Config.enable_backup_restore_job_streaming_json = true;
             writeJournal(file, createBackupJournalEntity(backupJob));
+        } finally {
+            Config.enable_table_meta_streaming_json = previousTableStreaming;
+            Config.enable_backup_restore_job_streaming_json = previousJobStreaming;
+        }
+    }
+
+    private static void prepareHandlerImageFixture(Scenario scenario, int tabletCount, int replicaCount,
+            long expectedReplicas, Path file) throws IOException, ReflectiveOperationException {
+        BackupJob backupJob = createDetachedBackupJob(scenario, tabletCount, replicaCount, expectedReplicas);
+        BackupHandler handler = createBackupHandler(backupJob);
+        boolean previousTableStreaming = Config.enable_table_meta_streaming_json;
+        boolean previousJobStreaming = Config.enable_backup_restore_job_streaming_json;
+        try {
+            Config.enable_table_meta_streaming_json = true;
+            Config.enable_backup_restore_job_streaming_json = true;
+            writeHandlerImage(file, handler);
         } finally {
             Config.enable_table_meta_streaming_json = previousTableStreaming;
             Config.enable_backup_restore_job_streaming_json = previousJobStreaming;
@@ -492,6 +555,22 @@ public class BackupRestoreMemoryBenchmark {
         field.set(job, backupMeta);
     }
 
+    private static BackupHandler createBackupHandler(BackupJob job) throws ReflectiveOperationException {
+        BackupHandler handler = new BackupHandler();
+        Deque<AbstractJob> dbJobs = new LinkedList<>();
+        dbJobs.add(job);
+        getBackupHandlerJobs(handler).put(job.getDbId(), dbJobs);
+        return handler;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Long, Deque<AbstractJob>> getBackupHandlerJobs(BackupHandler handler)
+            throws ReflectiveOperationException {
+        Field field = BackupHandler.class.getDeclaredField("dbIdToBackupOrRestoreJobs");
+        field.setAccessible(true);
+        return (Map<Long, Deque<AbstractJob>>) field.get(handler);
+    }
+
     private static JournalEntity createBackupJournalEntity(BackupJob job) {
         JournalEntity entity = new JournalEntity();
         entity.setOpCode(OperationType.OP_BACKUP_JOB);
@@ -515,15 +594,42 @@ public class BackupRestoreMemoryBenchmark {
         return restored;
     }
 
+    private static void writeHandlerImage(Path file, BackupHandler handler) throws IOException {
+        try (DataOutputStream output = new DataOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(file)))) {
+            handler.write(output);
+        }
+    }
+
+    private static BackupHandler readHandlerImage(Path file) throws IOException {
+        BackupHandler restored = new BackupHandler();
+        try (DataInputStream input = new DataInputStream(
+                new BufferedInputStream(Files.newInputStream(file)))) {
+            restored.readFields(input);
+        }
+        return restored;
+    }
+
     private static void verifyBackupJob(JournalEntity restored, int expectedTablets, long expectedReplicas) {
         Assert.assertEquals(OperationType.OP_BACKUP_JOB, restored.getOpCode());
         Assert.assertTrue(restored.getData() instanceof BackupJob);
         BackupMeta backupMeta = ((BackupJob) restored.getData()).getBackupMeta();
         Assert.assertNotNull(backupMeta);
-        Table table = backupMeta.getTable(TABLE_ID);
-        Assert.assertTrue(table instanceof OlapTable);
-        Assert.assertEquals(expectedTablets, countTablets((OlapTable) table));
-        Assert.assertEquals(expectedReplicas, countReplicas((OlapTable) table));
+        verifyBackupMeta(backupMeta, expectedTablets, expectedReplicas);
+    }
+
+    private static void verifyBackupHandler(BackupHandler restored, int expectedTablets,
+            long expectedReplicas) throws ReflectiveOperationException {
+        Map<Long, Deque<AbstractJob>> jobs = getBackupHandlerJobs(restored);
+        Assert.assertEquals(1, jobs.size());
+        Deque<AbstractJob> dbJobs = jobs.get(DB_ID);
+        Assert.assertNotNull(dbJobs);
+        Assert.assertEquals(1, dbJobs.size());
+        AbstractJob restoredJob = dbJobs.getFirst();
+        Assert.assertTrue(restoredJob instanceof BackupJob);
+        BackupMeta backupMeta = ((BackupJob) restoredJob).getBackupMeta();
+        Assert.assertNotNull(backupMeta);
+        verifyBackupMeta(backupMeta, expectedTablets, expectedReplicas);
     }
 
     private static void forceFullGc() throws InterruptedException {
@@ -623,9 +729,11 @@ public class BackupRestoreMemoryBenchmark {
                 + GsonUtils.GSON.toJson(tempDirectory) + "}";
     }
 
-    private static void cleanupAfterOutOfMemory(Path backupMetaFile, Path journalFile, Path tempDirectory) {
+    private static void cleanupAfterOutOfMemory(Path backupMetaFile, Path journalFile,
+            Path handlerImageFile, Path tempDirectory) {
         deleteAfterOutOfMemory(backupMetaFile);
         deleteAfterOutOfMemory(journalFile);
+        deleteAfterOutOfMemory(handlerImageFile);
         deleteAfterOutOfMemory(tempDirectory);
     }
 
@@ -688,7 +796,9 @@ public class BackupRestoreMemoryBenchmark {
         BACKUP_META_WRITE("backup_meta_write"),
         BACKUP_META_READ("backup_meta_read"),
         JOURNAL_WRITE("journal_write"),
-        JOURNAL_REPLAY("journal_replay");
+        JOURNAL_REPLAY("journal_replay"),
+        HANDLER_IMAGE_WRITE("handler_image_write"),
+        HANDLER_IMAGE_REPLAY("handler_image_replay");
 
         private final String propertyValue;
 
@@ -705,7 +815,7 @@ public class BackupRestoreMemoryBenchmark {
             }
             throw new IllegalArgumentException("unknown benchmark stage '" + value
                     + "'; expected selective_copy, backup_meta_write, backup_meta_read, journal_write, "
-                    + "or journal_replay");
+                    + "journal_replay, handler_image_write, or handler_image_replay");
         }
     }
 
