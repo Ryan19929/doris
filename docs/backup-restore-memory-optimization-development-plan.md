@@ -2,8 +2,8 @@
 
 ## 文档状态
 
-- 状态：执行中（核心实现、兼容矩阵、单 FE E2E、四个运行阶段中断重启、checkpoint/image
-  跨配置恢复和 Follower replay 已完成；Observer、压力测试和上游合入门禁未完成）
+- 状态：执行中（核心实现、兼容矩阵、四阶段中断重启、checkpoint/image 跨配置恢复、
+  Follower/Observer replay 和运行中角色切换已完成；特殊元数据、压力测试和上游门禁未完成）
 - 目标分支：Apache Doris `master`
 - 相关实现：
   - HYDCP/hy-doris#49：RestoreJob Guava Table/Multimap 流式 JSON 序列化
@@ -22,8 +22,9 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 `master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和受控 spill
 已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；单 FE/单 BE 的
 真实 BACKUP/RESTORE E2E、RestoreJob 在四个运行阶段的 FE 重启续跑，以及 streaming writer
-生成 checkpoint 后由 legacy reader 加载，以及 Leader streaming writer → Follower legacy reader
-的实时 replay 均已完成；Observer replay、特殊元数据矩阵和 200 万压力验证仍未完成。
+生成 checkpoint 后由 legacy reader 加载、Leader streaming writer → Follower/Observer legacy
+reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；特殊元数据矩阵和 200 万压力
+验证仍未完成。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
@@ -35,11 +36,11 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 | --- | --- | --- |
 | 核心实现 | PR 1—5 已完成本地拆分并推送个人远端 | 五个职责分支均有独立提交历史和回退边界 |
 | Streaming 基础设施 | 已完成 | PR 3 兼容矩阵 20/20，通过 wrapper 复用和 Gson capability probe 缓存消除逐对象异常分配 |
-| RestoreJob | 代码、状态矩阵、四阶段单 FE restart 和 Follower replay 已完成 | CREATING/SNAPSHOTING/DOWNLOADING/COMMITTING 中断后均续跑至 FINISHED；跨配置 replay 通过 |
+| RestoreJob | 状态矩阵、四阶段 restart、Follower/Observer replay 和 failover 已完成 | DOWNLOADING 停原 Leader 后 legacy Follower 接管至 FINISHED；旧 Leader 成功回归 |
 | BackupMeta/Table | 三阶段实现完成 | streaming deep copy/持久化、受控 spill、兼容性与异常清理；PR 5 矩阵 16/16、spill helper 11/11 |
 | 容量与性能 | 20 万 tablet 快速基准完成 | 2 GiB heap 下五阶段通过；`journal_replay` 根因经 JFR 定位并复测 |
 | 真实功能 | 单 FE/单 BE E2E、四阶段中断重启和 checkpoint 跨配置恢复完成 | 每次重启后 Restore 均 FINISHED，10 万行校验不变；streaming image 由 legacy reader 加载成功 |
-| 上游就绪度 | 尚未满足 | 缺少 Observer、特殊元数据矩阵、200 万压力、最新 master rebase 和完整 CI |
+| 上游就绪度 | 尚未满足 | 缺少特殊元数据矩阵、200 万压力、最新 master rebase 和完整 CI |
 
 ### 相关 PR 状态
 
@@ -62,10 +63,10 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 
 1. [已完成] RestoreJob 在 `CREATING`、`SNAPSHOTING`、`DOWNLOADING`、`COMMITTING` 阶段
    分别执行 FE 重启，任务均继续运行至正确终态。
-2. 覆盖 `EditLog.loadJournal`、`BackupHandler.replayAddJob`、image load 和 checkpoint 线程，
-   确认 legacy/streaming 两种 payload 都能真实 replay。
-3. Master streaming 写入、Follower legacy replay 和节点间配置不一致已通过；继续补 Observer
-   replay 和角色切换后的运行时回退。
+2. [已完成] 覆盖 `EditLog.loadJournal`、`BackupHandler.replayAddJob`、image load 和 checkpoint
+   线程，确认 legacy/streaming 两种 payload 都能真实 replay。
+3. [已完成] Master streaming 写入、Follower/Observer legacy replay、节点间配置不一致，以及
+   DOWNLOADING 阶段角色切换后的运行时回退。
 4. 补齐 colocate、动态分区、CloudTablet、`reserve_replica=true/false` 和大型 checkpoint 元数据。
 
 这些项目完成前，不默认开启 streaming，也不把单节点 E2E 等同于持久化兼容已经闭环。
@@ -280,7 +281,7 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 - [x] `EditLog.loadJournal`/`BackupHandler.replayAddJob` 自动化 replay；legacy/streaming writer ×
   reader 四组 PENDING → COMMIT 路径均通过。
 - [x] Master 两个 streaming config 开启写入后，两个 config 均关闭的 Follower 实时 replay。
-- [ ] Observer replay 和角色切换。
+- [x] Observer legacy replay、streaming checkpoint image 重启加载和三 electable FE 角色切换。
 - [x] 配置开启写入后关闭配置读取。
 - [x] 配置关闭写入后开启配置读取。
 - [x] FE 在 CREATING、SNAPSHOTING、DOWNLOADING、COMMITTING 阶段重启后，RestoreJob 均从
@@ -387,8 +388,9 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 - [ ] 新旧 writer/reader 兼容矩阵全部通过。
 - [ ] 20 万 tablet 快速基准稳定通过。
 - [ ] 200 万 tablet 压力基准无 OOM。
-- [ ] 至少完成一次 Master/Follower/Observer 重启及 replay 验证。
-- [x] streaming writer → legacy reader 的单 FE restart/image load 与 Follower replay 演练成功。
+- [x] Master/Follower/Observer 重启、replay 和运行中角色切换验证。
+- [x] streaming writer → legacy reader 的单 FE restart/image load、Follower/Observer replay 和
+  角色切换演练成功。
 - [ ] PR 描述包含优化前后数据和已知边界。
 
 ## 性能基准方案
@@ -539,8 +541,8 @@ image load。
 完成 Follower 实验并恢复单 FE 拓扑后，复用同一 10 万行快照，分别在 SNAPSHOTING、
 DOWNLOADING、COMMITTING 状态停止 FE。三次重启后的日志分别显示从 PENDING、DOWNLOAD、
 COMMIT 持久化状态恢复；与先前 CREATING 中断一起，四个目标阶段均续跑至 FINISHED。每轮的
-行数、ID 边界和 SUM 校验都与上述结果一致。由此单 FE 运行中重启矩阵已闭环，Observer 和节点
-角色切换仍待验证。
+行数、ID 边界和 SUM 校验都与上述结果一致。由此单 FE 运行中重启矩阵已闭环；Follower、
+Observer 和节点角色切换结果见后续两节。
 
 ### Follower replay 与节点间配置不一致（2026-07-20）
 
@@ -562,8 +564,28 @@ RestoreJob 的 PENDING、DOWNLOAD、COMMIT、FINISHED；无反序列化或 repla
 Alive，Follower journal 仅落后 2，恢复数据仍为 100000 行、ID 0—99999、总和 4999950000。
 
 该实验完成 Master streaming writer → Follower legacy reader 的真实 edit log replay；Observer
-以及节点角色切换仍待验证。Follower restart/image load 已完成，但该次重启时两节点 config 相同，
-跨配置 image load 的证据来自上一节的单 FE 实验。
+和节点角色切换的独立验证见下一节。Follower restart/image load 已完成，但该次重启时两节点
+config 相同，跨配置 image load 的证据来自上一节的单 FE 实验。
+
+### Observer replay、checkpoint 与运行中角色切换（2026-07-20）
+
+在 Docker bridge 独立 IP 上增加 Observer，确认 `Role=OBSERVER`、`Join=true`、`Alive=true`。
+使用各节点本地配置接口固定 Leader 的两个 streaming config 为 `true`、Observer 均为 `false`，
+通过新 label `codex_observer_mismatch_snapshot` 完成 BACKUP/RESTORE。Observer replayer 日志完整
+记录 BACKUP 的 PENDING、UPLOAD_SNAPSHOT、SAVE_META、UPLOAD_INFO、FINISHED，以及 RestoreJob
+的 PENDING、DOWNLOAD、COMMIT、FINISHED；测试前后配置未变化，journal 差距为 2，10 万行
+数据校验保持不变。
+
+随后临时把 Leader 的 `edit_log_roll_num` 降为 1，生成 `image.51002` 并成功推送至 Observer。
+Observer 在两个 streaming config 仍为 `false` 时重启，主线程明确从 `image.51002` 加载；节点
+恢复 Alive 后 journal 差 1，数据校验仍为 100000 行、ID 0—99999、总和 4999950000。
+
+角色切换使用原 Leader、两个新增 Follower 和一个 Observer。原 Leader 两个 streaming config
+为 `true`，两个候选 Follower 均为 `false`。复用上述快照发起 RESTORE，在 DOWNLOADING 状态
+停止原 Leader；`172.17.0.8` 成为新 Leader，其日志显示从 PENDING、DOWNLOAD journal replay，
+随后完成任务并得到相同数据结果。旧 Leader 重启后作为 Follower 回归，最终一个 Leader、两个
+Follower、一个 Observer 均 Alive，journal 差距为 1。该实验完成 streaming writer → legacy
+reader 在真实选主和运行中任务接管路径上的验证。
 
 ### Branch 3.1 参考基线（2026-07-17）
 
