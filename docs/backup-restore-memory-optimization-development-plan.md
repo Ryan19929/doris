@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-- 状态：执行中（核心实现、兼容矩阵、单 FE E2E、CREATING 中断重启、checkpoint/image
+- 状态：执行中（核心实现、兼容矩阵、单 FE E2E、四个运行阶段中断重启、checkpoint/image
   跨配置恢复和 Follower replay 已完成；Observer、压力测试和上游合入门禁未完成）
 - 目标分支：Apache Doris `master`
 - 相关实现：
@@ -21,9 +21,9 @@
 PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
 `master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和受控 spill
 已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；单 FE/单 BE 的
-真实 BACKUP/RESTORE E2E、RestoreJob 在 CREATING 阶段的 FE 重启续跑，以及 streaming writer
+真实 BACKUP/RESTORE E2E、RestoreJob 在四个运行阶段的 FE 重启续跑，以及 streaming writer
 生成 checkpoint 后由 legacy reader 加载，以及 Leader streaming writer → Follower legacy reader
-的实时 replay 均已完成；其余运行阶段重启、Observer replay 和 200 万压力验证仍未完成。
+的实时 replay 均已完成；Observer replay、特殊元数据矩阵和 200 万压力验证仍未完成。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
@@ -35,11 +35,11 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 | --- | --- | --- |
 | 核心实现 | PR 1—5 已完成本地拆分并推送个人远端 | 五个职责分支均有独立提交历史和回退边界 |
 | Streaming 基础设施 | 已完成 | PR 3 兼容矩阵 20/20，通过 wrapper 复用和 Gson capability probe 缓存消除逐对象异常分配 |
-| RestoreJob | 代码、状态矩阵、单 FE restart 和 Follower replay 已完成 | CREATING 阶段重启后续跑至 FINISHED；Leader=true/Follower=false 跨配置 replay 通过 |
+| RestoreJob | 代码、状态矩阵、四阶段单 FE restart 和 Follower replay 已完成 | CREATING/SNAPSHOTING/DOWNLOADING/COMMITTING 中断后均续跑至 FINISHED；跨配置 replay 通过 |
 | BackupMeta/Table | 三阶段实现完成 | streaming deep copy/持久化、受控 spill、兼容性与异常清理；PR 5 矩阵 16/16、spill helper 11/11 |
 | 容量与性能 | 20 万 tablet 快速基准完成 | 2 GiB heap 下五阶段通过；`journal_replay` 根因经 JFR 定位并复测 |
-| 真实功能 | 单 FE/单 BE E2E、一次中断重启和 checkpoint 跨配置恢复完成 | 10 万行 Restore 在 CREATING 中断，重启后 FINISHED；streaming image 由 legacy reader 加载成功 |
-| 上游就绪度 | 尚未满足 | 缺少其余状态 restart、Observer、200 万压力、最新 master rebase 和完整 CI |
+| 真实功能 | 单 FE/单 BE E2E、四阶段中断重启和 checkpoint 跨配置恢复完成 | 每次重启后 Restore 均 FINISHED，10 万行校验不变；streaming image 由 legacy reader 加载成功 |
+| 上游就绪度 | 尚未满足 | 缺少 Observer、特殊元数据矩阵、200 万压力、最新 master rebase 和完整 CI |
 
 ### 相关 PR 状态
 
@@ -60,8 +60,8 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 
 ### P0：先关闭持久化正确性风险
 
-1. RestoreJob 的 `CREATING` 阶段重启已通过；继续在 `SNAPSHOTING`、`DOWNLOADING`、
-   `COMMITTING` 阶段分别执行 FE 重启，验证任务继续运行或保持正确终态。
+1. [已完成] RestoreJob 在 `CREATING`、`SNAPSHOTING`、`DOWNLOADING`、`COMMITTING` 阶段
+   分别执行 FE 重启，任务均继续运行至正确终态。
 2. 覆盖 `EditLog.loadJournal`、`BackupHandler.replayAddJob`、image load 和 checkpoint 线程，
    确认 legacy/streaming 两种 payload 都能真实 replay。
 3. Master streaming 写入、Follower legacy replay 和节点间配置不一致已通过；继续补 Observer
@@ -283,8 +283,8 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 - [ ] Observer replay 和角色切换。
 - [x] 配置开启写入后关闭配置读取。
 - [x] 配置关闭写入后开启配置读取。
-- [x] FE 在 CREATING 阶段重启后，RestoreJob 从 PENDING journal 继续运行并到达 FINISHED。
-- [ ] FE 在 SNAPSHOTING、DOWNLOADING、COMMITTING 阶段重启后能继续运行或保持正确终态。
+- [x] FE 在 CREATING、SNAPSHOTING、DOWNLOADING、COMMITTING 阶段重启后，RestoreJob 均从
+  对应的 PENDING、DOWNLOAD 或 COMMIT journal 继续运行并到达 FINISHED。
 
 ### 双向兼容矩阵
 
@@ -428,7 +428,7 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 - 当前远端机器同时运行其他 FE/BE 进程，单次 10 ms heap sampler 和耗时数据会受 GC/调度影响。
   在获得隔离资源、至少三次 fork 中位数和 JFR allocation 数据前，不使用这些数字声明性能比例。
 - 未完成：spill 修正后 before/after 矩阵、RestoreJob 大对象 benchmark、200 万压力基准、
-  RestoreJob 其余阶段重启和多 FE replay。
+  Observer replay 和角色切换。
 
 正式 Maven heap 参数为 `-Dfe.ut.max.heap=2g`，固定初始堆可额外使用
 `-Dfe.ut.extra.jvm.args=-Xms2g`；不能再使用 `-DargLine` 覆盖 fe-core 的默认 heap。
@@ -534,8 +534,13 @@ SNAPSHOTING、DOWNLOAD、DOWNLOADING、COMMIT、COMMITTING 和 FINISHED。恢复
 leader checkpoint 线程成功生成并自检 `image.48201`。关闭两个 config、恢复 roll 阈值并二次
 重启后，主线程明确从 `image.48201` 加载；SHOW RESTORE 仍为 FINISHED，以上四项数据校验保持
 不变。该实验覆盖了 streaming writer → legacy reader 的真实 journal replay 和 checkpoint
-image load，但仍是单 FE；Follower/Observer 以及 SNAPSHOTING、DOWNLOADING、COMMITTING
-中断点仍待验证。
+image load。
+
+完成 Follower 实验并恢复单 FE 拓扑后，复用同一 10 万行快照，分别在 SNAPSHOTING、
+DOWNLOADING、COMMITTING 状态停止 FE。三次重启后的日志分别显示从 PENDING、DOWNLOAD、
+COMMIT 持久化状态恢复；与先前 CREATING 中断一起，四个目标阶段均续跑至 FINISHED。每轮的
+行数、ID 边界和 SUM 校验都与上述结果一致。由此单 FE 运行中重启矩阵已闭环，Observer 和节点
+角色切换仍待验证。
 
 ### Follower replay 与节点间配置不一致（2026-07-20）
 
