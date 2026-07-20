@@ -2,7 +2,8 @@
 
 ## 文档状态
 
-- 状态：执行中（核心实现、兼容矩阵和单 FE E2E 已完成；重启/replay、压力测试和上游合入门禁未完成）
+- 状态：执行中（核心实现、兼容矩阵、单 FE E2E、CREATING 中断重启、checkpoint/image
+  跨配置恢复和 Follower replay 已完成；Observer、压力测试和上游合入门禁未完成）
 - 目标分支：Apache Doris `master`
 - 相关实现：
   - HYDCP/hy-doris#49：RestoreJob Guava Table/Multimap 流式 JSON 序列化
@@ -20,7 +21,9 @@
 PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
 `master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和受控 spill
 已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；单 FE/单 BE 的
-真实 BACKUP/RESTORE E2E 已完成，重启恢复、多 FE replay 和 200 万压力验证仍未完成。
+真实 BACKUP/RESTORE E2E、RestoreJob 在 CREATING 阶段的 FE 重启续跑，以及 streaming writer
+生成 checkpoint 后由 legacy reader 加载，以及 Leader streaming writer → Follower legacy reader
+的实时 replay 均已完成；其余运行阶段重启、Observer replay 和 200 万压力验证仍未完成。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
@@ -32,11 +35,11 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 | --- | --- | --- |
 | 核心实现 | PR 1—5 已完成本地拆分并推送个人远端 | 五个职责分支均有独立提交历史和回退边界 |
 | Streaming 基础设施 | 已完成 | PR 3 兼容矩阵 20/20，通过 wrapper 复用和 Gson capability probe 缓存消除逐对象异常分配 |
-| RestoreJob | 代码和单测完成，真实 replay 未完成 | PR 4 状态/配置矩阵 5/5；缺少中途重启、Follower replay 和大对象基准 |
+| RestoreJob | 代码、状态矩阵、单 FE restart 和 Follower replay 已完成 | CREATING 阶段重启后续跑至 FINISHED；Leader=true/Follower=false 跨配置 replay 通过 |
 | BackupMeta/Table | 三阶段实现完成 | streaming deep copy/持久化、受控 spill、兼容性与异常清理；PR 5 矩阵 16/16、spill helper 11/11 |
 | 容量与性能 | 20 万 tablet 快速基准完成 | 2 GiB heap 下五阶段通过；`journal_replay` 根因经 JFR 定位并复测 |
-| 真实功能 | 单 FE/单 BE E2E 完成 | 普通表、分区表、MV/rollup 共 4 个 suite，failed/fatal/skipped 均为 0 |
-| 上游就绪度 | 尚未满足 | 缺少 restart/replay、checkpoint、多 FE、200 万压力、最新 master rebase 和完整 CI |
+| 真实功能 | 单 FE/单 BE E2E、一次中断重启和 checkpoint 跨配置恢复完成 | 10 万行 Restore 在 CREATING 中断，重启后 FINISHED；streaming image 由 legacy reader 加载成功 |
+| 上游就绪度 | 尚未满足 | 缺少其余状态 restart、Observer、200 万压力、最新 master rebase 和完整 CI |
 
 ### 相关 PR 状态
 
@@ -57,11 +60,12 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 
 ### P0：先关闭持久化正确性风险
 
-1. 在 RestoreJob 的 `CREATING`、`SNAPSHOTING`、`DOWNLOADING`、`COMMITTING` 阶段分别执行 FE
-   重启，验证任务继续运行或保持正确终态。
+1. RestoreJob 的 `CREATING` 阶段重启已通过；继续在 `SNAPSHOTING`、`DOWNLOADING`、
+   `COMMITTING` 阶段分别执行 FE 重启，验证任务继续运行或保持正确终态。
 2. 覆盖 `EditLog.loadJournal`、`BackupHandler.replayAddJob`、image load 和 checkpoint 线程，
    确认 legacy/streaming 两种 payload 都能真实 replay。
-3. 完成 Master 写入、Follower/Observer replay，并演练节点间配置不一致及运行时回退。
+3. Master streaming 写入、Follower legacy replay 和节点间配置不一致已通过；继续补 Observer
+   replay 和角色切换后的运行时回退。
 4. 补齐 colocate、动态分区、CloudTablet、`reserve_replica=true/false` 和大型 checkpoint 元数据。
 
 这些项目完成前，不默认开启 streaming，也不把单节点 E2E 等同于持久化兼容已经闭环。
@@ -273,11 +277,14 @@ PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5�
 - [x] DOWNLOAD、DOWNLOADING、COMMIT、COMMITTING 大映射状态四象限写入/读取。
 - [x] FINISHED、CANCELLED 终态四象限写入/读取。
 - [x] `JournalEntity.readFields` 对 legacy/streaming 两种输出和两种 reader 配置兼容。
-- [ ] `EditLog.loadJournal`/`BackupHandler.replayAddJob` 真实 replay。
-- [ ] Master 写入后 Follower replay。
+- [x] `EditLog.loadJournal`/`BackupHandler.replayAddJob` 自动化 replay；legacy/streaming writer ×
+  reader 四组 PENDING → COMMIT 路径均通过。
+- [x] Master 两个 streaming config 开启写入后，两个 config 均关闭的 Follower 实时 replay。
+- [ ] Observer replay 和角色切换。
 - [x] 配置开启写入后关闭配置读取。
 - [x] 配置关闭写入后开启配置读取。
-- [ ] FE 重启后 RestoreJob 能继续运行或保持正确终态。
+- [x] FE 在 CREATING 阶段重启后，RestoreJob 从 PENDING journal 继续运行并到达 FINISHED。
+- [ ] FE 在 SNAPSHOTING、DOWNLOADING、COMMITTING 阶段重启后能继续运行或保持正确终态。
 
 ### 双向兼容矩阵
 
@@ -343,7 +350,8 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 - [x] BackupMeta 文件 legacy/streaming writer × reader 四象限及原始字节一致。
 - [x] BackupJobInfo 文件四象限、原始字节及 UTF-8 行为不变。
 - [ ] BackupJob editlog write/read/replay。
-- [ ] image/checkpoint 中包含大型 OlapTable 时可正常生成和加载。
+- [x] streaming writer 生成真实 checkpoint image 后，关闭两个 streaming config 并重启，legacy
+  reader 成功加载 image，RestoreJob 终态和 10 万行表数据完整。
 - [x] 默认 subtype、兼容 label 和非首位 type 的 legacy Table/Partition/Tablet/Replica JSON 可读取。
 - [x] Replica 剥离后的空 LocalTablet/CloudTablet 可被两种 reader 配置读取。
 - [ ] 部分分区、rollup、colocate、动态分区和 Cloud Tablet 元数据 round-trip。
@@ -356,6 +364,9 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 - PR 4 `7ad57e168b0`：Linux 官方 thirdparty、Maven 3.9.14、JDK 17 下
   `BackupRestoreJobStreamingJsonConfigTest` 5/5，25-module reactor `BUILD SUCCESS`；覆盖全部
   9 个 RestoreJob 状态、1024-cell 活跃状态、压缩 CloudRestoreJob 和 `JournalEntity.readFields`。
+- PR 4/PR 5 验证分支于 2026-07-20 使用 Maven 3.9.9、JDK 17 补充
+  `EditLog.loadJournal`/`BackupHandler.replayAddJob` 和 `BackupHandler.write/readFields` image
+  四象限测试；目标用例 7/7、25-module reactor `BUILD SUCCESS`。
 - PR 5 `02a5d1017a7`：同一 Linux 环境运行 DeepCopy、TableMeta、Restore/Backup job、
   BackupMeta、BackupJobInfo 五类测试共 16/16，25-module reactor `BUILD SUCCESS`；另有
   `LengthPrefixedJsonStreamTest` 11/11。这里的 replay 证据只到 `JournalEntity.readFields`，不包含
@@ -377,7 +388,7 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 - [ ] 20 万 tablet 快速基准稳定通过。
 - [ ] 200 万 tablet 压力基准无 OOM。
 - [ ] 至少完成一次 Master/Follower/Observer 重启及 replay 验证。
-- [ ] 配置回退演练成功。
+- [x] streaming writer → legacy reader 的单 FE restart/image load 与 Follower replay 演练成功。
 - [ ] PR 描述包含优化前后数据和已知边界。
 
 ## 性能基准方案
@@ -417,7 +428,7 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 - 当前远端机器同时运行其他 FE/BE 进程，单次 10 ms heap sampler 和耗时数据会受 GC/调度影响。
   在获得隔离资源、至少三次 fork 中位数和 JFR allocation 数据前，不使用这些数字声明性能比例。
 - 未完成：spill 修正后 before/after 矩阵、RestoreJob 大对象 benchmark、200 万压力基准、
-  FE 重启和多 FE replay。
+  RestoreJob 其余阶段重启和多 FE replay。
 
 正式 Maven heap 参数为 `-Dfe.ut.max.heap=2g`，固定初始堆可额外使用
 `-Dfe.ut.extra.jvm.args=-Xms2g`；不能再使用 `-DargLine` 覆盖 fe-core 的默认 heap。
@@ -501,6 +512,53 @@ failed/fatal/skipped 均为 0：
 实验结束后 FE、BE 与 MinIO 均存活，日志扫描未发现 ASAN 或运行时 fatal。该结果证明普通表、
 分区元数据和 rollup/MV 元数据在真实 S3-compatible 存储路径下可备份、恢复和查询；它不替代
 进行中的 RestoreJob 中途重启、journal replay、checkpoint、多 FE 和 200 万 tablet 容量验证。
+
+上述回归 suite 运行时，`enable_backup_restore_job_streaming_json` 和
+`enable_table_meta_streaming_json` 均为 `false`，因此它们是 legacy 路径的真实功能基线，不能
+单独作为 streaming persistence 的证据。
+
+### Streaming journal 与 checkpoint 重启验证（2026-07-20）
+
+在同一单 FE、单 BE、MinIO 环境中，将两个 streaming config 同时置为 `true`，备份包含 4 个
+分区、32 个 tablet、10 万行的 `restart_table`。BACKUP 从 PENDING 运行至 FINISHED 后删除原表，
+发起 RESTORE，并在 SHOW RESTORE 首次进入 CREATING 时停止 FE。重启时运行时 config 回落为
+`false`，FE 日志显示从该 RestoreJob 的 PENDING journal 加载，随后依次完成 CREATING、
+SNAPSHOTING、DOWNLOAD、DOWNLOADING、COMMIT、COMMITTING 和 FINISHED。恢复结果为：
+
+- `COUNT(*) = 100000`
+- `MIN(id) = 0`
+- `MAX(id) = 99999`
+- `SUM(id) = 4999950000`
+
+随后再次将两个 config 置为 `true`，把 `edit_log_roll_num` 临时降为 1 并生成标记 journal，
+leader checkpoint 线程成功生成并自检 `image.48201`。关闭两个 config、恢复 roll 阈值并二次
+重启后，主线程明确从 `image.48201` 加载；SHOW RESTORE 仍为 FINISHED，以上四项数据校验保持
+不变。该实验覆盖了 streaming writer → legacy reader 的真实 journal replay 和 checkpoint
+image load，但仍是单 FE；Follower/Observer 以及 SNAPSHOTING、DOWNLOADING、COMMITTING
+中断点仍待验证。
+
+### Follower replay 与节点间配置不一致（2026-07-20）
+
+在 Docker bridge 独立 IP 上增加一个 Follower，与 Leader 使用相同服务端口和独立的 meta/log
+目录。两节点 `Alive=true` 后，先完成一轮同配置 BACKUP/RESTORE replay，并由 Leader 生成
+`image.48438`、成功推送至 1 个 Follower；Follower 重启日志明确从该 image 加载，集群恢复后
+journal 差距保持在 1—2。
+
+由于 `ADMIN SET FRONTEND CONFIG` 会传播动态配置，同配置 replay 不能作为配置不一致证据。
+因此第二轮通过各 FE 本地配置接口固定并在测试前后核对：
+
+- Leader：`enable_backup_restore_job_streaming_json=true`、
+  `enable_table_meta_streaming_json=true`
+- Follower：上述两个配置均为 `false`
+
+随后使用新 label `codex_follower_mismatch_snapshot` 完成 BACKUP 和 RESTORE。Follower 的 replayer
+日志记录了 BACKUP 的 PENDING、UPLOAD_SNAPSHOT、SAVE_META、UPLOAD_INFO、FINISHED，以及
+RestoreJob 的 PENDING、DOWNLOAD、COMMIT、FINISHED；无反序列化或 replay 异常。最终两节点均
+Alive，Follower journal 仅落后 2，恢复数据仍为 100000 行、ID 0—99999、总和 4999950000。
+
+该实验完成 Master streaming writer → Follower legacy reader 的真实 edit log replay；Observer
+以及节点角色切换仍待验证。Follower restart/image load 已完成，但该次重启时两节点 config 相同，
+跨配置 image load 的证据来自上一节的单 FE 实验。
 
 ### Branch 3.1 参考基线（2026-07-17）
 
