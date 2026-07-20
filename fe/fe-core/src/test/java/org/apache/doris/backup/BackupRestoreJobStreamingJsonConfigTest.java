@@ -17,6 +17,7 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.cloud.backup.CloudRestoreJob;
 import org.apache.doris.common.Config;
@@ -24,6 +25,7 @@ import org.apache.doris.common.io.Text;
 import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.nereids.trees.plans.commands.BackupCommand;
 import org.apache.doris.nereids.trees.plans.commands.RestoreCommand;
+import org.apache.doris.persist.EditLog;
 import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.gson.GsonUtils;
 
@@ -40,6 +42,7 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -47,6 +50,9 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.Map;
 
 public class BackupRestoreJobStreamingJsonConfigTest {
     private boolean savedStreamingConfig;
@@ -93,6 +99,70 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         for (byte[] journal : new byte[][] {legacyJournal, streamingJournal}) {
             assertLargeFields(job, readRestoreJournal(journal, false));
             assertLargeFields(job, readRestoreJournal(journal, true));
+        }
+    }
+
+    @Test
+    public void testEditLogLoadJournalCompatibilityMatrix() throws Exception {
+        RestoreJob job = newRestoreJob("edit_log_replay", 128);
+        byte[] pendingLegacyJournal = writeJournal(job, false);
+        byte[] pendingStreamingJournal = writeJournal(job, true);
+        setField(job, "state", RestoreJob.RestoreJobState.COMMIT);
+        setField(job, "showState", RestoreJob.RestoreJobState.COMMIT);
+        byte[] commitLegacyJournal = writeJournal(job, false);
+        byte[] commitStreamingJournal = writeJournal(job, true);
+
+        for (int writeMode = 0; writeMode < 2; writeMode++) {
+            byte[] pendingJournal = writeMode == 0 ? pendingLegacyJournal : pendingStreamingJournal;
+            byte[] commitJournal = writeMode == 0 ? commitLegacyJournal : commitStreamingJournal;
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Env env = Mockito.mock(Env.class);
+                BackupHandler handler = new BackupHandler(env);
+                Mockito.when(env.getBackupHandler()).thenReturn(handler);
+
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                JournalEntity pendingEntity = new JournalEntity();
+                pendingEntity.readFields(dataInput(pendingJournal));
+                EditLog.loadJournal(env, 1L, pendingEntity);
+
+                JournalEntity commitEntity = new JournalEntity();
+                commitEntity.readFields(dataInput(commitJournal));
+                EditLog.loadJournal(env, 2L, commitEntity);
+
+                Map<Long, Deque<AbstractJob>> jobs = getField(handler, "dbIdToBackupOrRestoreJobs");
+                Assert.assertEquals(1, jobs.size());
+                Assert.assertEquals(1, jobs.get(job.getDbId()).size());
+                AbstractJob replayedJob = jobs.get(job.getDbId()).getLast();
+                Assert.assertTrue(replayedJob instanceof RestoreJob);
+                RestoreJob replayedRestoreJob = (RestoreJob) replayedJob;
+                Assert.assertSame(env, getField(replayedRestoreJob, "env"));
+                assertLargeFields(job, replayedRestoreJob);
+            }
+        }
+    }
+
+    @Test
+    public void testBackupHandlerImageCompatibilityMatrix() throws Exception {
+        RestoreJob job = newRestoreJob("image_replay", 128);
+        setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
+        setField(job, "showState", RestoreJob.RestoreJobState.DOWNLOADING);
+
+        byte[] legacyImage = writeBackupHandlerImage(job, false);
+        byte[] streamingImage = writeBackupHandlerImage(job, true);
+        Assert.assertArrayEquals(legacyImage, streamingImage);
+        for (byte[] image : new byte[][] {legacyImage, streamingImage}) {
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                Config.enable_backup_restore_job_streaming_json = streamingRead;
+                BackupHandler handler = new BackupHandler();
+                handler.readFields(dataInput(image));
+
+                Map<Long, Deque<AbstractJob>> jobs = getField(handler, "dbIdToBackupOrRestoreJobs");
+                Assert.assertEquals(1, jobs.size());
+                Assert.assertEquals(1, jobs.get(job.getDbId()).size());
+                AbstractJob replayedJob = jobs.get(job.getDbId()).getLast();
+                Assert.assertTrue(replayedJob instanceof RestoreJob);
+                assertLargeFields(job, (RestoreJob) replayedJob);
+            }
         }
     }
 
@@ -307,6 +377,18 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         entity.setData(job);
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         entity.write(new DataOutputStream(bytes));
+        return bytes.toByteArray();
+    }
+
+    private static byte[] writeBackupHandlerImage(AbstractJob job, boolean streaming) throws Exception {
+        Config.enable_backup_restore_job_streaming_json = streaming;
+        BackupHandler handler = new BackupHandler();
+        Map<Long, Deque<AbstractJob>> jobs = getField(handler, "dbIdToBackupOrRestoreJobs");
+        Deque<AbstractJob> dbJobs = new LinkedList<>();
+        dbJobs.add(job);
+        jobs.put(job.getDbId(), dbJobs);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        handler.write(new DataOutputStream(bytes));
         return bytes.toByteArray();
     }
 
