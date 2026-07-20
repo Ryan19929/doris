@@ -2,11 +2,12 @@
 
 ## 文档状态
 
-- 状态：执行中（本地实现与定向验证阶段，尚未满足提交上游或合入条件）
+- 状态：执行中（核心实现、兼容矩阵和单 FE E2E 已完成；重启/replay、压力测试和上游合入门禁未完成）
 - 目标分支：Apache Doris `master`
 - 相关实现：
   - HYDCP/hy-doris#49：RestoreJob Guava Table/Multimap 流式 JSON 序列化
   - HYDCP/hy-doris#63：BackupMeta/Table 流式 JSON、Replica 剥离及 journal size 计数优化
+  - HYDCP/hy-doris#66：本地 snapshot 目录生命周期、输入侧流式压缩及 RPC 大小保护
   - apache/doris#65321：从 BackupMeta 剥离无用 Replica
 - 本地实现分支（均未合入 `master`）：
   - PR 1：`codex/backup-strip-replica-info` @ `04cb7272895`
@@ -22,6 +23,78 @@ PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、�
 真实 BACKUP/RESTORE E2E 已完成，重启恢复、多 FE replay 和 200 万压力验证仍未完成。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
+
+## 当前进度快照（2026-07-20）
+
+### 实现与验证
+
+| 维度 | 当前结论 | 证据 |
+| --- | --- | --- |
+| 核心实现 | PR 1—5 已完成本地拆分并推送个人远端 | 五个职责分支均有独立提交历史和回退边界 |
+| Streaming 基础设施 | 已完成 | PR 3 兼容矩阵 20/20，通过 wrapper 复用和 Gson capability probe 缓存消除逐对象异常分配 |
+| RestoreJob | 代码和单测完成，真实 replay 未完成 | PR 4 状态/配置矩阵 5/5；缺少中途重启、Follower replay 和大对象基准 |
+| BackupMeta/Table | 三阶段实现完成 | streaming deep copy/持久化、受控 spill、兼容性与异常清理；PR 5 矩阵 16/16、spill helper 11/11 |
+| 容量与性能 | 20 万 tablet 快速基准完成 | 2 GiB heap 下五阶段通过；`journal_replay` 根因经 JFR 定位并复测 |
+| 真实功能 | 单 FE/单 BE E2E 完成 | 普通表、分区表、MV/rollup 共 4 个 suite，failed/fatal/skipped 均为 0 |
+| 上游就绪度 | 尚未满足 | 缺少 restart/replay、checkpoint、多 FE、200 万压力、最新 master rebase 和完整 CI |
+
+### 相关 PR 状态
+
+以下是 2026-07-20 的状态快照，后续以 GitHub 实时状态为准：
+
+- HYDCP/hy-doris#49 已合并，是 RestoreJob streaming 的 3.1 参考实现。
+- HYDCP/hy-doris#63 已批准但仍为 Open/Blocked，是 Backup 组合方案的参考实现，不直接替代
+  面向 `master` 的 PR 1—5 拆分。
+- HYDCP/hy-doris#66 已合并，解决本地 snapshot 目录清理、并发 pin、输入侧流式压缩和 Thrift
+  尺寸保护。它与 RestoreJob Gson streaming 共享“输入侧流式处理”原则，但没有复用 TypeAdapter
+  或 JSON spill；压缩结果仍以完整 `byte[]` 驻留 FE heap，因此不能视为 RestoreJob JVM 峰值问题
+  的完整解法。
+- apache/doris#65321 仍为 Draft/Open，需要 review。Compile、FE UT、BE UT 和 P0 等主要检查已通过，
+  External Regression 与 `cloud_p0` 仍需处理或证明与改动无关。
+- PR 2—5 尚未向 Apache Doris 创建上游 PR，当前只存在个人远端实现分支。
+
+## 未来机会与优先级
+
+### P0：先关闭持久化正确性风险
+
+1. 在 RestoreJob 的 `CREATING`、`SNAPSHOTING`、`DOWNLOADING`、`COMMITTING` 阶段分别执行 FE
+   重启，验证任务继续运行或保持正确终态。
+2. 覆盖 `EditLog.loadJournal`、`BackupHandler.replayAddJob`、image load 和 checkpoint 线程，
+   确认 legacy/streaming 两种 payload 都能真实 replay。
+3. 完成 Master 写入、Follower/Observer replay，并演练节点间配置不一致及运行时回退。
+4. 补齐 colocate、动态分区、CloudTablet、`reserve_replica=true/false` 和大型 checkpoint 元数据。
+
+这些项目完成前，不默认开启 streaming，也不把单节点 E2E 等同于持久化兼容已经闭环。
+
+### P1：建立可用于上游评审的性能证据
+
+1. 执行 200 万 tablets × 3 replicas 压力基准，确认容量边界和 spill 行为。
+2. 对 spill 修正后的 20 万 tablet before/after 矩阵进行多次独立 fork，报告中位数、GC、retained
+   heap 和 JFR allocation，而不是使用单次 sampled peak 声明比例。
+3. 增加大 RestoreJob before/after benchmark，覆盖 snapshot mapping 和 commit mapping 主导场景。
+4. 补充 journal size counting 的旧缓冲/计数流 heap、allocation 和耗时对照。
+
+### P1：延伸 #66 的 snapshot RPC 内存治理
+
+#66 已避免压缩前把完整原始文件加载进堆，但 `ByteArrayOutputStream` 扩容、`toByteArray()` 复制和
+Thrift `byte[]` 仍会使完整压缩结果驻留堆中。后续机会应作为独立设计处理：
+
+1. 根据 FE heap 和 RPC 并发度设置保守的响应上限，而不是只依赖约 2 GiB 的协议边界。
+2. 评估 file-backed/spillable 压缩输出，先消除 `ByteArrayOutputStream` 扩容和复制峰值。
+3. 如果要从根本上移除最终完整 `byte[]`，需要设计分块或流式 snapshot RPC；这属于协议改造，
+   不应混入 PR 3—5 的 Gson persistence 系列。
+4. bounded output、计数和 spill 可以在语义稳定后提炼共享基础设施，但不能为了复用而合并错误
+   语义：JSON 持久化要求格式兼容，snapshot RPC 还受到 Thrift 消息边界约束。
+
+### P2：按可审查顺序进入 Apache Doris master
+
+1. 先整理 apache/doris#65321：删除 Cloud 模式下必然失败的 BACKUP 用例、处理 External
+   Regression、补全 PR 模板并 rebase 最新 `master`。
+2. PR 2 可独立提交；随后严格按 PR 3 → PR 4 → PR 5 提交，避免同时修改 Gson 和
+   `AbstractJob` 造成审查/回滚困难。
+3. 每个 PR 独立执行定向测试、完整 FE 门禁和相关 regression，不把组合验证结果直接当成拆分 PR
+   的 CI 结果。
+4. 只有 P0 replay 门禁、200 万压力和配置回退通过后，才提交 PR 6 或讨论默认开启。
 
 ## 背景
 
@@ -558,13 +631,15 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 6. 所有运行时开关都有明确的作用范围、默认值和回退操作。
 7. 没有未解释的 CI failure、未更新的模板占位符或与实际测试不一致的 checklist。
 
-## 预计周期
+## 剩余预计周期
 
-在不计算 reviewer 等待和全量 CI 排队的情况下，预计需要 10—15 个工作日：
+截至 2026-07-20，在不计算 reviewer 等待和全量 CI 排队的情况下，剩余验证和上游整理预计需要
+6—10 个工作日：
 
-- PR 1：1—2 日。
-- PR 2：1 日。
-- PR 3：3—4 日。
-- PR 4：2—3 日。
-- PR 5：4—6 日。
-- 最终压力测试和默认开启：2—3 日，可与 PR review 部分并行。
+- restart、journal/image/checkpoint 和多 FE replay：2—3 日。
+- colocate、动态分区、CloudTablet 和配置回退 E2E：1—2 日。
+- 200 万压力、大 RestoreJob 及补充 before/after/JFR：2—3 日。
+- rebase、拆分 PR 自验证、PR 模板和 CI 问题整理：1—2 日。
+
+上述项目可以部分并行，但不能通过并行省略合入门禁；默认开启的决定仍以后续容量和 replay 结果
+为准。
