@@ -95,7 +95,8 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p>Run exactly one stage and scenario in each forked JVM. Valid stages are {@code selective_copy},
  * {@code backup_meta_write}, {@code backup_meta_read}, {@code journal_write}, {@code journal_replay},
- * {@code handler_image_write}, and {@code handler_image_replay}.
+ * {@code restore_job_write}, {@code restore_job_replay}, {@code handler_image_write}, and
+ * {@code handler_image_replay}.
  * Reader stages accept {@code doris.benchmark.read_table_streaming} and
  * {@code doris.benchmark.read_job_streaming} for mixed writer/reader compatibility measurements. Use
  * {@code -Dfe.ut.extra.jvm.args=...} for optional JVM flags such as JFR recording; this is composed with the
@@ -248,6 +249,14 @@ public class BackupRestoreMemoryBenchmark {
                 runJournalReplayStage(scenario, tabletCount, replicaCount, expectedReplicas,
                         readTableStreaming, readJobStreaming, journalFile, metrics);
                 return;
+            case RESTORE_JOB_WRITE:
+                runRestoreJobWriteStage(scenario,
+                        expectedRestoreSnapshotInfoCount(tabletCount, replicaCount), journalFile, metrics);
+                return;
+            case RESTORE_JOB_REPLAY:
+                runRestoreJobReplayStage(expectedRestoreSnapshotInfoCount(tabletCount, replicaCount),
+                        readJobStreaming, journalFile, metrics);
+                return;
             case HANDLER_IMAGE_WRITE:
                 runHandlerImageWriteStage(scenario, tabletCount, replicaCount, expectedReplicas,
                         handlerImageFile, metrics);
@@ -344,6 +353,37 @@ public class BackupRestoreMemoryBenchmark {
         verifyBackupJob(restored, tabletCount, expectedReplicas);
     }
 
+    private static void runRestoreJobWriteStage(Scenario scenario, int snapshotInfoCount, Path file,
+            Map<String, Object> metrics) throws Throwable {
+        long setupStart = System.nanoTime();
+        RestoreJob restoreJob = createRestoreJob(snapshotInfoCount);
+        JournalEntity journalEntity = createRestoreJournalEntity(restoreJob);
+        recordRestoreJobSizes(restoreJob, metrics);
+        metrics.put("setup_ms", elapsedMillis(setupStart));
+
+        measure(metrics, () -> {
+            writeJournal(file, journalEntity);
+            return null;
+        });
+
+        metrics.put("payload_bytes", Files.size(file));
+        metrics.put("writer_job_streaming", scenario.jobStreaming);
+    }
+
+    private static void runRestoreJobReplayStage(int snapshotInfoCount, boolean readJobStreaming,
+            Path file, Map<String, Object> metrics) throws Throwable {
+        long setupStart = System.nanoTime();
+        prepareRestoreJobFixture(snapshotInfoCount, file);
+        Config.enable_backup_restore_job_streaming_json = readJobStreaming;
+        metrics.put("setup_ms", elapsedMillis(setupStart));
+        metrics.put("payload_bytes", Files.size(file));
+        metrics.put("fixture_writer_job_streaming", true);
+
+        JournalEntity restored = measure(metrics, () -> readJournal(file));
+
+        verifyRestoreJob(restored, snapshotInfoCount, metrics);
+    }
+
     private static void runHandlerImageWriteStage(Scenario scenario, int tabletCount, int replicaCount,
             long expectedReplicas, Path file, Map<String, Object> metrics) throws Throwable {
         long setupStart = System.nanoTime();
@@ -395,6 +435,29 @@ public class BackupRestoreMemoryBenchmark {
         return backupJob;
     }
 
+    private static RestoreJob createRestoreJob(int snapshotInfoCount) throws ReflectiveOperationException {
+        BackupJobInfo jobInfo = new BackupJobInfo();
+        jobInfo.isForceReplicationAllocation = false;
+        RestoreJob restoreJob = new RestoreJob("restore_memory_benchmark", "2026-07-20 12:00:00",
+                DB_ID, "benchmark_db", jobInfo, false, new ReplicaAllocation((short) 1), 3_600_000L,
+                FeConstants.meta_version, false, false, false, true, false, false, false, false,
+                null, 60L);
+        for (int offset = 0; offset < snapshotInfoCount; offset++) {
+            long tabletId = FIRST_TABLET_ID + offset;
+            long backendId = offset % 128 + 1L;
+            restoreJob.snapshotInfos.put(tabletId, backendId,
+                    new SnapshotInfo(DB_ID, TABLE_ID, PARTITION_ID, INDEX_ID, tabletId, backendId, 1,
+                            "/snapshot/" + tabletId, Lists.newArrayList(tabletId + ".dat")));
+        }
+        com.google.common.collect.Table<Long, Long, Long> restoredVersionInfo =
+                getRestoredVersionInfo(restoreJob);
+        int versionInfoCount = expectedRestoreVersionInfoCount(snapshotInfoCount);
+        for (int offset = 0; offset < versionInfoCount; offset++) {
+            restoredVersionInfo.put(TABLE_ID + offset, PARTITION_ID + offset, 1L + offset);
+        }
+        return restoreJob;
+    }
+
     private static void prepareBackupMetaFixture(Scenario scenario, int tabletCount, int replicaCount,
             long expectedReplicas, Path file) throws IOException {
         // Use the bounded-memory writer for fixture setup so a reader-stage JVM measures only the reader graph.
@@ -422,6 +485,18 @@ public class BackupRestoreMemoryBenchmark {
             writeJournal(file, createBackupJournalEntity(backupJob));
         } finally {
             Config.enable_table_meta_streaming_json = previousTableStreaming;
+            Config.enable_backup_restore_job_streaming_json = previousJobStreaming;
+        }
+    }
+
+    private static void prepareRestoreJobFixture(int snapshotInfoCount, Path file)
+            throws IOException, ReflectiveOperationException {
+        RestoreJob restoreJob = createRestoreJob(snapshotInfoCount);
+        boolean previousJobStreaming = Config.enable_backup_restore_job_streaming_json;
+        try {
+            Config.enable_backup_restore_job_streaming_json = true;
+            writeJournal(file, createRestoreJournalEntity(restoreJob));
+        } finally {
             Config.enable_backup_restore_job_streaming_json = previousJobStreaming;
         }
     }
@@ -578,6 +653,13 @@ public class BackupRestoreMemoryBenchmark {
         return entity;
     }
 
+    private static JournalEntity createRestoreJournalEntity(RestoreJob job) {
+        JournalEntity entity = new JournalEntity();
+        entity.setOpCode(OperationType.OP_RESTORE_JOB);
+        entity.setData(job);
+        return entity;
+    }
+
     private static void writeJournal(Path file, JournalEntity entity) throws IOException {
         try (DataOutputStream output = new DataOutputStream(
                 new BufferedOutputStream(Files.newOutputStream(file)))) {
@@ -616,6 +698,58 @@ public class BackupRestoreMemoryBenchmark {
         BackupMeta backupMeta = ((BackupJob) restored.getData()).getBackupMeta();
         Assert.assertNotNull(backupMeta);
         verifyBackupMeta(backupMeta, expectedTablets, expectedReplicas);
+    }
+
+    private static void verifyRestoreJob(JournalEntity restored, int expectedSnapshotInfoCount,
+            Map<String, Object> metrics) throws ReflectiveOperationException {
+        Assert.assertEquals(OperationType.OP_RESTORE_JOB, restored.getOpCode());
+        Assert.assertTrue(restored.getData() instanceof RestoreJob);
+        RestoreJob restoreJob = (RestoreJob) restored.getData();
+        Assert.assertEquals(expectedSnapshotInfoCount, restoreJob.snapshotInfos.size());
+        int expectedVersionInfoCount = expectedRestoreVersionInfoCount(expectedSnapshotInfoCount);
+        Assert.assertEquals(expectedVersionInfoCount, getRestoredVersionInfo(restoreJob).size());
+        verifyRestoreSnapshotInfo(restoreJob, 0);
+        verifyRestoreSnapshotInfo(restoreJob, expectedSnapshotInfoCount / 2);
+        verifyRestoreSnapshotInfo(restoreJob, expectedSnapshotInfoCount - 1);
+        metrics.put("restore_snapshot_info_count", restoreJob.snapshotInfos.size());
+        metrics.put("restore_version_info_count", expectedVersionInfoCount);
+    }
+
+    private static void verifyRestoreSnapshotInfo(RestoreJob restoreJob, int offset) {
+        long tabletId = FIRST_TABLET_ID + offset;
+        long backendId = offset % 128 + 1L;
+        SnapshotInfo snapshotInfo = restoreJob.snapshotInfos.get(tabletId, backendId);
+        Assert.assertNotNull(snapshotInfo);
+        Assert.assertEquals(DB_ID, snapshotInfo.getDbId());
+        Assert.assertEquals(TABLE_ID, snapshotInfo.getTblId());
+        Assert.assertEquals(PARTITION_ID, snapshotInfo.getPartitionId());
+        Assert.assertEquals(INDEX_ID, snapshotInfo.getIndexId());
+        Assert.assertEquals(tabletId, snapshotInfo.getTabletId());
+        Assert.assertEquals(backendId, snapshotInfo.getBeId());
+        Assert.assertEquals("/snapshot/" + tabletId, snapshotInfo.getPath());
+        Assert.assertEquals(Lists.newArrayList(tabletId + ".dat"), snapshotInfo.getFiles());
+    }
+
+    private static void recordRestoreJobSizes(RestoreJob restoreJob, Map<String, Object> metrics)
+            throws ReflectiveOperationException {
+        metrics.put("restore_snapshot_info_count", restoreJob.snapshotInfos.size());
+        metrics.put("restore_version_info_count", getRestoredVersionInfo(restoreJob).size());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static com.google.common.collect.Table<Long, Long, Long> getRestoredVersionInfo(RestoreJob job)
+            throws ReflectiveOperationException {
+        Field field = RestoreJob.class.getDeclaredField("restoredVersionInfo");
+        field.setAccessible(true);
+        return (com.google.common.collect.Table<Long, Long, Long>) field.get(job);
+    }
+
+    private static int expectedRestoreVersionInfoCount(int snapshotInfoCount) {
+        return Math.max(1, snapshotInfoCount / 8);
+    }
+
+    private static int expectedRestoreSnapshotInfoCount(int tabletCount, int replicaCount) {
+        return Math.multiplyExact(tabletCount, replicaCount);
     }
 
     private static void verifyBackupHandler(BackupHandler restored, int expectedTablets,
@@ -797,6 +931,8 @@ public class BackupRestoreMemoryBenchmark {
         BACKUP_META_READ("backup_meta_read"),
         JOURNAL_WRITE("journal_write"),
         JOURNAL_REPLAY("journal_replay"),
+        RESTORE_JOB_WRITE("restore_job_write"),
+        RESTORE_JOB_REPLAY("restore_job_replay"),
         HANDLER_IMAGE_WRITE("handler_image_write"),
         HANDLER_IMAGE_REPLAY("handler_image_replay");
 
@@ -815,7 +951,8 @@ public class BackupRestoreMemoryBenchmark {
             }
             throw new IllegalArgumentException("unknown benchmark stage '" + value
                     + "'; expected selective_copy, backup_meta_write, backup_meta_read, journal_write, "
-                    + "journal_replay, handler_image_write, or handler_image_replay");
+                    + "journal_replay, restore_job_write, restore_job_replay, handler_image_write, "
+                    + "or handler_image_replay");
         }
     }
 
