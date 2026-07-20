@@ -4,7 +4,8 @@
 
 - 状态：执行中（核心实现、兼容矩阵、四阶段中断重启、checkpoint/image 跨配置恢复、
   Follower/Observer replay、运行中角色切换、特殊元数据矩阵和 200 万压力测试已完成；
-  20 万五阶段、大 RestoreJob 和 journal size counting 三次独立 fork 对照已完成；上游门禁未完成）
+  20 万五阶段、大 RestoreJob、journal size counting 对照、最新 master rebase 和拆分 PR
+  定向自验证已完成；上游提交与完整 CI 未完成）
 - 目标分支：Apache Doris `master`
 - 相关实现：
   - HYDCP/hy-doris#49：RestoreJob Guava Table/Multimap 流式 JSON 序列化
@@ -12,16 +13,17 @@
   - HYDCP/hy-doris#66：本地 snapshot 目录生命周期、输入侧流式压缩及 RPC 大小保护
   - apache/doris#65321：从 BackupMeta 剥离无用 Replica
 - 本地实现分支（均未合入 `master`）：
-  - PR 1：`codex/backup-strip-replica-info` @ `04cb7272895`
-  - PR 2：`codex/backup-journal-size-counting` @ `c9b930bcfec`
-  - PR 3：`codex/streaming-gson-foundation` @ `46d6fa0aae4`
-  - PR 4：`codex/restore-job-streaming` @ `7ad57e168b0`
-  - PR 5：`codex/backup-meta-streaming` @ `02a5d1017a7`
+  - PR 1：`codex/backup-strip-replica-info` @ `3ec7ff3f374`
+  - PR 2：`codex/backup-journal-size-counting` @ `f71760e5d7a`
+  - PR 3：`codex/streaming-gson-foundation` @ `bdacd53ee31`
+  - PR 4：`codex/restore-job-streaming` @ `e599cf60f1b`
+  - PR 5：`codex/backup-meta-streaming` @ `a3a5578602e`
   - 验证分支：`codex/backup-memory-benchmark` @ `dd2c4b437a4`
 
-PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
-`master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和受控 spill
-已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；单 FE/单 BE 的
+PR 1—5 已完成本地实现、分支拆分和最新 `master` rebase，但不代表已提交上游、通过完整 CI
+或可以合入 `master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和
+受控 spill 已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成 rebase 后定向复测；
+单 FE/单 BE 的
 真实 BACKUP/RESTORE E2E、RestoreJob 在四个运行阶段的 FE 重启续跑，以及 streaming writer
 生成 checkpoint 后由 legacy reader 加载、Leader streaming writer → Follower/Observer legacy
 reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；colocate、动态分区、Replica
@@ -37,13 +39,13 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；co
 
 | 维度 | 当前结论 | 证据 |
 | --- | --- | --- |
-| 核心实现 | PR 1—5 已完成本地拆分并推送个人远端 | 五个职责分支均有独立提交历史和回退边界 |
+| 核心实现 | PR 1—5 已完成拆分、最新 master rebase 和个人远端正式分支更新 | 五个职责分支均有独立提交历史、备份 ref 和回退边界 |
 | Streaming 基础设施 | 已完成 | PR 3 兼容矩阵 20/20，通过 wrapper 复用和 Gson capability probe 缓存消除逐对象异常分配 |
 | RestoreJob | 状态矩阵、四阶段 restart、Follower/Observer replay 和 failover 已完成 | DOWNLOADING 停原 Leader 后 legacy Follower 接管至 FINISHED；旧 Leader 成功回归 |
 | BackupMeta/Table | 三阶段实现完成 | streaming deep copy/持久化、受控 spill、兼容性与异常清理；PR 5 矩阵 16/16、spill helper 11/11 |
 | 容量与性能 | 20 万重复矩阵、200 万压力矩阵、大 RestoreJob 和 journal size 对照完成 | 20 万五阶段 peak delta 降低 5.78%—88.19%；Restore reader 降低 80.17%；512 MiB size check 不再保留完整 buffer |
 | 真实功能 | 单 FE/单 BE E2E、四阶段中断重启、checkpoint 跨配置恢复和特殊元数据矩阵完成 | Restore 均 FINISHED，数据校验不变；colocate/动态分区及 Replica true/false 通过，Cloud 子类型完成定向 UT |
-| 上游就绪度 | 尚未满足 | 缺少最新 master rebase、拆分 PR 自验证和完整 CI |
+| 上游就绪度 | 尚未满足 | rebase 后定向 FE UT 均通过；仍缺 PR 模板整理、上游提交和完整 CI |
 
 ### 相关 PR 状态
 
@@ -74,8 +76,8 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；co
    `reserve_replica=true/false`、`backup_meta_reserve_replica_info=true/false` 和 20 万 tablet
    BackupHandler checkpoint image。真实 CloudRestoreJob E2E 留待具备 MetaService 的 Cloud 环境执行。
 
-P0 正确性门禁、200 万 tablet 容量门禁和计划内性能对照已完成，但在最新 master rebase、拆分 PR
-自验证和完整 CI 通过前，
+P0 正确性门禁、200 万 tablet 容量门禁、计划内性能对照、最新 master rebase 和拆分 PR
+定向自验证已完成，但在完整 CI 通过前，
 仍不默认开启 streaming，也不把 Cloud 子类型单元矩阵等同于真实 CloudRestoreJob E2E。
 
 ### P1：建立可用于上游评审的性能证据
@@ -147,11 +149,11 @@ Thrift `byte[]` 仍会使完整压缩结果驻留堆中。后续机会应作为�
 
 | 顺序 | PR | 主要内容 | 依赖 | 当前状态 |
 | --- | --- | --- | --- | --- |
-| 1 | Replica 剥离 | 修复并完善 apache/doris#65321 | 无 | 本地实现分支完成；完整门禁未完成 |
-| 2 | Journal size 计数 | 使用计数流替代完整缓冲 | 无 | 定向 FE UT 2/2、512 MiB 三次对照通过；上游未提交 |
-| 3 | Streaming Gson 基础设施 | Guava 与多态 TypeAdapter 的流式实现 | 无 | 兼容矩阵 20/20、JFR 和五阶段三次对照完成；FE 全量门禁未完成 |
-| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 | 9 状态、四阶段重启、replay/failover 和大对象对照完成；上游未提交 |
-| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 | 兼容矩阵 16/16、真实 E2E、特殊元数据和 200 万压力通过；上游未提交 |
+| 1 | Replica 剥离 | 修复并完善 apache/doris#65321 | 无 | 已 rebase；定向 FE UT 16/16；完整 CI 未完成 |
+| 2 | Journal size 计数 | 使用计数流替代完整缓冲 | 无 | 已 rebase；定向 FE UT 2/2、512 MiB 三次对照通过；上游未提交 |
+| 3 | Streaming Gson 基础设施 | Guava 与多态 TypeAdapter 的流式实现 | 无 | 已 rebase；兼容矩阵 20/20、JFR 和五阶段三次对照完成；完整 CI 未完成 |
+| 4 | RestoreJob 流式序列化 | 迁移 HYDCP/hy-doris#49 的 Restore 优化 | PR 3 | 已重建到完整 PR 3；定向 FE UT 7/7，重启、replay/failover 和大对象对照完成 |
+| 5 | BackupMeta/Table 流式序列化 | 迁移 HYDCP/hy-doris#63 的 Backup 优化 | PR 1、3、4 | 已去重重建；定向 FE UT 27/27，真实 E2E、特殊元数据和 200 万压力通过 |
 | 6 | 默认开启与最终验证 | 根据兼容性和压力测试结果开启默认配置 | PR 1—5 | 未开始 |
 
 PR 1 和 PR 2 可以独立推进。PR 3 合入后再依次提交 PR 4 和 PR 5，避免多个 PR 同时修改 `GsonUtils`、`RuntimeTypeAdapterFactory` 和 `AbstractJob`。
@@ -444,7 +446,8 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
   能输出结构化 `status=oom` 后以 OOME 失败。
 - 当前远端机器同时运行其他 FE/BE 进程，单次 10 ms heap sampler 和耗时数据会受 GC/调度影响。
   在获得隔离资源、至少三次 fork 中位数和 JFR allocation 数据前，不使用这些数字声明性能比例。
-- 计划内性能证据已完成；后续重点转为最新 master rebase、拆分 PR 自验证和完整 CI。
+- 计划内性能证据、最新 master rebase 和拆分 PR 定向自验证已完成；后续重点转为 PR 模板、
+  上游提交和完整 CI。
 
 正式 Maven heap 参数为 `-Dfe.ut.max.heap=2g`，固定初始堆可额外使用
 `-Dfe.ut.extra.jvm.args=-Xms2g`；不能再使用 `-DargLine` 覆盖 fe-core 的默认 heap。
@@ -542,6 +545,31 @@ JFR 证明这是两个叠加的逐对象分配问题：
 刻意隔离 size-check buffer，不包含 BackupJob Gson 序列化成本，因此只能量化 PR 2 消除的完整
 buffer，不能替代前述真实 BackupJob 五阶段矩阵。8 MiB 冒烟的 buffered/counting 两种模式也
 通过；`BDBJEJournalSizeTest` 2/2、Checkstyle 0 violations，临时目录和 spill 残留均为 0。
+
+### 最新 master rebase 与拆分 PR 自验证（2026-07-20）
+
+五个职责分支从共同旧基点更新到 `upstream/master` @ `8460676f3fc`。PR 1、PR 2、PR 3 的
+`range-diff` 逐提交等价；PR 4 只回放 RestoreJob 专属提交到完整 PR 3 之上；PR 5 使用
+“新 PR 4 + 新 PR 1”组合基线重建，Git 自动去除重复的 DeepCopy、Restore 兼容修复和 replay
+测试提交。重建后的 PR 5 在本方案涉及的生产文件上与已完成压力测试的验证分支一致，额外差异
+仅来自最新 master 已合入的 Cloud timeout 和 Repository URI 修复。
+
+为避免在验证通过前覆盖个人远端正式分支，先推送五个 `codex/rebase-test-*-20260720` 候选分支。
+在 `192.168.9.44` 的独立 worktree 中使用仓库标准 `run-fe-ut.sh` 逐分支验证，结果如下：
+
+| 分支 | 定向测试 | 结果 |
+| --- | --- | ---: |
+| PR 1 | `BackupMetaTest`、`OlapTableTest`、`CloudTabletTest`、`DeepCopyTest` | 16/16 |
+| PR 2 | `BDBJEJournalSizeTest` | 2/2 |
+| PR 3 | streaming collection 与 runtime type adapter 测试 | 20/20 |
+| PR 4 | RestoreJob 序列化、Journal/EditLog 与 image replay 兼容矩阵 | 7/7 |
+| PR 5 | spill helper、BackupMeta/JobInfo、Table metadata 与组合兼容矩阵 | 27/27 |
+
+五轮 Maven reactor 均为 `BUILD SUCCESS`，Checkstyle 无 violation。验证通过后，使用带精确旧
+hash 保护的 `--force-with-lease` 更新五个个人远端 `codex/*` 正式分支；作为 apache/doris#65321
+head 的 `origin/backup-strip-replica-info` 保持不变。原测试集群在验证后 FE HTTP 和 BE health 均
+返回 200；占用 2.9 GiB 的临时 worktree 已清理。此次只推送个人 remote，未创建或更新 Apache
+upstream PR。
 
 ### 真实集群 MinIO E2E（2026-07-17）
 
@@ -857,10 +885,10 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 ## 剩余预计周期
 
 截至 2026-07-20，在不计算 reviewer 等待和全量 CI 排队的情况下，剩余上游整理预计需要
-1—2 个工作日；如补真实 CloudRestoreJob E2E，另需 0.5—1 日：
+0.5—1.5 个工作日；如补真实 CloudRestoreJob E2E，另需 0.5—1 日：
 
 - 如上游要求真实 CloudRestoreJob 证据，在具备 MetaService 的 Cloud 环境补测：0.5—1 日。
-- rebase、拆分 PR 自验证、PR 模板和 CI 问题整理：1—2 日。
+- PR 模板、上游提交顺序和 CI 问题整理：0.5—1.5 日。
 
 上述项目可以部分并行，但不能通过并行省略合入门禁；默认开启的决定仍以后续容量和 replay 结果
 为准。
