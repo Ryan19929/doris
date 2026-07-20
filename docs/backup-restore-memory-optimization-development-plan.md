@@ -3,7 +3,7 @@
 ## 文档状态
 
 - 状态：执行中（核心实现、兼容矩阵、四阶段中断重启、checkpoint/image 跨配置恢复、
-  Follower/Observer replay 和运行中角色切换已完成；特殊元数据、压力测试和上游门禁未完成）
+  Follower/Observer replay、运行中角色切换和特殊元数据矩阵已完成；200 万压力测试和上游门禁未完成）
 - 目标分支：Apache Doris `master`
 - 相关实现：
   - HYDCP/hy-doris#49：RestoreJob Guava Table/Multimap 流式 JSON 序列化
@@ -16,15 +16,16 @@
   - PR 3：`codex/streaming-gson-foundation` @ `46d6fa0aae4`
   - PR 4：`codex/restore-job-streaming` @ `7ad57e168b0`
   - PR 5：`codex/backup-meta-streaming` @ `02a5d1017a7`
-  - 验证分支：`codex/backup-memory-benchmark` @ `8b830a04599`
+  - 验证分支：`codex/backup-memory-benchmark` @ `ae8874f7f41`
 
 PR 1—5 已完成本地实现和分支拆分，但不代表已提交上游、通过完整 CI 或可以合入
 `master`。验证分支中的 wrapper 复用、Gson 可选能力探测缓存、OOM 传播修复和受控 spill
 已经按职责回迁 PR 3/PR 5，并在 Linux 官方 thirdparty 环境完成定向复测；单 FE/单 BE 的
 真实 BACKUP/RESTORE E2E、RestoreJob 在四个运行阶段的 FE 重启续跑，以及 streaming writer
 生成 checkpoint 后由 legacy reader 加载、Leader streaming writer → Follower/Observer legacy
-reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；特殊元数据矩阵和 200 万压力
-验证仍未完成。
+reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；colocate、动态分区、Replica
+保留开关、Cloud 元数据子类型和 20 万 tablet BackupHandler image 矩阵也已完成。真实 Cloud
+BACKUP/RESTORE 需要 Cloud 集群与 MetaService，当前经典集群不具备该条件；200 万压力验证仍未完成。
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
@@ -38,9 +39,9 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；�
 | Streaming 基础设施 | 已完成 | PR 3 兼容矩阵 20/20，通过 wrapper 复用和 Gson capability probe 缓存消除逐对象异常分配 |
 | RestoreJob | 状态矩阵、四阶段 restart、Follower/Observer replay 和 failover 已完成 | DOWNLOADING 停原 Leader 后 legacy Follower 接管至 FINISHED；旧 Leader 成功回归 |
 | BackupMeta/Table | 三阶段实现完成 | streaming deep copy/持久化、受控 spill、兼容性与异常清理；PR 5 矩阵 16/16、spill helper 11/11 |
-| 容量与性能 | 20 万 tablet 快速基准完成 | 2 GiB heap 下五阶段通过；`journal_replay` 根因经 JFR 定位并复测 |
-| 真实功能 | 单 FE/单 BE E2E、四阶段中断重启和 checkpoint 跨配置恢复完成 | 每次重启后 Restore 均 FINISHED，10 万行校验不变；streaming image 由 legacy reader 加载成功 |
-| 上游就绪度 | 尚未满足 | 缺少特殊元数据矩阵、200 万压力、最新 master rebase 和完整 CI |
+| 容量与性能 | 20 万 tablet 快速基准完成 | 2 GiB heap 下原五阶段及 BackupHandler image write/replay 通过；`journal_replay` 根因经 JFR 定位并复测 |
+| 真实功能 | 单 FE/单 BE E2E、四阶段中断重启、checkpoint 跨配置恢复和特殊元数据矩阵完成 | Restore 均 FINISHED，数据校验不变；colocate/动态分区及 Replica true/false 通过，Cloud 子类型完成定向 UT |
+| 上游就绪度 | 尚未满足 | 缺少 200 万压力、最新 master rebase 和完整 CI |
 
 ### 相关 PR 状态
 
@@ -67,9 +68,12 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；�
    线程，确认 legacy/streaming 两种 payload 都能真实 replay。
 3. [已完成] Master streaming 写入、Follower/Observer legacy replay、节点间配置不一致，以及
    DOWNLOADING 阶段角色切换后的运行时回退。
-4. 补齐 colocate、动态分区、CloudTablet、`reserve_replica=true/false` 和大型 checkpoint 元数据。
+4. [已完成] 补齐 colocate、动态分区、CloudTablet/CloudReplica 持久化子类型、
+   `reserve_replica=true/false`、`backup_meta_reserve_replica_info=true/false` 和 20 万 tablet
+   BackupHandler checkpoint image。真实 CloudRestoreJob E2E 留待具备 MetaService 的 Cloud 环境执行。
 
-这些项目完成前，不默认开启 streaming，也不把单节点 E2E 等同于持久化兼容已经闭环。
+P0 正确性门禁已完成，但在 200 万 tablet 压力基准、最新 master rebase 和完整 CI 通过前，
+仍不默认开启 streaming，也不把 Cloud 子类型单元矩阵等同于真实 CloudRestoreJob E2E。
 
 ### P1：建立可用于上游评审的性能证据
 
@@ -350,12 +354,15 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 - [x] Table/OlapTable legacy/streaming writer × reader 四象限及原始字节一致。
 - [x] BackupMeta 文件 legacy/streaming writer × reader 四象限及原始字节一致。
 - [x] BackupJobInfo 文件四象限、原始字节及 UTF-8 行为不变。
-- [ ] BackupJob editlog write/read/replay。
+- [x] BackupJob editlog write/read/replay，覆盖 `JournalEntity.readFields`、`EditLog.loadJournal` 和
+  `BackupHandler.replayAddJob`。
 - [x] streaming writer 生成真实 checkpoint image 后，关闭两个 streaming config 并重启，legacy
   reader 成功加载 image，RestoreJob 终态和 10 万行表数据完整。
 - [x] 默认 subtype、兼容 label 和非首位 type 的 legacy Table/Partition/Tablet/Replica JSON 可读取。
 - [x] Replica 剥离后的空 LocalTablet/CloudTablet 可被两种 reader 配置读取。
-- [ ] 部分分区、rollup、colocate、动态分区和 Cloud Tablet 元数据 round-trip。
+- [x] 部分分区、rollup、colocate、动态分区和 Cloud Tablet 元数据 round-trip；前四项已完成真实
+  BACKUP/RESTORE，CloudTablet/CloudReplica 由 legacy/streaming 单元兼容矩阵覆盖，真实 Cloud
+  BACKUP/RESTORE 仍需 MetaService 环境。
 
 ### 兼容矩阵验证记录（2026-07-17）
 
@@ -385,8 +392,8 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 如果 PR 3—5 为降低首次合入风险而默认关闭 streaming，则使用一个只修改默认配置的小 PR 开启功能。开启前必须满足：
 
 - [ ] 完整 CI 连续通过。
-- [ ] 新旧 writer/reader 兼容矩阵全部通过。
-- [ ] 20 万 tablet 快速基准稳定通过。
+- [x] 新旧 writer/reader 兼容矩阵全部通过。
+- [x] 20 万 tablet 快速基准稳定通过。
 - [ ] 200 万 tablet 压力基准无 OOM。
 - [x] Master/Follower/Observer 重启、replay 和运行中角色切换验证。
 - [x] streaming writer → legacy reader 的单 FE restart/image load、Follower/Observer replay 和
@@ -410,6 +417,7 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
 | BackupMeta write/read | 峰值 heap、耗时、文件大小 |
 | BackupJob editlog write/replay | 峰值 heap、耗时、journal payload 大小 |
 | RestoreJob write/read/replay | 峰值 heap、耗时、payload 大小 |
+| BackupHandler image write/replay | 峰值 heap、耗时、image payload 大小 |
 | journal size check | 峰值 heap、序列化次数、耗时 |
 
 推荐使用固定 JVM 参数和 JFR/async-profiler allocation 结果，并在每次测试前完成同样的 warm-up。PR 中必须同时提供 before/after，而不能只给优化后的数据。
@@ -429,8 +437,7 @@ bounded-memory writer。20 万 tablet 对照测试暴露该设计缺陷后，验
   能输出结构化 `status=oom` 后以 OOME 失败。
 - 当前远端机器同时运行其他 FE/BE 进程，单次 10 ms heap sampler 和耗时数据会受 GC/调度影响。
   在获得隔离资源、至少三次 fork 中位数和 JFR allocation 数据前，不使用这些数字声明性能比例。
-- 未完成：spill 修正后 before/after 矩阵、RestoreJob 大对象 benchmark、200 万压力基准、
-  Observer replay 和角色切换。
+- 未完成：spill 修正后 before/after 重复矩阵、RestoreJob 大对象 benchmark 和 200 万压力基准。
 
 正式 Maven heap 参数为 `-Dfe.ut.max.heap=2g`，固定初始堆可额外使用
 `-Dfe.ut.extra.jvm.args=-Xms2g`；不能再使用 `-DargLine` 覆盖 fe-core 的默认 heap。
@@ -587,6 +594,41 @@ Observer 在两个 streaming config 仍为 `false` 时重启，主线程明确�
 Follower、一个 Observer 均 Alive，journal 差距为 1。该实验完成 streaming writer → legacy
 reader 在真实选主和运行中任务接管路径上的验证。
 
+### 特殊元数据与大型 BackupHandler image（2026-07-20）
+
+测试前发现回归入口连接的是旧 Follower，节点级 streaming config 没有落到新 Leader。后续通过
+新 Leader `172.17.0.8` 的本地配置接口直接设置并复核
+`enable_backup_restore_job_streaming_json=true` 和
+`enable_table_meta_streaming_json=true`，避免把 legacy 基线误记为 streaming 结果。
+
+- 动态分区分别在 `reserve_dynamic_partition_enable=true/false` 下完成真实
+  BACKUP → MinIO → RESTORE。55 个年度分区和 20 行数据保持完整；`true` 保留动态分区属性，
+  `false` 按预期关闭 `dynamic_partition.enable`。legacy 基线和 streaming 路径均通过。
+- colocate 普通表和分区/MV 两组 suite 均通过。覆盖默认、`reserve_colocate=false/true`、
+  colocate group 冲突和 bucket 数不一致；保留场景恢复 COLOCATE plan，12 个 tablet 健康，
+  `ColocateMismatchNum=0`。
+- `backup_meta_reserve_replica_info=false` 是 streaming E2E 的默认路径；随后在实际 Leader 置为
+  `true`，再次完成动态分区 BACKUP/RESTORE，并在测试后恢复为 `false`。Restore SQL 的
+  `reserve_replica=true` 也在上述路径中执行。
+- `BackupMetaTest` 2/2 和 `TableMetaStreamingJsonTest` 4/4 通过，完整 25-module reactor
+  `BUILD SUCCESS`。前者覆盖保留开关的 true/false、legacy/streaming reader/writer、
+  LocalTablet/CloudTablet 和 LocalReplica/CloudReplica；后者覆盖 CloudPartition、CloudTablet、
+  CloudReplica 等显式多态子类型。当前为经典集群、没有 MetaService，因此不声称完成真实
+  CloudRestoreJob E2E。
+
+验证分支新增 `handler_image_write` 和 `handler_image_replay` 两个独立 JVM benchmark stage，
+通过 `BackupHandler.write/readFields` 处理包含 20 万 tablets × 3 replicas 的 BackupJob image。
+两阶段均在 `-Xms2g/-Xmx2g` 下通过，reader 使用 streaming writer fixture 并关闭两个 streaming
+配置，验证 legacy reader 可加载 image，且精确回放 20 万 tablets、Replica 按配置剥离：
+
+| 阶段 | peak delta | retained delta | elapsed | payload |
+| --- | ---: | ---: | ---: | ---: |
+| `handler_image_write` | 471,067,456 | 13,198,600 | 4,332 ms | 19,802,346 |
+| `handler_image_replay` | 1,133,510,656 | 41,107,168 | 1,812 ms | 19,802,346 |
+
+这组结果证明大型 BackupHandler checkpoint image 在 2 GiB 容量门槛下可以写入并跨配置回放；
+机器仍与多 FE/BE 共享资源，因此单次 sampled peak 和耗时只作为容量证据，不用于声明性能比例。
+
 ### Branch 3.1 参考基线（2026-07-17）
 
 在 `branch-3.1-backup-mem` @ `b8c24f5404e` 上，通过未 push 的纯测试分支
@@ -683,7 +725,7 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 
 - [x] 完成 PR 4 本地实现分支。
 - [x] 完成全部状态与配置切换的单元兼容矩阵（5/5）。
-- [ ] 验证 RestoreJob replay 和中途重启。
+- [x] 验证 RestoreJob replay 和中途重启。
 - [ ] 提供大 RestoreJob before/after 数据。
 
 ### 阶段 E：Backup
@@ -692,16 +734,17 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 - [x] 完成 PR 5 流式 deep copy、持久化迁移与 spillable buffer 本地实现。
 - [x] 完成 Table/BackupMeta/BackupJobInfo/job 压缩路径兼容矩阵（16/16）。
 - [x] 完成单 FE/单 BE 的普通表、分区表、MV/rollup BACKUP/RESTORE 端到端验证。
-- [ ] 完成 RestoreJob 中途重启、journal replay 和 checkpoint 验证。
+- [x] 完成 RestoreJob 中途重启、journal replay 和 checkpoint 验证。
 
 ### 阶段 F：默认开启
 
-- [x] 完成 20 万 tablet `full_streaming` 五阶段单次容量快速基准。
+- [x] 完成 20 万 tablet `full_streaming` 七阶段单次容量快速基准，包含 BackupHandler image
+  write/replay。
 - [x] 完成 wrapper 复用前后 reader/replay 三次 fork 对照和 spill 残留验证。
 - [x] 完成 `journal_replay` JFR allocation 根因分析、修复及三次复测。
 - [ ] 完成 spill 修正后的 20 万 before/after 重复基准与 JFR allocation 分析。
 - [ ] 完成 200 万 tablet 压力基准。
-- [ ] 完成多 FE replay 和回退演练。
+- [x] 完成多 FE replay 和回退演练。
 - [ ] 提交 PR 6 或在 reviewer 同意后确认默认开启。
 
 ## 完成定义
@@ -719,11 +762,10 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 ## 剩余预计周期
 
 截至 2026-07-20，在不计算 reviewer 等待和全量 CI 排队的情况下，剩余验证和上游整理预计需要
-6—10 个工作日：
+3—5 个工作日：
 
-- restart、journal/image/checkpoint 和多 FE replay：2—3 日。
-- colocate、动态分区、CloudTablet 和配置回退 E2E：1—2 日。
 - 200 万压力、大 RestoreJob 及补充 before/after/JFR：2—3 日。
+- 如上游要求真实 CloudRestoreJob 证据，在具备 MetaService 的 Cloud 环境补测：0.5—1 日。
 - rebase、拆分 PR 自验证、PR 模板和 CI 问题整理：1—2 日。
 
 上述项目可以部分并行，但不能通过并行省略合入门禁；默认开启的决定仍以后续容量和 replay 结果
