@@ -4,6 +4,9 @@ This file is the proposed text for updating apache/doris#65321. It assumes the g
 commit is split into a separate prerequisite PR. If that commit remains in PR1, the PR scope and release note must
 also describe the global behavior change.
 
+The reviewer-facing explanation for the complete PR1–PR5 series is in
+`backup-restore-memory-optimization-review-guide-en.md`.
+
 ## Suggested title
 
 ```text

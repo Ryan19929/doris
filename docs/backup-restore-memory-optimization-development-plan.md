@@ -33,6 +33,13 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；co
 
 本文用于跟踪上述优化向 Apache Doris `master` 的移植、拆分、验证和发布。计划中的每个 PR 必须能够独立审查、独立验证，并在出现问题时独立回滚。
 
+配套审查材料：
+
+- `backup-restore-memory-optimization-review-guide.md`：PR1—PR5 中文原理与审查指南；
+- `backup-restore-memory-optimization-review-guide-en.md`：面向 Apache reviewer 的英文版；
+- `backup-meta-replica-stripping-principle.md`：PR1 Replica 剥离专项深挖；
+- `backup-meta-replica-stripping-pr-draft.md`：PR1 英文 PR 正文草案。
+
 ## 当前进度快照（2026-07-20）
 
 ### 实现与验证

@@ -1,5 +1,9 @@
 # BackupMeta Replica 剥离原理与审查指南
 
+本文是 PR1 专项深挖。PR1—PR5 的整体原理、依赖和跨 PR 兼容矩阵见
+`backup-restore-memory-optimization-review-guide.md`；面向 Apache reviewer 的英文版见
+`backup-restore-memory-optimization-review-guide-en.md`。
+
 ## 1. 结论先行
 
 PR1 的核心做法是：BACKUP 仍然从 live catalog tablet 选择可用 Replica 并创建 BE snapshot task，
