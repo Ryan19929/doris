@@ -823,8 +823,10 @@ adapter 和 RestoreJob 字段级 adapter，且关闭配置时两层都选择 leg
 
 ### 阶段 A：修复现有 Draft
 
-- [ ] 完成 PR 1 测试和描述修复。
-- [ ] rebase 最新 master。
+- [x] 完成 PR 1 定向 FE UT（16/16）和描述草案。
+- [x] rebase 到 `upstream/master` @ `8460676f3fc` 并完成 Linux 定向验证。
+- [ ] 将 PR 1 的全局 DeepCopy Error 传播提交拆出，或经审查确认保留在 PR 1。
+- [ ] 在最终更新 Draft 前 rebase 当前 master（2026-07-21 仅新增 1 个无关 Iceberg regression 提交）。
 - [ ] 重跑 buildall 和相关 regression。
 - [ ] 请求 backup/restore maintainer review。
 
