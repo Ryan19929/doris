@@ -35,6 +35,7 @@ reader 的实时 replay，以及 DOWNLOADING 阶段主从切换均已完成；co
 
 配套审查材料：
 
+- `backup-restore-memory-optimization-beginner-guide.md`：从术语和“搬家清单”例子开始的零基础帮助；
 - `backup-restore-memory-optimization-review-guide.md`：PR1—PR5 中文原理与审查指南；
 - `backup-restore-memory-optimization-review-guide-en.md`：面向 Apache reviewer 的英文版；
 - `backup-meta-replica-stripping-principle.md`：PR1 Replica 剥离专项深挖；

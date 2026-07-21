@@ -5,6 +5,9 @@
 本文面向代码作者、内部审查者和 Apache Doris reviewer，解释 PR1—PR5 为什么需要拆分、每个 PR
 解决哪一层内存放大、哪些持久化语义必须保持不变，以及审查时应重点验证什么。
 
+如果还不熟悉 FE、Tablet、Replica、journal、image、Gson 或 streaming，建议先读
+`backup-restore-memory-optimization-beginner-guide.md`。
+
 本文不是 PR 合并状态记录。实时进度、提交 hash 和完整实验记录见
 `backup-restore-memory-optimization-development-plan.md`；PR1 的 Replica 剥离细节另见
 `backup-meta-replica-stripping-principle.md`。
@@ -174,8 +177,11 @@ adapter；null、empty、嵌套泛型和运行时 value 类型均在兼容矩阵
 delegate.toJsonTree(value) -> JsonObject 添加 clazz -> Streams.write()
 ```
 
-新路径用 `TypeFieldInjectingJsonWriter` 在 delegate 开始写对象时注入类型字段；读取时用
-`EnteredObjectJsonReader` 扫描类型字段，再把已经进入对象的 reader 交给正确 subtype delegate。
+新路径用 `TypeFieldInjectingJsonWriter` 在 delegate 开始写对象时把类型字段注入为首字段。读取
+canonical type-first JSON 时，`EnteredObjectJsonReader` 把已经进入对象的 reader 交给正确 subtype
+delegate，不构造 DOM。若历史输入的 type 不在首位或缺失，则进入 `readLegacyObject()` 兼容慢路径，
+为当前对象构造 JsonObject 后再调用 legacy delegate；它保证兼容，但不声称旧非 canonical 输入也
+完全 streaming。
 
 必须处理的历史输入包括：
 
@@ -196,7 +202,7 @@ copier/no-op，不能在每个对象 acquire 时通过 `Class.getMethod()` 制�
 
 1. streaming 开关关闭时是否完全走 legacy tree delegate；
 2. writer 是否只向 JSON object 注入一次 type 字段；
-3. reader 对非首位 type/default subtype 的回放是否不丢字段；
+3. reader 的 type-first streaming 主路径，以及非首位/default subtype 的 legacy fallback 是否都不丢字段；
 4. wrapper 异常退出后是否仍按 LIFO 释放并清除引用；
 5. `JsonReaderInternalAccess` hook 是否只解包自定义 wrapper，不改变普通 JsonReader；
 6. Gson 版本不存在的可选方法是否缓存 no-op，真实调用失败是否明确抛错；

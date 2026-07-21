@@ -102,9 +102,11 @@ PR3 replaces tree-based Guava Table/Multimap handling with TypeAdapters that rea
 JsonReader/JsonWriter while preserving the existing JSON shape.
 
 For polymorphic values, the legacy factory materializes a JsonElement tree to inject or find the type field. The
-streaming path instead uses a `TypeFieldInjectingJsonWriter` and an `EnteredObjectJsonReader`. It must support type
-fields at the beginning, middle, or end; missing type fields with a default subtype; compatible labels; and explicit
-failures for unknown/duplicate types, malformed values, and truncated JSON.
+streaming writer uses a `TypeFieldInjectingJsonWriter` and emits the type as the first field. Canonical type-first
+input then uses `EnteredObjectJsonReader` without materializing a DOM. Historical input with a non-first or missing
+type field intentionally falls back through `readLegacyObject()` and materializes that one object for compatibility.
+The reader must still support compatible labels and explicit failures for unknown/duplicate types, malformed
+values, and truncated JSON. Compatibility with non-canonical input is not claimed to be a zero-DOM path.
 
 High-cardinality metadata exposed two allocation hazards. The final implementation therefore:
 
@@ -116,7 +118,7 @@ High-cardinality metadata exposed two allocation hazards. The final implementati
 Review points:
 
 - config false must use the original tree delegate;
-- fields consumed before subtype selection must be replayed without loss;
+- the type-first streaming path and the non-first/default-subtype legacy fallback must both preserve every field;
 - wrappers must be released after success and exceptions;
 - the `JsonReaderInternalAccess` hook must only unwrap the custom reader;
 - declared byte-compatible paths must compare raw output bytes, not only round-tripped objects.
