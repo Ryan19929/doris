@@ -150,6 +150,36 @@ public class RuntimeTypeAdapterFactoryStreamingTest {
     }
 
     @Test
+    public void testCompatibleSubtypeLabelsReadInBothModesAndWriteCanonicalLabel() {
+        AtomicBoolean streaming = new AtomicBoolean(false);
+        RuntimeTypeAdapterFactory<Shape> factory = newFactory(streaming)
+                .registerCompatibleSubtype(Rectangle.class, "LegacyRectangle");
+        Gson gson = newGson(factory);
+
+        String[] payloads = {
+                "{\"clazz\":\"LegacyRectangle\",\"w\":7,\"h\":8}",
+                "{\"w\":7,\"clazz\":\"LegacyRectangle\",\"h\":8}",
+                "{\"w\":7,\"h\":8,\"clazz\":\"LegacyRectangle\"}"
+        };
+        for (boolean streamingEnabled : new boolean[] {false, true}) {
+            streaming.set(streamingEnabled);
+            for (String payload : payloads) {
+                Shape shape = gson.fromJson(payload, Shape.class);
+                Assert.assertTrue(shape instanceof Rectangle);
+                Assert.assertEquals(7, ((Rectangle) shape).width);
+                Assert.assertEquals(8, ((Rectangle) shape).height);
+            }
+
+            Rectangle rectangle = new Rectangle();
+            rectangle.width = 7;
+            rectangle.height = 8;
+            String json = gson.toJson(rectangle, Shape.class);
+            Assert.assertTrue(json, json.contains("\"clazz\":\"Rectangle\""));
+            Assert.assertFalse(json, json.contains("LegacyRectangle"));
+        }
+    }
+
+    @Test
     public void testStreamingReplaysLegacyPayloadWithDefaultSubtype() {
         AtomicBoolean streaming = new AtomicBoolean(false);
         RuntimeTypeAdapterFactory<Shape> factory = newFactory(streaming).registerDefaultSubtype(Circle.class);
