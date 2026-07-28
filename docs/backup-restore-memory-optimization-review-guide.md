@@ -12,6 +12,69 @@
 `backup-restore-memory-optimization-development-plan.md`；PR1 的 Replica 剥离细节另见
 `backup-meta-replica-stripping-principle.md`。
 
+### 1.1 评审背景：这组改动从哪里来
+
+这不是一次单点 OOM 修复，也不是要重新设计 BACKUP/RESTORE 文件格式。问题出现在 tablet 数量很大
+时：同一份 FE 元数据会依次经过 catalog deep copy、BackupJob/RestoreJob 持久化、edit log
+size preflight、checkpoint/image 和 BackupMeta 文件写入。旧实现会在不同阶段额外保留 Replica 对象、
+JSON DOM、完整 JSON String 和 byte buffer，因此最终 payload 尚未超过 FE heap 时，瞬时分配和
+Old Gen 占用就可能先触发 Full GC 或 OOM。
+
+最初的 branch-3.1 实验覆盖过 5 万级 tablet 的 RestoreJob，以及约 200 万 tablet、每 tablet
+3 副本的 BACKUP 生产规模。后者的旧格式单条 edit log 按实测比例外推可能超过 BDBJE 的 1 GiB
+journal 限制。这里引用这些规模是为了解释问题为什么值得处理；branch-3.1 的实测结果不能直接当作
+master 上每个拆分 PR 的独立收益承诺。
+
+方案经历了三个阶段：
+
+1. [HYDCP/hy-doris#49](https://github.com/HYDCP/hy-doris/pull/49) 先在 branch-3.1 优化
+   RestoreJob：为 `snapshotInfos`、`restoredVersionInfo` 和 job 多态分发引入 streaming Gson
+   路径，并验证旧写新读、新写新读和重启 replay。它是当前 PR3、PR4 的主要来源；
+2. [HYDCP/hy-doris#63](https://github.com/HYDCP/hy-doris/pull/63) 在 branch-3.1 把方案扩展到
+   BACKUP，组合了 Replica 剥离、Table 元数据 streaming、长度前缀 I/O 和 journal 计数。它提供了
+   完整链路和性能证据，但一个提交同时改变多个持久化层，范围不适合作为 master 的最终 review
+   单元；
+3. [apache/doris#65321](https://github.com/apache/doris/pull/65321) 是面向 master 的第一个
+   Draft，只保留 detached BackupMeta 中 Replica 剥离这一项。后续工作不直接把 #63 整体搬到
+   master，而是重新整理为 PR1—PR5。
+
+拆成五个 PR 的原因不是代码量，而是五类改动的正确性证明不同：PR1 要证明数据确实不会被 Restore
+消费；PR2 要证明只计数仍与真实 journal 字节数一致；PR3 要证明通用 adapter 的 JSON schema 和
+兼容回退不变；PR4 要证明 RestoreJob replay 安全；PR5 要证明外层 byte format、bounded read 和
+spill 生命周期安全。独立拆分后，每一项都可以单独 review、测试和回滚。
+
+### 1.2 本轮 reviewer 要判断什么
+
+本轮评审的目标是确认这套 master 拆分方案是否满足以下三个条件：
+
+1. 功能语义不变：BACKUP 仍从 live catalog 选择 snapshot Replica，RESTORE 仍按目标集群重新创建
+   Tablet/Replica；
+2. 持久化兼容：不新增 journal opcode、不提升 meta version，已有 journal、image 和 BackupMeta
+   仍可读取，开关不一致和回滚场景可 replay；
+3. 内存峰值逐层降低：每个 PR 只认领自己消除的那一层放大，不把组合分支的总收益归到单个 PR。
+
+本轮不试图改变 BE snapshot 数据格式、BACKUP/RESTORE SQL 接口或状态机，也不在 PR1—PR5 中直接
+决定 streaming 默认开启。默认值策略留到 PR6；真实 CloudRestoreJob + MetaService E2E 仍是可选的
+补充验证，不应被误写成已经完成。
+
+### 1.3 当前可供代码评审的分支快照
+
+以下是 2026-07-28 的个人 remote 快照。它们用于逐项 review，不代表已经完成最终 rebase 或满足
+Apache CI：
+
+| 计划 PR | 分支 | 快照 commit | 依赖 |
+| --- | --- | --- | --- |
+| PR1 | `codex/backup-strip-replica-info` | `3ec7ff3f374` | 无 |
+| PR2 | `codex/backup-journal-size-counting` | `f71760e5d7a` | 无 |
+| PR3 | `codex/streaming-gson-foundation` | `bdacd53ee31` | 无 |
+| PR4 | `codex/restore-job-streaming` | `e599cf60f1b` | PR3 |
+| PR5 | `codex/backup-meta-streaming` | `a3a5578602e` | PR1、PR3、PR4 |
+
+截至该快照，五个分支相对本地跟踪的 `upstream/master` 均落后 75 个提交，因此 reviewer 可以先审
+设计边界和实现逻辑，但最终逐 PR diff、CI 和 merge 判断应在 rebase 后再做。PR1 分支还包含一项
+全局 DeepCopy `Error` 传播修改，建议先拆成独立前置 PR。Apache Draft #65321 的
+`backup-strip-replica-info` 是另一条尚未更新的 remote 分支，不应与上述 `codex/` 快照混为一谈。
+
 ## 2. 总体结论
 
 这组优化处理的是同一条持久化链路上的五种不同放大：

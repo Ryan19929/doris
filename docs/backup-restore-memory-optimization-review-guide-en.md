@@ -9,6 +9,64 @@ that each PR may or may not make.
 Detailed execution records and benchmark methodology are maintained in
 `backup-restore-memory-optimization-development-plan.md`.
 
+## Background and provenance
+
+This is neither a single-point OOM fix nor a redesign of the BACKUP/RESTORE file format. With a large tablet
+count, the same FE metadata passes through catalog deep copy, BackupJob/RestoreJob persistence, edit-log size
+preflight, checkpoint/image persistence, and BackupMeta file output. The legacy path may retain Replica objects,
+a complete JSON DOM, a complete JSON String, and an additional byte buffer at different stages. Consequently,
+transient allocation or Old Gen pressure may trigger Full GC or OOM before the final payload itself approaches
+the FE heap limit.
+
+The original branch-3.1 investigation covered RestoreJob workloads with more than 50,000 tablets and a production
+BACKUP scale of roughly two million tablets with three replicas each. At the latter scale, extrapolation from the
+measured legacy payload indicates that a single edit-log entry may exceed BDBJE's one-GiB journal limit. These
+numbers explain the motivation; they are not per-PR performance claims for the master branches.
+
+The design evolved through three pull requests:
+
+1. [HYDCP/hy-doris#49](https://github.com/HYDCP/hy-doris/pull/49) first optimized RestoreJob on branch-3.1.
+   It introduced streaming Gson paths for `snapshotInfos`, `restoredVersionInfo`, and job polymorphic dispatch,
+   then validated cross-mode reads and restart replay. It is the main predecessor of PR3 and PR4.
+2. [HYDCP/hy-doris#63](https://github.com/HYDCP/hy-doris/pull/63) extended the branch-3.1 work to BACKUP and
+   combined Replica stripping, table-metadata streaming, length-prefixed I/O, and journal size counting. It
+   provides end-to-end evidence, but changes too many persistence layers to be an appropriate single master
+   review unit.
+3. [apache/doris#65321](https://github.com/apache/doris/pull/65321) is the first master-targeted Draft. It
+   deliberately keeps only Replica stripping from the detached BackupMeta copy. The remaining work is being
+   reshaped as PR1 through PR5 instead of copying #63 wholesale.
+
+The split follows correctness boundaries rather than line count. PR1 must prove that omitted data is not consumed
+by RESTORE. PR2 must prove that counting is byte-equivalent to a real journal write. PR3 must preserve JSON schema
+and compatibility fallback in shared adapters. PR4 must preserve RestoreJob replay. PR5 must preserve the outer
+byte format while bounding reads and managing spill-file lifetime. This makes every change independently
+reviewable, testable, and revertible.
+
+The review should establish three outcomes: BACKUP/RESTORE semantics remain unchanged; existing journal, image,
+and BackupMeta data remain readable across config mismatch and rollback; and each PR claims only the memory
+amplification layer that it actually removes. Changing the BE snapshot format, SQL surface, or job state machine is
+out of scope. Default enablement is deferred to PR6. A true CloudRestoreJob plus MetaService end-to-end run remains
+optional follow-up validation and is not claimed as completed.
+
+## Review branch snapshot
+
+The following personal-remote heads are the 2026-07-28 review snapshot. They are logical-review inputs, not
+merge-ready claims:
+
+| Planned PR | Branch | Snapshot commit | Dependency |
+| --- | --- | --- | --- |
+| PR1 | `codex/backup-strip-replica-info` | `3ec7ff3f374` | None |
+| PR2 | `codex/backup-journal-size-counting` | `f71760e5d7a` | None |
+| PR3 | `codex/streaming-gson-foundation` | `bdacd53ee31` | None |
+| PR4 | `codex/restore-job-streaming` | `e599cf60f1b` | PR3 |
+| PR5 | `codex/backup-meta-streaming` | `a3a5578602e` | PR1, PR3, PR4 |
+
+At this snapshot, all five branches are 75 commits behind the locally tracked `upstream/master`. Reviewers can
+evaluate design boundaries and implementation logic now, but final per-PR diffs, CI, and merge decisions must use
+the rebased heads. PR1 also contains a global DeepCopy `Error` propagation change that should preferably become a
+separate prerequisite PR. The `backup-strip-replica-info` head used by Apache Draft #65321 is a different,
+not-yet-updated remote branch and should not be confused with the `codex/` review snapshot.
+
 ## Design map
 
 ```text
