@@ -17,11 +17,17 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.ReplicaAllocation;
+import org.apache.doris.catalog.Table.TableType;
+import org.apache.doris.catalog.View;
 import org.apache.doris.cloud.backup.CloudRestoreJob;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.io.Text;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.nereids.trees.plans.commands.BackupCommand;
 import org.apache.doris.nereids.trees.plans.commands.RestoreCommand;
@@ -42,6 +48,7 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
@@ -52,7 +59,9 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.util.Deque;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class BackupRestoreJobStreamingJsonConfigTest {
     private boolean savedStreamingConfig;
@@ -137,6 +146,48 @@ public class BackupRestoreJobStreamingJsonConfigTest {
                 RestoreJob replayedRestoreJob = (RestoreJob) replayedJob;
                 Assert.assertSame(env, getField(replayedRestoreJob, "env"));
                 assertLargeFields(job, replayedRestoreJob);
+            }
+        }
+    }
+
+    @Test
+    public void testEditLogLoadJournalRunsRestoreReplaySideEffectsAcrossReadModes() throws Exception {
+        AtomicReference<Env> currentEnv = new AtomicReference<>();
+
+        try (MockedStatic<Env> mockedEnv = Mockito.mockStatic(Env.class)) {
+            mockedEnv.when(Env::getCurrentEnvJournalVersion).thenReturn(FeConstants.meta_version);
+            mockedEnv.when(Env::getCurrentEnv).thenAnswer(invocation -> currentEnv.get());
+            RestoreReplayJournals finishedJournals = newRestoreReplayJournals(
+                    RestoreJob.RestoreJobState.FINISHED);
+            RestoreReplayJournals cancelledJournals = newRestoreReplayJournals(
+                    RestoreJob.RestoreJobState.CANCELLED);
+
+            for (boolean streamingRead : new boolean[] {false, true}) {
+                RestoreReplayContext finishedContext = newRestoreReplayContext(currentEnv);
+                replayRestoreJournal(finishedContext.env, finishedJournals.pending, streamingRead, 1L);
+                replayRestoreJournal(finishedContext.env, finishedJournals.download, streamingRead, 2L);
+                Mockito.verify(finishedContext.existingTable)
+                        .setState(OlapTable.OlapTableState.RESTORE);
+                Mockito.verify(finishedContext.db).registerTable(
+                        Mockito.argThat(table -> "restored_view".equals(table.getName())));
+
+                replayRestoreJournal(finishedContext.env, finishedJournals.terminal, streamingRead, 3L);
+                Mockito.verify(finishedContext.existingTable)
+                        .setState(OlapTable.OlapTableState.NORMAL);
+                RestoreJob finished = latestRestoreJob(finishedContext.handler);
+                Assert.assertEquals(RestoreJob.RestoreJobState.FINISHED, finished.getState());
+                Assert.assertEquals(RestoreJob.RestoreJobState.FINISHED, finished.showState);
+
+                RestoreReplayContext cancelledContext = newRestoreReplayContext(currentEnv);
+                replayRestoreJournal(cancelledContext.env, cancelledJournals.pending, streamingRead, 4L);
+                replayRestoreJournal(cancelledContext.env, cancelledJournals.download, streamingRead, 5L);
+                replayRestoreJournal(cancelledContext.env, cancelledJournals.terminal, streamingRead, 6L);
+                Mockito.verify(cancelledContext.db).unregisterTable("restored_view");
+                Mockito.verify(cancelledContext.existingTable)
+                        .setState(OlapTable.OlapTableState.NORMAL);
+                RestoreJob cancelled = latestRestoreJob(cancelledContext.handler);
+                Assert.assertEquals(RestoreJob.RestoreJobState.CANCELLED, cancelled.getState());
+                Assert.assertEquals(RestoreJob.RestoreJobState.CANCELLED, cancelled.showState);
             }
         }
     }
@@ -304,6 +355,67 @@ public class BackupRestoreJobStreamingJsonConfigTest {
         return job;
     }
 
+    private static RestoreReplayJournals newRestoreReplayJournals(
+            RestoreJob.RestoreJobState terminalState) throws Exception {
+        RestoreJob job = newRestoreJob("side_effect_" + terminalState.name(), 8);
+        BackupJobInfo jobInfo = getField(job, "jobInfo");
+        jobInfo.backupOlapTableObjects.put("existing_table", new BackupJobInfo.BackupOlapTableInfo());
+
+        setField(job, "state", RestoreJob.RestoreJobState.PENDING);
+        setField(job, "showState", RestoreJob.RestoreJobState.PENDING);
+        byte[] pending = writeJournal(job, false);
+
+        List<org.apache.doris.catalog.Table> restoredTables = getField(job, "restoredTbls");
+        restoredTables.add(new View(90_001L, "restored_view", Lists.newArrayList()));
+        setField(job, "state", RestoreJob.RestoreJobState.DOWNLOAD);
+        setField(job, "showState", RestoreJob.RestoreJobState.DOWNLOAD);
+        byte[] download = writeJournal(job, false);
+
+        restoredTables.clear();
+        setField(job, "state", terminalState);
+        setField(job, "showState", terminalState);
+        byte[] terminal = writeJournal(job, false);
+        return new RestoreReplayJournals(pending, download, terminal);
+    }
+
+    private static RestoreReplayContext newRestoreReplayContext(AtomicReference<Env> currentEnv) throws Exception {
+        Env env = Mockito.mock(Env.class);
+        BackupHandler handler = new BackupHandler(env);
+        InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
+        Database db = Mockito.mock(Database.class);
+        OlapTable existingTable = Mockito.mock(OlapTable.class);
+
+        Mockito.when(env.getBackupHandler()).thenReturn(handler);
+        Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
+        Mockito.when(catalog.getDbOrMetaException(Mockito.anyLong())).thenReturn(db);
+        Mockito.when(catalog.getDbNullable(Mockito.anyLong())).thenReturn(db);
+        Mockito.when(db.getTableNullable("existing_table")).thenReturn(existingTable);
+        Mockito.when(db.writeLockIfExist()).thenReturn(true);
+        Mockito.when(db.getName()).thenReturn("db");
+        Mockito.when(existingTable.getType()).thenReturn(TableType.OLAP);
+        Mockito.when(existingTable.writeLockIfExist()).thenReturn(true);
+        Mockito.when(existingTable.getState()).thenReturn(OlapTable.OlapTableState.RESTORE);
+        Mockito.when(existingTable.getNextVersion()).thenReturn(10L);
+
+        currentEnv.set(env);
+        return new RestoreReplayContext(env, handler, db, existingTable);
+    }
+
+    private static void replayRestoreJournal(Env env, byte[] bytes, boolean streamingRead, long logId)
+            throws Exception {
+        Config.enable_backup_restore_job_streaming_json = streamingRead;
+        JournalEntity entity = new JournalEntity();
+        entity.readFields(dataInput(bytes));
+        EditLog.loadJournal(env, logId, entity);
+    }
+
+    private static RestoreJob latestRestoreJob(BackupHandler handler) throws Exception {
+        Map<Long, Deque<AbstractJob>> jobs = getField(handler, "dbIdToBackupOrRestoreJobs");
+        Assert.assertEquals(1, jobs.size());
+        Assert.assertEquals(1, jobs.values().iterator().next().size());
+        return (RestoreJob) jobs.values().iterator().next().getLast();
+    }
+
     private static CloudRestoreJob newCloudRestoreJob() throws Exception {
         CloudRestoreJob cloudJob = new CloudRestoreJob(AbstractJob.JobType.RESTORE);
         setField(cloudJob, "label", "cloud_restore");
@@ -441,6 +553,32 @@ public class BackupRestoreJobStreamingJsonConfigTest {
 
     private static class PlainTableHolder {
         private Table<Long, Long, Long> table = HashBasedTable.create();
+    }
+
+    private static class RestoreReplayJournals {
+        private final byte[] pending;
+        private final byte[] download;
+        private final byte[] terminal;
+
+        private RestoreReplayJournals(byte[] pending, byte[] download, byte[] terminal) {
+            this.pending = pending;
+            this.download = download;
+            this.terminal = terminal;
+        }
+    }
+
+    private static class RestoreReplayContext {
+        private final Env env;
+        private final BackupHandler handler;
+        private final Database db;
+        private final OlapTable existingTable;
+
+        private RestoreReplayContext(Env env, BackupHandler handler, Database db, OlapTable existingTable) {
+            this.env = env;
+            this.handler = handler;
+            this.db = db;
+            this.existingTable = existingTable;
+        }
     }
 
     private static class LegacyMarkerTableAdapter extends TypeAdapter<Table<?, ?, ?>> {
