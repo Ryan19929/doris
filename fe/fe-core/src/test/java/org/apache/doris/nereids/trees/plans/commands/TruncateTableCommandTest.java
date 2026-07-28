@@ -39,12 +39,17 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mockito;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 public class TruncateTableCommandTest extends TestWithFeService {
     @Override
@@ -271,6 +276,61 @@ public class TruncateTableCommandTest extends TestWithFeService {
             }
         } finally {
             DebugPointUtil.removeDebugPoint("InternalCatalog.truncateTable.metaChanged");
+        }
+    }
+
+    @Test
+    public void testStreamingDeepCopyFailurePreservesCauseAndTableState(@TempDir Path tempDirectory)
+            throws Exception {
+        String createTableStr = "create table internal.testcommand.tbl_streaming_spill_failure"
+                + "(d1 date, k1 int) duplicate key(d1, k1) "
+                + "partition by range(d1) "
+                + "(partition p1 values [('2021-09-01'), ('2021-09-02'))) "
+                + "distributed by hash(k1) buckets 1 "
+                + "properties('replication_num' = '1');";
+        createTable(createTableStr);
+
+        Database db = Env.getCurrentInternalCatalog().getDbNullable("testcommand");
+        OlapTable table = db.getOlapTableOrDdlException("tbl_streaming_spill_failure");
+        Partition originalPartition = table.getPartition("p1");
+        long originalPartitionId = originalPartition.getId();
+        String originalComment = table.getComment();
+        boolean previousStreaming = Config.enable_table_meta_streaming_json;
+        String previousTmpDirectory = Config.tmp_dir;
+        Path regularFile = tempDirectory.resolve("not-a-directory");
+        Files.write(regularFile, new byte[] {1});
+
+        List<Long> backendIds = Env.getCurrentSystemInfo().getAllBackendIds();
+        Map<Long, Set<Long>> originalBackendTablets = Maps.newHashMap();
+        for (long backendId : backendIds) {
+            originalBackendTablets.put(backendId,
+                    Sets.newHashSet(Env.getCurrentInvertedIndex().getTabletIdsByBackendId(backendId)));
+        }
+
+        try {
+            table.setComment("x".repeat(9 * 1024 * 1024));
+            Config.enable_table_meta_streaming_json = true;
+            Config.tmp_dir = regularFile.toString();
+
+            LogicalPlan plan = new NereidsParser().parseSingle(
+                    "truncate table internal.testcommand.tbl_streaming_spill_failure partition (p1)");
+            DdlException exception = Assertions.assertThrows(DdlException.class,
+                    () -> Env.getCurrentEnv().truncateTable((TruncateTableCommand) plan));
+
+            Assertions.assertTrue(exception.getMessage().contains("through streaming JSON"));
+            Assertions.assertInstanceOf(IOException.class, exception.getCause());
+            Assertions.assertSame(originalPartition, table.getPartition("p1"));
+            Assertions.assertEquals(originalPartitionId, table.getPartition("p1").getId());
+            for (long backendId : backendIds) {
+                Assertions.assertEquals(originalBackendTablets.get(backendId),
+                        Sets.newHashSet(Env.getCurrentInvertedIndex().getTabletIdsByBackendId(backendId)));
+            }
+            Assertions.assertTrue(table.tryWriteLock(1, TimeUnit.SECONDS));
+            table.writeUnlock();
+        } finally {
+            table.setComment(originalComment);
+            Config.enable_table_meta_streaming_json = previousStreaming;
+            Config.tmp_dir = previousTmpDirectory;
         }
     }
 

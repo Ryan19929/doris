@@ -727,7 +727,15 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         // only copy visible indexes
         List<String> reservedPartitions = tableRef.getPartitionNamesInfo() == null ? null
                 : tableRef.getPartitionNamesInfo().getPartitionNames();
-        OlapTable copiedTbl = olapTable.selectiveCopy(reservedPartitions, IndexExtState.VISIBLE, true);
+        OlapTable copiedTbl;
+        try {
+            copiedTbl = olapTable.selectiveCopy(reservedPartitions, IndexExtState.VISIBLE, true);
+        } catch (GsonUtils.JsonDeepCopyException e) {
+            LOG.warn("failed to copy table {} for backup", olapTable.getName(), e.getCause());
+            status = new Status(ErrCode.COMMON_ERROR,
+                    "failed to copy table " + olapTable.getName() + ": " + e.getCause().getMessage());
+            return;
+        }
         if (copiedTbl == null) {
             status = new Status(ErrCode.COMMON_ERROR, "failed to copy table: " + olapTable.getName());
             return;
