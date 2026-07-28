@@ -136,6 +136,7 @@ import org.apache.doris.persist.PartitionPersistInfo;
 import org.apache.doris.persist.RecoverInfo;
 import org.apache.doris.persist.ReplicaPersistInfo;
 import org.apache.doris.persist.TruncateTableInfo;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.resource.Tag;
@@ -3549,7 +3550,15 @@ public class InternalCatalog implements CatalogIf<Database> {
                         dbName, tableName);
                 return;
             }
-            copiedTbl = olapTable.selectiveCopy(origPartitions.keySet(), IndexExtState.VISIBLE, false);
+            try {
+                copiedTbl = olapTable.selectiveCopy(origPartitions.keySet(), IndexExtState.VISIBLE, false);
+            } catch (GsonUtils.JsonDeepCopyException e) {
+                throw new DdlException("Failed to copy table " + olapTable.getName()
+                        + " through streaming JSON: " + e.getCause().getMessage(), e.getCause());
+            }
+            if (copiedTbl == null) {
+                throw new DdlException("Failed to copy table " + olapTable.getName());
+            }
 
             binlogConfig = new BinlogConfig(olapTable.getBinlogConfig());
         } finally {

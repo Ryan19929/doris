@@ -214,9 +214,6 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.ReflectionAccessFilter;
 import com.google.gson.ToNumberPolicy;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
-
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /*
@@ -235,8 +232,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * See the following "GuavaTableAdapter" and "GuavaMultimapAdapter" for example.
  */
 public class GsonUtils {
-    private static final Logger LOG = LogManager.getLogger(GsonUtils.class);
-
     // runtime adapter for class "Type"
     private static RuntimeTypeAdapterFactory<org.apache.doris.catalog.Type> columnTypeAdapterFactory
             = RuntimeTypeAdapterFactory
@@ -702,14 +697,19 @@ public class GsonUtils {
                 return LengthPrefixedJsonStream.read(buffer, type, GSON);
             }
         } catch (Exception e) {
-            LOG.warn("failed to copy object via spillable JSON stream", e);
-            return null;
+            throw new JsonDeepCopyException("failed to copy object via spillable JSON stream", e);
         } finally {
             if (previousContext == null) {
                 MetaContext.remove();
             } else {
                 previousContext.setThreadLocalInfo();
             }
+        }
+    }
+
+    public static final class JsonDeepCopyException extends RuntimeException {
+        public JsonDeepCopyException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
