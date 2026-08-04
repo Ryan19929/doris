@@ -64,7 +64,7 @@ suite("test_backup_restore_alias", "backup_restore") {
     }
 
     sql "INSERT INTO ${dbName}.${tableName} VALUES (20, 21), (123, 341)"
-    order_qt_select "SELECT * FROM ${dbName}.${tableName}"
+    qt_select "SELECT * FROM ${dbName}.${tableName} ORDER BY id"
 
     sql """
         RESTORE SNAPSHOT ${dbName}.${snapshotName}
@@ -79,8 +79,8 @@ suite("test_backup_restore_alias", "backup_restore") {
 
     syncer.waitAllRestoreFinish(dbName)
 
-    order_qt_select "SELECT * FROM ${dbName}.${tableName}"
-    order_qt_select "SELECT * FROM ${dbName}.${aliasName}"
+    qt_select "SELECT * FROM ${dbName}.${tableName} ORDER BY id"
+    qt_select "SELECT * FROM ${dbName}.${aliasName} ORDER BY id"
 
     sql "DROP REPOSITORY `${repoName}`"
 }
