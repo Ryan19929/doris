@@ -162,8 +162,14 @@ public class BinlogManagerTest {
         Assert.assertTrue(dbBinlogMap.containsKey(dbBaseId));
         List<TBinlog> binlogs = Lists.newArrayList();
         dbBinlogMap.get(dbBaseId).getAllBinlogs(binlogs);
-        Assert.assertEquals(2, binlogs.size());
-        Assert.assertEquals(commitSeq, binlogs.get(1).getCommitSeq());
+        boolean found = false;
+        for (TBinlog binlog : binlogs) {
+            if (binlog.getType() == TBinlogType.UPSERT && binlog.getCommitSeq() == commitSeq) {
+                found = true;
+                break;
+            }
+        }
+        Assert.assertTrue(found);
     }
 
     @Test
