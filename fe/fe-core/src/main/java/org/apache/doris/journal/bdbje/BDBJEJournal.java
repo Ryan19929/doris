@@ -247,7 +247,7 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         DataOutputBuffer buffer = new DataOutputBuffer(OUTPUT_BUFFER_INIT_SIZE);
         entity.write(buffer);
 
-        DatabaseEntry theData = new DatabaseEntry(buffer.getData());
+        DatabaseEntry theData = createDatabaseEntry(buffer);
         if (MetricRepo.isInit) {
             MetricRepo.COUNTER_EDIT_LOG_SIZE_BYTES.increase((long) theData.getSize());
             MetricRepo.COUNTER_CURRENT_EDIT_LOG_SIZE_BYTES.increase((long) theData.getSize());
@@ -723,22 +723,35 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         return bdbEnvironment.getNotReadyReason();
     }
 
-    @Override
-    public boolean exceedMaxJournalSize(short op, Writable writable) throws IOException {
+    static DatabaseEntry createDatabaseEntry(DataOutputBuffer buffer) {
+        return new DatabaseEntry(buffer.getData(), 0, buffer.getLength());
+    }
+
+    static long countJournalSize(short op, Writable writable) throws IOException {
         JournalEntity entity = new JournalEntity();
         entity.setOpCode(op);
         entity.setData(writable);
 
-        // only count the serialized size instead of buffering the whole entity,
-        // the entity of a huge backup/restore job may take GBs in memory
         CountingDataOutputStream countingStream = new CountingDataOutputStream(new NullOutputStream());
         entity.write(countingStream);
+        return countingStream.getCount();
+    }
+
+    @Override
+    public boolean exceedMaxJournalSize(short op, Writable writable) throws IOException {
+        // 1GB
+        return exceedMaxJournalSize(op, writable, 1 << 30);
+    }
+
+    static boolean exceedMaxJournalSize(short op, Writable writable, long maxJournalSize) throws IOException {
+        // only count the serialized size instead of buffering the whole entity,
+        // the entity of a huge backup/restore job may take GBs in memory
+        long serializedSize = countJournalSize(op, writable);
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("opCode = {}, journal size = {}", op, countingStream.getCount());
+            LOG.debug("opCode = {}, journal size = {}", op, serializedSize);
         }
 
-        // 1GB
-        return countingStream.getCount() > (1 << 30);
+        return serializedSize > maxJournalSize;
     }
 }
