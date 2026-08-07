@@ -732,7 +732,7 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
         entity.setOpCode(op);
         entity.setData(writable);
 
-        CountingDataOutputStream countingStream = new CountingDataOutputStream(new NullOutputStream());
+        CountingDataOutputStream countingStream = new CountingDataOutputStream(NullOutputStream.INSTANCE);
         entity.write(countingStream);
         return countingStream.getCount();
     }

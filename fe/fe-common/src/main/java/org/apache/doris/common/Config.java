@@ -1633,23 +1633,24 @@ public class Config extends ConfigBase {
                     + "polymorphic dispatch, to reduce FE heap peak when serializing large table meta "
                     + "(e.g. backup meta, editlog, image)"
     })
-    public static boolean enable_table_meta_streaming_json = true;
+    public static volatile boolean enable_table_meta_streaming_json = false;
 
     /**
      * A internal config, whether to reserve the replica info of tablets in backup meta.
      *
      * The replica info of the backed up table is never used by restore jobs (replicas are
-     * always re-created on restore), so it is stripped by default to reduce the backup meta
-     * size and the FE memory usage of large backup jobs.
+     * always re-created on restore), so it can be stripped to reduce the backup meta size and
+     * the FE memory usage of large backup jobs. Keep the legacy behavior by default for a
+     * conservative rollout.
      */
     @ConfField(mutable = true, masterOnly = true, description = {
             "备份元数据中是否保留 tablet 的副本信息。恢复时副本总是被重建，副本信息从不被使用，"
-                    + "默认剔除以降低大规模备份任务的元数据大小和 FE 内存占用",
+                    + "可关闭此配置以降低大规模备份任务的元数据大小和 FE 内存占用",
             "Whether to reserve the replica info of tablets in backup meta. Replicas are always "
-                    + "re-created on restore and the backed up replica info is never used, so it is "
-                    + "stripped by default to reduce backup meta size and FE memory usage of large backup jobs"
+                    + "re-created on restore and the backed up replica info is never used. Disable this "
+                    + "configuration to reduce backup meta size and FE memory usage of large backup jobs"
     })
-    public static boolean backup_meta_reserve_replica_info = false;
+    public static volatile boolean backup_meta_reserve_replica_info = true;
 
     /**
      * A internal config, to reduce the restore job size during serialization by compress.

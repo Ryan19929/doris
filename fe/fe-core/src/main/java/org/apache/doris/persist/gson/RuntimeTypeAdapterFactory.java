@@ -117,6 +117,13 @@ import java.util.function.BooleanSupplier;
  * Both the type field name ({@code "type"}) and the type labels ({@code
  * "Rectangle"}) are configurable.
  *
+ * <p>When streaming dispatch is enabled, the type field must be the first field
+ * for registered subtypes. The streaming writer always emits it first. Legacy
+ * payloads without a type field remain readable only when a default subtype is
+ * registered; in that case the consumed first field name is replayed to the
+ * default subtype adapter. Payloads generated outside Doris with a type field
+ * in any other position are not supported in streaming mode.
+ *
  * <h3>Registering Types</h3>
  * Create a {@code RuntimeTypeAdapterFactory} by passing the base type and type
  * field

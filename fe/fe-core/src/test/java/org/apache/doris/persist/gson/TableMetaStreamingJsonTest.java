@@ -34,12 +34,16 @@ import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.SinglePartitionInfo;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.TabletMeta;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.datasource.hive.HMSExternalCatalog;
+import org.apache.doris.datasource.hive.HMSExternalDatabase;
+import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TStorageType;
 import org.apache.doris.thrift.TTabletType;
@@ -47,6 +51,7 @@ import org.apache.doris.thrift.TTabletType;
 import com.google.common.collect.Lists;
 import org.junit.Assert;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -64,6 +69,12 @@ import java.util.List;
  * with Text.writeString/readString.
  */
 public class TableMetaStreamingJsonTest {
+
+    @Test
+    public void testSafeRolloutDefaults() {
+        Assert.assertFalse(Config.enable_table_meta_streaming_json);
+        Assert.assertTrue(Config.backup_meta_reserve_replica_info);
+    }
 
     private static OlapTable createTable() {
         long dbId = 1L;
@@ -106,6 +117,15 @@ public class TableMetaStreamingJsonTest {
         table.addPartition(partition);
         table.setIndexMeta(indexId, "tbl1", columns, 0, 0, (short) 1, TStorageType.COLUMN, KeysType.AGG_KEYS);
         return table;
+    }
+
+    private static HMSExternalTable createHmsExternalTable() {
+        HMSExternalCatalog catalog = Mockito.mock(HMSExternalCatalog.class);
+        HMSExternalDatabase database = Mockito.mock(HMSExternalDatabase.class);
+        Mockito.when(catalog.getId()).thenReturn(10L);
+        Mockito.when(database.getFullName()).thenReturn("hms_db");
+        Mockito.when(database.getRemoteName()).thenReturn("remote_hms_db");
+        return new HMSExternalTable(11L, "hms_table", "remote_hms_table", catalog, database);
     }
 
     private static String toJsonWithStreaming(Object src, Class<?> declaredType, boolean streaming) {
@@ -157,6 +177,27 @@ public class TableMetaStreamingJsonTest {
             Tablet tablet = index.getTablets().get(0);
             Assert.assertEquals(5L, tablet.getId());
             Assert.assertEquals(3, tablet.getReplicas().size());
+        }
+    }
+
+    @Test
+    public void testHmsExternalTableStreamingWriteByteIdenticalAndCrossModeReadable() {
+        HMSExternalTable table = createHmsExternalTable();
+        String treeJson = toJsonWithStreaming(table, TableIf.class, false);
+        String streamingJson = toJsonWithStreaming(table, TableIf.class, true);
+
+        Assert.assertEquals(treeJson, streamingJson);
+        Assert.assertTrue(streamingJson, streamingJson.startsWith("{\"clazz\":\"HMSExternalTable\","));
+
+        for (String json : new String[] {treeJson, streamingJson}) {
+            for (boolean streaming : new boolean[] {false, true}) {
+                TableIf restored = fromJsonWithStreaming(json, TableIf.class, streaming);
+                Assert.assertTrue(restored instanceof HMSExternalTable);
+                Assert.assertEquals(table.getId(), restored.getId());
+                Assert.assertEquals(table.getName(), restored.getName());
+                Assert.assertEquals(table.getType(), restored.getType());
+                Assert.assertEquals(table.getRemoteName(), ((HMSExternalTable) restored).getRemoteName());
+            }
         }
     }
 
