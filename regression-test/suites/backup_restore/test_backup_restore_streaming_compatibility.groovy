@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_backup_restore_streaming_compatibility", "backup_restore") {
+suite("test_backup_restore_streaming_compatibility", "backup_restore,nonConcurrent") {
     String repoName = "test_backup_restore_streaming_compatibility_repo_" +
             UUID.randomUUID().toString().replace("-", "")
     def syncer = getSyncer()
