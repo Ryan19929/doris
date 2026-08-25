@@ -136,7 +136,7 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
     TStatus tstatus;
     std::vector<std::string> download_success_files;
     Defer defer {[=, &engine, &tstatus, ingest_binlog_tstatus = arg->tstatus, &watch,
-                  &total_download_bytes, &total_download_files]() {
+                  &total_download_bytes, &total_download_files, &download_success_files]() {
         g_ingest_binlog_latency << watch.elapsed_time_microseconds();
         auto elapsed_time_ms = static_cast<int64_t>(watch.elapsed_time_milliseconds());
         double copy_rate = 0.0;
@@ -604,10 +604,21 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
             }
         }
 
-        static_cast<void>(BaseTablet::commit_phase_update_delete_bitmap(
+        status = BaseTablet::commit_phase_update_delete_bitmap(
                 local_tablet, rowset, pre_rowset_ids, delete_bitmap, segments, txn_id,
-                calc_delete_bitmap_token.get(), nullptr));
-        static_cast<void>(calc_delete_bitmap_token->wait());
+                calc_delete_bitmap_token.get(), nullptr);
+        auto wait_status = calc_delete_bitmap_token->wait();
+        if (status.ok()) {
+            status = wait_status;
+        }
+        if (!status.ok()) {
+            LOG(WARNING) << "failed to calculate delete bitmap for ingest binlog"
+                         << ", tablet_id=" << local_tablet_id
+                         << ", rowset_id=" << rowset->rowset_id() << ", txn_id=" << txn_id
+                         << ", status=" << status;
+            status.to_thrift(&tstatus);
+            return;
+        }
     }
 
     // Step 7.3: commit txn
