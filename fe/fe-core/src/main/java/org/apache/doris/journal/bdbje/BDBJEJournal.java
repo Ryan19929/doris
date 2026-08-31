@@ -146,7 +146,7 @@ public class BDBJEJournal implements Journal { // CHECKSTYLE IGNORE THIS LINE: B
                 for (int j = 0; j < entitySize; ++j) {
                     JournalBatch.Entity entity = entities.get(j);
                     DatabaseEntry theKey = idToKey(firstId + j);
-                    DatabaseEntry theData = new DatabaseEntry(entity.getBinaryData());
+                    DatabaseEntry theData = new DatabaseEntry(entity.getBinaryData(), 0, entity.getBinaryDataLength());
                     currentJournalDB.put(txn, theKey, theData);  // Put with overwrite, it always success
                     dataSize += theData.getSize();
                     if (i == 0 && LOG.isDebugEnabled()) {

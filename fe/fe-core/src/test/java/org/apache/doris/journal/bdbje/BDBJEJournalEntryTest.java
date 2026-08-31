@@ -19,11 +19,14 @@ package org.apache.doris.journal.bdbje;
 
 import org.apache.doris.common.io.DataOutputBuffer;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.journal.JournalBatch;
 import org.apache.doris.journal.JournalEntity;
 import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.gson.GsonUtils;
 
 import com.sleepycat.je.DatabaseEntry;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -33,6 +36,7 @@ import java.io.IOException;
 import java.util.Arrays;
 
 public class BDBJEJournalEntryTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE should use uppercase
+    private static final Logger LOG = LogManager.getLogger(BDBJEJournalEntryTest.class);
     private static final int OUTPUT_BUFFER_INIT_SIZE = 128;
     private static final String JSON_PAYLOAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -72,6 +76,39 @@ public class BDBJEJournalEntryTest { // CHECKSTYLE IGNORE THIS LINE: BDBJE shoul
         Assertions.assertEquals(OperationType.OP_TIMESTAMP, compactEntity.getOpCode());
         Assertions.assertEquals(((Timestamp) paddedEntity.getData()).getTimestamp(),
                 ((Timestamp) compactEntity.getData()).getTimestamp());
+    }
+
+    @Test
+    public void testBatchEntityValidDataLength() throws Exception {
+        String payload = buildLargeAsciiString(2 * 1024 * 1024);
+        // the payload object is reusable, so the same writable can be serialized twice
+        // (once by countJournalSize, once by JournalBatch.addJournal)
+        Writable writable = out -> GsonUtils.toJsonAsText(out, payload);
+
+        JournalBatch batch = new JournalBatch();
+        batch.addJournal(OperationType.OP_LOCAL_EOF, writable);
+        JournalBatch.Entity entity = batch.getJournalEntities().get(0);
+
+        LOG.info("batch entity valid length {}, backing array capacity {}",
+                entity.getBinaryDataLength(), entity.getBinaryData().length);
+        // the backing array grows past the valid bytes, so padding must exist
+        Assertions.assertTrue(entity.getBinaryData().length > entity.getBinaryDataLength());
+        Assertions.assertEquals(entity.getBinaryDataLength(), batch.getSize());
+
+        long serializedSize = BDBJEJournal.countJournalSize(OperationType.OP_LOCAL_EOF, writable);
+        Assertions.assertEquals(entity.getBinaryDataLength(), serializedSize);
+        Assertions.assertTrue(BDBJEJournal.exceedMaxJournalSize(
+                OperationType.OP_LOCAL_EOF, writable, serializedSize - 1));
+        Assertions.assertFalse(BDBJEJournal.exceedMaxJournalSize(
+                OperationType.OP_LOCAL_EOF, writable, serializedSize));
+        Assertions.assertFalse(BDBJEJournal.exceedMaxJournalSize(
+                OperationType.OP_LOCAL_EOF, writable, serializedSize + 1));
+    }
+
+    private static String buildLargeAsciiString(int length) {
+        char[] chars = new char[length];
+        Arrays.fill(chars, 'a');
+        return new String(chars);
     }
 
     private static DataOutputBuffer serialize(short op, Writable writable) throws IOException {
