@@ -7030,7 +7030,16 @@ public class Env {
     }
 
     public List<String> getAllAliveSessionIds() {
-        return new ArrayList<>(aliveSessionSet);
+        // Derive from the live connection registry instead of aliveSessionSet:
+        // the registry always reflects real client sessions, needs no
+        // register/unregister bookkeeping (which leaked, see #59535), and keeps
+        // alive-session reporting accurate for an old-version master during
+        // rolling upgrades.
+        List<String> sessionIds = new ArrayList<>();
+        for (ConnectContext ctx : ExecuteEnv.getInstance().getScheduler().getConnectionMap().values()) {
+            sessionIds.add(ctx.getSessionId());
+        }
+        return sessionIds;
     }
 }
 
