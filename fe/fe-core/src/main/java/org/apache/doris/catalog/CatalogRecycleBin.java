@@ -1827,11 +1827,11 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
         }
 
         public void write(DataOutput out) throws IOException {
-            Text.writeString(out, GsonUtils.GSON.toJson(this));
+            GsonUtils.toJsonAsText(out, this);
         }
 
         public RecycleTableInfo read(DataInput in) throws IOException {
-            return GsonUtils.GSON.fromJson(Text.readString(in), RecycleTableInfo.class);
+            return GsonUtils.fromJsonAsText(in, RecycleTableInfo.class);
         }
 
         @Deprecated
@@ -1917,11 +1917,11 @@ public class CatalogRecycleBin extends MasterDaemon implements Writable, GsonPos
         }
 
         public void write(DataOutput out) throws IOException {
-            Text.writeString(out, GsonUtils.GSON.toJson(this));
+            GsonUtils.toJsonAsText(out, this);
         }
 
         public RecyclePartitionInfo read(DataInput in) throws IOException {
-            return GsonUtils.GSON.fromJson(Text.readString(in), RecyclePartitionInfo.class);
+            return GsonUtils.fromJsonAsText(in, RecyclePartitionInfo.class);
         }
 
         public void readFields(DataInput in) throws IOException {

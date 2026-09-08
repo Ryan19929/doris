@@ -24,7 +24,9 @@ import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.io.Text;
 import org.apache.doris.meta.MetaContext;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.utframe.UtFrameUtils;
 
@@ -42,6 +44,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -204,6 +207,47 @@ public class CatalogRecycleBinTest {
 
         // test recycling same table again should fail
         Assert.assertFalse(recycleBin.recycleTable(CatalogTestUtil.testDbId1, olapTable, false, false, 0));
+    }
+
+    @Test
+    public void testRecycleTableInfoWriteReadRoundTrip() throws IOException {
+        Database db = CatalogTestUtil.createSimpleDb(
+                CatalogTestUtil.testDbId1,
+                CatalogTestUtil.testTableId1,
+                CatalogTestUtil.testPartitionId1,
+                CatalogTestUtil.testIndexId1,
+                CatalogTestUtil.testTabletId1,
+                CatalogTestUtil.testStartVersion
+            );
+
+        Optional<Table> table = db.getTable(CatalogTestUtil.testTableId1);
+        Assert.assertTrue(table.isPresent());
+
+        CatalogRecycleBin.RecycleTableInfo info =
+                Env.getCurrentRecycleBin().new RecycleTableInfo(CatalogTestUtil.testDbId1, table.get());
+
+        // write with the streaming helper
+        ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(byteStream);
+        info.write(out);
+        out.flush();
+        byte[] record = byteStream.toByteArray();
+
+        // the produced bytes are identical to the legacy Text.writeString(out, json) format
+        ByteArrayOutputStream legacyStream = new ByteArrayOutputStream();
+        DataOutputStream legacyOut = new DataOutputStream(legacyStream);
+        Text.writeString(legacyOut, GsonUtils.GSON.toJson(info));
+        legacyOut.flush();
+        Assert.assertArrayEquals(legacyStream.toByteArray(), record);
+
+        // read back
+        DataInputStream in = new DataInputStream(new ByteArrayInputStream(record));
+        CatalogRecycleBin.RecycleTableInfo restored =
+                Env.getCurrentRecycleBin().new RecycleTableInfo().read(in);
+        Assert.assertEquals(0, in.available());
+        Assert.assertEquals(CatalogTestUtil.testDbId1, restored.getDbId());
+        Assert.assertEquals(table.get().getId(), restored.getTable().getId());
+        Assert.assertEquals(table.get().getName(), restored.getTable().getName());
     }
 
     @Test
