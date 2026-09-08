@@ -1243,7 +1243,9 @@ public class GsonUtils {
     public static void toJsonCompressed(DataOutput out, Object src) throws IOException {
         ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
         try (GZIPOutputStream gzipStream = new GZIPOutputStream(byteStream)) {
-            try (OutputStreamWriter writer = new OutputStreamWriter(gzipStream)) {
+            // Buffer the json writer: JsonWriter emits per-token fragments, and an unbuffered
+            // StreamEncoder allocates a scratch char[]/CharBuffer on every single write call.
+            try (Writer writer = new BufferedWriter(new OutputStreamWriter(gzipStream))) {
                 GsonUtils.GSON.toJson(src, writer);
             }
         }
