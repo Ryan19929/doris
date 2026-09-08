@@ -52,6 +52,7 @@ import com.google.gson.annotations.SerializedName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.BufferedWriter;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.File;
@@ -775,7 +776,10 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
     public void writeToFile(File jobInfoFile) throws IOException {
         // stream the json directly to the file instead of materializing the whole json
         // String of a huge job info in memory; the file content is unchanged
-        try (Writer writer = new OutputStreamWriter(new FileOutputStream(jobInfoFile), StandardCharsets.UTF_8)) {
+        // Buffer the json writer: JsonWriter emits per-token fragments, and an unbuffered
+        // StreamEncoder allocates a scratch char[]/CharBuffer on every single write call.
+        try (Writer writer = new BufferedWriter(
+                new OutputStreamWriter(new FileOutputStream(jobInfoFile), StandardCharsets.UTF_8))) {
             GsonUtils.GSON.toJson(this, writer);
         }
     }
