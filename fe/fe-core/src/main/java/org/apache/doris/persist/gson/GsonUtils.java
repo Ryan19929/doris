@@ -1352,7 +1352,9 @@ public class GsonUtils {
         metaContext.setThreadLocalInfo();
         try {
             UnsynchronizedByteArrayOutputStream byteStream = UnsynchronizedByteArrayOutputStream.builder().get();
-            try (OutputStreamWriter writer = new OutputStreamWriter(byteStream, utf8ReplacingEncoder())) {
+            // Buffer the json writer: JsonWriter emits per-token fragments, and an unbuffered
+            // StreamEncoder allocates a scratch char[]/CharBuffer on every single write call.
+            try (Writer writer = new BufferedWriter(new OutputStreamWriter(byteStream, utf8ReplacingEncoder()))) {
                 GsonUtils.GSON.toJson(src, writer);
             }
             try (Reader reader = new InputStreamReader(byteStream.toInputStream(), utf8ReplacingDecoder())) {
