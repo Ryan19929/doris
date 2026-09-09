@@ -255,6 +255,7 @@ import org.apache.commons.lang3.reflect.TypeUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.BufferedWriter;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInput;
@@ -265,6 +266,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Reader;
+import java.io.Writer;
 import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
@@ -1241,7 +1243,9 @@ public class GsonUtils {
     public static void toJsonCompressed(DataOutput out, Object src) throws IOException {
         ByteArrayOutputStream byteStream = new ByteArrayOutputStream();
         try (GZIPOutputStream gzipStream = new GZIPOutputStream(byteStream)) {
-            try (OutputStreamWriter writer = new OutputStreamWriter(gzipStream)) {
+            // Buffer the json writer: JsonWriter emits per-token fragments, and an unbuffered
+            // StreamEncoder allocates a scratch char[]/CharBuffer on every single write call.
+            try (Writer writer = new BufferedWriter(new OutputStreamWriter(gzipStream))) {
                 GsonUtils.GSON.toJson(src, writer);
             }
         }
@@ -1301,7 +1305,9 @@ public class GsonUtils {
      */
     public static void toJsonAsText(DataOutput out, Object src) throws IOException {
         UnsynchronizedByteArrayOutputStream byteStream = UnsynchronizedByteArrayOutputStream.builder().get();
-        try (OutputStreamWriter writer = new OutputStreamWriter(byteStream, utf8ReplacingEncoder())) {
+        // Buffer the json writer: JsonWriter emits per-token fragments, and an unbuffered
+        // StreamEncoder allocates a scratch char[]/CharBuffer on every single write call.
+        try (Writer writer = new BufferedWriter(new OutputStreamWriter(byteStream, utf8ReplacingEncoder()))) {
             GsonUtils.GSON.toJson(src, writer);
         }
         out.writeInt(byteStream.size());
@@ -1348,7 +1354,9 @@ public class GsonUtils {
         metaContext.setThreadLocalInfo();
         try {
             UnsynchronizedByteArrayOutputStream byteStream = UnsynchronizedByteArrayOutputStream.builder().get();
-            try (OutputStreamWriter writer = new OutputStreamWriter(byteStream, utf8ReplacingEncoder())) {
+            // Buffer the json writer: JsonWriter emits per-token fragments, and an unbuffered
+            // StreamEncoder allocates a scratch char[]/CharBuffer on every single write call.
+            try (Writer writer = new BufferedWriter(new OutputStreamWriter(byteStream, utf8ReplacingEncoder()))) {
                 GsonUtils.GSON.toJson(src, writer);
             }
             try (Reader reader = new InputStreamReader(byteStream.toInputStream(), utf8ReplacingDecoder())) {
