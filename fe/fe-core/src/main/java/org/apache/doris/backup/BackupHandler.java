@@ -83,6 +83,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -122,6 +123,14 @@ public class BackupHandler extends MasterDaemon implements Writable {
     // Runs local staging cleanup on every serving FE; started from Env.startNonMasterDaemonThreads().
     private final LocalStagingCleanerDaemon localStagingCleaner =
             new LocalStagingCleanerDaemon("backupLocalStagingCleaner", Config.backup_handler_update_interval_millis);
+
+    // Per-directory mutual exclusion between staging writers (BackupJob.saveMetaInfo) and the
+    // orphan staging deleter, keyed by normalized absolute job dir path. Static so that writers
+    // and deleters always agree on one lock instance per directory regardless of which handler
+    // instance they reach; computeIfAbsent on the ConcurrentHashMap keeps registration atomic.
+    // Entries stay for the process lifetime; their number is bounded by the number of distinct
+    // staging directories ever written or deleted on this FE.
+    private static final Map<Path, ReentrantLock> JOB_DIR_WRITE_LOCKS = new ConcurrentHashMap<>();
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
@@ -901,6 +910,40 @@ public class BackupHandler extends MasterDaemon implements Writable {
         return referencedJobDirs;
     }
 
+    /**
+     * Returns the per-directory lock serializing staging writers ({@link BackupJob#saveMetaInfo})
+     * and the orphan staging deleter for one job dir. Callers must unlock it themselves.
+     */
+    static ReentrantLock getJobDirWriteLock(Path normalizedJobDir) {
+        return JOB_DIR_WRITE_LOCKS.computeIfAbsent(normalizedJobDir, k -> new ReentrantLock());
+    }
+
+    /**
+     * Re-checks whether any current, history or pending-cleanup job references the job dir.
+     * Used by the orphan deleter to revalidate candidates selected from a stale snapshot.
+     */
+    private boolean isJobDirReferenced(Path normalizedJobDir) {
+        jobLock.lock();
+        try {
+            for (Deque<AbstractJob> jobs : dbIdToBackupOrRestoreJobs.values()) {
+                for (AbstractJob job : jobs) {
+                    if (job instanceof BackupJob
+                            && normalizedJobDir.equals(((BackupJob) job).getLocalJobDirPath())) {
+                        return true;
+                    }
+                }
+            }
+            for (BackupJob pendingJob : pendingCleanupJobs) {
+                if (normalizedJobDir.equals(pendingJob.getLocalJobDirPath())) {
+                    return true;
+                }
+            }
+            return false;
+        } finally {
+            jobLock.unlock();
+        }
+    }
+
     private void cleanupOrphanJobDirsInRepo(Path repoDir, Set<Path> referencedJobDirs,
                                             long orphanExpireBeforeMs, CleanupStats stats) {
         List<Path> jobDirs;
@@ -922,7 +965,21 @@ public class BackupHandler extends MasterDaemon implements Writable {
                                 > orphanExpireBeforeMs) {
                     continue;
                 }
-                BackupJob.deleteLocalJobDirRecursively(normalizedJobDir);
+                // Serialize with a staging writer that may be building this directory right now
+                // (replayAddJob writes the staging dir before the job is published), then
+                // revalidate the deletion conditions under the same mutual exclusion.
+                ReentrantLock jobDirWriteLock = getJobDirWriteLock(normalizedJobDir);
+                jobDirWriteLock.lock();
+                try {
+                    if (isJobDirReferenced(normalizedJobDir)
+                            || Files.getLastModifiedTime(normalizedJobDir, LinkOption.NOFOLLOW_LINKS).toMillis()
+                                    > orphanExpireBeforeMs) {
+                        continue;
+                    }
+                    BackupJob.deleteLocalJobDirRecursively(normalizedJobDir);
+                } finally {
+                    jobDirWriteLock.unlock();
+                }
                 stats.directoriesCleaned++;
                 LOG.info("cleaned orphan backup job dir: {}, elapsed_ms={}", normalizedJobDir,
                         elapsedMillis(cleanupStartNanos));
