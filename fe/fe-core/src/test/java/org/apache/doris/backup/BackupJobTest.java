@@ -931,6 +931,92 @@ public class BackupJobTest {
         }
     }
 
+    @Test
+    public void testLocalStagingCleanerCleansTerminalAndOrphanDirs() throws Exception {
+        Deencapsulation.setField(backupHandler, "isInit", true);
+        long nowMs = System.currentTimeMillis();
+
+        // terminal remote job whose staging dir also exists on a follower after journal replay
+        BackupJob finishedJob = new BackupJob("cleaner_finished", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        File finishedDir = createLocalJobDir("cleaner_finished");
+        File metaInfo = new File(finishedDir, Repository.FILE_META_INFO);
+        File jobInfo = new File(finishedDir, Repository.PREFIX_JOB_INFO + "2026-09-10-10-00-00");
+        Assert.assertTrue(metaInfo.createNewFile());
+        Assert.assertTrue(jobInfo.createNewFile());
+        Deencapsulation.setField(finishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(finishedJob, "localJobDirPath", null);
+        Deencapsulation.setField(finishedJob, "localMetaInfoFilePath", metaInfo.getAbsolutePath());
+        Deencapsulation.setField(finishedJob, "localJobInfoFilePath", jobInfo.getAbsolutePath());
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, finishedJob);
+
+        // evicted terminal job sitting in the pending cleanup queue
+        BackupJob pendingJob = new BackupJob("cleaner_pending", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        File pendingDir = createLocalJobDir("cleaner_pending");
+        Deencapsulation.setField(pendingJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(pendingJob, "localJobDirPath", pendingDir.toPath());
+        Deque<BackupJob> pendingCleanupJobs = Deencapsulation.getField(backupHandler, "pendingCleanupJobs");
+        pendingCleanupJobs.add(pendingJob);
+
+        File orphanDir = createRepoJobDir(repoId, "cleaner_orphan");
+        Files.setLastModifiedTime(orphanDir.toPath(), FileTime.fromMillis(nowMs - TimeUnit.DAYS.toMillis(3)));
+
+        Object cleaner = Deencapsulation.getField(backupHandler, "localStagingCleaner");
+        Deencapsulation.invoke(cleaner, "runAfterCatalogReady");
+
+        Assert.assertFalse(finishedDir.exists());
+        Assert.assertFalse(pendingDir.exists());
+        Assert.assertFalse(orphanDir.exists());
+        Assert.assertTrue(pendingCleanupJobs.isEmpty());
+    }
+
+    @Test
+    public void testRunAfterCatalogReadyDoesNotCleanStagingDirs() throws Exception {
+        Deencapsulation.setField(backupHandler, "isInit", true);
+
+        BackupJob finishedJob = new BackupJob("master_no_cleanup", dbId, UnitTestUtil.DB_NAME,
+                Lists.newArrayList(), 1000, BackupStmt.BackupContent.ALL, env, repoId, 0);
+        File finishedDir = createLocalJobDir("master_no_cleanup");
+        Deencapsulation.setField(finishedJob, "state", BackupJobState.FINISHED);
+        Deencapsulation.setField(finishedJob, "localJobDirPath", finishedDir.toPath());
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, finishedJob);
+
+        // the backup handler daemon only advances jobs now; staging cleanup has moved to the
+        // local staging cleaner daemon which runs on every serving FE
+        backupHandler.runAfterCatalogReady();
+        Assert.assertTrue(finishedDir.exists());
+
+        Object cleaner = Deencapsulation.getField(backupHandler, "localStagingCleaner");
+        Deencapsulation.invoke(cleaner, "runAfterCatalogReady");
+        Assert.assertFalse(finishedDir.exists());
+    }
+
+    @Test
+    public void testOrphanCleanupClampsTooSmallKeepMaxSecond() throws Exception {
+        int oldOrphanKeepSecond = Config.backup_orphan_dir_keep_max_second;
+        Config.backup_orphan_dir_keep_max_second = 1;
+        try {
+            long nowMs = System.currentTimeMillis();
+            File recentOrphanDir = createRepoJobDir(repoId, "clamp_recent_orphan");
+            Files.setLastModifiedTime(recentOrphanDir.toPath(),
+                    FileTime.fromMillis(nowMs - TimeUnit.SECONDS.toMillis(5)));
+
+            Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs);
+            // without the clamp a 1s retention would delete a 5s-old directory that may still be
+            // written by concurrent replay
+            Assert.assertTrue(recentOrphanDir.exists());
+            Assert.assertTrue(Deencapsulation.getField(backupHandler, "orphanDirKeepMaxClampWarned"));
+
+            Files.setLastModifiedTime(recentOrphanDir.toPath(),
+                    FileTime.fromMillis(nowMs - TimeUnit.SECONDS.toMillis(400)));
+            Deencapsulation.invoke(backupHandler, "cleanupOrphanBackupJobLocalJobDirs", nowMs);
+            Assert.assertFalse(recentOrphanDir.exists());
+        } finally {
+            Config.backup_orphan_dir_keep_max_second = oldOrphanKeepSecond;
+        }
+    }
+
     /**
      * Test backup job execution with non-existent table
      *
