@@ -49,6 +49,7 @@ import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.ResourceMgr;
+import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Tablet;
@@ -57,6 +58,7 @@ import org.apache.doris.catalog.View;
 import org.apache.doris.clone.DynamicPartitionScheduler;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.MetaNotFoundException;
@@ -197,6 +199,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     @SerializedName("si")
     @JsonAdapter(GsonUtils.GuavaTableTypeAdapterFactory.class)
     protected com.google.common.collect.Table<Long, Long, SnapshotInfo> snapshotInfos = HashBasedTable.create();
+
+    // How many partitions (and bytes) could be kept locally instead of downloading if partition level reuse
+    // were enabled, computed before the job modifies anything. Only for display, null if not computed.
+    @SerializedName("rss")
+    private RestoreReuseShadowStats reuseShadowStats;
 
     // the meta version is used when reading backup meta from file.
     // we do not persist this field, because this is just a temporary solution.
@@ -581,6 +588,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
         Preconditions.checkNotNull(backupMeta);
+
+        // Must be done before any local partition is modified by this job.
+        computeReuseShadowStats(db);
+        // The backup meta carries the restore lineage of the source partitions, which must not be inherited.
+        clearRestoreLineageInBackupMeta();
 
         // Check the olap table state.
         //
@@ -2133,6 +2145,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
+        // Use the same time on replay, it is persisted as the finished time of the job.
+        long commitTime = isReplay ? finishedTime : System.currentTimeMillis();
+        stampRestoreLineage(db, commitTime);
+
         // Drop the exists but non-restored table/partitions.
         if (isCleanTables || isCleanPartitions) {
             Status st = dropAllNonRestoredTableAndPartitions(db);
@@ -2153,7 +2169,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             fileMapping.clear();
             jobInfo.releaseSnapshotInfo();
 
-            finishedTime = System.currentTimeMillis();
+            finishedTime = commitTime;
             state = RestoreJobState.FINISHED;
 
             env.getEditLog().logRestoreJob(this);
@@ -2296,7 +2312,120 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         info.add(status.toString());
         info.add(String.valueOf(timeoutMs / 1000));
+        if (!isBrief) {
+            info.add(reuseShadowStats == null ? FeConstants.null_string : reuseShadowStats.toString());
+        }
         return info;
+    }
+
+    public RestoreReuseShadowStats getReuseShadowStats() {
+        return reuseShadowStats;
+    }
+
+    static long getSrcCommitSeq(BackupJobInfo jobInfo, long srcTableId) {
+        if (jobInfo.tableCommitSeqMap == null) {
+            return RestoreLineage.UNKNOWN_COMMIT_SEQ;
+        }
+        Long commitSeq = jobInfo.tableCommitSeqMap.get(srcTableId);
+        return commitSeq == null ? RestoreLineage.UNKNOWN_COMMIT_SEQ : commitSeq;
+    }
+
+    static RestoreLineage buildRestoreLineage(BackupJobInfo jobInfo, BackupOlapTableInfo tblInfo,
+            BackupPartitionInfo partInfo, long restoreTime) {
+        return new RestoreLineage(jobInfo.dbId, tblInfo.id, partInfo.id, partInfo.version,
+                getSrcCommitSeq(jobInfo, tblInfo.id), jobInfo.backupTime, restoreTime);
+    }
+
+    /**
+     * Judge each partition to restore by the lineage check (L0), and count the partitions and bytes that
+     * could be kept locally instead of downloading. It only records the result, and never fails the job.
+     */
+    @VisibleForTesting
+    void computeReuseShadowStats(Database db) {
+        try {
+            RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
+            for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
+                BackupOlapTableInfo tblInfo = tblEntry.getValue();
+                long srcCommitSeq = getSrcCommitSeq(jobInfo, tblInfo.id);
+                Table localTbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
+                if (localTbl == null || localTbl.getType() != TableType.OLAP) {
+                    for (int i = 0; i < tblInfo.partitions.size(); i++) {
+                        stats.add(RestoreReuseShadowStats.L0Verdict.NO_LOCAL_PARTITION,
+                                RestoreReuseShadowStats.Unsupported.NONE, 0);
+                    }
+                    continue;
+                }
+                OlapTable localOlapTbl = (OlapTable) localTbl;
+                localOlapTbl.readLock();
+                try {
+                    for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
+                        BackupPartitionInfo partInfo = partEntry.getValue();
+                        Partition localPart = localOlapTbl.getPartition(partEntry.getKey(), false);
+                        RestoreReuseShadowStats.L0Verdict verdict = RestoreReuseShadowStats.checkL0(localPart,
+                                jobInfo.dbId, tblInfo.id, partInfo.id, partInfo.version, srcCommitSeq);
+                        RestoreReuseShadowStats.Unsupported unsupported = RestoreReuseShadowStats.Unsupported.NONE;
+                        long bytes = 0;
+                        if (verdict == RestoreReuseShadowStats.L0Verdict.REUSABLE) {
+                            unsupported = RestoreReuseShadowStats.checkUnsupported(isAtomicRestore, localOlapTbl,
+                                    localPart);
+                            bytes = RestoreReuseShadowStats.getSingleReplicaLocalDataSize(localPart);
+                        }
+                        stats.add(verdict, unsupported, bytes);
+                    }
+                } finally {
+                    localOlapTbl.readUnlock();
+                }
+            }
+            reuseShadowStats = stats;
+            LOG.info("restore reuse shadow stats: {}, job: {}", stats, jobId);
+        } catch (Exception e) {
+            reuseShadowStats = null;
+            LOG.warn("failed to compute restore reuse shadow stats, ignore it. job: {}", jobId, e);
+        }
+    }
+
+    @VisibleForTesting
+    void clearRestoreLineageInBackupMeta() {
+        for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
+            Table remoteTbl = backupMeta.getTable(tableName);
+            if (!(remoteTbl instanceof OlapTable)) {
+                continue;
+            }
+            for (Partition remotePart : ((OlapTable) remoteTbl).getAllPartitions()) {
+                remotePart.setRestoreLineage(null);
+            }
+        }
+    }
+
+    /**
+     * Write the restore lineage of all partitions restored by this job, both the existing partitions that
+     * are overwritten and the newly created partitions and tables. The lineage is always rebuilt from the
+     * job info of this job, and never inherited from the backup meta. Called on both master and replay.
+     */
+    @VisibleForTesting
+    void stampRestoreLineage(Database db, long restoreTime) {
+        for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
+            Table tbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
+            if (tbl == null || tbl.getType() != TableType.OLAP) {
+                continue;
+            }
+            OlapTable olapTbl = (OlapTable) tbl;
+            if (!olapTbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                BackupOlapTableInfo tblInfo = tblEntry.getValue();
+                for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
+                    Partition part = olapTbl.getPartition(partEntry.getKey(), false);
+                    if (part == null) {
+                        continue;
+                    }
+                    part.setRestoreLineage(buildRestoreLineage(jobInfo, tblInfo, partEntry.getValue(), restoreTime));
+                }
+            } finally {
+                olapTbl.writeUnlock();
+            }
+        }
     }
 
     private String getRestoreObjs() {
