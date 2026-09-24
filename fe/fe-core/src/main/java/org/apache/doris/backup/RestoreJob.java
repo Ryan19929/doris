@@ -1009,6 +1009,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
 
+        // The data of the existing partitions to overwrite is about to change. Their lineage must not outlive
+        // the data it describes, e.g. if the job is cancelled after some tablets are moved in COMMITTING.
+        // This is persisted with the DOWNLOAD edit log (replayed by replayCheckAndPrepareMeta), which is
+        // written before any tablet data is moved, and the lineage is written again in allTabletCommitted.
+        invalidateRestoreLineageOfOverwrittenPartitions(db);
+
         // check and restore resources
         checkAndRestoreResources();
         if (!status.ok()) {
@@ -1616,6 +1622,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             LOG.warn("[INCONSISTENT META] replayCheckAndPrepareMeta failed", e);
             return;
         }
+
+        invalidateRestoreLineageOfOverwrittenPartitions(db);
 
         // replay set all existing tables's state to RESTORE
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
@@ -2342,6 +2350,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     void computeReuseShadowStats(Database db) {
+        if (Config.isCloudMode()) {
+            // Storage is shared in cloud mode, there is nothing to download or reuse locally. Besides,
+            // CloudPartition.getVisibleVersion() may call the meta service, which must not be done for every
+            // partition while holding the table lock.
+            reuseShadowStats = null;
+            return;
+        }
         try {
             RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
             for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
@@ -2381,6 +2396,36 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         } catch (Exception e) {
             reuseShadowStats = null;
             LOG.warn("failed to compute restore reuse shadow stats, ignore it. job: {}", jobId, e);
+        }
+    }
+
+    /**
+     * Clear the restore lineage of the existing partitions that this job overwrites in place (non-atomic
+     * restore, see restoredVersionInfo). Partitions and tables created by this job are dropped if the job is
+     * cancelled, and atomic restore does not touch the origin table before it is replaced, so they are not
+     * cleared here.
+     */
+    @VisibleForTesting
+    void invalidateRestoreLineageOfOverwrittenPartitions(Database db) {
+        for (long tblId : restoredVersionInfo.rowKeySet()) {
+            Table tbl = db.getTableNullable(tblId);
+            if (!(tbl instanceof OlapTable)) {
+                continue;
+            }
+            OlapTable olapTbl = (OlapTable) tbl;
+            if (!olapTbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    Partition part = olapTbl.getPartition(partId);
+                    if (part != null) {
+                        part.setRestoreLineage(null);
+                    }
+                }
+            } finally {
+                olapTbl.writeUnlock();
+            }
         }
     }
 
