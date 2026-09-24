@@ -17,8 +17,11 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
+import org.apache.doris.backup.BackupJobInfo.BackupTabletInfo;
+import org.apache.doris.backup.RestoreJob.RestoreJobState;
 import org.apache.doris.backup.RestoreReuseShadowStats.L0Verdict;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
@@ -27,6 +30,7 @@ import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.ReplicaAllocation;
@@ -34,6 +38,7 @@ import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.jmockit.Deencapsulation;
@@ -100,6 +105,7 @@ public class RestoreLineageTest {
         Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
         Mockito.when(env.getEditLog()).thenReturn(editLog);
         Mockito.when(catalog.getDbNullable(Mockito.anyLong())).thenReturn(db);
+        Mockito.when(catalog.getDbOrMetaException(Mockito.anyLong())).thenReturn(db);
         CatalogMgr catalogMgr = Mockito.mock(CatalogMgr.class);
         Mockito.when(env.getCatalogMgr()).thenReturn(catalogMgr);
         Mockito.when(catalogMgr.getCatalog(Mockito.anyString())).thenReturn(catalog);
@@ -615,5 +621,161 @@ public class RestoreLineageTest {
         RestoreReuseShadowStats stats = atomicJob.getReuseShadowStats();
         Assertions.assertEquals(2, stats.getNoLineage());
         Assertions.assertEquals(0, stats.getL0PassedButAtomicRestore() + stats.getL0PassedButAggregateTable());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Invalidating the lineage of the partitions overwritten in place
+    // ---------------------------------------------------------------------------------------------
+
+    private static final long V1 = 10;
+    private static final long V2 = 20;
+
+    // A backup of test_tbl2 taken in this cluster, with all partitions at the given version. The ids match
+    // the backup meta made by backupMetaWithStaleLineage(), so the job can go through checkAndPrepareMeta.
+    private BackupJobInfo selfBackupJobInfo(long version) {
+        BackupJobInfo info = new BackupJobInfo();
+        info.name = "snapshot_v" + version;
+        info.backupTime = BACKUP_TIME + version;
+        info.dbId = db.getId();
+        info.dbName = db.getFullName();
+        info.success = true;
+        info.tableCommitSeqMap = Maps.newHashMap();
+        info.tableCommitSeqMap.put(tbl2.getId(), SRC_COMMIT_SEQ + version);
+        BackupOlapTableInfo tblInfo = new BackupOlapTableInfo();
+        tblInfo.id = tbl2.getId();
+        for (Partition part : tbl2.getPartitions()) {
+            BackupPartitionInfo partInfo = partInfo(part.getId(), version);
+            for (MaterializedIndex index : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                BackupIndexInfo idxInfo = new BackupIndexInfo();
+                idxInfo.id = index.getId();
+                idxInfo.schemaHash = tbl2.getSchemaHashByIndexId(index.getId());
+                partInfo.indexes.put(tbl2.getIndexNameById(index.getId()), idxInfo);
+                for (Tablet tablet : index.getTablets()) {
+                    idxInfo.sortedTabletInfoList.add(new BackupTabletInfo(tablet.getId(), Lists.newArrayList()));
+                }
+            }
+            tblInfo.partitions.put(part.getName(), partInfo);
+        }
+        info.backupOlapTableObjects.put(tbl2.getName(), tblInfo);
+        return info;
+    }
+
+    private RestoreLineage selfLineage(BackupJobInfo info, Partition part, long restoreTime) {
+        BackupOlapTableInfo tblInfo = info.getOlapTableInfo(tbl2.getName());
+        return RestoreJob.buildRestoreLineage(info, tblInfo, tblInfo.getPartInfo(part.getName()), restoreTime);
+    }
+
+    // p1 and p2 were restored from the backup at V1 and not written since then.
+    private BackupJobInfo restoredFromV1() {
+        BackupJobInfo infoV1 = selfBackupJobInfo(V1);
+        for (Partition part : Lists.newArrayList(p1(), p2())) {
+            part.updateVersionForRestore(V1);
+            part.setRestoreLineage(selfLineage(infoV1, part, RESTORE_TIME));
+        }
+        return infoV1;
+    }
+
+    // A non-atomic restore of the backup at V2 onto the existing test_tbl2, after checkAndPrepareMeta.
+    private RestoreJob prepareOverwriteJob(BackupJobInfo info) {
+        // CatalogMocker does not set the range of p2, the restore job compares it with the backup meta.
+        PartitionInfo partitionInfo = tbl2.getPartitionInfo();
+        if (partitionInfo.getItem(CatalogMocker.TEST_PARTITION2_ID) == null) {
+            partitionInfo.setItem(CatalogMocker.TEST_PARTITION2_ID, false,
+                    partitionInfo.getItem(CatalogMocker.TEST_PARTITION1_ID));
+        }
+        RestoreJob restoreJob = new RestoreJob("restore_label", "2024-01-01 00:00:00", db.getId(), db.getFullName(),
+                info, false, new ReplicaAllocation((short) 3), 100000, -1, false, false, false, false, false, false,
+                false, false, env, Repository.KEEP_ON_LOCAL_REPO_ID, backupMetaWithStaleLineage());
+        Deencapsulation.invoke(restoreJob, "checkAndPrepareMeta");
+        Assertions.assertTrue(restoreJob.getStatus().ok(), restoreJob.getStatus().toString());
+        Assertions.assertEquals(RestoreJobState.CREATING, restoreJob.getState());
+        com.google.common.collect.Table<Long, Long, Long> restoredVersionInfo =
+                Deencapsulation.getField(restoreJob, "restoredVersionInfo");
+        Assertions.assertEquals(2, restoredVersionInfo.size());
+        return restoreJob;
+    }
+
+    @Test
+    public void testPrepareInvalidatesLineageOfOverwrittenPartitions() {
+        restoredFromV1();
+        RestoreJob jobV2 = prepareOverwriteJob(selfBackupJobInfo(V2));
+
+        // The shadow statistics were computed with the old lineage, before it was cleared.
+        RestoreReuseShadowStats stats = jobV2.getReuseShadowStats();
+        Assertions.assertEquals(2, stats.getSourceVersionChanged());
+        // The lineage of the partitions to overwrite is cleared, the data (version) is not changed yet.
+        Assertions.assertNull(p1().getRestoreLineage());
+        Assertions.assertNull(p2().getRestoreLineage());
+        Assertions.assertEquals(V1, p1().getVisibleVersion());
+    }
+
+    @Test
+    public void testCancelInCommittingLeavesNoLineage() {
+        BackupJobInfo infoV1 = restoredFromV1();
+        RestoreJob jobV2 = prepareOverwriteJob(selfBackupJobInfo(V2));
+
+        // Cancelled after some tablets may have been moved: the version is still V1, but the data may not be.
+        Deencapsulation.setField(jobV2, "state", RestoreJobState.COMMITTING);
+        Assertions.assertTrue(jobV2.cancel().ok());
+        Assertions.assertEquals(RestoreJobState.CANCELLED, jobV2.getState());
+        Assertions.assertEquals(V1, p1().getVisibleVersion());
+        Assertions.assertNull(p1().getRestoreLineage());
+        Assertions.assertNull(p2().getRestoreLineage());
+
+        // Restoring the backup at V1 again must not reuse them.
+        RestoreJob jobV1 = newJob(infoV1, null, false);
+        jobV1.computeReuseShadowStats(db);
+        Assertions.assertEquals(2, jobV1.getReuseShadowStats().getNoLineage());
+        Assertions.assertEquals(0, jobV1.getReuseShadowStats().getReusable());
+    }
+
+    @Test
+    public void testCommitAfterPrepareWritesLineageAgain() {
+        restoredFromV1();
+        BackupJobInfo infoV2 = selfBackupJobInfo(V2);
+        RestoreJob jobV2 = prepareOverwriteJob(infoV2);
+
+        Status st = jobV2.allTabletCommitted(false /* not replay */);
+        Assertions.assertTrue(st.ok(), st.toString());
+        for (Partition part : Lists.newArrayList(p1(), p2())) {
+            Assertions.assertEquals(V2, part.getVisibleVersion());
+            Assertions.assertEquals(selfLineage(infoV2, part, jobV2.getFinishedTime()), part.getRestoreLineage());
+        }
+    }
+
+    @Test
+    public void testReplayDownloadInvalidatesLineage() throws Exception {
+        BackupJobInfo infoV1 = restoredFromV1();
+        RestoreJob jobV2 = prepareOverwriteJob(selfBackupJobInfo(V2));
+        // The DOWNLOAD edit log written by the master after the snapshots are made.
+        Deencapsulation.setField(jobV2, "state", RestoreJobState.DOWNLOAD);
+        RestoreJob replayed = writeAndRead(jobV2);
+
+        // The follower still has the old lineage.
+        for (Partition part : Lists.newArrayList(p1(), p2())) {
+            part.setRestoreLineage(selfLineage(infoV1, part, RESTORE_TIME));
+        }
+        replayed.setEnv(env);
+        replayed.replayRun();
+        Assertions.assertNull(p1().getRestoreLineage());
+        Assertions.assertNull(p2().getRestoreLineage());
+    }
+
+    @Test
+    public void testShadowStatsSkippedInCloudMode() {
+        makeBothPartitionsPassL0();
+        String origDeployMode = Config.deploy_mode;
+        try {
+            Config.deploy_mode = "cloud";
+            Assertions.assertTrue(Config.isCloudMode());
+            job.computeReuseShadowStats(db);
+            Assertions.assertNull(job.getReuseShadowStats());
+            List<String> fullInfo = job.getFullInfo();
+            Assertions.assertEquals(FeConstants.null_string, fullInfo.get(fullInfo.size() - 1));
+        } finally {
+            Config.deploy_mode = origDeployMode;
+        }
+        job.computeReuseShadowStats(db);
+        Assertions.assertEquals(2, job.getReuseShadowStats().getReusable());
     }
 }
