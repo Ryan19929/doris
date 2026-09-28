@@ -81,6 +81,7 @@ public class RestoreLineageTest {
     private static final long BACKUP_TIME = 1700000000000L;
     private static final long RESTORE_TIME = 1800000000000L;
     private static final RestoreLineage STALE = new RestoreLineage(7, 7, 7, 7, 7, 7, 7);
+    private static final int REUSE_ESTIMATE_COLUMN = ShowRestoreCommand.TITLE_NAMES.indexOf("ReuseEstimate");
 
     private final Env env = Mockito.mock(Env.class);
     private final InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
@@ -503,12 +504,11 @@ public class RestoreLineageTest {
         Assertions.assertEquals(p1Version, p1().getVisibleVersion());
         Assertions.assertEquals(expectedLineage(SRC_P1_ID, SRC_P1_VERSION), p1().getRestoreLineage());
 
-        // Shown in the last column of SHOW RESTORE, and not in SHOW BRIEF RESTORE.
+        // Shown in the ReuseEstimate column of SHOW RESTORE (after Timeout), and not in SHOW BRIEF RESTORE.
         List<String> fullInfo = job.getFullInfo();
         Assertions.assertEquals(ShowRestoreCommand.TITLE_NAMES.size(), fullInfo.size());
-        Assertions.assertEquals("ReuseEstimate",
-                ShowRestoreCommand.TITLE_NAMES.get(ShowRestoreCommand.TITLE_NAMES.size() - 1));
-        String shown = fullInfo.get(fullInfo.size() - 1);
+        Assertions.assertEquals("Timeout", ShowRestoreCommand.TITLE_NAMES.get(REUSE_ESTIMATE_COLUMN - 1));
+        String shown = fullInfo.get(REUSE_ESTIMATE_COLUMN);
         Assertions.assertEquals("{\"partitions\":4,\"reusable\":1,\"reusable_bytes_single_replica\":" + bytes
                 + ",\"l0_passed_but_atomic_restore\":0,\"l0_passed_but_aggregate_table\":0,"
                 + "\"l0_passed_but_remote_storage\":0,\"no_local\":2,\"no_lineage\":0,\"lineage_mismatch\":0,"
@@ -517,14 +517,14 @@ public class RestoreLineageTest {
 
         // Persisted with the job, so that it can be shown on followers and after restart.
         RestoreJob readJob = writeAndRead(job);
-        Assertions.assertEquals(shown, readJob.getFullInfo().get(fullInfo.size() - 1));
+        Assertions.assertEquals(shown, readJob.getFullInfo().get(REUSE_ESTIMATE_COLUMN));
     }
 
     @Test
     public void testComputeReuseShadowStatsNeverFailsTheJob() {
         // Not computed yet.
         List<String> fullInfo = job.getFullInfo();
-        Assertions.assertEquals(FeConstants.null_string, fullInfo.get(fullInfo.size() - 1));
+        Assertions.assertEquals(FeConstants.null_string, fullInfo.get(REUSE_ESTIMATE_COLUMN));
 
         // A broken job info makes the computation fail, the error is swallowed.
         jobInfo.backupOlapTableObjects.put("broken_tbl", null);
@@ -771,7 +771,7 @@ public class RestoreLineageTest {
             job.computeReuseShadowStats(db);
             Assertions.assertNull(job.getReuseShadowStats());
             List<String> fullInfo = job.getFullInfo();
-            Assertions.assertEquals(FeConstants.null_string, fullInfo.get(fullInfo.size() - 1));
+            Assertions.assertEquals(FeConstants.null_string, fullInfo.get(REUSE_ESTIMATE_COLUMN));
         } finally {
             Config.deploy_mode = origDeployMode;
         }

@@ -43,6 +43,7 @@
 #include "core/column/column.h"
 #include "core/data_type/define_primitive_type.h"
 #include "io/fs/file_reader.h"
+#include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
 #include "load/delta_writer/delta_writer.h"
 #include "load/memtable/memtable_memory_limiter.h"
@@ -510,5 +511,403 @@ TEST_F(SnapshotLoaderTest, TestLinkSameRowsetFiles) {
 
     // 9. Verify skip download files
     ASSERT_EQ(loader.get_http_download_files_num(), 0);
+}
+
+static void write_test_file(const std::string& path, const std::string& content) {
+    io::FileWriterPtr writer;
+    ASSERT_TRUE(io::global_local_filesystem()->create_file(path, &writer).ok());
+    ASSERT_TRUE(writer->append(Slice(content)).ok());
+    ASSERT_TRUE(writer->close().ok());
+}
+
+static TSnapshotFileStat file_stat(const std::string& name, int64_t size,
+                                   const std::string& sha256 = "") {
+    TSnapshotFileStat stat;
+    stat.__set_name(name);
+    stat.__set_size(size);
+    if (!sha256.empty()) {
+        stat.__set_sha256(sha256);
+    }
+    return stat;
+}
+
+// Build the manifest of a tablet snapshot dir, as the backup does.
+static TTabletManifest build_manifest(const std::string& dir, bool with_digest) {
+    TTabletManifest manifest;
+    std::vector<io::FileInfo> files;
+    bool exists = false;
+    EXPECT_TRUE(io::global_local_filesystem()->list(dir, true, &files, &exists).ok());
+    std::vector<TSnapshotFileStat> stats;
+    for (const auto& file : files) {
+        std::string sha256;
+        if (with_digest) {
+            EXPECT_TRUE(compute_file_digests(dir + "/" + file.file_name, nullptr, &sha256).ok());
+        }
+        stats.push_back(file_stat(file.file_name, file.file_size, sha256));
+    }
+    manifest.__set_files(stats);
+    return manifest;
+}
+
+TEST_F(SnapshotLoaderTest, ComputeFileDigests) {
+    std::string dir = storage_root_path + "/digest_test";
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(dir).ok());
+
+    std::string md5;
+    std::string sha256;
+    int64_t size = -1;
+    write_test_file(dir + "/abc", "abc");
+    ASSERT_TRUE(compute_file_digests(dir + "/abc", &md5, &sha256, &size).ok());
+    EXPECT_EQ("900150983cd24fb0d6963f7d28e17f72", md5);
+    EXPECT_EQ("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", sha256);
+    EXPECT_EQ(3, size);
+
+    write_test_file(dir + "/empty", "");
+    ASSERT_TRUE(compute_file_digests(dir + "/empty", &md5, &sha256, &size).ok());
+    EXPECT_EQ("d41d8cd98f00b204e9800998ecf8427e", md5);
+    EXPECT_EQ("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", sha256);
+    EXPECT_EQ(0, size);
+
+    // larger than the read buffer, the md5 must be the same as the one used in the repository.
+    std::string big(3 * 1024 * 1024 + 17, 'x');
+    for (size_t i = 0; i < big.size(); i += 4096) {
+        big[i] = static_cast<char>('a' + (i / 4096) % 26);
+    }
+    write_test_file(dir + "/big", big);
+    std::string expected_md5;
+    ASSERT_TRUE(io::global_local_filesystem()->md5sum(dir + "/big", &expected_md5).ok());
+    std::string only_sha256;
+    ASSERT_TRUE(compute_file_digests(dir + "/big", &md5, &sha256, &size).ok());
+    ASSERT_TRUE(compute_file_digests(dir + "/big", nullptr, &only_sha256).ok());
+    EXPECT_EQ(expected_md5, md5);
+    EXPECT_EQ(only_sha256, sha256);
+    EXPECT_EQ(64, sha256.size());
+    EXPECT_EQ(static_cast<int64_t>(big.size()), size);
+
+    EXPECT_FALSE(compute_file_digests(dir + "/not_exist", &md5, &sha256).ok());
+    ASSERT_TRUE(io::global_local_filesystem()->delete_directory(dir).ok());
+}
+
+TEST_F(SnapshotLoaderTest, CheckTabletSnapshotManifest) {
+    // A downloaded local snapshot of local tablet 2002, the source tablet is 1001.
+    std::string dir = storage_root_path + "/manifest_check/2002/3003";
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(dir).ok());
+    write_test_file(dir + "/2002.hdr", "header");
+    write_test_file(dir + "/rs1_0.dat", "segment");
+    write_test_file(dir + "/rs1_0.idx", "index");
+    std::string dat_sha256;
+    std::string idx_sha256;
+    ASSERT_TRUE(compute_file_digests(dir + "/rs1_0.dat", nullptr, &dat_sha256).ok());
+    ASSERT_TRUE(compute_file_digests(dir + "/rs1_0.idx", nullptr, &idx_sha256).ok());
+
+    auto make_manifest = [&]() {
+        TTabletManifest manifest;
+        manifest.__set_files({file_stat("1001.hdr", 6), file_stat("rs1_0.dat", 7, dat_sha256),
+                              file_stat("rs1_0.idx", 5, idx_sha256)});
+        return manifest;
+    };
+
+    // 1. matched, the tablet meta file is expected with the local tablet id
+    ManifestCheckResult result;
+    auto st = check_tablet_snapshot_manifest(dir, 2002, make_manifest(), false, &result);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(result.checked);
+    EXPECT_FALSE(result.digest_checked);
+
+    st = check_tablet_snapshot_manifest(dir, 2002, make_manifest(), true, &result);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(result.checked);
+    EXPECT_TRUE(result.digest_checked);
+
+    // the LOADED tag is not a snapshot file
+    write_test_file(dir + "/LOADED", "");
+    st = check_tablet_snapshot_manifest(dir, 2002, make_manifest(), true, &result);
+    ASSERT_TRUE(st.ok()) << st;
+    ASSERT_TRUE(io::global_local_filesystem()->delete_file(dir + "/LOADED").ok());
+
+    // 2. one file less in local
+    TTabletManifest more = make_manifest();
+    more.files.push_back(file_stat("rs2_0.dat", 10));
+    st = check_tablet_snapshot_manifest(dir, 2002, more, false, &result);
+    EXPECT_TRUE(st.is<ErrorCode::CORRUPTION>()) << st;
+    EXPECT_NE(st.to_string().find("missing file rs2_0.dat, expected size 10"), std::string::npos)
+            << st;
+    EXPECT_FALSE(result.checked);
+
+    // 3. one file more in local
+    write_test_file(dir + "/rs1_1.dat", "extra");
+    st = check_tablet_snapshot_manifest(dir, 2002, make_manifest(), false, &result);
+    EXPECT_TRUE(st.is<ErrorCode::CORRUPTION>()) << st;
+    EXPECT_NE(st.to_string().find("unexpected file rs1_1.dat"), std::string::npos) << st;
+    EXPECT_NE(st.to_string().find("actual size 5"), std::string::npos) << st;
+    ASSERT_TRUE(io::global_local_filesystem()->delete_file(dir + "/rs1_1.dat").ok());
+
+    // the tablet meta file of the source tablet id is not expected in local
+    write_test_file(dir + "/1001.hdr", "header");
+    st = check_tablet_snapshot_manifest(dir, 2002, make_manifest(), false, &result);
+    EXPECT_TRUE(st.is<ErrorCode::CORRUPTION>()) << st;
+    EXPECT_NE(st.to_string().find("unexpected file 1001.hdr"), std::string::npos) << st;
+    ASSERT_TRUE(io::global_local_filesystem()->delete_file(dir + "/1001.hdr").ok());
+
+    // 4. size mismatch
+    TTabletManifest wrong_size = make_manifest();
+    wrong_size.files[1].size = 8;
+    st = check_tablet_snapshot_manifest(dir, 2002, wrong_size, false, &result);
+    EXPECT_TRUE(st.is<ErrorCode::CORRUPTION>()) << st;
+    EXPECT_NE(st.to_string().find("size mismatch of file rs1_0.dat, expected 8, actual 7"),
+              std::string::npos)
+            << st;
+
+    // 5. digest mismatch, only checked when required
+    TTabletManifest wrong_digest = make_manifest();
+    wrong_digest.files[2].sha256 = std::string(64, '0');
+    st = check_tablet_snapshot_manifest(dir, 2002, wrong_digest, false, &result);
+    EXPECT_TRUE(st.ok()) << st;
+    st = check_tablet_snapshot_manifest(dir, 2002, wrong_digest, true, &result);
+    EXPECT_TRUE(st.is<ErrorCode::CORRUPTION>()) << st;
+    EXPECT_NE(st.to_string().find("sha256 mismatch of file rs1_0.idx, expected " +
+                                  std::string(64, '0') + ", actual " + idx_sha256),
+              std::string::npos)
+            << st;
+
+    // the digest of the tablet meta file is never checked, it is rewritten in restore
+    TTabletManifest hdr_digest = make_manifest();
+    hdr_digest.files[0].__set_sha256(std::string(64, '0'));
+    st = check_tablet_snapshot_manifest(dir, 2002, hdr_digest, true, &result);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(result.digest_checked);
+
+    // a file without digest in the manifest: checked, but not all digests are checked
+    TTabletManifest no_digest = make_manifest();
+    no_digest.files[1].__isset.sha256 = false;
+    st = check_tablet_snapshot_manifest(dir, 2002, no_digest, true, &result);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(result.checked);
+    EXPECT_FALSE(result.digest_checked);
+
+    // 6. an invalid manifest is not checked, never fails the download
+    TTabletManifest duplicated = make_manifest();
+    duplicated.files.push_back(file_stat("rs1_0.dat", 7));
+    st = check_tablet_snapshot_manifest(dir, 2002, duplicated, true, &result);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_FALSE(result.checked);
+    TTabletManifest no_size = make_manifest();
+    no_size.files[1].__isset.size = false;
+    st = check_tablet_snapshot_manifest(dir, 2002, no_size, true, &result);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_FALSE(result.checked);
+
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->delete_directory(storage_root_path + "/manifest_check")
+                        .ok());
+}
+
+// Prepare a local tablet with a snapshot, and a "remote" snapshot derived from it, as in
+// TestLinkSameRowsetFiles, so that the http download links the local files instead of downloading.
+static void prepare_http_snapshots(int64_t tablet_id, int32_t schema_hash, int64_t partition_id,
+                                   int64_t remote_tablet_id, int32_t remote_schema_hash,
+                                   TRemoteTabletSnapshot* remote_snapshot) {
+    TCreateTabletReq req = create_tablet(partition_id, tablet_id, schema_hash);
+    RuntimeProfile profile("CreateTablet");
+    ASSERT_TRUE(engine_ref->create_tablet(req, &profile).ok());
+    TabletSharedPtr tablet = engine_ref->tablet_manager()->get_tablet(tablet_id);
+    ASSERT_TRUE(tablet != nullptr);
+    add_rowset(tablet_id, schema_hash, partition_id, tablet_id * 10, 100);
+    auto version = tablet->max_version();
+
+    std::string snapshot_path;
+    bool allow_incremental_clone = false;
+    TSnapshotRequest snapshot_request;
+    snapshot_request.tablet_id = tablet_id;
+    snapshot_request.schema_hash = schema_hash;
+    snapshot_request.version = version.second;
+    ASSERT_TRUE(engine_ref->snapshot_mgr()
+                        ->make_snapshot(snapshot_request, &snapshot_path, &allow_incremental_clone)
+                        .ok());
+    snapshot_path = fmt::format("{}/{}/{}", snapshot_path, tablet_id, schema_hash);
+
+    std::string remote_dir = fmt::format("{}/remote_snapshot_{}", storage_root_path, tablet_id);
+    std::string remote_tablet_path =
+            fmt::format("{}/{}/{}", remote_dir, remote_tablet_id, remote_schema_hash);
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(remote_tablet_path).ok());
+    std::vector<io::FileInfo> snapshot_files;
+    bool is_exists = false;
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->list(snapshot_path, true, &snapshot_files, &is_exists)
+                        .ok());
+    for (const auto& file : snapshot_files) {
+        ASSERT_TRUE(io::global_local_filesystem()
+                            ->copy_path(snapshot_path + "/" + file.file_name,
+                                        remote_tablet_path + "/" + file.file_name)
+                            .ok());
+    }
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->rename(fmt::format("{}/{}.hdr", remote_tablet_path, tablet_id),
+                                 fmt::format("{}/{}.hdr", remote_tablet_path, remote_tablet_id))
+                        .ok());
+    auto guards = engine_ref->snapshot_mgr()->convert_rowset_ids(
+            remote_tablet_path, remote_tablet_id, 0, 0, partition_id, remote_schema_hash);
+    ASSERT_TRUE(guards.has_value());
+
+    remote_snapshot->__set_remote_tablet_id(remote_tablet_id);
+    remote_snapshot->__set_local_tablet_id(tablet_id);
+    remote_snapshot->__set_local_snapshot_path(snapshot_path);
+    remote_snapshot->__set_remote_snapshot_path(remote_tablet_path);
+    TNetworkAddress addr;
+    addr.hostname = "127.0.0.1";
+    addr.port = 1234;
+    remote_snapshot->__set_remote_be_addr(addr);
+    remote_snapshot->__set_remote_token("fake_token");
+}
+
+class ManifestConfigGuard {
+public:
+    ManifestConfigGuard(bool check, bool digest_check)
+            : _check(config::restore_manifest_check),
+              _digest_check(config::restore_manifest_digest_check) {
+        config::restore_manifest_check = check;
+        config::restore_manifest_digest_check = digest_check;
+    }
+    ~ManifestConfigGuard() {
+        config::restore_manifest_check = _check;
+        config::restore_manifest_digest_check = _digest_check;
+    }
+
+private:
+    bool _check;
+    bool _digest_check;
+};
+
+TEST_F(SnapshotLoaderTest, HttpDownloadCheckManifest) {
+    ManifestConfigGuard guard(true, true);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(1101, 1102, 1103, 1111, 1112, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest(build_manifest(remote_snapshot.remote_snapshot_path, true));
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 4L, 1101);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    // the linked files are checked too, nothing needs to be downloaded again.
+    EXPECT_EQ(0, loader.get_http_download_files_num());
+    EXPECT_EQ(std::vector<int64_t> {1101}, loader.manifest_verified_tablets());
+    EXPECT_TRUE(loader.manifest_digest_checked());
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadWithoutManifestOrCheckDisabled) {
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(1201, 1202, 1203, 1211, 1212, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    // a manifest which does not match at all
+    TTabletManifest wrong;
+    wrong.__set_files({file_stat("not_exist.dat", 1)});
+
+    {
+        // disabled: behaves as before, the manifest is ignored
+        ManifestConfigGuard guard(false, true);
+        remote_snapshot.__set_manifest(wrong);
+        std::vector<int64_t> downloaded_tablet_ids;
+        SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 5L, 1201);
+        auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+        ASSERT_TRUE(status.ok()) << status;
+        EXPECT_EQ(0, loader.get_http_download_files_num());
+        EXPECT_TRUE(loader.manifest_verified_tablets().empty());
+        EXPECT_FALSE(loader.manifest_digest_checked());
+    }
+    {
+        // no manifest in the request (old FE or old backup): not checked
+        ManifestConfigGuard guard(true, true);
+        remote_snapshot.__isset.manifest = false;
+        std::vector<int64_t> downloaded_tablet_ids;
+        SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 6L, 1201);
+        auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+        ASSERT_TRUE(status.ok()) << status;
+        EXPECT_TRUE(loader.manifest_verified_tablets().empty());
+    }
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadManifestMismatchRetryFails) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(1301, 1302, 1303, 1311, 1312, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    TTabletManifest manifest = build_manifest(remote_snapshot.remote_snapshot_path, false);
+    // the manifest records a file which is not in the remote snapshot
+    manifest.files.push_back(
+            file_stat("0200000000000000ffffffffffffffffffffffffffffffff_0.dat", 3));
+    remote_snapshot.__set_manifest(manifest);
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 7L, 1301);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.is<ErrorCode::CORRUPTION>()) << status;
+    EXPECT_NE(status.to_string().find(
+                      "missing file 0200000000000000ffffffffffffffffffffffffffffffff_0.dat"),
+              std::string::npos)
+            << status;
+    // retried without reusing local files: all remote files are downloaded
+    EXPECT_GT(loader.get_http_download_files_num(), 0);
+    EXPECT_TRUE(loader.manifest_verified_tablets().empty());
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadLinkedFileTamperedRetrySucceeds) {
+    ManifestConfigGuard guard(true, true);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(1401, 1402, 1403, 1411, 1412, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest(build_manifest(remote_snapshot.remote_snapshot_path, true));
+
+    // Tamper a local segment file which will be linked instead of downloaded: same size, different
+    // content. Replace the file instead of writing in place, to keep the tablet data intact.
+    const std::string& local_path = remote_snapshot.local_snapshot_path;
+    std::vector<io::FileInfo> local_files;
+    bool exists = false;
+    ASSERT_TRUE(io::global_local_filesystem()->list(local_path, true, &local_files, &exists).ok());
+    std::string tampered;
+    int64_t tampered_size = 0;
+    for (const auto& file : local_files) {
+        if (file.file_name.ends_with(".dat") && file.file_size > 0) {
+            tampered = file.file_name;
+            tampered_size = file.file_size;
+            break;
+        }
+    }
+    ASSERT_FALSE(tampered.empty());
+    std::string tmp = local_path + "/tampered.tmp";
+    write_test_file(tmp, std::string(tampered_size, 'z'));
+    ASSERT_TRUE(io::global_local_filesystem()->rename(tmp, local_path + "/" + tampered).ok());
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 8L, 1401);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    // the linked file is caught by the digest check, and the retry downloads all the files
+    EXPECT_GT(loader.get_http_download_files_num(), 0);
+    EXPECT_EQ(std::vector<int64_t> {1401}, loader.manifest_verified_tablets());
+    EXPECT_TRUE(loader.manifest_digest_checked());
+
+    ManifestCheckResult result;
+    auto st = check_tablet_snapshot_manifest(local_path, 1401, remote_snapshot.manifest, true,
+                                             &result);
+    EXPECT_TRUE(st.ok()) << st;
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadLinkedFileTamperedWithoutDigestCheck) {
+    // With only the size check, a same size tampered linked file is not detected: the digest
+    // check is off by default, see the design.
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(1501, 1502, 1503, 1511, 1512, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest(build_manifest(remote_snapshot.remote_snapshot_path, true));
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 9L, 1501);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(0, loader.get_http_download_files_num());
+    EXPECT_EQ(std::vector<int64_t> {1501}, loader.manifest_verified_tablets());
+    EXPECT_FALSE(loader.manifest_digest_checked());
 }
 } // namespace doris

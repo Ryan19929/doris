@@ -45,6 +45,7 @@ import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.UploadTask;
 import org.apache.doris.thrift.TBackend;
 import org.apache.doris.thrift.TFinishTaskRequest;
+import org.apache.doris.thrift.TSnapshotFileStat;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTaskType;
@@ -656,5 +657,133 @@ public class BackupJobTest {
         // 3. delete files
         in.close();
         Files.delete(path);
+    }
+
+    private static final String MD5 = "4f158689243a3d6030352fec3cfd3798";
+
+    private static TSnapshotFileStat fileStat(String name, long size, String sha256) {
+        TSnapshotFileStat stat = new TSnapshotFileStat();
+        stat.setName(name);
+        stat.setSize(size);
+        if (sha256 != null) {
+            stat.setSha256(sha256);
+        }
+        return stat;
+    }
+
+    private static String sha(char c) {
+        return String.valueOf(c).repeat(64).toLowerCase();
+    }
+
+    // Run the backup to a remote repository until the job info file is saved, returns the job info read from it.
+    // The snapshot task reports the file sizes if snapshotStats, the upload task reports the sizes and digests if
+    // uploadStats, as a new backend does.
+    private BackupJobInfo runBackupToSavedJobInfo(boolean snapshotStats, boolean uploadStats) throws IOException {
+        AgentTaskQueue.clearAllTasks();
+        job.run();
+        Assertions.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+        SnapshotTask snapshotTask = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT,
+                id.get() - 1);
+        // a remote repository computes the digests when uploading, not in the snapshot.
+        Assertions.assertFalse(snapshotTask.toThrift().isSetComputeDigest());
+
+        TBackend tBackend = new TBackend("", 0, 1);
+        TStatus ok = new TStatus(TStatusCode.OK);
+        TFinishTaskRequest request = new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT,
+                snapshotTask.getSignature(), ok);
+        request.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+        request.setSnapshotPath("/path/to/snapshot");
+        if (snapshotStats) {
+            request.setSnapshotFileStats(Lists.newArrayList(fileStat("1.dat", 100, null),
+                    fileStat("1.idx", 20, null), fileStat("1.hdr", 3, null)));
+        }
+        Assertions.assertTrue(job.finishTabletSnapshotTask(snapshotTask, request));
+        job.run();
+        Assertions.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+
+        AgentTaskQueue.clearAllTasks();
+        job.run();
+        Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+        UploadTask upTask = (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+        request = new TFinishTaskRequest(tBackend, TTaskType.UPLOAD, upTask.getSignature(), ok);
+        Map<Long, List<String>> tabletFileMap = Maps.newHashMap();
+        tabletFileMap.put(tabletId, Lists.newArrayList("1.dat." + MD5, "1.idx." + MD5, "1.hdr." + MD5));
+        request.setTabletFiles(tabletFileMap);
+        if (uploadStats) {
+            Map<Long, List<TSnapshotFileStat>> stats = Maps.newHashMap();
+            stats.put(tabletId, Lists.newArrayList(fileStat("1.idx", 20, sha('B')),
+                    fileStat("1.hdr", 3, sha('C')), fileStat("1.dat", 100, sha('A'))));
+            request.setTabletFileStats(stats);
+        }
+        Assertions.assertTrue(job.finishSnapshotUploadTask(upTask, request));
+        job.run();
+        Assertions.assertEquals(BackupJobState.SAVE_META, job.getState());
+        job.run();
+        Assertions.assertEquals(BackupJobState.UPLOAD_INFO, job.getState());
+        return BackupJobInfo.fromFile(job.getLocalJobInfoFilePath());
+    }
+
+    @Test
+    public void testBackupWritesManifest() throws IOException {
+        BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true);
+        Assertions.assertEquals(BackupJobInfo.MANIFEST_VERSION, (int) jobInfo.manifestVersion);
+        Assertions.assertEquals(BackupJobInfo.DIGEST_SHA256, jobInfo.digestAlgorithm);
+        Assertions.assertTrue(jobInfo.hasManifest());
+
+        BackupJobInfo.TabletManifest manifest = jobInfo.getTabletManifest(tabletId);
+        Assertions.assertNotNull(manifest);
+        // sorted by name, the sizes and digests reported by the upload task, no digest for the tablet meta file.
+        Assertions.assertEquals(Lists.newArrayList(
+                new BackupJobInfo.ManifestEntry("1.dat", 100, sha('A')),
+                new BackupJobInfo.ManifestEntry("1.hdr", 3, null),
+                new BackupJobInfo.ManifestEntry("1.idx", 20, sha('B'))), manifest.files);
+        Assertions.assertEquals(BackupJobInfo.TabletManifest.computeRoot(manifest.files), manifest.root);
+        Assertions.assertEquals(64, manifest.root.length());
+
+        // the BackupTabletInfo view of it
+        BackupJobInfo.BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.values().iterator().next()
+                .partitions.values().iterator().next().indexes.values().iterator().next();
+        BackupJobInfo.BackupTabletInfo tabletInfo = idxInfo.sortedTabletInfoList.get(0);
+        Assertions.assertEquals(manifest.files, tabletInfo.manifest);
+        Assertions.assertEquals(manifest.root, tabletInfo.manifestRoot);
+        // the existing files are unchanged
+        Assertions.assertEquals(Lists.newArrayList("1.dat." + MD5, "1.idx." + MD5, "1.hdr." + MD5),
+                tabletInfo.files);
+    }
+
+    @Test
+    public void testBackupWithoutManifestIfUploadHasNoFileStats() throws IOException {
+        // an old backend: the sizes are known from the snapshot, but the upload reports nothing.
+        BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, false);
+        Assertions.assertNull(jobInfo.manifestVersion);
+        Assertions.assertNull(jobInfo.digestAlgorithm);
+        Assertions.assertFalse(jobInfo.hasManifest());
+        Assertions.assertNull(jobInfo.getTabletManifest(tabletId));
+        // same as a backup of an old version: no new key in the job info file.
+        String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
+        Assertions.assertFalse(json.contains("manifest"), json);
+        Assertions.assertFalse(json.contains("digest_algorithm"), json);
+    }
+
+    @Test
+    public void testLocalSnapshotManifestDigest() {
+        List<TableRefInfo> tableRefs = Lists.newArrayList(new TableRefInfo(
+                new TableNameInfo(InternalCatalog.INTERNAL_CATALOG_NAME, UnitTestUtil.DB_NAME, UnitTestUtil.TABLE_NAME),
+                null, null, null, new ArrayList<>(), null, null, new ArrayList<>()));
+        for (boolean manifestDigest : new boolean[] {false, true}) {
+            AgentTaskQueue.clearAllTasks();
+            job = new BackupJob("label", dbId, UnitTestUtil.DB_NAME, tableRefs, 13600 * 1000,
+                    BackupCommand.BackupContent.ALL, env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+            if (manifestDigest) {
+                job.setManifestDigest(true);
+            }
+            Assertions.assertEquals(manifestDigest, job.isManifestDigest());
+            job.run();
+            Assertions.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+            SnapshotTask snapshotTask = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT,
+                    id.get() - 1);
+            Assertions.assertEquals(manifestDigest, snapshotTask.toThrift().isSetComputeDigest());
+            Assertions.assertEquals(manifestDigest, snapshotTask.isComputeDigest());
+        }
     }
 }
