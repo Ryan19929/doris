@@ -50,6 +50,7 @@ import org.apache.doris.task.ReleaseSnapshotTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.UploadTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
+import org.apache.doris.thrift.TSnapshotFileStat;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTaskType;
 
@@ -181,6 +182,20 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         return localMetaInfoFilePath;
     }
 
+    // Whether to compute the SHA-256 of the snapshot files when making snapshots, for the manifest of a backup
+    // kept on local (the http download path). The files uploaded to a remote repository always have it.
+    public void setManifestDigest(boolean manifestDigest) {
+        properties.put(BackupCommand.PROP_MANIFEST_DIGEST, String.valueOf(manifestDigest));
+    }
+
+    public boolean isManifestDigest() {
+        return Boolean.parseBoolean(properties.get(BackupCommand.PROP_MANIFEST_DIGEST));
+    }
+
+    private boolean computeDigestInSnapshot() {
+        return repoId == Repository.KEEP_ON_LOCAL_REPO_ID && isManifestDigest();
+    }
+
     public BackupContent getContent() {
         if (properties.containsKey(BackupCommand.PROP_CONTENT)) {
             return BackupCommand.BackupContent.valueOf(properties.get(BackupCommand.PROP_CONTENT).toUpperCase());
@@ -229,6 +244,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     task.getIndexId(), task.getTabletId(),
                     task.getVersion(),
                     task.getSchemaHash(), timeoutMs, false /* not restore task */);
+            newTask.setComputeDigest(computeDigestInSnapshot());
             unfinishedTaskIds.put(signature, beId);
 
             //send task
@@ -327,6 +343,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 task.getIndexId(), task.getTabletId(), task.getBackendId(),
                 task.getSchemaHash(), request.getSnapshotPath(),
                 request.getSnapshotFiles());
+        // the size (and digest if required) of the snapshot files, for the manifest. For a remote repository,
+        // it is replaced by the file stats reported by the upload task.
+        if (request.isSetSnapshotFileStats()) {
+            info.setFileStats(SnapshotInfo.fileStatsFromThrift(request.getSnapshotFileStats()));
+        }
 
         snapshotInfos.put(task.getTabletId(), info);
         taskProgress.remove(task.getSignature());
@@ -386,6 +407,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             // reset files in snapshot info with checksum filename
             info.setFiles(tabletFileMap.get(tabletId));
+            // the size and digest of the uploaded files, for the manifest. Absent if the backend is an old version,
+            // then the job has no manifest.
+            List<TSnapshotFileStat> fileStats = request.isSetTabletFileStats()
+                    ? request.getTabletFileStats().get(tabletId) : null;
+            info.setFileStats(SnapshotInfo.fileStatsFromThrift(fileStats));
         }
 
         taskProgress.remove(task.getSignature());
@@ -707,6 +733,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                             index.getId(), tablet.getId(),
                             visibleVersion,
                             schemaHash, timeoutMs, false /* not restore task */);
+                    task.setComputeDigest(computeDigestInSnapshot());
                     batchTask.addTask(task);
                     unfinishedTaskIds.put(signature, beId);
                 }
@@ -956,6 +983,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             jobInfo = BackupJobInfo.fromCatalog(createTime, label, dbName, dbId,
                     getContent(), backupMeta, filteredSnapshotInfos, tableCommitSeqMap);
+            boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos,
+                    repoId != Repository.KEEP_ON_LOCAL_REPO_ID, true /* with root */);
+            LOG.info("backup manifest: {}, digest algorithm: {}. {}", hasManifest, jobInfo.digestAlgorithm, this);
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
             }

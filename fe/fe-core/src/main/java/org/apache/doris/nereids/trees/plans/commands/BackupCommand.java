@@ -48,6 +48,9 @@ import java.util.Objects;
  */
 public class BackupCommand extends Command implements ForwardWithSync {
     public static final String PROP_CONTENT = "content";
+    // "true": compute the SHA-256 of the snapshot files for the manifest when the backup is kept on local
+    // (downloaded by http, e.g. CCR). The files uploaded to a remote repository always have it.
+    public static final String PROP_MANIFEST_DIGEST = "manifest_digest";
     private static final Logger LOG = LogManager.getLogger(BackupCommand.class);
     private static final String PROP_TIMEOUT = "timeout";
     private static final long MIN_TIMEOUT_MS = 600 * 1000L;
@@ -69,6 +72,7 @@ public class BackupCommand extends Command implements ForwardWithSync {
 
     private BackupType type = BackupType.FULL;
     private BackupContent content = BackupContent.ALL;
+    private boolean manifestDigest = false;
 
     private final LabelNameInfo labelNameInfo;
     private final String repoName;
@@ -215,6 +219,20 @@ public class BackupCommand extends Command implements ForwardWithSync {
             }
             copiedProperties.remove(PROP_CONTENT);
         }
+        // manifest digest
+        String manifestDigestProp = copiedProperties.get(PROP_MANIFEST_DIGEST);
+        if (manifestDigestProp != null) {
+            if (manifestDigestProp.equalsIgnoreCase("true")) {
+                manifestDigest = true;
+            } else if (manifestDigestProp.equalsIgnoreCase("false")) {
+                manifestDigest = false;
+            } else {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
+                        "Invalid backup job property " + PROP_MANIFEST_DIGEST + ": " + manifestDigestProp
+                                + ", expect true or false");
+            }
+            copiedProperties.remove(PROP_MANIFEST_DIGEST);
+        }
 
         if (!copiedProperties.isEmpty()) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_COMMON_ERROR,
@@ -244,6 +262,10 @@ public class BackupCommand extends Command implements ForwardWithSync {
 
     public BackupContent getContent() {
         return content;
+    }
+
+    public boolean isManifestDigest() {
+        return manifestDigest;
     }
 
     public String getLabel() {

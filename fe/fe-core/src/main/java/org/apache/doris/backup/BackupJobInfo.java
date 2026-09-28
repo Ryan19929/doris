@@ -32,12 +32,15 @@ import org.apache.doris.catalog.View;
 import org.apache.doris.catalog.info.PartitionNamesInfo;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.Version;
 import org.apache.doris.info.TableRefInfo;
 import org.apache.doris.nereids.trees.plans.commands.BackupCommand.BackupContent;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TSnapshotFileStat;
+import org.apache.doris.thrift.TTabletManifest;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
@@ -45,6 +48,7 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
 import com.google.gson.annotations.SerializedName;
+import org.apache.commons.codec.binary.Hex;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -57,10 +61,13 @@ import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 /*
@@ -70,6 +77,10 @@ import java.util.Set;
  */
 public class BackupJobInfo implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(BackupJobInfo.class);
+
+    public static final int MANIFEST_VERSION = 1;
+    public static final String DIGEST_SHA256 = "sha256";
+    public static final String DIGEST_NONE = "none";
 
     @SerializedName("name")
     public String name;
@@ -110,6 +121,18 @@ public class BackupJobInfo implements GsonPostProcessable {
 
     @SerializedName("table_commit_seq_map")
     public Map<Long, Long> tableCommitSeqMap;
+
+    // The version of the manifest (the expected files of each tablet snapshot, see TabletManifest).
+    // Null (absent in the json) means there is no manifest, e.g. a backup by an old version, or some backend
+    // did not report the file stats. Not written if null, so a job info without manifest is the same as before.
+    @SerializedName("manifest_version")
+    public Integer manifestVersion;
+    // The digest algorithm of the files in the manifest, DIGEST_SHA256 or DIGEST_NONE.
+    @SerializedName("digest_algorithm")
+    public String digestAlgorithm;
+
+    // tablet id -> manifest, built from the tablet manifests of all indexes on demand, not persisted.
+    private Map<Long, TabletManifest> tabletManifestIndex;
 
     public static class ExtraInfo {
         public static class NetworkAddrss {
@@ -164,6 +187,11 @@ public class BackupJobInfo implements GsonPostProcessable {
                             continue;
                         }
                         BackupTabletInfo backupTabletInfo = new BackupTabletInfo(tabletId, files);
+                        TabletManifest manifest = backupIndexInfo.getTabletManifest(tabletId);
+                        if (manifest != null) {
+                            backupTabletInfo.manifest = manifest.files;
+                            backupTabletInfo.manifestRoot = manifest.root;
+                        }
                         backupIndexInfo.sortedTabletInfoList.add(backupTabletInfo);
                     }
                 }
@@ -418,10 +446,17 @@ public class BackupJobInfo implements GsonPostProcessable {
         public Map<Long, List<String>> tablets = Maps.newHashMap();
         @SerializedName("tablets_order")
         public List<Long> tabletsOrder = Lists.newArrayList();
+        // tablet id -> the manifest of the tablet snapshot, next to "tablets". Null if the backup has no manifest.
+        @SerializedName("tablet_manifests")
+        public Map<Long, TabletManifest> tabletManifests;
         public List<BackupTabletInfo> sortedTabletInfoList = Lists.newArrayList();
 
         public List<String> getTabletFiles(long tabletId) {
             return tablets.get(tabletId);
+        }
+
+        public TabletManifest getTabletManifest(long tabletId) {
+            return tabletManifests == null ? null : tabletManifests.get(tabletId);
         }
 
         private List<Long> getSortedTabletIds() {
@@ -442,10 +477,119 @@ public class BackupJobInfo implements GsonPostProcessable {
         public long id;
         @SerializedName("files")
         public List<String> files;
+        // The expected files of the tablet snapshot, sorted by name, null if the backup has no manifest.
+        // Persisted in BackupIndexInfo.tabletManifests, this is a view of it.
+        public List<ManifestEntry> manifest;
+        // optional, see TabletManifest.root
+        public String manifestRoot;
 
         public BackupTabletInfo(long id, List<String> files) {
             this.id = id;
             this.files = files;
+        }
+    }
+
+    /**
+     * A file of a tablet snapshot in the manifest. The short names keep the manifest small, a backup may
+     * have millions of files.
+     */
+    public static class ManifestEntry {
+        // file name in the source tablet snapshot dir, without the md5 suffix used in the repository.
+        @SerializedName("n")
+        public String name;
+        @SerializedName("s")
+        public long size;
+        // hex encoded digest by the digest_algorithm of the job, absent if not computed.
+        // Never recorded for the tablet meta file (.hdr), which is rewritten in restore.
+        @SerializedName("d")
+        public String digest;
+
+        public ManifestEntry() {
+            // for persist
+        }
+
+        public ManifestEntry(String name, long size, String digest) {
+            this.name = name;
+            this.size = size;
+            this.digest = digest;
+        }
+
+        public TSnapshotFileStat toThrift() {
+            TSnapshotFileStat stat = new TSnapshotFileStat();
+            stat.setName(name);
+            stat.setSize(size);
+            if (digest != null) {
+                stat.setSha256(digest);
+            }
+            return stat;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof ManifestEntry)) {
+                return false;
+            }
+            ManifestEntry that = (ManifestEntry) o;
+            return size == that.size && Objects.equals(name, that.name) && Objects.equals(digest, that.digest);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(name, size, digest);
+        }
+
+        @Override
+        public String toString() {
+            return name + ":" + size + (digest == null ? "" : ":" + digest);
+        }
+    }
+
+    /**
+     * The manifest of a tablet snapshot: the complete list of its files, sorted by name.
+     */
+    public static class TabletManifest {
+        @SerializedName("files")
+        public List<ManifestEntry> files = Lists.newArrayList();
+        // SHA-256 of the sorted (name, size, digest) of all files, see computeRoot(). Optional, the entries
+        // are the authority.
+        @SerializedName("root")
+        public String root;
+
+        public TabletManifest() {
+            // for persist
+        }
+
+        public TabletManifest(List<ManifestEntry> files, boolean withRoot) {
+            this.files = files;
+            this.root = withRoot ? computeRoot(files) : null;
+        }
+
+        public TTabletManifest toThrift() {
+            TTabletManifest manifest = new TTabletManifest();
+            List<TSnapshotFileStat> stats = Lists.newArrayListWithCapacity(files.size());
+            for (ManifestEntry entry : files) {
+                stats.add(entry.toThrift());
+            }
+            manifest.setFiles(stats);
+            return manifest;
+        }
+
+        // One line "name \t size \t digest \n" for each file in the given order, digest is empty if absent.
+        public static String computeRoot(List<ManifestEntry> files) {
+            try {
+                MessageDigest md = MessageDigest.getInstance("SHA-256");
+                for (ManifestEntry entry : files) {
+                    String line = entry.name + "\t" + entry.size + "\t" + (entry.digest == null ? "" : entry.digest)
+                            + "\n";
+                    md.update(line.getBytes(StandardCharsets.UTF_8));
+                }
+                return Hex.encodeHexString(md.digest());
+            } catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException(e);
+            }
         }
     }
 
@@ -678,6 +822,155 @@ public class BackupJobInfo implements GsonPostProcessable {
         return jobInfo;
     }
 
+    /**
+     * Build the manifest of all the tablets from the file stats reported by the backends, see
+     * SnapshotInfo.getFileStats(). All or nothing: if any tablet has no file stats (e.g. an old backend), or the
+     * file stats do not match the snapshot files, no manifest is written for the whole job, the same as a backup
+     * of an old version.
+     *
+     * @param snapshotInfos tablet id -> snapshot info
+     * @param filesWithChecksum whether the file names in the snapshot infos have the md5 suffix (remote repository)
+     * @param withRoot whether to record the manifest root of each tablet
+     * @return true if the manifest is written
+     */
+    public boolean buildManifest(Map<Long, SnapshotInfo> snapshotInfos, boolean filesWithChecksum,
+            boolean withRoot) {
+        clearManifest();
+        if (content == BackupContent.METADATA_ONLY) {
+            return false;
+        }
+
+        // index info -> tablet id -> sorted entries
+        Map<BackupIndexInfo, Map<Long, List<ManifestEntry>>> built = Maps.newHashMap();
+        boolean allDigested = true;
+        for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    Map<Long, List<ManifestEntry>> idxManifests = Maps.newHashMap();
+                    built.put(idxInfo, idxManifests);
+                    for (Long tabletId : idxInfo.tablets.keySet()) {
+                        SnapshotInfo info = snapshotInfos.get(tabletId);
+                        List<ManifestEntry> entries = info == null ? null
+                                : toManifestEntries(info, filesWithChecksum);
+                        if (entries == null) {
+                            LOG.info("no manifest for backup {}, tablet {} has no valid file stats", name, tabletId);
+                            return false;
+                        }
+                        for (ManifestEntry entry : entries) {
+                            if (entry.digest == null && !isTabletMetaFile(entry.name)) {
+                                allDigested = false;
+                            }
+                        }
+                        idxManifests.put(tabletId, entries);
+                    }
+                }
+            }
+        }
+
+        for (Map.Entry<BackupIndexInfo, Map<Long, List<ManifestEntry>>> idxEntry : built.entrySet()) {
+            Map<Long, TabletManifest> tabletManifests = Maps.newHashMap();
+            for (Map.Entry<Long, List<ManifestEntry>> tabletEntry : idxEntry.getValue().entrySet()) {
+                List<ManifestEntry> entries = tabletEntry.getValue();
+                if (!allDigested) {
+                    // keep the manifest uniform, the digests are all or nothing too.
+                    for (ManifestEntry entry : entries) {
+                        entry.digest = null;
+                    }
+                }
+                tabletManifests.put(tabletEntry.getKey(), new TabletManifest(entries, withRoot));
+            }
+            idxEntry.getKey().tabletManifests = tabletManifests;
+        }
+        manifestVersion = MANIFEST_VERSION;
+        digestAlgorithm = allDigested ? DIGEST_SHA256 : DIGEST_NONE;
+        tabletManifestIndex = null;
+        return true;
+    }
+
+    // Returns the entries sorted by name, or null if the file stats are absent or do not match the files.
+    private static List<ManifestEntry> toManifestEntries(SnapshotInfo info, boolean filesWithChecksum) {
+        List<ManifestEntry> stats = info.getFileStats();
+        if (stats == null || info.getFiles() == null) {
+            return null;
+        }
+        Set<String> expectedNames = Sets.newHashSet();
+        for (String file : info.getFiles()) {
+            if (filesWithChecksum) {
+                Pair<String, String> decoded = Repository.decodeFileNameWithChecksum(file);
+                if (decoded == null) {
+                    return null;
+                }
+                expectedNames.add(decoded.first);
+            } else {
+                expectedNames.add(file);
+            }
+        }
+        List<ManifestEntry> entries = Lists.newArrayListWithCapacity(stats.size());
+        Set<String> names = Sets.newHashSet();
+        for (ManifestEntry stat : stats) {
+            if (stat == null || stat.name == null || stat.size < 0 || !names.add(stat.name)) {
+                return null;
+            }
+            String digest = isTabletMetaFile(stat.name) || stat.digest == null || stat.digest.isEmpty()
+                    ? null : stat.digest.toLowerCase();
+            entries.add(new ManifestEntry(stat.name, stat.size, digest));
+        }
+        if (!names.equals(expectedNames)) {
+            return null;
+        }
+        entries.sort((a, b) -> a.name.compareTo(b.name));
+        return entries;
+    }
+
+    public static boolean isTabletMetaFile(String name) {
+        return name.endsWith(".hdr");
+    }
+
+    /**
+     * Whether this backup has a manifest that this version can check. A manifest of an unknown (newer) version
+     * is not checked, never fails a restore.
+     */
+    public boolean hasManifest() {
+        return manifestVersion != null && manifestVersion == MANIFEST_VERSION;
+    }
+
+    // Returns the manifest of a tablet in the backup, null if absent.
+    public TabletManifest getTabletManifest(long tabletId) {
+        if (!hasManifest()) {
+            return null;
+        }
+        if (tabletManifestIndex == null) {
+            Map<Long, TabletManifest> index = Maps.newHashMap();
+            for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+                if (tblInfo == null) {
+                    continue;
+                }
+                for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                    for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                        if (idxInfo.tabletManifests != null) {
+                            index.putAll(idxInfo.tabletManifests);
+                        }
+                    }
+                }
+            }
+            tabletManifestIndex = index;
+        }
+        return tabletManifestIndex.get(tabletId);
+    }
+
+    private void clearManifest() {
+        manifestVersion = null;
+        digestAlgorithm = null;
+        tabletManifestIndex = null;
+        for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    idxInfo.tabletManifests = null;
+                }
+            }
+        }
+    }
+
     public static BackupJobInfo fromFile(String path) throws IOException {
         byte[] bytes = Files.readAllBytes(Paths.get(path));
         String json = new String(bytes, StandardCharsets.UTF_8);
@@ -794,10 +1087,16 @@ public class BackupJobInfo implements GsonPostProcessable {
                 for (BackupIndexInfo indexInfo : partInfo.indexes.values()) {
                     for (BackupTabletInfo tabletInfo : indexInfo.sortedTabletInfoList) {
                         tabletInfo.files.clear();
+                        tabletInfo.manifest = null;
+                        tabletInfo.manifestRoot = null;
                     }
+                    // The manifest is only needed for downloading. Keep manifest_version and digest_algorithm,
+                    // they are shown in SHOW RESTORE.
+                    indexInfo.tabletManifests = null;
                 }
             }
         }
+        tabletManifestIndex = null;
     }
 
     @Override
