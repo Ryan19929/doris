@@ -281,6 +281,8 @@ DEFINE_mBool(enable_batch_download, "true");
 DEFINE_mBool(enable_group_commit_streamload_be_forward, "false");
 // whether to check md5sum when download
 DEFINE_mBool(enable_download_md5sum_check, "false");
+DEFINE_mBool(restore_manifest_check, "true");
+DEFINE_mBool(restore_manifest_digest_check, "false");
 // download binlog meta timeout, default 30s
 DEFINE_mInt32(download_binlog_meta_timeout_ms, "30000");
 // the interval time(seconds) for agent report index policy to FE

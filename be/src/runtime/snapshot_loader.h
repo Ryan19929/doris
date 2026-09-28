@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <gen_cpp/AgentService_types.h>
 #include <gen_cpp/Types_types.h>
 
 #include <cstdint>
@@ -44,6 +45,34 @@ struct FileStat {
     int64_t size;
 };
 class ExecEnv;
+
+// Compute the md5 and the SHA-256 of a local file by reading it once. Both are lower case hex strings.
+// Pass nullptr to skip one of them. If size is not nullptr, it is set to the number of bytes read.
+Status compute_file_digests(const std::string& path, std::string* md5, std::string* sha256,
+                            int64_t* size = nullptr);
+
+struct ManifestCheckResult {
+    // The manifest is valid and the local tablet snapshot matches it.
+    bool checked = false;
+    // The SHA-256 of all the files except the tablet meta file are checked.
+    bool digest_checked = false;
+};
+
+// Check the files of a downloaded local tablet snapshot against the manifest of the source tablet
+// snapshot, which is recorded at backup time:
+//  - the set of files must be the same, no more and no less;
+//  - the size of each file must be the same;
+//  - if check_digest is true, the SHA-256 of each file must be the same, if the manifest has it. The
+//    tablet meta file is excluded, it is rewritten in restore.
+// The names in the manifest are those of the source tablet, the tablet meta file "<source tablet id>.hdr"
+// is expected as "<local_tablet_id>.hdr", as it is renamed when downloading.
+//
+// Returns a Corruption status with the first mismatched file, the expected and the actual value, if the
+// local tablet snapshot does not match. An invalid manifest is not checked: returns OK with
+// result->checked = false.
+Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t local_tablet_id,
+                                      const TTabletManifest& manifest, bool check_digest,
+                                      ManifestCheckResult* result);
 
 class BaseSnapshotLoader {
 public:
@@ -123,7 +152,41 @@ public:
 
     int64_t get_http_download_files_num() const { return _http_download_files_num; }
 
+    // The expected files of each tablet to download, the key is the remote path, the same as the key
+    // of src_to_dest_path of download().
+    void set_expected_files(std::map<std::string, TTabletManifest> expected_files) {
+        _expected_files = std::move(expected_files);
+    }
+
+    // The size and SHA-256 of the files of each tablet, collected by upload().
+    const std::map<int64_t, std::vector<TSnapshotFileStat>>& tablet_file_stats() const {
+        return _tablet_file_stats;
+    }
+
+    // The local tablets whose downloaded snapshot has been checked against the manifest.
+    const std::vector<int64_t>& manifest_verified_tablets() const {
+        return _manifest_verified_tablets;
+    }
+
+    // Whether the digests are checked for all the tablets in manifest_verified_tablets().
+    bool manifest_digest_checked() const {
+        return !_manifest_verified_tablets.empty() &&
+               _manifest_digest_checked_num == _manifest_verified_tablets.size();
+    }
+
 private:
+    // Download the files of a tablet from the remote path to the local path, see download().
+    Status _download_tablet_from_remote(const std::string& remote_path,
+                                        const std::string& local_path, int64_t local_tablet_id,
+                                        int64_t remote_tablet_id, int* report_counter,
+                                        int finished_num, int total_num);
+
+    // Delete all the files in a local tablet snapshot dir, so that it can be downloaded again
+    // without reusing any local file.
+    Status _clear_local_snapshot_files(const std::string& local_path);
+
+    void _add_manifest_verified_tablet(int64_t tablet_id, bool digest_checked);
+
     Status _replace_tablet_id(const std::string& file_name, int64_t tablet_id,
                               std::string* new_file_name);
 
@@ -144,6 +207,11 @@ private:
     StorageEngine& _engine;
     // for test remote_http_download
     size_t _http_download_files_num;
+
+    std::map<std::string, TTabletManifest> _expected_files;
+    std::map<int64_t, std::vector<TSnapshotFileStat>> _tablet_file_stats;
+    std::vector<int64_t> _manifest_verified_tablets;
+    size_t _manifest_digest_checked_num = 0;
 };
 
 } // end namespace doris

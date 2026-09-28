@@ -1309,6 +1309,9 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_tablet_files(tablet_files);
+    if (status.ok()) {
+        finish_task_request.__set_tablet_file_stats(loader->tablet_file_stats());
+    }
 
     finish_task(finish_task_request);
     remove_task_info(req.task_type, req.signature);
@@ -1322,6 +1325,8 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
 
     // TODO: download
     std::vector<int64_t> downloaded_tablet_ids;
+    std::vector<int64_t> manifest_verified_tablets;
+    bool manifest_digest_checked = false;
 
     auto status = Status::OK();
     if (download_request.__isset.remote_tablet_snapshots) {
@@ -1330,6 +1335,8 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
         SCOPED_ATTACH_TASK(loader->resource_ctx());
         status = loader->remote_http_download(download_request.remote_tablet_snapshots,
                                               &downloaded_tablet_ids);
+        manifest_verified_tablets = loader->manifest_verified_tablets();
+        manifest_digest_checked = loader->manifest_digest_checked();
     } else {
         std::unique_ptr<SnapshotLoader> loader = std::make_unique<SnapshotLoader>(
                 engine, env, download_request.job_id, req.signature, download_request.broker_addr,
@@ -1340,8 +1347,13 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
                                       : TStorageBackendType::type::BROKER,
                               download_request.__isset.location ? download_request.location : "");
         if (status.ok()) {
+            if (download_request.__isset.expected_files) {
+                loader->set_expected_files(download_request.expected_files);
+            }
             status = loader->download(download_request.src_dest_map, &downloaded_tablet_ids);
         }
+        manifest_verified_tablets = loader->manifest_verified_tablets();
+        manifest_digest_checked = loader->manifest_digest_checked();
     }
 
     if (!status.ok()) {
@@ -1361,6 +1373,11 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_downloaded_tablet_ids(downloaded_tablet_ids);
+    if (status.ok()) {
+        // Always set, so that FE knows the manifest is supported even if no tablet is verified.
+        finish_task_request.__set_manifest_verified_tablets(manifest_verified_tablets);
+        finish_task_request.__set_manifest_digest_checked(manifest_digest_checked);
+    }
 
     finish_task(finish_task_request);
     remove_task_info(req.task_type, req.signature);
@@ -1423,6 +1440,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     std::string snapshot_path;
     bool allow_incremental_clone = false; // not used
     std::vector<std::string> snapshot_files;
+    std::vector<TSnapshotFileStat> snapshot_file_stats;
     Status status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
                                                          &allow_incremental_clone);
     if (status.ok() && snapshot_request.__isset.list_files) {
@@ -1435,8 +1453,26 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
                                     snapshot_request.schema_hash);
         status = io::global_local_filesystem()->list(path, true, &files, &exists);
         if (status.ok()) {
+            bool compute_digest =
+                    snapshot_request.__isset.compute_digest && snapshot_request.compute_digest;
             for (auto& file : files) {
                 snapshot_files.push_back(file.file_name);
+                // the size (and the sha256 if required) of each file, for the manifest.
+                TSnapshotFileStat file_stat;
+                file_stat.__set_name(file.file_name);
+                file_stat.__set_size(file.file_size);
+                if (compute_digest) {
+                    std::string sha256;
+                    int64_t file_size = 0;
+                    status = compute_file_digests((path / file.file_name).native(), nullptr,
+                                                  &sha256, &file_size);
+                    if (!status.ok()) {
+                        break;
+                    }
+                    file_stat.__set_size(file_size);
+                    file_stat.__set_sha256(sha256);
+                }
+                snapshot_file_stats.push_back(std::move(file_stat));
             }
         }
     }
@@ -1460,6 +1496,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_snapshot_path(snapshot_path);
     finish_task_request.__set_snapshot_files(snapshot_files);
+    if (status.ok() && snapshot_request.__isset.list_files) {
+        finish_task_request.__set_snapshot_file_stats(snapshot_file_stats);
+    }
     finish_task_request.__set_task_status(status.to_thrift());
 
     finish_task(finish_task_request);
