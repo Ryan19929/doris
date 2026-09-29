@@ -21,8 +21,6 @@ import org.apache.doris.analysis.StorageBackend;
 import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
-import org.apache.doris.backup.BackupJobInfo.ManifestEntry;
-import org.apache.doris.backup.BackupJobInfo.TabletManifest;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.FsBroker;
@@ -39,10 +37,8 @@ import org.apache.doris.thrift.TBackend;
 import org.apache.doris.thrift.TDownloadReq;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TRemoteTabletSnapshot;
-import org.apache.doris.thrift.TSnapshotFileStat;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
-import org.apache.doris.thrift.TTabletManifest;
 import org.apache.doris.thrift.TTaskType;
 
 import com.google.common.collect.Lists;
@@ -125,17 +121,15 @@ public class RestoreManifestTest {
         return jobInfo;
     }
 
-    private static SnapshotInfo snapshotInfo(long tabletId, List<ManifestEntry> fileStats) {
-        SnapshotInfo info = new SnapshotInfo(1, 2, 3, 4, tabletId, 10001, 5, "/path",
-                Lists.newArrayList("1.dat." + MD5, "1.idx." + MD5, tabletId + ".hdr." + MD5));
-        info.setFileStats(fileStats);
-        return info;
+    private static String root(long tabletId) {
+        return String.format("%064x", tabletId);
     }
 
-    private static List<ManifestEntry> stats(long tabletId, boolean withDigest) {
-        return Lists.newArrayList(new ManifestEntry(tabletId + ".hdr", 3, withDigest ? sha('c') : null),
-                new ManifestEntry("1.idx", 20, withDigest ? sha('B') : null),
-                new ManifestEntry("1.dat", 100, withDigest ? sha('a') : null));
+    private static SnapshotInfo snapshotInfo(long tabletId, String manifestRoot) {
+        SnapshotInfo info = new SnapshotInfo(1, 2, 3, 4, tabletId, 10001, 5, "/path",
+                Lists.newArrayList("1.dat." + MD5, "1.idx." + MD5, tabletId + ".hdr." + MD5));
+        info.setManifestRoot(manifestRoot);
+        return info;
     }
 
     private static Map<Long, SnapshotInfo> snapshotInfos(SnapshotInfo... infos) {
@@ -150,9 +144,9 @@ public class RestoreManifestTest {
         BackupJobInfo jobInfo = newJobInfo(tabletIds);
         SnapshotInfo[] infos = new SnapshotInfo[tabletIds.length];
         for (int i = 0; i < tabletIds.length; i++) {
-            infos[i] = snapshotInfo(tabletIds[i], stats(tabletIds[i], true));
+            infos[i] = snapshotInfo(tabletIds[i], root(tabletIds[i]));
         }
-        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(infos), true, true));
+        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(infos), BackupJobInfo.DIGEST_SHA256));
         return jobInfo;
     }
 
@@ -163,104 +157,50 @@ public class RestoreManifestTest {
         BackupJobInfo jobInfo = jobInfoWithManifest(TABLET_1, TABLET_2);
         Assertions.assertEquals(1, (int) jobInfo.manifestVersion);
         Assertions.assertEquals("sha256", jobInfo.digestAlgorithm);
-        TabletManifest manifest = jobInfo.getTabletManifest(TABLET_1);
-        // sorted by name, digests in lower case, no digest for the tablet meta file
-        Assertions.assertEquals(Lists.newArrayList(new ManifestEntry("1.dat", 100, sha('a')),
-                new ManifestEntry("1.idx", 20, sha('b')), new ManifestEntry("101.hdr", 3, null)), manifest.files);
-        Assertions.assertEquals(TabletManifest.computeRoot(manifest.files), manifest.root);
-        Assertions.assertEquals(64, manifest.root.length());
-        Assertions.assertNotEquals(manifest.root, jobInfo.getTabletManifest(TABLET_2).root);
-        Assertions.assertNull(jobInfo.getTabletManifest(999));
+        Assertions.assertEquals(root(TABLET_1), jobInfo.getManifestRoot(TABLET_1));
+        Assertions.assertEquals(root(TABLET_2), jobInfo.getManifestRoot(TABLET_2));
+        Assertions.assertNull(jobInfo.getManifestRoot(999));
 
-        // without root
-        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true)),
-                snapshotInfo(TABLET_2, stats(TABLET_2, true))), true, false));
-        Assertions.assertNull(jobInfo.getTabletManifest(TABLET_1).root);
+        // a backup kept on local without manifest_digest; upper case roots are normalized
+        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(
+                snapshotInfo(TABLET_1, root(TABLET_1).toUpperCase().replace('0', 'A')),
+                snapshotInfo(TABLET_2, root(TABLET_2))), BackupJobInfo.DIGEST_NONE));
+        Assertions.assertEquals("none", jobInfo.digestAlgorithm);
+        Assertions.assertEquals(root(TABLET_1).replace('0', 'a'), jobInfo.getManifestRoot(TABLET_1));
     }
 
     @Test
-    public void testBuildManifestWithoutDigest() {
-        // http path without manifest_digest: sizes only
-        BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2);
-        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, false)),
-                snapshotInfo(TABLET_2, stats(TABLET_2, false))), true, true));
-        Assertions.assertEquals("none", jobInfo.digestAlgorithm);
-
-        // mixed: the digests are all or nothing
-        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true)),
-                snapshotInfo(TABLET_2, stats(TABLET_2, false))), true, true));
-        Assertions.assertEquals("none", jobInfo.digestAlgorithm);
-        for (ManifestEntry entry : jobInfo.getTabletManifest(TABLET_1).files) {
-            Assertions.assertNull(entry.digest);
-        }
-    }
-
-    @Test
-    public void testNoManifestIfAnyTabletLacksFileStats() {
+    public void testNoManifestIfAnyTabletLacksManifestRoot() {
         BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2);
         // tablet 2 is on an old backend
-        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true)),
-                snapshotInfo(TABLET_2, null)), true, true));
+        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, root(TABLET_1)),
+                snapshotInfo(TABLET_2, null)), BackupJobInfo.DIGEST_SHA256));
         Assertions.assertFalse(jobInfo.hasManifest());
         Assertions.assertNull(jobInfo.manifestVersion);
         Assertions.assertNull(jobInfo.digestAlgorithm);
-        Assertions.assertNull(jobInfo.getTabletManifest(TABLET_1));
+        Assertions.assertNull(jobInfo.getManifestRoot(TABLET_1));
         Assertions.assertFalse(jobInfo.toJson(false).contains("manifest"));
 
-        // the file stats do not match the snapshot files: one file less
-        List<ManifestEntry> lessFiles = stats(TABLET_2, true);
-        lessFiles.remove(0);
-        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true)),
-                snapshotInfo(TABLET_2, lessFiles)), true, true));
-        // a duplicated file
-        List<ManifestEntry> duplicated = stats(TABLET_2, true);
-        duplicated.add(new ManifestEntry("1.dat", 100, sha('a')));
-        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true)),
-                snapshotInfo(TABLET_2, duplicated)), true, true));
+        // not a SHA-256
+        for (String bad : new String[] {"", "abc", root(TABLET_2).substring(1) + "g"}) {
+            Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, root(TABLET_1)),
+                    snapshotInfo(TABLET_2, bad)), BackupJobInfo.DIGEST_SHA256), bad);
+        }
         // a snapshot info is missing
-        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true))),
-                true, true));
+        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, root(TABLET_1))),
+                BackupJobInfo.DIGEST_SHA256));
 
         // a successful build after a failed one
-        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true)),
-                snapshotInfo(TABLET_2, stats(TABLET_2, true))), true, true));
+        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, root(TABLET_1)),
+                snapshotInfo(TABLET_2, root(TABLET_2))), BackupJobInfo.DIGEST_SHA256));
         Assertions.assertTrue(jobInfo.hasManifest());
 
         // metadata only backup has no files
         jobInfo.content = BackupContent.METADATA_ONLY;
-        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, stats(TABLET_1, true)),
-                snapshotInfo(TABLET_2, stats(TABLET_2, true))), true, true));
+        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, root(TABLET_1)),
+                snapshotInfo(TABLET_2, root(TABLET_2))), BackupJobInfo.DIGEST_SHA256));
         Assertions.assertFalse(jobInfo.hasManifest());
-        Assertions.assertNull(jobInfo.getTabletManifest(TABLET_1));
-    }
-
-    @Test
-    public void testBuildManifestLocalSnapshotFilesWithoutChecksum() {
-        BackupJobInfo jobInfo = newJobInfo(TABLET_1);
-        SnapshotInfo info = new SnapshotInfo(1, 2, 3, 4, TABLET_1, 10001, 5, "/path",
-                Lists.newArrayList("1.dat", "1.idx", TABLET_1 + ".hdr"));
-        info.setFileStats(stats(TABLET_1, false));
-        Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(info), false, true));
-        // treated as names with checksum, they do not match
-        Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(info), true, true));
-    }
-
-    @Test
-    public void testFileStatsFromThrift() {
-        Assertions.assertNull(SnapshotInfo.fileStatsFromThrift(null));
-        TSnapshotFileStat stat = new TSnapshotFileStat();
-        stat.setName("1.dat");
-        stat.setSize(10);
-        stat.setSha256(sha('a'));
-        TSnapshotFileStat noDigest = new TSnapshotFileStat();
-        noDigest.setName("1.hdr");
-        noDigest.setSize(1);
-        Assertions.assertEquals(Lists.newArrayList(new ManifestEntry("1.dat", 10, sha('a')),
-                new ManifestEntry("1.hdr", 1, null)),
-                SnapshotInfo.fileStatsFromThrift(Lists.newArrayList(stat, noDigest)));
-        TSnapshotFileStat noSize = new TSnapshotFileStat();
-        noSize.setName("1.idx");
-        Assertions.assertNull(SnapshotInfo.fileStatsFromThrift(Lists.newArrayList(stat, noSize)));
+        Assertions.assertNull(jobInfo.getManifestRoot(TABLET_1));
     }
 
     // ---- persisting ----
@@ -271,35 +211,27 @@ public class RestoreManifestTest {
         String json = jobInfo.toJson(false);
         Assertions.assertTrue(json.contains("\"manifest_version\":1"), json);
         Assertions.assertTrue(json.contains("\"digest_algorithm\":\"sha256\""), json);
-        Assertions.assertTrue(json.contains("\"tablet_manifests\":{"), json);
-        Assertions.assertTrue(json.contains("{\"n\":\"1.dat\",\"s\":100,\"d\":\"" + sha('a') + "\"}"), json);
-        // no digest key for the tablet meta file
-        Assertions.assertTrue(json.contains("{\"n\":\"101.hdr\",\"s\":3}"), json);
+        Assertions.assertTrue(json.contains("\"manifest_roots\":{"), json);
+        Assertions.assertTrue(json.contains("\"101\":\"" + root(TABLET_1) + "\""), json);
 
         BackupJobInfo read = BackupJobInfo.genFromJson(json);
         Assertions.assertTrue(read.hasManifest());
         Assertions.assertEquals("sha256", read.digestAlgorithm);
-        for (long tabletId : new long[] {TABLET_1, TABLET_2}) {
-            TabletManifest expected = jobInfo.getTabletManifest(tabletId);
-            TabletManifest actual = read.getTabletManifest(tabletId);
-            Assertions.assertEquals(expected.files, actual.files);
-            Assertions.assertEquals(expected.root, actual.root);
-        }
+        Assertions.assertEquals(root(TABLET_1), read.getManifestRoot(TABLET_1));
+        Assertions.assertEquals(root(TABLET_2), read.getManifestRoot(TABLET_2));
         // the BackupTabletInfo view
         BackupIndexInfo idxInfo = read.backupOlapTableObjects.get("tbl").partitions.get("p1").indexes.get("tbl");
         Assertions.assertEquals(2, idxInfo.sortedTabletInfoList.size());
-        Assertions.assertEquals(read.getTabletManifest(TABLET_1).files, idxInfo.sortedTabletInfoList.get(0).manifest);
-        Assertions.assertEquals(read.getTabletManifest(TABLET_1).root,
-                idxInfo.sortedTabletInfoList.get(0).manifestRoot);
+        Assertions.assertEquals(root(TABLET_1), idxInfo.sortedTabletInfoList.get(0).manifestRoot);
         // written again, the same
         Assertions.assertEquals(json, read.toJson(false));
 
-        // released after the restore: the manifest is gone, the version and algorithm are kept for SHOW RESTORE.
+        // released after the restore: the roots are gone, the version and algorithm are kept for SHOW RESTORE.
         read.releaseSnapshotInfo();
         Assertions.assertTrue(read.hasManifest());
-        Assertions.assertNull(read.getTabletManifest(TABLET_1));
-        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).manifest);
-        Assertions.assertFalse(read.toJson(false).contains("tablet_manifests"));
+        Assertions.assertNull(read.getManifestRoot(TABLET_1));
+        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).manifestRoot);
+        Assertions.assertFalse(read.toJson(false).contains("manifest_roots"));
     }
 
     @Test
@@ -315,10 +247,10 @@ public class RestoreManifestTest {
         Assertions.assertFalse(jobInfo.hasManifest());
         Assertions.assertNull(jobInfo.manifestVersion);
         Assertions.assertNull(jobInfo.digestAlgorithm);
-        Assertions.assertNull(jobInfo.getTabletManifest(101));
+        Assertions.assertNull(jobInfo.getManifestRoot(101));
         BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.get("tbl").partitions.get("p1").indexes.get("tbl");
-        Assertions.assertNull(idxInfo.tabletManifests);
-        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).manifest);
+        Assertions.assertNull(idxInfo.manifestRoots);
+        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).manifestRoot);
         Assertions.assertEquals(2, idxInfo.sortedTabletInfoList.get(0).files.size());
         Assertions.assertFalse(jobInfo.toJson(false).contains("manifest"));
     }
@@ -330,10 +262,10 @@ public class RestoreManifestTest {
         BackupJobInfo read = BackupJobInfo.genFromJson(json);
         Assertions.assertEquals(2, (int) read.manifestVersion);
         Assertions.assertFalse(read.hasManifest());
-        Assertions.assertNull(read.getTabletManifest(TABLET_1));
+        Assertions.assertNull(read.getManifestRoot(TABLET_1));
 
         RestoreJob job = newRestoreJob(read);
-        Assertions.assertNull(job.getExpectedTabletManifest(TABLET_1));
+        Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
         Assertions.assertEquals(FeConstants.null_string, manifestCheckColumn(job));
     }
 
@@ -363,24 +295,16 @@ public class RestoreManifestTest {
         // an old backup has no manifest
         RestoreJob job = newRestoreJob(newJobInfo(TABLET_1));
         Assertions.assertEquals(FeConstants.null_string, manifestCheckColumn(job));
-        Assertions.assertNull(job.getExpectedTabletManifest(TABLET_1));
+        Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
         Assertions.assertEquals(ShowRestoreCommand.BRIEF_TITLE_NAMES.size(), job.getBriefInfo().size());
     }
 
     @Test
-    public void testExpectedManifestInDownloadTask() {
+    public void testManifestRootInDownloadTask() {
         RestoreJob job = newRestoreJob(jobInfoWithManifest(TABLET_1));
-        TTabletManifest manifest = job.getExpectedTabletManifest(TABLET_1);
-        Assertions.assertNotNull(manifest);
-        Assertions.assertEquals(3, manifest.getFilesSize());
-        TSnapshotFileStat dat = manifest.getFiles().get(0);
-        Assertions.assertEquals("1.dat", dat.getName());
-        Assertions.assertEquals(100, dat.getSize());
-        Assertions.assertEquals(sha('a'), dat.getSha256());
-        TSnapshotFileStat hdr = manifest.getFiles().get(2);
-        Assertions.assertEquals("101.hdr", hdr.getName());
-        Assertions.assertFalse(hdr.isSetSha256());
-        Assertions.assertNull(job.getExpectedTabletManifest(999));
+        String manifestRoot = job.getExpectedManifestRoot(TABLET_1);
+        Assertions.assertEquals(root(TABLET_1), manifestRoot);
+        Assertions.assertNull(job.getExpectedManifestRoot(999));
 
         // repository path: keyed by the src path, the same as src_dest_map
         Map<String, String> srcToDest = Maps.newHashMap();
@@ -388,29 +312,29 @@ public class RestoreManifestTest {
         DownloadTask task = new DownloadTask(null, 10001, 1, 2, 3, srcToDest, new FsBroker("127.0.0.1", 8000),
                 Maps.newHashMap(), StorageBackend.StorageType.BROKER, "bos://repo", "");
         TDownloadReq req = task.toThrift();
-        Assertions.assertFalse(req.isSetExpectedFiles());
-        Map<String, TTabletManifest> expected = Maps.newHashMap();
-        expected.put("bos://repo/__101", manifest);
-        task.setExpectedFiles(expected);
+        Assertions.assertFalse(req.isSetManifestRoots());
+        Map<String, String> roots = Maps.newHashMap();
+        roots.put("bos://repo/__101", manifestRoot);
+        task.setManifestRoots(roots);
         req = task.toThrift();
-        Assertions.assertTrue(req.isSetExpectedFiles());
-        Assertions.assertEquals(manifest, req.getExpectedFiles().get("bos://repo/__101"));
-        Assertions.assertEquals(req.getSrcDestMap().keySet(), req.getExpectedFiles().keySet());
+        Assertions.assertTrue(req.isSetManifestRoots());
+        Assertions.assertEquals(manifestRoot, req.getManifestRoots().get("bos://repo/__101"));
+        Assertions.assertEquals(req.getSrcDestMap().keySet(), req.getManifestRoots().keySet());
 
         // http path: in the remote tablet snapshot
         TRemoteTabletSnapshot snapshot = new TRemoteTabletSnapshot();
         snapshot.setLocalTabletId(201);
         snapshot.setRemoteTabletId(TABLET_1);
-        snapshot.setManifest(manifest);
+        snapshot.setManifestRoot(manifestRoot);
         req = new DownloadTask(null, 10001, 1, 2, 3, Lists.newArrayList(snapshot)).toThrift();
-        Assertions.assertFalse(req.isSetExpectedFiles());
-        Assertions.assertEquals(manifest, req.getRemoteTabletSnapshots().get(0).getManifest());
+        Assertions.assertFalse(req.isSetManifestRoots());
+        Assertions.assertEquals(manifestRoot, req.getRemoteTabletSnapshots().get(0).getManifestRoot());
 
         // not in cloud mode
         String origDeployMode = Config.deploy_mode;
         try {
             Config.deploy_mode = "cloud";
-            Assertions.assertNull(job.getExpectedTabletManifest(TABLET_1));
+            Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
         } finally {
             Config.deploy_mode = origDeployMode;
         }
@@ -479,6 +403,45 @@ public class RestoreManifestTest {
         Assertions.assertEquals(FeConstants.null_string, manifestCheckColumn(readJob));
     }
 
+    private static TFinishTaskRequest downloadFailed(TStatusCode code, String errMsg) {
+        TStatus status = new TStatus(code);
+        status.setErrorMsgs(Lists.newArrayList(errMsg));
+        return new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.DOWNLOAD, 1, status);
+    }
+
+    @Test
+    public void testManifestMismatchCancelsTheJobAtOnce() {
+        String errMsg = "restore manifest check failed, tablet 201, path /p: size mismatch of file 1.dat, "
+                + "expected 100, actual 99";
+        RestoreJob job = newRestoreJob(jobInfoWithManifest(TABLET_1));
+        Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
+        DownloadTask task = new DownloadTask(null, 10001, 1, job.getJobId(), db.getId(), Lists.newArrayList());
+        Assertions.assertFalse(job.finishTabletDownloadTask(task,
+                downloadFailed(TStatusCode.RESTORE_MANIFEST_MISMATCH, errMsg)));
+        Assertions.assertEquals(RestoreJob.RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertEquals(Status.ErrCode.COMMON_ERROR, job.getStatus().getErrCode());
+        Assertions.assertTrue(job.getStatus().getErrMsg().contains("restore manifest check failed on backend 10001"),
+                job.getStatus().getErrMsg());
+        Assertions.assertTrue(job.getStatus().getErrMsg().contains(errMsg), job.getStatus().getErrMsg());
+        // the partial result of the check is kept
+        Assertions.assertNotNull(job.getManifestCheck());
+
+        // other download failures keep the current behavior: the task is retried until the job times out.
+        RestoreJob other = newRestoreJob(jobInfoWithManifest(TABLET_1));
+        Deencapsulation.setField(other, "state", RestoreJob.RestoreJobState.DOWNLOADING);
+        DownloadTask otherTask = new DownloadTask(null, 10001, 2, other.getJobId(), db.getId(),
+                Lists.newArrayList());
+        Assertions.assertFalse(other.finishTabletDownloadTask(otherTask,
+                downloadFailed(TStatusCode.INTERNAL_ERROR, "failed to download")));
+        Assertions.assertEquals(RestoreJob.RestoreJobState.DOWNLOADING, other.getState());
+        Assertions.assertTrue(other.getStatus().ok());
+
+        // a late report after the job is done changes nothing
+        Assertions.assertFalse(job.finishTabletDownloadTask(task,
+                downloadFailed(TStatusCode.RESTORE_MANIFEST_MISMATCH, errMsg)));
+        Assertions.assertEquals(RestoreJob.RestoreJobState.CANCELLED, job.getState());
+    }
+
     private static RestoreJob writeAndRead(RestoreJob job) throws Exception {
         Path path = Files.createTempFile("restoreManifest", "tmp");
         try {
@@ -496,39 +459,33 @@ public class RestoreManifestTest {
     // ---- the size of the manifest ----
 
     /**
-     * Measure how much a manifest adds to the job info, which is kept in FE memory and written to the edit log with
-     * the restore job, to decide whether the manifest should be split into separate files. The file names and
-     * sizes mimic real snapshots: rowset id v2 (48 hex chars) segment and index files, SHA-256 digests.
+     * Measure how much the manifest adds to the job info, which is kept in FE memory and written to the edit log with
+     * the restore job: only the root of each tablet, the manifest itself is a file next to the tablet data. Also
+     * estimate the size of a manifest file of a tablet with 30 files, in the format written by BE.
      */
     @Test
     public void testManifestSize() {
-        int filesPerTablet = 30;
         int tablets = 10000;
-        long[] withRoot = measureManifestSize(tablets, filesPerTablet, true, true);
-        long[] noRoot = measureManifestSize(tablets, filesPerTablet, true, false);
-        long[] noDigest = measureManifestSize(tablets, filesPerTablet, false, true);
-        long[] half = measureManifestSize(tablets / 2, filesPerTablet, true, true);
-        // grows linearly with the number of tablets
-        long perTablet = (withRoot[1] - withRoot[0]) / tablets;
-        long perTabletHalf = (half[1] - half[0]) / (tablets / 2);
-        Assertions.assertTrue(Math.abs(perTablet - perTabletHalf) <= 2, perTablet + " vs " + perTabletHalf);
-        System.out.printf("manifest size, %d files per tablet, job info bytes without manifest -> with manifest:%n",
-                filesPerTablet);
-        print("sha256 + root", tablets, withRoot);
-        print("sha256, no root", tablets, noRoot);
-        print("size only (http path default)", tablets, noDigest);
-    }
-
-    private static void print(String what, int tablets, long[] r) {
+        long[] r = measureManifestSize(tablets);
+        long[] half = measureManifestSize(tablets / 2);
         long delta = r[1] - r[0];
-        System.out.printf("  %s: %d tablets: %d -> %d bytes, +%d bytes (+%d per tablet, x%.1f); "
-                        + "estimated +%.1f MB for 10k tablets, +%.1f MB for 100k tablets%n",
-                what, tablets, r[0], r[1], delta, delta / tablets, (double) r[1] / r[0],
+        long perTablet = delta / tablets;
+        // grows linearly with the number of tablets, about 80 bytes per tablet
+        Assertions.assertTrue(Math.abs(perTablet - (half[1] - half[0]) / (tablets / 2)) <= 1);
+        Assertions.assertTrue(perTablet <= 100, String.valueOf(perTablet));
+        System.out.printf("manifest in job info: %d tablets: %d -> %d bytes, +%d bytes (+%d per tablet, x%.3f); "
+                        + "estimated +%.2f MB for 10k tablets, +%.2f MB for 100k tablets%n",
+                tablets, r[0], r[1], delta, perTablet, (double) r[1] / r[0],
                 delta * 10000.0 / tablets / 1024 / 1024, delta * 100000.0 / tablets / 1024 / 1024);
+        System.out.printf("manifest file of a tablet with 30 files: repository (md5 + sha256) %d bytes, "
+                        + "local with sha256 %d bytes, local sizes only %d bytes%n",
+                manifestFileSize(30, true, true), manifestFileSize(30, false, true),
+                manifestFileSize(30, false, false));
     }
 
-    // Returns {bytes without manifest, bytes with manifest} of the job info json.
-    private static long[] measureManifestSize(int tablets, int filesPerTablet, boolean withDigest, boolean withRoot) {
+    // The job info of a table with 30 files per tablet, returns {bytes without manifest, bytes with manifest}.
+    private static long[] measureManifestSize(int tablets) {
+        int filesPerTablet = 30;
         BackupJobInfo jobInfo = new BackupJobInfo();
         jobInfo.name = "snapshot_1";
         jobInfo.dbName = "src_db";
@@ -544,25 +501,42 @@ public class RestoreManifestTest {
         for (int t = 0; t < tablets; t++) {
             long tabletId = baseTabletId + t;
             List<String> files = Lists.newArrayListWithCapacity(filesPerTablet);
-            List<ManifestEntry> stats = Lists.newArrayListWithCapacity(filesPerTablet);
             files.add(tabletId + ".hdr." + MD5);
-            stats.add(new ManifestEntry(tabletId + ".hdr", 4096 + t, null));
             for (int f = 1; f < filesPerTablet; f++) {
-                String rowsetId = String.format("02%014x%032x", tabletId, (long) t * filesPerTablet + f);
-                String name = rowsetId + "_" + (f % 4) + (f % 2 == 0 ? ".dat" : ".idx");
-                files.add(name + "." + MD5);
-                String digest = withDigest ? String.format("%064x", (long) t * 1000003 + f).replace('0', 'e') : null;
-                stats.add(new ManifestEntry(name, 1_234_567_890L + f, digest));
+                files.add(fileName(tabletId, t * filesPerTablet + f) + "." + MD5);
             }
             idxInfo.tablets.put(tabletId, files);
             idxInfo.tabletsOrder.add(tabletId);
             SnapshotInfo info = new SnapshotInfo(1, 2, 3, 4, tabletId, 10001, 5, "/path", files);
-            info.setFileStats(stats);
+            info.setManifestRoot(String.format("%064x", tabletId * 1000003L).replace('0', 'e'));
             infos.put(tabletId, info);
         }
         long without = jobInfo.toJson(false).getBytes(StandardCharsets.UTF_8).length;
-        Assertions.assertTrue(jobInfo.buildManifest(infos, true, withRoot));
+        Assertions.assertTrue(jobInfo.buildManifest(infos, BackupJobInfo.DIGEST_SHA256));
         long with = jobInfo.toJson(false).getBytes(StandardCharsets.UTF_8).length;
         return new long[] {without, with};
+    }
+
+    // a segment or index file name with a rowset id v2 (48 hex chars)
+    private static String fileName(long tabletId, int seq) {
+        return String.format("02%014x%032x", tabletId, (long) seq) + "_" + (seq % 4) + (seq % 2 == 0 ? ".dat" : ".idx");
+    }
+
+    // The size of a manifest file in the format written by BE, see SnapshotManifest::serialize.
+    private static int manifestFileSize(int files, boolean withMd5, boolean withDigest) {
+        long tabletId = 1_700_000_000L;
+        StringBuilder sb = new StringBuilder("{\"version\":1,\"tablet_id\":" + tabletId + ",\"files\":[");
+        for (int f = 0; f < files; f++) {
+            String name = f == 0 ? tabletId + ".hdr" : fileName(tabletId, f);
+            sb.append(f == 0 ? "" : ",").append("{\"n\":\"").append(name).append("\",\"s\":").append(1_234_567_890L);
+            if (withMd5) {
+                sb.append(",\"m\":\"").append(MD5).append('"');
+            }
+            if (withDigest && f > 0) {
+                sb.append(",\"d\":\"").append("e".repeat(64)).append('"');
+            }
+            sb.append('}');
+        }
+        return sb.append("]}").toString().getBytes(StandardCharsets.UTF_8).length;
     }
 }
