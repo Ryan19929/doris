@@ -92,7 +92,6 @@ import org.apache.doris.thrift.TRemoteTabletSnapshot;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TStorageType;
-import org.apache.doris.thrift.TTabletManifest;
 import org.apache.doris.thrift.TTaskType;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -366,6 +365,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
 
     public synchronized boolean finishTabletDownloadTask(DownloadTask task, TFinishTaskRequest request) {
+        if (request.getTaskStatus().getStatusCode() == TStatusCode.RESTORE_MANIFEST_MISMATCH
+                && task.getJobId() == jobId) {
+            // The downloaded snapshot does not match the manifest of the backup even after the backend downloaded
+            // it again: the backup is broken, waiting until the timeout does not help. Cancel the job at once.
+            handleManifestMismatch(task, request);
+            return false;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -391,6 +397,22 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         taskErrMsg.remove(task.getSignature());
         recordManifestCheck(task.getBackendId(), request);
         return true;
+    }
+
+    private void handleManifestMismatch(DownloadTask task, TFinishTaskRequest request) {
+        String errMsg = request.getTaskStatus().isSetErrorMsgs()
+                ? Joiner.on(",").join(request.getTaskStatus().getErrorMsgs()) : "";
+        taskErrMsg.put(task.getSignature(), errMsg);
+        if (state != RestoreJobState.DOWNLOADING) {
+            LOG.warn("ignore manifest mismatch of download task {} in state {}: {}. {}",
+                    task.getSignature(), state, errMsg, this);
+            return;
+        }
+        LOG.warn("cancel restore job, the downloaded snapshot does not match the manifest, backend {}: {}. {}",
+                task.getBackendId(), errMsg, this);
+        status = new Status(ErrCode.COMMON_ERROR, "restore manifest check failed on backend "
+                + task.getBackendId() + ": " + errMsg);
+        cancelInternal(false);
     }
 
     // Record the tablets checked against the manifest by the backend. An old backend does not report it, its
@@ -427,15 +449,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         return manifestCheck != null ? manifestCheck : computeManifestCheck();
     }
 
-    // The expected files of a tablet in the backup for the backend to check the downloaded snapshot, null if the
-    // backup has no manifest.
+    // The manifest root of a tablet in the backup for the backend to download by the manifest and check the
+    // downloaded snapshot, null if the backup has no manifest.
     @VisibleForTesting
-    TTabletManifest getExpectedTabletManifest(long repoTabletId) {
+    String getExpectedManifestRoot(long repoTabletId) {
         if (Config.isCloudMode() || jobInfo == null || !jobInfo.hasManifest()) {
             return null;
         }
-        BackupJobInfo.TabletManifest manifest = jobInfo.getTabletManifest(repoTabletId);
-        return manifest == null ? null : manifest.toThrift();
+        return jobInfo.getManifestRoot(repoTabletId);
     }
 
     private void resetManifestCheck() {
@@ -1952,7 +1973,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     // allot tasks
                     for (int index = 0; index < totalNum; index += taskNumPerBatch) {
                         Map<String, String> srcToDest = Maps.newHashMap();
-                        Map<String, TTabletManifest> expectedFiles = Maps.newHashMap();
+                        Map<String, String> manifestRoots = Maps.newHashMap();
                         for (int j = 0; j < taskNumPerBatch && index + j < totalNum; j++) {
                             SnapshotInfo info = beSnapshotInfos.get(index + j);
                             Table tbl = db.getTableNullable(info.getTblId());
@@ -1982,9 +2003,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 // download to previous exist snapshot dir
                                 String dest = snapshotInfo.getTabletPath();
                                 srcToDest.put(src, dest);
-                                TTabletManifest manifest = getExpectedTabletManifest(result.second.getTabletId());
-                                if (manifest != null) {
-                                    expectedFiles.put(src, manifest);
+                                String manifestRoot = getExpectedManifestRoot(result.second.getTabletId());
+                                if (manifestRoot != null) {
+                                    manifestRoots.put(src, manifestRoot);
                                 }
                                 if (LOG.isDebugEnabled()) {
                                     LOG.debug("create download src path: {}, dest path: {}", src, dest);
@@ -1997,8 +2018,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         long signature = env.getNextId();
                         DownloadTask task = createDownloadTask(beId, signature, jobId, dbId, srcToDest,
                                 brokerAddrs.get(0));
-                        if (!expectedFiles.isEmpty()) {
-                            task.setExpectedFiles(expectedFiles);
+                        if (!manifestRoots.isEmpty()) {
+                            task.setManifestRoots(manifestRoots);
                         }
                         batchTask.addTask(task);
                         unfinishedSignatureToId.put(signature, beId);
@@ -2118,9 +2139,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 remoteTabletSnapshot.setRemoteBeAddr(remoteBeAddr);
                                 remoteTabletSnapshot.setRemoteSnapshotPath(remoteSnapshotPath);
                                 remoteTabletSnapshot.setRemoteToken(remoteToken);
-                                TTabletManifest manifest = getExpectedTabletManifest(remoteTabletId);
-                                if (manifest != null) {
-                                    remoteTabletSnapshot.setManifest(manifest);
+                                String manifestRoot = getExpectedManifestRoot(remoteTabletId);
+                                if (manifestRoot != null) {
+                                    remoteTabletSnapshot.setManifestRoot(manifestRoot);
                                 }
 
                                 remoteTabletSnapshots.add(remoteTabletSnapshot);

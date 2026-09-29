@@ -21,7 +21,6 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonUtils;
-import org.apache.doris.thrift.TSnapshotFileStat;
 
 import com.google.common.base.Joiner;
 import com.google.common.collect.Lists;
@@ -55,10 +54,11 @@ public class SnapshotInfo implements Writable {
     // 10006.hdr
     @SerializedName("f")
     private List<String> files = Lists.newArrayList();
-    // The name, size and optional digest of each file, reported by the backend, for the manifest of the backup.
-    // The names have no md5 suffix. Null if not reported (e.g. an old backend).
-    @SerializedName("fst")
-    private List<BackupJobInfo.ManifestEntry> fileStats;
+    // The SHA-256 of the manifest file of the tablet snapshot, reported by the backend: the manifest written
+    // when making the snapshot (kept on local), or the one uploaded next to the files (repository).
+    // Null if not reported (e.g. an old backend).
+    @SerializedName("mr")
+    private String manifestRoot;
 
     // for cloud
     @SerializedName("storageVaultId")
@@ -132,28 +132,12 @@ public class SnapshotInfo implements Writable {
         this.files = files;
     }
 
-    public List<BackupJobInfo.ManifestEntry> getFileStats() {
-        return fileStats;
+    public String getManifestRoot() {
+        return manifestRoot;
     }
 
-    public void setFileStats(List<BackupJobInfo.ManifestEntry> fileStats) {
-        this.fileStats = fileStats;
-    }
-
-    // Convert the file stats reported by the backend, null if not reported.
-    public static List<BackupJobInfo.ManifestEntry> fileStatsFromThrift(List<TSnapshotFileStat> stats) {
-        if (stats == null) {
-            return null;
-        }
-        List<BackupJobInfo.ManifestEntry> entries = Lists.newArrayListWithCapacity(stats.size());
-        for (TSnapshotFileStat stat : stats) {
-            if (!stat.isSetName() || !stat.isSetSize()) {
-                return null;
-            }
-            entries.add(new BackupJobInfo.ManifestEntry(stat.getName(), stat.getSize(),
-                    stat.isSetSha256() ? stat.getSha256() : null));
-        }
-        return entries;
+    public void setManifestRoot(String manifestRoot) {
+        this.manifestRoot = manifestRoot;
     }
 
     public String getTabletPath() {

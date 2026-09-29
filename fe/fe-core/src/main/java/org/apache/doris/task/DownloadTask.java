@@ -23,7 +23,6 @@ import org.apache.doris.thrift.TDownloadReq;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TRemoteTabletSnapshot;
 import org.apache.doris.thrift.TResourceInfo;
-import org.apache.doris.thrift.TTabletManifest;
 import org.apache.doris.thrift.TTaskType;
 
 import java.util.List;
@@ -39,9 +38,9 @@ public class DownloadTask extends AgentTask {
     private String location;
     private List<TRemoteTabletSnapshot> remoteTabletSnapshots;
     private boolean isFromLocalSnapshot = false;
-    // src path (the key of srcToDestPath) -> the expected files of the tablet snapshot, for the manifest check.
-    // Only for downloading from a repository, the manifest of the http path is in remoteTabletSnapshots.
-    private Map<String, TTabletManifest> expectedFiles;
+    // src path (the key of srcToDestPath) -> the manifest root of the tablet snapshot, for the manifest check.
+    // Only for downloading from a repository, the manifest root of the http path is in remoteTabletSnapshots.
+    private Map<String, String> manifestRoots;
 
     // for cloud mode
     private String storageVaultId;
@@ -90,12 +89,12 @@ public class DownloadTask extends AgentTask {
         return remoteTabletSnapshots;
     }
 
-    public Map<String, TTabletManifest> getExpectedFiles() {
-        return expectedFiles;
+    public Map<String, String> getManifestRoots() {
+        return manifestRoots;
     }
 
-    public void setExpectedFiles(Map<String, TTabletManifest> expectedFiles) {
-        this.expectedFiles = expectedFiles;
+    public void setManifestRoots(Map<String, String> manifestRoots) {
+        this.manifestRoots = manifestRoots;
     }
 
     public void updateBrokerProperties(Map<String, String> brokerProperties) {
@@ -119,8 +118,8 @@ public class DownloadTask extends AgentTask {
             req.setStorageBackend(storageType.toThrift());
             req.setLocation(location);
             req.setVaultId(storageVaultId);
-            if (expectedFiles != null && !expectedFiles.isEmpty()) {
-                req.setExpectedFiles(expectedFiles);
+            if (manifestRoots != null && !manifestRoots.isEmpty()) {
+                req.setManifestRoots(manifestRoots);
             }
         }
         return req;

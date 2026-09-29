@@ -50,7 +50,6 @@ import org.apache.doris.task.ReleaseSnapshotTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.UploadTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
-import org.apache.doris.thrift.TSnapshotFileStat;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTaskType;
 
@@ -343,10 +342,10 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 task.getIndexId(), task.getTabletId(), task.getBackendId(),
                 task.getSchemaHash(), request.getSnapshotPath(),
                 request.getSnapshotFiles());
-        // the size (and digest if required) of the snapshot files, for the manifest. For a remote repository,
-        // it is replaced by the file stats reported by the upload task.
-        if (request.isSetSnapshotFileStats()) {
-            info.setFileStats(SnapshotInfo.fileStatsFromThrift(request.getSnapshotFileStats()));
+        // the root of the manifest written with the snapshot. For a remote repository, it is replaced by the root
+        // of the manifest uploaded by the upload task.
+        if (request.isSetManifestRoot()) {
+            info.setManifestRoot(request.getManifestRoot());
         }
 
         snapshotInfos.put(task.getTabletId(), info);
@@ -407,11 +406,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             // reset files in snapshot info with checksum filename
             info.setFiles(tabletFileMap.get(tabletId));
-            // the size and digest of the uploaded files, for the manifest. Absent if the backend is an old version,
-            // then the job has no manifest.
-            List<TSnapshotFileStat> fileStats = request.isSetTabletFileStats()
-                    ? request.getTabletFileStats().get(tabletId) : null;
-            info.setFileStats(SnapshotInfo.fileStatsFromThrift(fileStats));
+            // the root of the manifest uploaded next to the files. Absent if the backend is an old version, then the
+            // job has no manifest.
+            info.setManifestRoot(request.isSetManifestRoots() ? request.getManifestRoots().get(tabletId) : null);
         }
 
         taskProgress.remove(task.getSignature());
@@ -983,8 +980,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             jobInfo = BackupJobInfo.fromCatalog(createTime, label, dbName, dbId,
                     getContent(), backupMeta, filteredSnapshotInfos, tableCommitSeqMap);
-            boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos,
-                    repoId != Repository.KEEP_ON_LOCAL_REPO_ID, true /* with root */);
+            // the files uploaded to a repository always have the digests, a backup kept on local has them only if
+            // required by the manifest_digest property.
+            String digestAlgorithm = repoId != Repository.KEEP_ON_LOCAL_REPO_ID || isManifestDigest()
+                    ? BackupJobInfo.DIGEST_SHA256 : BackupJobInfo.DIGEST_NONE;
+            boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos, digestAlgorithm);
             LOG.info("backup manifest: {}, digest algorithm: {}. {}", hasManifest, jobInfo.digestAlgorithm, this);
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
