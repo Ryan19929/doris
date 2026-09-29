@@ -1310,7 +1310,7 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_tablet_files(tablet_files);
     if (status.ok()) {
-        finish_task_request.__set_tablet_file_stats(loader->tablet_file_stats());
+        finish_task_request.__set_manifest_roots(loader->uploaded_manifest_roots());
     }
 
     finish_task(finish_task_request);
@@ -1347,8 +1347,8 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
                                       : TStorageBackendType::type::BROKER,
                               download_request.__isset.location ? download_request.location : "");
         if (status.ok()) {
-            if (download_request.__isset.expected_files) {
-                loader->set_expected_files(download_request.expected_files);
+            if (download_request.__isset.manifest_roots) {
+                loader->set_manifest_roots(download_request.manifest_roots);
             }
             status = loader->download(download_request.src_dest_map, &downloaded_tablet_ids);
         }
@@ -1440,7 +1440,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     std::string snapshot_path;
     bool allow_incremental_clone = false; // not used
     std::vector<std::string> snapshot_files;
-    std::vector<TSnapshotFileStat> snapshot_file_stats;
+    std::string manifest_root;
     Status status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
                                                          &allow_incremental_clone);
     if (status.ok() && snapshot_request.__isset.list_files) {
@@ -1455,24 +1455,30 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
         if (status.ok()) {
             bool compute_digest =
                     snapshot_request.__isset.compute_digest && snapshot_request.compute_digest;
+            // The manifest of the snapshot: the name and size (and the sha256 if required) of each
+            // file, written next to the snapshot dir, one level up:
+            // <snapshot_path>/<tablet_id>/manifest
+            SnapshotManifest manifest;
+            manifest.tablet_id = snapshot_request.tablet_id;
             for (auto& file : files) {
                 snapshot_files.push_back(file.file_name);
-                // the size (and the sha256 if required) of each file, for the manifest.
-                TSnapshotFileStat file_stat;
-                file_stat.__set_name(file.file_name);
-                file_stat.__set_size(file.file_size);
-                if (compute_digest) {
-                    std::string sha256;
-                    int64_t file_size = 0;
+                SnapshotManifestFile manifest_file {.name = file.file_name, .size = file.file_size};
+                // the tablet meta file is rewritten in restore, it has no digest.
+                if (compute_digest && !file.file_name.ends_with(".hdr")) {
                     status = compute_file_digests((path / file.file_name).native(), nullptr,
-                                                  &sha256, &file_size);
+                                                  &manifest_file.sha256, &manifest_file.size);
                     if (!status.ok()) {
                         break;
                     }
-                    file_stat.__set_size(file_size);
-                    file_stat.__set_sha256(sha256);
                 }
-                snapshot_file_stats.push_back(std::move(file_stat));
+                manifest.files.push_back(std::move(manifest_file));
+            }
+            if (status.ok()) {
+                status = write_snapshot_manifest(
+                        manifest,
+                        fmt::format("{}/{}/{}", snapshot_path, snapshot_request.tablet_id,
+                                    SnapshotManifest::kLocalFileName),
+                        &manifest_root);
             }
         }
     }
@@ -1497,7 +1503,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     finish_task_request.__set_snapshot_path(snapshot_path);
     finish_task_request.__set_snapshot_files(snapshot_files);
     if (status.ok() && snapshot_request.__isset.list_files) {
-        finish_task_request.__set_snapshot_file_stats(snapshot_file_stats);
+        finish_task_request.__set_manifest_root(manifest_root);
     }
     finish_task_request.__set_task_status(status.to_thrift());
 

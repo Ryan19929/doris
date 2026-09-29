@@ -78,10 +78,10 @@ struct TFinishTaskRequest {
     19: optional map<i64, map<i64, i64>> table_id_to_tablet_id_to_delta_num_rows
     // for Cloud mow table only, used by FE to check if the response is for the latest request
     20: optional list<AgentService.TCalcDeleteBitmapPartitionInfo> resp_partitions;
-    // upload task: the size and SHA-256 of the uploaded files of each tablet
-    21: optional map<Types.TTabletId, list<AgentService.TSnapshotFileStat>> tablet_file_stats
-    // snapshot task: the size (and SHA-256 if requested) of the files in snapshot_files
-    22: optional list<AgentService.TSnapshotFileStat> snapshot_file_stats
+    // upload task: SHA-256 of the manifest file uploaded next to the files of each tablet
+    21: optional map<Types.TTabletId, string> manifest_roots
+    // snapshot task: SHA-256 of the manifest file written next to the snapshot files
+    22: optional string manifest_root
     // download task: the tablets whose downloaded snapshot has been checked against the manifest
     23: optional list<Types.TTabletId> manifest_verified_tablets
     // download task: whether the digests of the files of all manifest_verified_tablets are checked

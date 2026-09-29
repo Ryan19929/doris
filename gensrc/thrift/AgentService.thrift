@@ -426,20 +426,6 @@ struct TUploadReq {
     6: optional string location // root path
 }
 
-// The name, size and optional digest of a file in a tablet snapshot.
-struct TSnapshotFileStat {
-    // file name as it is in the source snapshot dir, without the md5 suffix used in the repository
-    1: optional string name
-    2: optional i64 size
-    // hex encoded lower case SHA-256 of the file content, not set if not computed
-    3: optional string sha256
-}
-
-// The expected files of a tablet snapshot, recorded at backup time (the manifest).
-struct TTabletManifest {
-    1: optional list<TSnapshotFileStat> files
-}
-
 struct TRemoteTabletSnapshot {
     1: optional i64 local_tablet_id
     2: optional string local_snapshot_path
@@ -448,8 +434,10 @@ struct TRemoteTabletSnapshot {
     5: optional Types.TNetworkAddress remote_be_addr
     6: optional string remote_snapshot_path
     7: optional string remote_token
-    // if set, the downloaded tablet snapshot is checked against it
-    8: optional TTabletManifest manifest
+    // SHA-256 of the manifest file of the remote tablet snapshot, recorded at backup time. If set, the
+    // manifest is fetched from "<parent of remote_snapshot_path>/manifest", the files are downloaded by it
+    // and the downloaded tablet snapshot is checked against it.
+    8: optional string manifest_root
 }
 
 struct TDownloadReq {
@@ -461,9 +449,11 @@ struct TDownloadReq {
     6: optional string location // root path
     7: optional list<TRemoteTabletSnapshot> remote_tablet_snapshots
     8: optional string vault_id // for cloud restore
-    // src path (same key as src_dest_map) -> the expected files of the tablet snapshot.
-    // If set, the downloaded tablet snapshot is checked against it.
-    9: optional map<string, TTabletManifest> expected_files
+    // src path (same key as src_dest_map) -> SHA-256 of the manifest file of the tablet, recorded at backup
+    // time. If set, the manifest is fetched from "<parent of src path>/__manifest__<tablet id>.<first 32 hex
+    // chars of the SHA-256>", the files are downloaded by it and the downloaded tablet snapshot is checked
+    // against it.
+    9: optional map<string, string> manifest_roots
 }
 
 struct TSnapshotRequest {
@@ -483,7 +473,7 @@ struct TSnapshotRequest {
     12: optional Types.TVersion end_version
     13: optional bool is_copy_binlog
     14: optional Types.TTabletId ref_tablet_id
-    // compute the SHA-256 of each snapshot file and report it in snapshot_file_stats
+    // record the SHA-256 of each snapshot file in the manifest file of the snapshot
     15: optional bool compute_digest
 }
 
