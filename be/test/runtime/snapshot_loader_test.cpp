@@ -753,7 +753,8 @@ static std::string write_remote_manifest(const std::string& remote_tablet_path,
             io::global_local_filesystem()->list(remote_tablet_path, true, &files, &exists).ok());
     bool changed = false;
     for (const auto& file : files) {
-        SnapshotManifestFile entry {.name = file.file_name, .size = file.file_size};
+        SnapshotManifestFile entry {
+                .name = file.file_name, .size = file.file_size, .md5 = "", .sha256 = ""};
         if (with_digest && !file.file_name.ends_with(".hdr")) {
             EXPECT_TRUE(compute_file_digests(remote_tablet_path + "/" + file.file_name, nullptr,
                                              &entry.sha256)
