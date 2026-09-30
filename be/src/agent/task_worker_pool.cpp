@@ -1462,7 +1462,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
             manifest.tablet_id = snapshot_request.tablet_id;
             for (auto& file : files) {
                 snapshot_files.push_back(file.file_name);
-                SnapshotManifestFile manifest_file {.name = file.file_name, .size = file.file_size};
+                SnapshotManifestFile manifest_file;
+                manifest_file.name = file.file_name;
+                manifest_file.size = file.file_size;
                 // the tablet meta file is rewritten in restore, it has no digest.
                 if (compute_digest && !file.file_name.ends_with(".hdr")) {
                     status = compute_file_digests((path / file.file_name).native(), nullptr,
