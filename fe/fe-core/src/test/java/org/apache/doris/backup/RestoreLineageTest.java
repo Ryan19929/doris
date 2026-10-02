@@ -510,7 +510,8 @@ public class RestoreLineageTest {
         Assertions.assertEquals("Timeout", ShowRestoreCommand.TITLE_NAMES.get(REUSE_ESTIMATE_COLUMN - 1));
         String shown = fullInfo.get(REUSE_ESTIMATE_COLUMN);
         Assertions.assertEquals("{\"partitions\":4,\"reusable\":1,\"reusable_bytes_single_replica\":" + bytes
-                + ",\"l0_passed_but_atomic_restore\":0,\"l0_passed_but_aggregate_table\":0,"
+                + ",\"reusable_a\":1,\"reusable_b\":0,\"reusable_c\":0,"
+                + "\"l0_passed_but_atomic_restore\":0,\"l0_passed_but_aggregate_table\":0,"
                 + "\"l0_passed_but_remote_storage\":0,\"no_local\":2,\"no_lineage\":0,\"lineage_mismatch\":0,"
                 + "\"local_version_changed\":1,\"source_version_changed\":0,\"commit_seq_mismatch\":0}", shown);
         Assertions.assertEquals(ShowRestoreCommand.BRIEF_TITLE_NAMES.size(), job.getBriefInfo().size());

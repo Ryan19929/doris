@@ -32,11 +32,13 @@ import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionInfo;
+import org.apache.doris.catalog.PartitionItem;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.RestoreLineage;
+import org.apache.doris.catalog.RestoreSource;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
@@ -449,6 +451,369 @@ public class RestoreReuseTest {
         Assertions.assertNull(RestoreReuseJudge.firstReject(in));
     }
 
+
+    // ---------------------------------------------------------------------------------------------
+    // the extended L0: reverse (b) and table level (c)
+    // ---------------------------------------------------------------------------------------------
+
+    // The version of the partition and of all its replicas, as after the increments of a synchronization.
+    private static void setVersion(Partition part, long version) {
+        part.updateVersionForRestore(version);
+        for (MaterializedIndex index : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            for (Tablet tablet : index.getTablets()) {
+                for (Replica replica : tablet.getReplicas()) {
+                    replica.updateVersionForRestore(version);
+                }
+            }
+        }
+    }
+
+    private RestoreLineage lineageToLocal(Partition part, long version) {
+        return new RestoreLineage(db.getId(), tbl2.getId(), part.getId(), version, COMMIT_SEQ, BACKUP_TIME, 1);
+    }
+
+    // The input of a partition that fails the forward check: the local partition has no lineage.
+    private RestoreReuseJudge.Input inputWithoutForward(CheckLevel level) {
+        RestoreReuseJudge.Input in = input(level);
+        p1().setRestoreLineage(null);
+        in.backupOlapTable = tbl2.selectiveCopy(null, IndexExtState.VISIBLE, true);
+        return in;
+    }
+
+    @Test
+    public void testReverseL0() {
+        // forward only: no lineage on the local partition
+        RestoreReuseJudge.Input in = inputWithoutForward(CheckLevel.FULL);
+        in.localDbId = db.getId();
+        Assertions.assertEquals("L0_NO_LINEAGE", RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.NO_BACKUP_LINEAGE,
+                RestoreReuseJudge.REVERSE_L0.check(in));
+
+        // the source partition in the backup was restored from this local partition, at the same version
+        in.backupLineage = lineageToLocal(p1(), 2);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseJudge.L0_REVERSE, in.l0Path);
+        in.level = CheckLevel.SAMPLE;
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseJudge.L0_REVERSE, in.l0Path);
+
+        // the ids must all be the local ones
+        for (RestoreLineage other : Lists.newArrayList(
+                new RestoreLineage(db.getId() + 1, tbl2.getId(), p1().getId(), V1, COMMIT_SEQ, 1, 1),
+                new RestoreLineage(db.getId(), tbl2.getId() + 1, p1().getId(), V1, COMMIT_SEQ, 1, 1),
+                new RestoreLineage(db.getId(), tbl2.getId(), p2().getId(), V1, COMMIT_SEQ, 1, 1))) {
+            in.backupLineage = other;
+            Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.LINEAGE_MISMATCH,
+                    RestoreReuseJudge.REVERSE_L0.check(in));
+            Assertions.assertEquals("L0_NO_LINEAGE", RestoreReuseJudge.firstReject(in));
+            Assertions.assertNull(in.l0Path);
+        }
+
+        // the versions must be equal: the local partition was written (the lineage version of the backup is not
+        // looked at, the digest is the proof)
+        in.backupLineage = lineageToLocal(p1(), V1);
+        p1().updateVersionForRestore(V1 + 1);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.VERSION_MISMATCH,
+                RestoreReuseJudge.REVERSE_L0.check(in));
+        Assertions.assertNotNull(RestoreReuseJudge.firstReject(in));
+        in.backupPartition.version = V1 + 1;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.REVERSE_L0.check(in));
+        p1().updateVersionForRestore(V1);
+
+        // not allowed without a digest
+        in.backupPartition.version = V1;
+        in.level = CheckLevel.OFF;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.LEVEL_NOT_ALLOWED,
+                RestoreReuseJudge.REVERSE_L0.check(in));
+        Assertions.assertEquals("L0_NO_LINEAGE", RestoreReuseJudge.firstReject(in));
+        in.level = CheckLevel.DISABLE;
+        Assertions.assertNotNull(RestoreReuseJudge.firstReject(in));
+    }
+
+    @Test
+    public void testTableLevelL0() {
+        RestoreReuseJudge.Input in = inputWithoutForward(CheckLevel.FULL);
+        in.localDbId = db.getId();
+        // no relation
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertEquals("L0_NO_LINEAGE", RestoreReuseJudge.firstReject(in));
+
+        // forward: the local table was restored from the source table of the backup (the local lineage is stale,
+        // the increments of a synchronization moved the versions of both)
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id));
+        p1().setRestoreLineage(lineage(in.jobInfo, p1()));
+        setVersion(p1(), V1 + 3);
+        in.backupPartition.version = V1 + 3;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.LOCAL_VERSION_CHANGED,
+                RestoreReuseJudge.FORWARD_L0.check(in));
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseJudge.L0_TABLE, in.l0Path);
+        // another source table
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id + 1));
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId + 1, in.backupTable.id));
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id));
+
+        // reverse: the source table in the backup was restored from the local table
+        tbl2.setRestoreSource(null);
+        in.backupTableSource = new RestoreSource(db.getId(), tbl2.getId());
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseJudge.L0_TABLE, in.l0Path);
+        in.backupTableSource = new RestoreSource(db.getId(), tbl2.getId() + 1);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        in.backupTableSource = new RestoreSource(db.getId() + 1, tbl2.getId());
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        in.backupTableSource = new RestoreSource(db.getId(), tbl2.getId());
+
+        // the versions differ
+        in.backupPartition.version = V1 + 2;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.VERSION_MISMATCH,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertNotNull(RestoreReuseJudge.firstReject(in));
+        in.backupPartition.version = V1 + 3;
+
+        // the range differs
+        PartitionInfo backupInfo = in.backupOlapTable.getPartitionInfo();
+        long backupPartId = in.backupOlapTable.getPartition(p1().getName()).getId();
+        backupInfo.setItem(backupPartId, false, backupInfo.getItem(CatalogMocker.TEST_PARTITION2_ID));
+        PartitionInfo localInfo = tbl2.getPartitionInfo();
+        PartitionItem localItem = localInfo.getItem(p1().getId());
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        backupInfo.setItem(backupPartId, false, org.apache.doris.catalog.RangePartitionItem.DUMMY_ITEM);
+        Assertions.assertNotEquals(localItem, backupInfo.getItem(backupPartId));
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.PARTITION_MISMATCH,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        backupInfo.setItem(backupPartId, false, localItem);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        // the range of another partition type
+        PartitionInfo other = Mockito.mock(PartitionInfo.class);
+        Mockito.when(other.getType()).thenReturn(org.apache.doris.catalog.PartitionType.LIST);
+        Deencapsulation.setField(in.backupOlapTable, "partitionInfo", other);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.PARTITION_MISMATCH,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        Deencapsulation.setField(in.backupOlapTable, "partitionInfo", backupInfo);
+        // the partition name differs: no such partition in the backup table
+        Map<String, Partition> nameToPartition = Deencapsulation.getField(in.backupOlapTable, "nameToPartition");
+        Partition removed = nameToPartition.remove(p1().getName());
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.PARTITION_MISMATCH,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        nameToPartition.put(p1().getName(), removed);
+        // unknown backup table
+        in.backupOlapTable = null;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.PARTITION_MISMATCH,
+                RestoreReuseJudge.TABLE_L0.check(in));
+    }
+
+    @Test
+    public void testOffLevelOnlyAcceptsForward() {
+        RestoreReuseJudge.Input in = inputWithoutForward(CheckLevel.OFF);
+        in.localDbId = db.getId();
+        in.backupLineage = lineageToLocal(p1(), V1);
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id));
+        // b and c both hold, but off judges by a only
+        Assertions.assertEquals("L0_NO_LINEAGE", RestoreReuseJudge.firstReject(in));
+        for (CheckLevel level : new CheckLevel[] {CheckLevel.SAMPLE, CheckLevel.FULL}) {
+            in.level = level;
+            Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+            // the first check that passes: a does not, b does
+            Assertions.assertEquals(RestoreReuseJudge.L0_REVERSE, in.l0Path);
+        }
+        // forward is accepted at off
+        p1().setRestoreLineage(lineage(in.jobInfo, p1()));
+        in = input(CheckLevel.OFF);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseJudge.L0_FORWARD, in.l0Path);
+    }
+
+    // A restore of the backup onto the existing test_tbl2, where the local partitions have no lineage, and the
+    // partitions in the backup meta carry the lineage that is set by the given function.
+    private RestoreJob prepareJobWithBackupStamps(String level,
+            java.util.function.Consumer<OlapTable> backupTableStamps) {
+        BackupJobInfo info = selfBackupJobInfo();
+        OlapTable remoteTbl = tbl2.selectiveCopy(null, IndexExtState.VISIBLE, true);
+        backupTableStamps.accept(remoteTbl);
+        BackupMeta meta = new BackupMeta(Lists.newArrayList(remoteTbl), Lists.<Resource>newArrayList());
+        RestoreJob job = new RestoreJob("restore_label", "2024-01-01 00:00:00", db.getId(), db.getFullName(), info,
+                false, new ReplicaAllocation((short) 3), 100000, -1, false, false, false, false, false, false,
+                false, false, env, Repository.KEEP_ON_LOCAL_REPO_ID, meta);
+        job.setReuseCheckLevel(level);
+        p1().setRestoreLineage(null);
+        p2().setRestoreLineage(null);
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+        return job;
+    }
+
+    @Test
+    public void testReverseKeepsAndIsObservable() {
+        // the backup comes from a table that was restored from this local table
+        RestoreJob job = prepareJobWithBackupStamps("full", remote -> {
+            for (Partition part : remote.getAllPartitions()) {
+                part.setRestoreLineage(lineageToLocal(part, V1));
+            }
+        });
+        // the estimate counts the reverse path
+        RestoreReuseShadowStats estimate = job.getReuseShadowStats();
+        Assertions.assertEquals(2, estimate.getReusable());
+        Assertions.assertEquals(0, estimate.getReusableForward());
+        Assertions.assertEquals(2, estimate.getReusableReverse());
+        Assertions.assertEquals(0, estimate.getReusableTable());
+        Assertions.assertEquals(0, estimate.getNoLineage());
+
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getKeptPartitions());
+        Assertions.assertEquals(2, result.getKeptByPath(RestoreReuseJudge.L0_REVERSE));
+        Assertions.assertEquals(0, result.getKeptByPath(RestoreReuseJudge.L0_FORWARD));
+        Assertions.assertEquals(0, result.getKeptByPath(RestoreReuseJudge.L0_TABLE));
+        Assertions.assertTrue(versionInfo(job).isEmpty());
+        // all replicas, by the size of each
+        long all = RestoreReuseShadowStats.getAllReplicasLocalDataSize(p1())
+                + RestoreReuseShadowStats.getAllReplicasLocalDataSize(p2());
+        Assertions.assertEquals(all, result.getKeptBytesAllReplicas());
+        Assertions.assertTrue(all > result.getKeptBytesSingleReplica());
+
+        // the ReuseEstimate and DownloadStats columns
+        List<String> info = job.getInfo(false);
+        com.google.gson.JsonObject estimateJson = com.google.gson.JsonParser.parseString(
+                info.get(info.size() - 3)).getAsJsonObject();
+        Assertions.assertEquals(2, estimateJson.get("kept_partitions").getAsLong());
+        Assertions.assertEquals(result.getKeptBytesSingleReplica(),
+                estimateJson.get("kept_bytes_single_replica").getAsLong());
+        Assertions.assertEquals(2, estimateJson.get("kept_b").getAsLong());
+        Assertions.assertEquals(0, estimateJson.get("kept_a").getAsLong());
+        Assertions.assertEquals(2, estimateJson.get("reusable_b").getAsLong());
+        Assertions.assertEquals(0, estimateJson.get("download_digest_mismatch").getAsLong());
+        com.google.gson.JsonObject downloadJson = com.google.gson.JsonParser.parseString(
+                info.get(info.size() - 1)).getAsJsonObject();
+        Assertions.assertEquals(all, downloadJson.get("kept_bytes").getAsLong());
+        Assertions.assertEquals(1.0, downloadJson.get("reuse_ratio").getAsDouble(), 0.0001);
+    }
+
+    @Test
+    public void testTableLevelKeepsAfterIncrementsAndCountsDownloads() {
+        // the table is a replica of the backup's source table, and both moved on by the same increments
+        tbl2.setRestoreSource(new RestoreSource(db.getId(), tbl2.getId()));
+        RestoreJob job = prepareJobWithBackupStamps("full", remote -> {
+            for (Partition part : remote.getAllPartitions()) {
+                part.setRestoreLineage(null);
+            }
+        });
+        // both partitions are candidates by c, with the lineage that a does not accept
+        Assertions.assertEquals(2, job.getReuseShadowStats().getReusableTable());
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        // p1 has a different digest
+        Map<Long, TFinishTaskRequest> faulty = Maps.newHashMap();
+        faulty.put(tasks.stream().filter(t -> t.getPartitionId() == p1().getId()).findFirst().get().getSignature(),
+                okReport("ffff", SIG, 1));
+        reportAll(job, tasks, faulty);
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(1, result.getKeptPartitions());
+        Assertions.assertEquals(1, result.getKeptByPath(RestoreReuseJudge.L0_TABLE));
+        List<String> row = job.getInfo(false);
+        com.google.gson.JsonObject estimateJson = com.google.gson.JsonParser.parseString(
+                row.get(row.size() - 3)).getAsJsonObject();
+        Assertions.assertEquals(1, estimateJson.get("kept_partitions").getAsLong());
+        Assertions.assertEquals(1, estimateJson.get("kept_c").getAsLong());
+        Assertions.assertEquals(1, estimateJson.get("download_digest_mismatch").getAsLong());
+        Assertions.assertEquals(0, estimateJson.get("download_timeout").getAsLong());
+        Assertions.assertEquals(0, estimateJson.get("download_not_supported").getAsLong());
+        Assertions.assertEquals(0, estimateJson.get("download_sample_failed").getAsLong());
+        // the partition with the mismatch is downloaded, and its lineage is gone
+        Assertions.assertTrue(versionInfo(job).contains(tbl2.getId(), p1().getId()));
+        Assertions.assertNull(p1().getRestoreLineage());
+    }
+
+    @Test
+    public void testEstimateAtOffLevelCountsForwardOnly() {
+        RestoreJob job = prepareJobWithBackupStamps("off", remote -> {
+            for (Partition part : remote.getAllPartitions()) {
+                part.setRestoreLineage(lineageToLocal(part, V1));
+            }
+        });
+        Assertions.assertEquals(0, job.getReuseShadowStats().getReusable());
+    }
+
+    @Test
+    public void testRestoreSourceIsClearedThenWritten() {
+        // the backup meta carries the restore source and the lineage of the source cluster's own upstream
+        RestoreSource upstream = new RestoreSource(7001, 7002);
+        RestoreJob job = prepareJobWithBackupStamps("full", remote -> {
+            remote.setRestoreSource(upstream);
+            for (Partition part : remote.getAllPartitions()) {
+                part.setRestoreLineage(new RestoreLineage(7001, 7002, 7003, V1, COMMIT_SEQ, 1, 1));
+            }
+        });
+        // captured before the clear, which the job did in checkAndPrepareMeta
+        OlapTable remote = (OlapTable) ((BackupMeta) Deencapsulation.getField(job, "backupMeta"))
+                .getTable(CatalogMocker.TEST_TBL2_NAME);
+        Assertions.assertNull(remote.getRestoreSource());
+        Assertions.assertTrue(remote.getAllPartitions().stream().allMatch(p -> p.getRestoreLineage() == null));
+        Assertions.assertNull(tbl2.getRestoreSource());
+
+        // commit writes the source of this job, never the one of the backup meta
+        BackupJobInfo info = Deencapsulation.getField(job, "jobInfo");
+        job.stampRestoreLineage(db, 1);
+        Assertions.assertEquals(new RestoreSource(info.dbId, tbl2.getId()), tbl2.getRestoreSource());
+        Assertions.assertNotEquals(upstream, tbl2.getRestoreSource());
+        // a second restore overwrites it
+        BackupJobInfo other = selfBackupJobInfo();
+        other.dbId = 8001;
+        Deencapsulation.setField(job, "jobInfo", other);
+        job.stampRestoreLineage(db, 2);
+        Assertions.assertEquals(new RestoreSource(8001, tbl2.getId()), tbl2.getRestoreSource());
+    }
+
+    @Test
+    public void testRestoreSourcePersists() throws Exception {
+        tbl2.setRestoreSource(new RestoreSource(11, 22));
+        OlapTable copy = org.apache.doris.persist.gson.GsonUtils.GSON.fromJson(
+                org.apache.doris.persist.gson.GsonUtils.GSON.toJson(tbl2), OlapTable.class);
+        Assertions.assertEquals(new RestoreSource(11, 22), copy.getRestoreSource());
+        // the deep copy of a backup carries it too, which is why it is cleared in the backup meta
+        OlapTable backupCopy = tbl2.selectiveCopy(null, IndexExtState.VISIBLE, true);
+        Assertions.assertEquals(new RestoreSource(11, 22), backupCopy.getRestoreSource());
+        // an old table without it
+        tbl2.setRestoreSource(null);
+        String json = org.apache.doris.persist.gson.GsonUtils.GSON.toJson(tbl2);
+        Assertions.assertFalse(json.contains("\"rsrc\""));
+        Assertions.assertNull(org.apache.doris.persist.gson.GsonUtils.GSON.fromJson(json, OlapTable.class)
+                .getRestoreSource());
+    }
+
+    @Test
+    public void testDownloadStatsReuseRatioWithKeptBytes() {
+        RestoreDownloadStats stats = new RestoreDownloadStats();
+        Assertions.assertEquals(0.0, stats.getReuseRatio(0), 0.0001);
+        Assertions.assertEquals(1.0, stats.getReuseRatio(500), 0.0001);
+        org.apache.doris.thrift.TDownloadStats reported = new org.apache.doris.thrift.TDownloadStats();
+        reported.setLinkedBytes(100);
+        reported.setSkippedBytes(100);
+        reported.setDownloadedBytes(300);
+        stats.add(reported, 3);
+        Assertions.assertEquals(0.4, stats.getReuseRatio(), 0.0001);
+        // (100 + 100 + 500) / (100 + 100 + 500 + 300)
+        Assertions.assertEquals(0.7, stats.getReuseRatio(500), 0.0001);
+        com.google.gson.JsonObject json = com.google.gson.JsonParser.parseString(stats.toJson(3, 500))
+                .getAsJsonObject();
+        Assertions.assertEquals(500, json.get("kept_bytes").getAsLong());
+        Assertions.assertEquals(0.7, json.get("reuse_ratio").getAsDouble(), 0.0001);
+        // without partition level reuse nothing changes
+        json = com.google.gson.JsonParser.parseString(stats.toJson(3)).getAsJsonObject();
+        Assertions.assertEquals(0, json.get("kept_bytes").getAsLong());
+        Assertions.assertEquals(0.4, json.get("reuse_ratio").getAsDouble(), 0.0001);
+    }
+
     @Test
     public void testReplicaMustBeHealthyAtTheBackupVersion() {
         Replica replica = p1().getBaseIndex().getTablets().get(0).getReplicas().get(0);
@@ -465,8 +830,10 @@ public class RestoreReuseTest {
 
     @Test
     public void testConditionChainIsExtensible() {
-        // A new way to pass L0 (b, c of the design for the later phase) only needs to be added to the list.
-        Assertions.assertEquals(1, RestoreReuseJudge.L0_CHECKS.size());
+        // A new way to pass L0 only needs to be added to the list: a forward, b reverse, c table level.
+        Assertions.assertEquals(3, RestoreReuseJudge.L0_CHECKS.size());
+        Assertions.assertEquals(Lists.newArrayList("a", "b", "c"), RestoreReuseJudge.L0_CHECKS.stream()
+                .map(c -> c.name).collect(Collectors.toList()));
         Assertions.assertEquals(6, RestoreReuseJudge.CONDITIONS.size());
     }
 

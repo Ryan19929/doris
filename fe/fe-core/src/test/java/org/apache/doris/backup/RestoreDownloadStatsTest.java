@@ -152,7 +152,7 @@ public class RestoreDownloadStatsTest {
         // 4 replicas: tablets 201 and 202 on backends 1 and 2
         addReplicas(job, 201, 202);
         resetDownloadStats(job);
-        Assertions.assertEquals("{\"linked_bytes\":0,\"skipped_bytes\":0,\"downloaded_bytes\":0,\"reuse_ratio\":0.0,"
+        Assertions.assertEquals("{\"linked_bytes\":0,\"skipped_bytes\":0,\"kept_bytes\":0,\"downloaded_bytes\":0,\"reuse_ratio\":0.0,"
                 + "\"linked_files\":0,\"skipped_files\":0,\"downloaded_files\":0,"
                 + "\"replicas\":{\"full_reuse\":0,\"partial_reuse\":0,\"no_reuse\":0,\"not_reported\":4},"
                 + "\"unmatched_rowsets\":0,"
