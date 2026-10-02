@@ -48,6 +48,7 @@ import org.apache.doris.nereids.trees.plans.commands.RestoreCommand;
 import org.apache.doris.persist.BarrierLog;
 import org.apache.doris.task.DirMoveTask;
 import org.apache.doris.task.DownloadTask;
+import org.apache.doris.task.RestoreDigestTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.UploadTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
@@ -560,6 +561,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
         if (command.isManifestDigest()) {
             backupJob.setManifestDigest(true);
         }
+        if (command.isLogicalDigest()) {
+            backupJob.setLogicalDigest(true);
+        }
         // write log
         env.getEditLog().logBackupJob(backupJob);
 
@@ -876,6 +880,24 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         return ((RestoreJob) job).finishTabletDownloadTask(task, request);
+    }
+
+    public boolean handleFinishedRestoreDigestTask(RestoreDigestTask task, TFinishTaskRequest request) {
+        AbstractJob job = getCurrentJob(task.getDbId());
+        if (!(job instanceof RestoreJob)) {
+            LOG.warn("failed to find restore job for task: {}", task);
+            // return true to remove this task from AgentTaskQueue
+            return true;
+        }
+
+        if (job.getJobId() != task.getJobId()) {
+            LOG.warn("invalid restore digest task: {}, job id: {}, task job id: {}", task, job.getJobId(),
+                    task.getJobId());
+            // return true to remove this task from AgentTaskQueue
+            return true;
+        }
+
+        return ((RestoreJob) job).finishRestoreDigestTask(task, request);
     }
 
     public boolean handleDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {

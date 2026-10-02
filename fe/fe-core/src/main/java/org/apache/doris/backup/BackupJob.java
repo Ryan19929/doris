@@ -191,6 +191,20 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         return Boolean.parseBoolean(properties.get(BackupCommand.PROP_MANIFEST_DIGEST));
     }
 
+    // Whether the backend computes the logical digest of each tablet in the snapshot task, and the job info records
+    // it per tablet. Local (non cloud) tablets only.
+    public void setLogicalDigest(boolean logicalDigest) {
+        properties.put(BackupCommand.PROP_LOGICAL_DIGEST, String.valueOf(logicalDigest));
+    }
+
+    public boolean isLogicalDigest() {
+        return Boolean.parseBoolean(properties.get(BackupCommand.PROP_LOGICAL_DIGEST));
+    }
+
+    private boolean computeLogicalDigestInSnapshot() {
+        return isLogicalDigest() && !Config.isCloudMode();
+    }
+
     private boolean computeDigestInSnapshot() {
         return repoId == Repository.KEEP_ON_LOCAL_REPO_ID && isManifestDigest();
     }
@@ -244,6 +258,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     task.getVersion(),
                     task.getSchemaHash(), timeoutMs, false /* not restore task */);
             newTask.setComputeDigest(computeDigestInSnapshot());
+            newTask.setComputeLogicalDigest(computeLogicalDigestInSnapshot());
             unfinishedTaskIds.put(signature, beId);
 
             //send task
@@ -346,6 +361,12 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         // of the manifest uploaded by the upload task.
         if (request.isSetManifestRoot()) {
             info.setManifestRoot(request.getManifestRoot());
+        }
+        // The logical digest never fails the snapshot: NOT_SUPPORTED and errors are recorded as the reason why
+        // the tablet has no digest.
+        if (task.isComputeLogicalDigest()) {
+            info.setLogicalDigest(LogicalDigestInfo.fromThrift(
+                    request.isSetLogicalDigest() ? request.getLogicalDigest() : null));
         }
 
         snapshotInfos.put(task.getTabletId(), info);
@@ -731,6 +752,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                             visibleVersion,
                             schemaHash, timeoutMs, false /* not restore task */);
                     task.setComputeDigest(computeDigestInSnapshot());
+                    task.setComputeLogicalDigest(computeLogicalDigestInSnapshot());
                     batchTask.addTask(task);
                     unfinishedTaskIds.put(signature, beId);
                 }
@@ -986,6 +1008,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     ? BackupJobInfo.DIGEST_SHA256 : BackupJobInfo.DIGEST_NONE;
             boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos, digestAlgorithm);
             LOG.info("backup manifest: {}, digest algorithm: {}. {}", hasManifest, jobInfo.digestAlgorithm, this);
+            if (isLogicalDigest()) {
+                int withDigest = jobInfo.buildLogicalDigests(filteredSnapshotInfos);
+                LOG.info("backup logical digest: {} of {} tablets have a digest. {}", withDigest,
+                        filteredSnapshotInfos.size(), this);
+            }
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
             }

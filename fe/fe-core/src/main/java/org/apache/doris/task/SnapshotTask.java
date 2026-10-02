@@ -40,6 +40,8 @@ public class SnapshotTask extends AgentTask {
     private String resultSnapshotPath;
     // Whether the backend computes the SHA-256 of the snapshot files, for the manifest of a backup.
     private boolean computeDigest = false;
+    // Whether the backend computes the logical digest of the tablet over (0, version] after the snapshot is made.
+    private boolean computeLogicalDigest = false;
 
     public SnapshotTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId, long tableId,
             long partitionId, long indexId, long tabletId, long version, int schemaHash, long timeoutMs,
@@ -109,6 +111,14 @@ public class SnapshotTask extends AgentTask {
         return computeDigest;
     }
 
+    public void setComputeLogicalDigest(boolean computeLogicalDigest) {
+        this.computeLogicalDigest = computeLogicalDigest;
+    }
+
+    public boolean isComputeLogicalDigest() {
+        return computeLogicalDigest;
+    }
+
     public void setRefTabletId(long refTabletId) {
         assert refTabletId > 0;
         this.refTabletId = refTabletId;
@@ -128,6 +138,9 @@ public class SnapshotTask extends AgentTask {
         }
         if (computeDigest) {
             request.setComputeDigest(true);
+        }
+        if (computeLogicalDigest) {
+            request.setComputeLogicalDigest(true);
         }
         return request;
     }

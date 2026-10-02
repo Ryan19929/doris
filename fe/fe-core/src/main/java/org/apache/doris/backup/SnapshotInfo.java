@@ -59,6 +59,9 @@ public class SnapshotInfo implements Writable {
     // Null if not reported (e.g. an old backend).
     @SerializedName("mr")
     private String manifestRoot;
+    // The logical digest of the tablet snapshot reported by the backend, null if it was not asked for.
+    @SerializedName("ld")
+    private LogicalDigestInfo logicalDigest;
 
     // for cloud
     @SerializedName("storageVaultId")
@@ -138,6 +141,14 @@ public class SnapshotInfo implements Writable {
 
     public void setManifestRoot(String manifestRoot) {
         this.manifestRoot = manifestRoot;
+    }
+
+    public LogicalDigestInfo getLogicalDigest() {
+        return logicalDigest;
+    }
+
+    public void setLogicalDigest(LogicalDigestInfo logicalDigest) {
+        this.logicalDigest = logicalDigest;
     }
 
     public String getTabletPath() {

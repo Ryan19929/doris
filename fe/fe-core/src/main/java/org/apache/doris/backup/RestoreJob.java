@@ -85,6 +85,7 @@ import org.apache.doris.task.CreateReplicaTask;
 import org.apache.doris.task.DirMoveTask;
 import org.apache.doris.task.DownloadTask;
 import org.apache.doris.task.ReleaseSnapshotTask;
+import org.apache.doris.task.RestoreDigestTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TNetworkAddress;
@@ -368,6 +369,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         return false;
     }
 
+
+    // The finish report of a RESTORE_DIGEST task: the logical digest of one local replica, see
+    // TFinishTaskRequest.logical_digest. Nothing uses it yet. Returns true to remove the task from AgentTaskQueue.
+    public synchronized boolean finishRestoreDigestTask(RestoreDigestTask task, TFinishTaskRequest request) {
+        return true;
+    }
 
     public synchronized boolean finishTabletDownloadTask(DownloadTask task, TFinishTaskRequest request) {
         if (request.getTaskStatus().getStatusCode() == TStatusCode.RESTORE_MANIFEST_MISMATCH
