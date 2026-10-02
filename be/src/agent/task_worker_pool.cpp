@@ -1328,6 +1328,8 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
     std::vector<int64_t> manifest_verified_tablets;
     bool manifest_digest_checked = false;
 
+    SnapshotDownloadStats download_stats;
+
     auto status = Status::OK();
     if (download_request.__isset.remote_tablet_snapshots) {
         std::unique_ptr<SnapshotLoader> loader = std::make_unique<SnapshotLoader>(
@@ -1337,6 +1339,7 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
                                               &downloaded_tablet_ids);
         manifest_verified_tablets = loader->manifest_verified_tablets();
         manifest_digest_checked = loader->manifest_digest_checked();
+        download_stats = loader->download_stats();
     } else {
         std::unique_ptr<SnapshotLoader> loader = std::make_unique<SnapshotLoader>(
                 engine, env, download_request.job_id, req.signature, download_request.broker_addr,
@@ -1354,6 +1357,7 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
         }
         manifest_verified_tablets = loader->manifest_verified_tablets();
         manifest_digest_checked = loader->manifest_digest_checked();
+        download_stats = loader->download_stats();
     }
 
     if (!status.ok()) {
@@ -1377,6 +1381,7 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
         // Always set, so that FE knows the manifest is supported even if no tablet is verified.
         finish_task_request.__set_manifest_verified_tablets(manifest_verified_tablets);
         finish_task_request.__set_manifest_digest_checked(manifest_digest_checked);
+        finish_task_request.__set_download_stats(download_stats.to_thrift());
     }
 
     finish_task(finish_task_request);

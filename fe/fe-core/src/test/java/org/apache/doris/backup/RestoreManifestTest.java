@@ -287,7 +287,8 @@ public class RestoreManifestTest {
     public void testShowRestoreColumn() {
         // appended after ReuseEstimate, at the end; SHOW BRIEF RESTORE is unchanged.
         int column = ShowRestoreCommand.TITLE_NAMES.indexOf("ManifestCheck");
-        Assertions.assertEquals(ShowRestoreCommand.TITLE_NAMES.size() - 1, column);
+        // DownloadStats is appended after it.
+        Assertions.assertEquals(ShowRestoreCommand.TITLE_NAMES.size() - 2, column);
         Assertions.assertEquals(column - 1, ShowRestoreCommand.TITLE_NAMES.indexOf("ReuseEstimate"));
         Assertions.assertFalse(ShowRestoreCommand.BRIEF_TITLE_NAMES.contains("ManifestCheck"));
         Assertions.assertFalse(ShowRestoreCommand.BRIEF_TITLE_NAMES.contains("ReuseEstimate"));

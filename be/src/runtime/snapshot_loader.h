@@ -18,7 +18,9 @@
 #pragma once
 
 #include <gen_cpp/AgentService_types.h>
+#include <gen_cpp/MasterService_types.h>
 #include <gen_cpp/Types_types.h>
+#include <gen_cpp/olap_file.pb.h>
 
 #include <cstdint>
 #include <map>
@@ -123,6 +125,41 @@ Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t loc
                                       const SnapshotManifest& manifest, bool check_digest,
                                       ManifestCheckResult* result);
 
+// Statistics of the data reused locally and downloaded by a download task, the tablet meta files excluded.
+struct SnapshotDownloadStats {
+    int64_t linked_files = 0;
+    int64_t linked_bytes = 0;
+    int64_t skipped_files = 0;
+    int64_t skipped_bytes = 0;
+    int64_t downloaded_files = 0;
+    int64_t downloaded_bytes = 0;
+    int64_t tablets_full_reuse = 0;
+    int64_t tablets_partial_reuse = 0;
+    int64_t tablets_no_reuse = 0;
+    int64_t unmatched_rowsets = 0;
+    int64_t unmatched_no_source_rowset_id = 0;
+    int64_t unmatched_source_not_in_snapshot = 0;
+    int64_t unmatched_version_mismatch = 0;
+
+    // Count the stats of one tablet as full / partial / no reuse by its files, nothing if it has no file.
+    void classify_tablet();
+    void merge(const SnapshotDownloadStats& other);
+    std::string to_string() const;
+    TDownloadStats to_thrift() const;
+};
+
+// Count the rowsets of the remote tablet which have no lineage match in the local tablet, with the reason.
+// A remote rowset matches if a local rowset has it as source_rowset_id, or it has a local rowset as
+// source_rowset_id, with the same version range. Rowsets without segments and remote storage rowsets
+// have nothing to reuse and are not counted. The reason of a remote rowset without match is:
+//  - version_mismatch: a local rowset has the lineage with it, but a different version range;
+//  - source_not_in_snapshot: the local rowsets overlapping its version range all have a source, but not
+//    this rowset (e.g. the source rowset was compacted in the snapshot);
+//  - no_source_rowset_id: otherwise, a local rowset overlapping its version range has no source, or no
+//    local rowset overlaps it.
+void count_unmatched_rowsets(const TabletMetaPB& local_meta, const TabletMetaPB& remote_meta,
+                             SnapshotDownloadStats* stats);
+
 class BaseSnapshotLoader {
 public:
     BaseSnapshotLoader(ExecEnv* env, int64_t job_id, int64_t task_id,
@@ -217,6 +254,9 @@ public:
         return _manifest_verified_tablets;
     }
 
+    // The data reused and downloaded by the tablets downloaded so far.
+    const SnapshotDownloadStats& download_stats() const { return _download_stats; }
+
     // Whether the digests are checked for all the tablets in manifest_verified_tablets().
     bool manifest_digest_checked() const {
         return !_manifest_verified_tablets.empty() &&
@@ -228,7 +268,8 @@ private:
     Status _download_tablet_from_remote(const std::string& remote_path,
                                         const std::string& local_path, int64_t local_tablet_id,
                                         int64_t remote_tablet_id, int* report_counter,
-                                        int finished_num, int total_num);
+                                        int finished_num, int total_num,
+                                        SnapshotDownloadStats* stats);
 
     // Fetch the manifest of a tablet from the repository and check it against the root.
     Status _fetch_remote_manifest(const std::string& remote_path, const std::string& local_path,
@@ -241,7 +282,8 @@ private:
     Status _download_tablet_by_manifest(const std::string& remote_path,
                                         const std::string& local_path, int64_t local_tablet_id,
                                         const SnapshotManifest& manifest, int* report_counter,
-                                        int finished_num, int total_num);
+                                        int finished_num, int total_num,
+                                        SnapshotDownloadStats* stats);
 
     // Upload the manifest of a tablet next to its dir in the repository, returns the root.
     Status _upload_manifest(const std::string& src_path, const std::string& dest_path,
@@ -253,6 +295,10 @@ private:
     Status _clear_local_snapshot_files(const std::string& local_path);
 
     void _add_manifest_verified_tablet(int64_t tablet_id, bool digest_checked);
+
+    // Add the stats of a finished tablet to the total and log them.
+    void _add_tablet_download_stats(int64_t local_tablet_id, int64_t remote_tablet_id,
+                                    SnapshotDownloadStats stats);
 
     Status _replace_tablet_id(const std::string& file_name, int64_t tablet_id,
                               std::string* new_file_name);
@@ -279,6 +325,7 @@ private:
     std::map<int64_t, std::string> _uploaded_manifest_roots;
     std::vector<int64_t> _manifest_verified_tablets;
     size_t _manifest_digest_checked_num = 0;
+    SnapshotDownloadStats _download_stats;
 };
 
 } // end namespace doris

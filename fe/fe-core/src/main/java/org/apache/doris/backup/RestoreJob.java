@@ -217,6 +217,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // backend, and those whose file digests are checked too. Only while downloading, not persisted: download tasks
     // are sent again after a restart.
     private Set<Pair<Long, Long>> manifestVerifiedReplicas = Sets.newHashSet();
+
+    // How much of the data was reused locally instead of downloaded, summed over the download tasks. Null if the job
+    // has not started downloading, or was restarted from an old version.
+    @SerializedName("dls")
+    private RestoreDownloadStats downloadStats;
     private Set<Pair<Long, Long>> manifestDigestCheckedReplicas = Sets.newHashSet();
 
     private List<ColocatePersistInfo> colocatePersistInfos = Lists.newArrayList();
@@ -396,7 +401,42 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         taskErrMsg.remove(task.getSignature());
         recordManifestCheck(task.getBackendId(), request);
+        recordDownloadStats(task.getBackendId(), request);
         return true;
+    }
+
+    // Add the download stats reported by the backend. An old backend does not report it, its replicas are counted as
+    // not reported. It never fails the job.
+    @VisibleForTesting
+    void recordDownloadStats(long beId, TFinishTaskRequest request) {
+        try {
+            if (!request.isSetDownloadStats()) {
+                return;
+            }
+            if (downloadStats == null) {
+                downloadStats = new RestoreDownloadStats();
+            }
+            downloadStats.add(request.getDownloadStats(), request.getDownloadedTabletIds().size());
+        } catch (Exception e) {
+            LOG.warn("failed to record the download stats of backend {}, ignore it. {}", beId, this, e);
+        }
+    }
+
+    public RestoreDownloadStats getDownloadStats() {
+        return downloadStats;
+    }
+
+    private void resetDownloadStats() {
+        downloadStats = new RestoreDownloadStats();
+    }
+
+    // Fix the replicas to download in the stats, when the download finishes or the job is cancelled.
+    @VisibleForTesting
+    void fixDownloadStats() {
+        if (downloadStats != null && !downloadStats.isFixed()) {
+            downloadStats.fix(snapshotInfos.size());
+            LOG.info("download stats: {}. {}", downloadStats, this);
+        }
     }
 
     private void handleManifestMismatch(DownloadTask task, TFinishTaskRequest request) {
@@ -1934,6 +1974,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         taskProgress.clear();
         taskErrMsg.clear();
         resetManifestCheck();
+        resetDownloadStats();
         AgentBoundedBatchTask batchTask = new AgentBoundedBatchTask(
                 Config.backup_restore_batch_task_num_per_rpc, Config.restore_task_concurrency_per_be);
         for (long dbId : dbToSnapshotInfos.keySet()) {
@@ -2050,6 +2091,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         taskProgress.clear();
         taskErrMsg.clear();
         resetManifestCheck();
+        resetDownloadStats();
         AgentBoundedBatchTask batchTask = new AgentBoundedBatchTask(
                 Config.backup_restore_batch_task_num_per_rpc, Config.restore_task_concurrency_per_be);
         for (long dbId : dbToSnapshotInfos.keySet()) {
@@ -2227,6 +2269,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // backupMeta is useless now
             backupMeta = null;
             manifestCheck = computeManifestCheck();
+            fixDownloadStats();
 
             env.getEditLog().logRestoreJob(this);
             LOG.info("finished to download, manifest check: {}. {}", manifestCheck, this);
@@ -2533,6 +2576,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             info.add(reuseShadowStats == null ? FeConstants.null_string : reuseShadowStats.toString());
             RestoreManifestCheck check = getManifestCheck();
             info.add(check == null ? FeConstants.null_string : check.toString());
+            info.add(downloadStats == null ? FeConstants.null_string : downloadStats.toJson(snapshotInfos.size()));
         }
         return info;
     }
@@ -2750,6 +2794,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             if (state == RestoreJobState.DOWNLOADING && manifestCheck == null) {
                 // keep the partial result of the manifest check for SHOW RESTORE
                 manifestCheck = computeManifestCheck();
+            }
+            if (state == RestoreJobState.DOWNLOADING) {
+                fixDownloadStats();
             }
             com.google.common.collect.Table<Long, Long, SnapshotInfo> savedSnapshotInfos = snapshotInfos;
             snapshotInfos = HashBasedTable.create();

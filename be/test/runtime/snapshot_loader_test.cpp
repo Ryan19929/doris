@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <system_error>
@@ -68,6 +69,7 @@
 #include "storage/storage_engine.h"
 #include "storage/tablet/tablet.h"
 #include "storage/tablet/tablet_manager.h"
+#include "storage/tablet/tablet_meta.h"
 #include "storage/tablet_info.h"
 #include "storage/task/engine_publish_version_task.h"
 #include "storage/txn/txn_manager.h"
@@ -1025,5 +1027,294 @@ TEST_F(SnapshotLoaderTest, HttpDownloadLinkedFileTamperedWithoutDigestCheck) {
     EXPECT_EQ(0, loader.get_http_download_files_num());
     EXPECT_EQ(std::vector<int64_t> {1501}, loader.manifest_verified_tablets());
     EXPECT_FALSE(loader.manifest_digest_checked());
+}
+
+// ---- download stats ----
+
+// The number and the total size of the data files (all but the tablet meta file) in a dir.
+static void data_files_of(const std::string& dir, int64_t* num, int64_t* bytes) {
+    std::vector<io::FileInfo> files;
+    bool exists = false;
+    ASSERT_TRUE(io::global_local_filesystem()->list(dir, true, &files, &exists).ok());
+    *num = 0;
+    *bytes = 0;
+    for (const auto& file : files) {
+        if (!file.file_name.ends_with(".hdr")) {
+            ++*num;
+            *bytes += file.file_size;
+        }
+    }
+}
+
+// Change a tablet meta file in place.
+static void edit_tablet_meta(const std::string& path,
+                             const std::function<void(TabletMetaPB*)>& edit) {
+    TabletMetaPB meta;
+    ASSERT_TRUE(TabletMeta::load_from_file(path, &meta).ok());
+    edit(&meta);
+    ASSERT_TRUE(TabletMeta::save(path, meta).ok());
+}
+
+static RowsetMetaPB* first_rowset_with_segments(TabletMetaPB* meta) {
+    for (auto& rs_meta : *meta->mutable_rs_metas()) {
+        if (rs_meta.num_segments() > 0) {
+            return &rs_meta;
+        }
+    }
+    return nullptr;
+}
+
+static RowsetMetaPB make_rowset_meta(const std::string& id, int64_t start, int64_t end,
+                                     const std::string& source = "", bool remote = false,
+                                     int64_t num_segments = 1) {
+    RowsetMetaPB meta;
+    meta.set_rowset_id_v2(id);
+    meta.set_start_version(start);
+    meta.set_end_version(end);
+    meta.set_num_segments(num_segments);
+    if (!source.empty()) {
+        meta.set_source_rowset_id(source);
+    }
+    if (remote) {
+        meta.set_resource_id("resource");
+    }
+    return meta;
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadStatsLinked) {
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(2601, 2602, 2603, 2611, 2612, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    int64_t files = 0;
+    int64_t bytes = 0;
+    data_files_of(remote_snapshot.remote_snapshot_path, &files, &bytes);
+    ASSERT_GT(files, 0);
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 20L, 2601);
+    ASSERT_TRUE(loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids).ok());
+    const auto& stats = loader.download_stats();
+    EXPECT_EQ(files, stats.linked_files);
+    EXPECT_EQ(bytes, stats.linked_bytes);
+    EXPECT_EQ(0, stats.skipped_files);
+    EXPECT_EQ(0, stats.skipped_bytes);
+    EXPECT_EQ(0, stats.downloaded_files);
+    EXPECT_EQ(0, stats.downloaded_bytes);
+    EXPECT_EQ(1, stats.tablets_full_reuse);
+    EXPECT_EQ(0, stats.tablets_partial_reuse);
+    EXPECT_EQ(0, stats.tablets_no_reuse);
+    EXPECT_EQ(0, stats.unmatched_rowsets);
+
+    // the thrift struct carries all the fields
+    TDownloadStats thrift_stats = stats.to_thrift();
+    EXPECT_EQ(files, thrift_stats.linked_files);
+    EXPECT_EQ(bytes, thrift_stats.linked_bytes);
+    EXPECT_EQ(1, thrift_stats.tablets_full_reuse);
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadStatsSkippedAndDownloaded) {
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(2701, 2702, 2703, 2711, 2712, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    int64_t files = 0;
+    int64_t bytes = 0;
+    data_files_of(remote_snapshot.remote_snapshot_path, &files, &bytes);
+    // a file which exists in both, and a file which only exists in the remote.
+    write_test_file(remote_snapshot.remote_snapshot_path + "/skip_0.dat", "0123456789");
+    write_test_file(remote_snapshot.local_snapshot_path + "/skip_0.dat", "0123456789");
+    write_test_file(remote_snapshot.remote_snapshot_path + "/download_0.dat",
+                    "abcdefghijklmnopqrst");
+    ASSERT_FALSE(HasFatalFailure());
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 21L, 2701);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    const auto& stats = loader.download_stats();
+    EXPECT_EQ(files, stats.linked_files);
+    EXPECT_EQ(bytes, stats.linked_bytes);
+    EXPECT_EQ(1, stats.skipped_files);
+    EXPECT_EQ(10, stats.skipped_bytes);
+    EXPECT_EQ(1, stats.downloaded_files);
+    EXPECT_EQ(20, stats.downloaded_bytes);
+    EXPECT_EQ(1, loader.get_http_download_files_num());
+    // partly reused
+    EXPECT_EQ(0, stats.tablets_full_reuse);
+    EXPECT_EQ(1, stats.tablets_partial_reuse);
+    EXPECT_EQ(0, stats.tablets_no_reuse);
+    EXPECT_EQ(0, stats.unmatched_rowsets);
+}
+
+// Download a "remote" snapshot made from the local tablet, after changing the tablet meta of the local or the
+// remote snapshot. Returns the stats of the download.
+static SnapshotDownloadStats download_with_edited_meta(
+        int64_t tablet_id, int64_t remote_tablet_id, int64_t task_id,
+        const std::function<void(TabletMetaPB*)>& edit_local,
+        const std::function<void(TabletMetaPB*)>& edit_remote, int64_t* downloaded_bytes) {
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(tablet_id, tablet_id + 1, tablet_id + 2, remote_tablet_id,
+                           remote_tablet_id + 1, &remote_snapshot);
+    if (::testing::Test::HasFatalFailure()) {
+        return {};
+    }
+    int64_t files = 0;
+    data_files_of(remote_snapshot.remote_snapshot_path, &files, downloaded_bytes);
+    if (edit_local) {
+        edit_tablet_meta(fmt::format("{}/{}.hdr", remote_snapshot.local_snapshot_path, tablet_id),
+                         edit_local);
+    }
+    if (edit_remote) {
+        edit_tablet_meta(
+                fmt::format("{}/{}.hdr", remote_snapshot.remote_snapshot_path, remote_tablet_id),
+                edit_remote);
+    }
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), task_id, tablet_id);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    EXPECT_TRUE(status.ok()) << status;
+    return loader.download_stats();
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadStatsUnmatchedNoSourceRowsetId) {
+    // the remote rowset has no source, and the local rowset has no source either: no lineage at all.
+    int64_t bytes = 0;
+    auto stats = download_with_edited_meta(
+            2801, 2811, 22L, nullptr,
+            [](TabletMetaPB* meta) { first_rowset_with_segments(meta)->clear_source_rowset_id(); },
+            &bytes);
+    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(1, stats.unmatched_rowsets);
+    EXPECT_EQ(1, stats.unmatched_no_source_rowset_id);
+    EXPECT_EQ(0, stats.unmatched_source_not_in_snapshot);
+    EXPECT_EQ(0, stats.unmatched_version_mismatch);
+    // nothing reused, everything is downloaded
+    EXPECT_EQ(0, stats.linked_files);
+    EXPECT_EQ(0, stats.skipped_files);
+    EXPECT_GT(stats.downloaded_files, 0);
+    EXPECT_EQ(bytes, stats.downloaded_bytes);
+    EXPECT_EQ(1, stats.tablets_no_reuse);
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadStatsUnmatchedSourceNotInSnapshot) {
+    // the local rowset was downloaded from another rowset, which is not in the remote snapshot.
+    int64_t bytes = 0;
+    auto stats = download_with_edited_meta(
+            2901, 2911, 23L,
+            [](TabletMetaPB* meta) {
+                first_rowset_with_segments(meta)->set_source_rowset_id("another_rowset");
+            },
+            [](TabletMetaPB* meta) { first_rowset_with_segments(meta)->clear_source_rowset_id(); },
+            &bytes);
+    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(1, stats.unmatched_rowsets);
+    EXPECT_EQ(0, stats.unmatched_no_source_rowset_id);
+    EXPECT_EQ(1, stats.unmatched_source_not_in_snapshot);
+    EXPECT_EQ(0, stats.unmatched_version_mismatch);
+    EXPECT_EQ(0, stats.linked_files);
+    EXPECT_EQ(bytes, stats.downloaded_bytes);
+    EXPECT_EQ(1, stats.tablets_no_reuse);
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadStatsUnmatchedVersionMismatch) {
+    // the remote rowset is derived from the local rowset, but with another version range.
+    int64_t bytes = 0;
+    auto stats = download_with_edited_meta(
+            3001, 3011, 24L, nullptr,
+            [](TabletMetaPB* meta) {
+                auto* rs_meta = first_rowset_with_segments(meta);
+                rs_meta->set_end_version(rs_meta->end_version() + 1);
+            },
+            &bytes);
+    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_EQ(1, stats.unmatched_rowsets);
+    EXPECT_EQ(0, stats.unmatched_no_source_rowset_id);
+    EXPECT_EQ(0, stats.unmatched_source_not_in_snapshot);
+    EXPECT_EQ(1, stats.unmatched_version_mismatch);
+    EXPECT_EQ(0, stats.linked_files);
+    EXPECT_EQ(bytes, stats.downloaded_bytes);
+    EXPECT_EQ(1, stats.tablets_no_reuse);
+}
+
+TEST_F(SnapshotLoaderTest, CountUnmatchedRowsets) {
+    TabletMetaPB local;
+    TabletMetaPB remote;
+    // local: l1 [2,2] derived from r1, l2 [3,3] derived from a rowset not in the remote, l3 [4,4] without
+    // source, l4 [5,5] derived from r5, l5 [6,6] is empty, l6 is in remote storage.
+    *local.add_rs_metas() = make_rowset_meta("l1", 2, 2, "r1");
+    *local.add_rs_metas() = make_rowset_meta("l2", 3, 3, "gone");
+    *local.add_rs_metas() = make_rowset_meta("l3", 4, 4);
+    *local.add_rs_metas() = make_rowset_meta("l4", 5, 5, "r5");
+    *local.add_rs_metas() = make_rowset_meta("l5", 6, 6, "r6", false, 0);
+    *local.add_rs_metas() = make_rowset_meta("l6", 7, 7, "r7", true);
+    // remote:
+    // r0 [0,1] empty, not counted
+    *remote.add_rs_metas() = make_rowset_meta("r0", 0, 1, "", false, 0);
+    // r1 [2,2] matched: local l1 is derived from it
+    *remote.add_rs_metas() = make_rowset_meta("r1", 2, 2);
+    // r2 [3,3] unmatched, overlaps l2 which has another source: source_not_in_snapshot
+    *remote.add_rs_metas() = make_rowset_meta("r2", 3, 3);
+    // r3 [4,4] unmatched, overlaps l3 which has no source: no_source_rowset_id
+    *remote.add_rs_metas() = make_rowset_meta("r3", 4, 4);
+    // r4 [8,9] unmatched, no local rowset overlaps: no_source_rowset_id
+    *remote.add_rs_metas() = make_rowset_meta("r4", 8, 9);
+    // r5 [5,6] derived from the same id but another version: version_mismatch
+    *remote.add_rs_metas() = make_rowset_meta("r5", 5, 6);
+    // r6 [6,6] derived from l5 which is empty, so not a lineage match, and no local rowset with segments
+    // overlaps it: no_source_rowset_id
+    *remote.add_rs_metas() = make_rowset_meta("r6", 6, 6, "l5");
+    // r7 in remote storage, not counted
+    *remote.add_rs_metas() = make_rowset_meta("r7", 7, 7, "", true);
+    // r8 [10,10] derived from l1 but another version: version_mismatch, found by the remote source
+    *remote.add_rs_metas() = make_rowset_meta("r8", 10, 10, "l1");
+
+    SnapshotDownloadStats stats;
+    count_unmatched_rowsets(local, remote, &stats);
+    // r2, r3, r4, r5, r6, r8
+    EXPECT_EQ(6, stats.unmatched_rowsets);
+    EXPECT_EQ(1, stats.unmatched_source_not_in_snapshot); // r2
+    EXPECT_EQ(3, stats.unmatched_no_source_rowset_id);    // r3, r4, r6
+    EXPECT_EQ(2, stats.unmatched_version_mismatch);       // r5, r8
+    EXPECT_EQ(stats.unmatched_rowsets, stats.unmatched_no_source_rowset_id +
+                                               stats.unmatched_source_not_in_snapshot +
+                                               stats.unmatched_version_mismatch);
+}
+
+TEST_F(SnapshotLoaderTest, DownloadStatsClassifyAndMerge) {
+    SnapshotDownloadStats full;
+    full.linked_files = 2;
+    full.linked_bytes = 20;
+    full.classify_tablet();
+    SnapshotDownloadStats partial;
+    partial.skipped_files = 1;
+    partial.skipped_bytes = 5;
+    partial.downloaded_files = 1;
+    partial.downloaded_bytes = 7;
+    partial.unmatched_rowsets = 1;
+    partial.unmatched_version_mismatch = 1;
+    partial.classify_tablet();
+    SnapshotDownloadStats none;
+    none.downloaded_files = 3;
+    none.downloaded_bytes = 30;
+    none.classify_tablet();
+    // a tablet without data files is not counted
+    SnapshotDownloadStats empty;
+    empty.classify_tablet();
+
+    SnapshotDownloadStats total;
+    for (const auto& stats : {full, partial, none, empty}) {
+        total.merge(stats);
+    }
+    EXPECT_EQ(2, total.linked_files);
+    EXPECT_EQ(20, total.linked_bytes);
+    EXPECT_EQ(1, total.skipped_files);
+    EXPECT_EQ(5, total.skipped_bytes);
+    EXPECT_EQ(4, total.downloaded_files);
+    EXPECT_EQ(37, total.downloaded_bytes);
+    EXPECT_EQ(1, total.tablets_full_reuse);
+    EXPECT_EQ(1, total.tablets_partial_reuse);
+    EXPECT_EQ(1, total.tablets_no_reuse);
+    EXPECT_EQ(1, total.unmatched_rowsets);
+    EXPECT_EQ(1, total.unmatched_version_mismatch);
+    EXPECT_FALSE(total.to_string().empty());
 }
 } // namespace doris

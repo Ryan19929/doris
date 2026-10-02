@@ -39,6 +39,7 @@
 #include <istream>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -122,6 +123,9 @@ public:
 
     const ManifestCheckResult& manifest_check_result() const { return _manifest_check_result; }
 
+    // The files reused and downloaded of the tablet, valid after download().
+    const SnapshotDownloadStats& stats() const { return _stats; }
+
     Status download();
 
 private:
@@ -183,6 +187,9 @@ private:
     bool _manifest_mismatch = false;
     SnapshotManifest _manifest;
     ManifestCheckResult _manifest_check_result;
+    SnapshotDownloadStats _stats;
+    // The remote file names linked from the local files of the same lineage, with the file sizes.
+    std::unordered_map<std::string, int64_t> _linked_files;
 
     std::string _base_url;
     int64_t _local_tablet_id;
@@ -428,6 +435,130 @@ static Status read_local_file(const std::string& path, std::string* content) {
                                content->size());
     }
     return Status::OK();
+}
+
+void SnapshotDownloadStats::classify_tablet() {
+    int64_t reused = linked_files + skipped_files;
+    if (reused == 0 && downloaded_files == 0) {
+        return;
+    }
+    if (downloaded_files == 0) {
+        ++tablets_full_reuse;
+    } else if (reused == 0) {
+        ++tablets_no_reuse;
+    } else {
+        ++tablets_partial_reuse;
+    }
+}
+
+void SnapshotDownloadStats::merge(const SnapshotDownloadStats& other) {
+    linked_files += other.linked_files;
+    linked_bytes += other.linked_bytes;
+    skipped_files += other.skipped_files;
+    skipped_bytes += other.skipped_bytes;
+    downloaded_files += other.downloaded_files;
+    downloaded_bytes += other.downloaded_bytes;
+    tablets_full_reuse += other.tablets_full_reuse;
+    tablets_partial_reuse += other.tablets_partial_reuse;
+    tablets_no_reuse += other.tablets_no_reuse;
+    unmatched_rowsets += other.unmatched_rowsets;
+    unmatched_no_source_rowset_id += other.unmatched_no_source_rowset_id;
+    unmatched_source_not_in_snapshot += other.unmatched_source_not_in_snapshot;
+    unmatched_version_mismatch += other.unmatched_version_mismatch;
+}
+
+std::string SnapshotDownloadStats::to_string() const {
+    return fmt::format(
+            "linked: {} files {} bytes, skipped: {} files {} bytes, downloaded: {} files {} bytes, "
+            "tablets full/partial/no reuse: {}/{}/{}, unmatched rowsets: {} (no_source_rowset_id "
+            "{}, source_not_in_snapshot {}, version_mismatch {})",
+            linked_files, linked_bytes, skipped_files, skipped_bytes, downloaded_files,
+            downloaded_bytes, tablets_full_reuse, tablets_partial_reuse, tablets_no_reuse,
+            unmatched_rowsets, unmatched_no_source_rowset_id, unmatched_source_not_in_snapshot,
+            unmatched_version_mismatch);
+}
+
+TDownloadStats SnapshotDownloadStats::to_thrift() const {
+    TDownloadStats result;
+    result.__set_linked_files(linked_files);
+    result.__set_linked_bytes(linked_bytes);
+    result.__set_skipped_files(skipped_files);
+    result.__set_skipped_bytes(skipped_bytes);
+    result.__set_downloaded_files(downloaded_files);
+    result.__set_downloaded_bytes(downloaded_bytes);
+    result.__set_tablets_full_reuse(tablets_full_reuse);
+    result.__set_tablets_partial_reuse(tablets_partial_reuse);
+    result.__set_tablets_no_reuse(tablets_no_reuse);
+    result.__set_unmatched_rowsets(unmatched_rowsets);
+    result.__set_unmatched_no_source_rowset_id(unmatched_no_source_rowset_id);
+    result.__set_unmatched_source_not_in_snapshot(unmatched_source_not_in_snapshot);
+    result.__set_unmatched_version_mismatch(unmatched_version_mismatch);
+    return result;
+}
+
+void count_unmatched_rowsets(const TabletMetaPB& local_meta, const TabletMetaPB& remote_meta,
+                             SnapshotDownloadStats* stats) {
+    std::vector<const RowsetMetaPB*> local_rowsets;
+    std::unordered_map<std::string, const RowsetMetaPB*> local_by_id;
+    for (const auto& meta : local_meta.rs_metas()) {
+        if (meta.has_resource_id() || meta.num_segments() == 0) {
+            continue;
+        }
+        local_rowsets.push_back(&meta);
+        local_by_id.emplace(meta.rowset_id_v2(), &meta);
+    }
+    // the source rowset id of the local rowsets -> the local rowsets
+    std::unordered_multimap<std::string, const RowsetMetaPB*> local_by_source;
+    for (const auto* meta : local_rowsets) {
+        if (meta->has_source_rowset_id()) {
+            local_by_source.emplace(meta->source_rowset_id(), meta);
+        }
+    }
+
+    auto same_version = [](const RowsetMetaPB& a, const RowsetMetaPB& b) {
+        return a.start_version() == b.start_version() && a.end_version() == b.end_version();
+    };
+    for (const auto& remote : remote_meta.rs_metas()) {
+        if (remote.has_resource_id() || remote.num_segments() == 0) {
+            continue;
+        }
+        bool matched = false;
+        bool version_mismatch = false;
+        auto sources = local_by_source.equal_range(remote.rowset_id_v2());
+        for (auto it = sources.first; it != sources.second; ++it) {
+            (same_version(*it->second, remote) ? matched : version_mismatch) = true;
+        }
+        if (remote.has_source_rowset_id()) {
+            auto it = local_by_id.find(remote.source_rowset_id());
+            if (it != local_by_id.end()) {
+                (same_version(*it->second, remote) ? matched : version_mismatch) = true;
+            }
+        }
+        if (matched) {
+            continue;
+        }
+
+        ++stats->unmatched_rowsets;
+        if (version_mismatch) {
+            ++stats->unmatched_version_mismatch;
+            continue;
+        }
+        bool overlapped = false;
+        bool overlapped_without_source = false;
+        for (const auto* local : local_rowsets) {
+            if (local->start_version() > remote.end_version() ||
+                local->end_version() < remote.start_version()) {
+                continue;
+            }
+            overlapped = true;
+            overlapped_without_source |= !local->has_source_rowset_id();
+        }
+        if (overlapped && !overlapped_without_source) {
+            ++stats->unmatched_source_not_in_snapshot;
+        } else {
+            ++stats->unmatched_no_source_rowset_id;
+        }
+    }
 }
 
 // The file which marks a tablet snapshot as moved to the tablet dir, see SnapshotLoader::move().
@@ -746,6 +877,8 @@ Status SnapshotHttpDownloader::_link_same_rowset_files() {
         return status;
     }
 
+    count_unmatched_rowsets(local_tablet_meta, remote_tablet_meta, &_stats);
+
     LOG(INFO) << "link rowset files by compare " << _local_hdr_filename << " and "
               << _remote_hdr_filename;
 
@@ -815,6 +948,7 @@ Status SnapshotHttpDownloader::_link_same_rowset_files() {
             }
 
             _local_files[remote_file] = local_filestat;
+            _linked_files[remote_file] = static_cast<int64_t>(local_filestat.size);
         }
     }
 
@@ -868,6 +1002,7 @@ Status SnapshotHttpDownloader::_link_same_rowset_files() {
                 auto it = _local_files.find(local_file);
                 if (it != _local_files.end()) {
                     _local_files[remote_file] = it->second;
+                    _linked_files[remote_file] = static_cast<int64_t>(it->second.size);
                 } else {
                     std::string msg =
                             fmt::format("local file {} don't exist in _local_files, err: {}",
@@ -920,6 +1055,21 @@ void SnapshotHttpDownloader::_get_need_download_files() {
 
         LOG(INFO) << fmt::format("file {} already exists, skip download url {}", remote_file,
                                  remote_filestat.url);
+        if (_linked_files.contains(remote_file)) {
+            // counted as linked below
+            continue;
+        }
+        ++_stats.skipped_files;
+        _stats.skipped_bytes += static_cast<int64_t>(remote_filestat.size);
+    }
+    // A linked file which differs from the remote one is downloaded again, it is not reused.
+    std::unordered_set<std::string> need_download(_need_download_files.begin(),
+                                                  _need_download_files.end());
+    for (const auto& [linked_file, linked_size] : _linked_files) {
+        if (_remote_files.contains(linked_file) && !need_download.contains(linked_file)) {
+            ++_stats.linked_files;
+            _stats.linked_bytes += linked_size;
+        }
     }
 }
 
@@ -946,6 +1096,8 @@ Status SnapshotHttpDownloader::_download_files() {
         RETURN_IF_ERROR(
                 _download_http_file(data_dir, remote_file_url, local_file_path, remote_filestat));
         total_file_size += file_size;
+        ++_stats.downloaded_files;
+        _stats.downloaded_bytes += static_cast<int64_t>(file_size);
 
         // local_files always keep the updated local files
         _local_files[filename] = LocalFileStat {file_size, remote_file_md5};
@@ -1346,23 +1498,26 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
                       << ", schema hash: " << schema_hash
                       << ", remote tablet id: " << remote_tablet_id;
 
+        SnapshotDownloadStats tablet_stats;
         auto manifest_root = _manifest_roots.find(remote_path);
         if (!config::restore_manifest_check || manifest_root == _manifest_roots.end()) {
             // no manifest (old backup, old FE) or the check is disabled: download by listing the
             // remote path, as before.
             RETURN_IF_ERROR(_download_tablet_from_remote(remote_path, local_path, local_tablet_id,
                                                          remote_tablet_id, &report_counter,
-                                                         finished_num, total_num));
+                                                         finished_num, total_num, &tablet_stats));
         } else {
             ManifestCheckResult result;
             // Fetch the manifest, download the files in it, then check the local snapshot.
             auto download_by_manifest = [&]() -> Status {
+                // the stats of the last attempt only
+                tablet_stats = SnapshotDownloadStats();
                 SnapshotManifest manifest;
                 RETURN_IF_ERROR(_fetch_remote_manifest(remote_path, local_path, remote_tablet_id,
                                                        manifest_root->second, &manifest));
                 RETURN_IF_ERROR(_download_tablet_by_manifest(
                         remote_path, local_path, local_tablet_id, manifest, &report_counter,
-                        finished_num, total_num));
+                        finished_num, total_num, &tablet_stats));
                 return check_tablet_snapshot_manifest(local_path, local_tablet_id, manifest,
                                                       config::restore_manifest_digest_check,
                                                       &result);
@@ -1387,6 +1542,7 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
             }
         }
 
+        _add_tablet_download_stats(local_tablet_id, remote_tablet_id, std::move(tablet_stats));
         finished_num++;
     } // end for src_to_dest_path
 
@@ -1398,7 +1554,8 @@ Status SnapshotLoader::_download_tablet_from_remote(const std::string& remote_pa
                                                     const std::string& local_path,
                                                     int64_t local_tablet_id,
                                                     int64_t remote_tablet_id, int* report_counter,
-                                                    int finished_num, int total_num) {
+                                                    int finished_num, int total_num,
+                                                    SnapshotDownloadStats* stats) {
     // 2.1. get local files
     std::vector<std::string> local_files;
     RETURN_IF_ERROR(_get_existing_files_from_local(local_path, &local_files));
@@ -1460,6 +1617,10 @@ Status SnapshotLoader::_download_tablet_from_remote(const std::string& remote_pa
         if (!need_download) {
             LOG(INFO) << "remote file already exist in local, no need to download."
                       << ", file: " << remote_file;
+            if (!_end_with(remote_file, ".hdr")) {
+                ++stats->skipped_files;
+                stats->skipped_bytes += static_cast<int64_t>(file_stat.size);
+            }
             continue;
         }
 
@@ -1496,6 +1657,11 @@ Status SnapshotLoader::_download_tablet_from_remote(const std::string& remote_pa
                << ", expected: " << file_stat.md5 << ", get: " << downloaded_md5sum;
             LOG(WARNING) << ss.str();
             return Status::InternalError(ss.str());
+        }
+
+        if (!_end_with(remote_file, ".hdr")) {
+            ++stats->downloaded_files;
+            stats->downloaded_bytes += static_cast<int64_t>(file_len);
         }
 
         // local_files always keep the updated local files
@@ -1580,9 +1746,12 @@ Status SnapshotLoader::_fetch_remote_manifest(const std::string& remote_path,
     return SnapshotManifest::parse(content, root, remote_tablet_id, manifest);
 }
 
-Status SnapshotLoader::_download_tablet_by_manifest(
-        const std::string& remote_path, const std::string& local_path, int64_t local_tablet_id,
-        const SnapshotManifest& manifest, int* report_counter, int finished_num, int total_num) {
+Status SnapshotLoader::_download_tablet_by_manifest(const std::string& remote_path,
+                                                    const std::string& local_path,
+                                                    int64_t local_tablet_id,
+                                                    const SnapshotManifest& manifest,
+                                                    int* report_counter, int finished_num,
+                                                    int total_num, SnapshotDownloadStats* stats) {
     std::vector<std::string> existing_files;
     RETURN_IF_ERROR(_get_existing_files_from_local(local_path, &existing_files));
     std::set<std::string> local_files(existing_files.begin(), existing_files.end());
@@ -1614,6 +1783,8 @@ Status SnapshotLoader::_download_tablet_by_manifest(
             if (st.ok() && local_md5sum == file.md5) {
                 LOG(INFO) << "remote file already exist in local, no need to download. file: "
                           << file.name;
+                ++stats->skipped_files;
+                stats->skipped_bytes += file.size;
                 continue;
             }
         }
@@ -1634,6 +1805,10 @@ Status SnapshotLoader::_download_tablet_by_manifest(
                     "restore manifest check failed, tablet {}, path {}: md5 mismatch of "
                     "downloaded file {}, expected {}, actual {}",
                     local_tablet_id, local_path, full_remote_file, file.md5, downloaded_md5sum);
+        }
+        if (!_end_with(file.name, ".hdr")) {
+            ++stats->downloaded_files;
+            stats->downloaded_bytes += file.size;
         }
         local_files.insert(local_file_name);
     }
@@ -1659,6 +1834,15 @@ Status SnapshotLoader::_clear_local_snapshot_files(const std::string& local_path
     LOG(INFO) << "cleared " << local_files.size() << " files in local snapshot path " << local_path
               << ", job: " << _job_id << ", task id: " << _task_id;
     return Status::OK();
+}
+
+void SnapshotLoader::_add_tablet_download_stats(int64_t local_tablet_id, int64_t remote_tablet_id,
+                                                SnapshotDownloadStats stats) {
+    stats.classify_tablet();
+    LOG(INFO) << "download stats of local tablet " << local_tablet_id << ", remote tablet "
+              << remote_tablet_id << ", job: " << _job_id << ", task id: " << _task_id << ", "
+              << stats.to_string();
+    _download_stats.merge(stats);
 }
 
 void SnapshotLoader::_add_manifest_verified_tablet(int64_t tablet_id, bool digest_checked) {
@@ -1704,6 +1888,7 @@ Status SnapshotLoader::remote_http_download(
         int finished_num = 0;
         int total_num = doris::cast_set<int>(remote_tablet_snapshots.size());
 #endif
+        SnapshotDownloadStats tablet_stats;
         auto download_tablet = [&](bool disable_reuse, bool* manifest_mismatch,
                                    ManifestCheckResult* manifest_check_result) {
             SnapshotHttpDownloader downloader(remote_tablet_snapshot, tablet, *this);
@@ -1719,6 +1904,8 @@ Status SnapshotLoader::remote_http_download(
             _set_http_download_files_num(downloader.get_download_file_num());
             *manifest_mismatch = downloader.manifest_mismatch();
             *manifest_check_result = downloader.manifest_check_result();
+            // the stats of the last attempt only
+            tablet_stats = downloader.stats();
             return st;
         };
 
@@ -1738,6 +1925,8 @@ Status SnapshotLoader::remote_http_download(
         if (manifest_check_result.checked) {
             _add_manifest_verified_tablet(local_tablet_id, manifest_check_result.digest_checked);
         }
+        _add_tablet_download_stats(local_tablet_id, remote_tablet_snapshot.remote_tablet_id,
+                                   std::move(tablet_stats));
 
 #ifndef BE_TEST
         ++finished_num;

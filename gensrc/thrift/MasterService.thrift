@@ -56,6 +56,28 @@ struct TTabletInfo {
     1000: optional bool is_persistent
 }
 
+// Statistics of a download task, summed over all the tablets (replicas) of the task. The bytes and files
+// exclude the tablet meta files.
+struct TDownloadStats {
+    // reused by hard linking the local files of the rowsets with the same lineage (http snapshot only)
+    1: optional i64 linked_files
+    2: optional i64 linked_bytes
+    // already exist locally with the same name and size (and md5), not downloaded
+    3: optional i64 skipped_files
+    4: optional i64 skipped_bytes
+    5: optional i64 downloaded_files
+    6: optional i64 downloaded_bytes
+    // tablets whose data files are all / partially / not reused
+    7: optional i64 tablets_full_reuse
+    8: optional i64 tablets_partial_reuse
+    9: optional i64 tablets_no_reuse
+    // rowsets of the remote tablets which have no lineage match in the local tablets, and why
+    10: optional i64 unmatched_rowsets
+    11: optional i64 unmatched_no_source_rowset_id
+    12: optional i64 unmatched_source_not_in_snapshot
+    13: optional i64 unmatched_version_mismatch
+}
+
 struct TFinishTaskRequest {
     1: required Types.TBackend backend
     2: required Types.TTaskType task_type
@@ -86,6 +108,8 @@ struct TFinishTaskRequest {
     23: optional list<Types.TTabletId> manifest_verified_tablets
     // download task: whether the digests of the files of all manifest_verified_tablets are checked
     24: optional bool manifest_digest_checked
+    // download task: how much of the data was reused locally instead of downloaded
+    25: optional TDownloadStats download_stats
 }
 
 struct TTablet {
