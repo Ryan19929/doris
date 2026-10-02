@@ -154,8 +154,9 @@ suite("test_backup_restore_partition_reuse_reverse", "backup_restore") {
     assertTrue((stats.downloaded_files as long) < baseline)
     assertTrue((stats.kept_bytes as long) > 0)
     assertTrue((stats.reuse_ratio as double) < 1.0)
+    // the partitions of A now carry the lineage of the restore in step 2 (forward, a), p1 of A changed in B
     assertEquals(2 * (numPartitions - 1), lastEstimate.kept_partitions as int)
-    assertEquals(2 * (numPartitions - 1), lastEstimate.kept_b as int)
+    assertEquals(2 * (numPartitions - 1), (lastEstimate.kept_a as int) + (lastEstimate.kept_b as int))
     assertSame(dbA, dbB)
 
     setConfig("restore_reuse_min_partition_bytes", "1073741824")
