@@ -19,6 +19,7 @@
 
 #include <gen_cpp/AgentService_types.h>
 #include <gen_cpp/Descriptors_types.h>
+#include <gen_cpp/PaloInternalService_types.h>
 #include <gen_cpp/Types_types.h>
 #include <gen_cpp/olap_file.pb.h>
 #include <gtest/gtest.h>
@@ -28,8 +29,12 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <random>
+#include <shared_mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -39,9 +44,12 @@
 #include "common/status.h"
 #include "core/block/block.h"
 #include "core/column/column.h"
+#include "core/field.h"
+#include "core/value/vdatetime_value.h"
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
 #include "storage/data_dir.h"
+#include "storage/delete/delete_handler.h"
 #include "storage/merger.h"
 #include "storage/olap_common.h"
 #include "storage/options.h"
@@ -51,12 +59,17 @@
 #include "storage/rowset/rowset_reader.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
+#include "storage/mow/mow_transform_test_base.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet/tablet.h"
+#include "storage/tablet/tablet_manager.h"
 #include "storage/tablet/tablet_meta.h"
 #include "storage/tablet/tablet_schema.h"
 #include "storage/utils.h"
+#include "testutil/creators.h"
 #include "util/defer_op.h"
+#include "util/jsonb_parser_simd.h"
+#include "util/jsonb_writer.h"
 
 namespace doris {
 using namespace ErrorCode;
@@ -66,6 +79,7 @@ namespace restore_digest_ut {
 struct Cell {
     bool null = false;
     std::string b; // raw bytes for fixed width types, content for strings
+    std::optional<Field> field; // ARRAY / MAP / STRUCT values
 };
 using Row = std::vector<Cell>;
 
@@ -84,6 +98,49 @@ Cell S(std::string s) {
     Cell c;
     c.b = std::move(s);
     return c;
+}
+// the JSONB binary of a JSON text
+std::string jsonb(const std::string& json) {
+    JsonbWriter writer;
+    Status st = JsonbParser::parse(json.data(), json.size(), writer);
+    EXPECT_TRUE(st.ok()) << st;
+    return std::string(writer.getOutput()->getBuffer(), writer.getOutput()->getSize());
+}
+Cell F(Field f) {
+    Cell c;
+    c.field = std::move(f);
+    return c;
+}
+// DATE / DATETIME v1 (the in-memory packed VecDateTimeValue)
+Cell D1(int y, int mo, int d, int h = 0, int mi = 0, int sec = 0, bool datetime = false) {
+    VecDateTimeValue v;
+    v.unchecked_set_time(y, mo, d, h, mi, sec);
+    v.set_type(datetime ? TIME_DATETIME : TIME_DATE);
+    Cell c;
+    c.b.assign(reinterpret_cast<const char*>(&v), sizeof(v));
+    return c;
+}
+// nested values
+Field FI(int32_t v) {
+    return Field::create_field<TYPE_INT>(v);
+}
+Field FS(std::string v) {
+    return Field::create_field<TYPE_STRING>(std::move(v));
+}
+Field FNull() {
+    return Field();
+}
+Field FArr(Array a) {
+    return Field::create_field<TYPE_ARRAY>(std::move(a));
+}
+Field FMap(Array keys, Array values) {
+    Map m;
+    m.push_back(FArr(std::move(keys)));
+    m.push_back(FArr(std::move(values)));
+    return Field::create_field<TYPE_MAP>(std::move(m));
+}
+Field FStruct(Struct st) {
+    return Field::create_field<TYPE_STRUCT>(std::move(st));
 }
 
 struct ColSpec {
@@ -104,6 +161,8 @@ struct ColSpec {
     int precision;
     int frac;
     std::string aggregation;
+    std::string default_value;
+    std::vector<ColSpec> children; // ARRAY: element, MAP: key and value, STRUCT: fields
 };
 
 int32_t key_of(const Row& r) {
@@ -147,7 +206,8 @@ protected:
     // ---------------------------------------------------------------- schema
     TabletSchemaSPtr make_schema(KeysType keys_type, const std::vector<ColSpec>& cols,
                                  int sequence_idx = -1,
-                                 const std::vector<uint32_t>& cluster_key_uids = {}) {
+                                 const std::vector<uint32_t>& cluster_key_uids = {},
+                                 int schema_version = 0) {
         auto schema = std::make_shared<TabletSchema>();
         TabletSchemaPB pb;
         pb.set_keys_type(keys_type);
@@ -155,6 +215,7 @@ protected:
         pb.set_num_rows_per_row_block(1024);
         pb.set_compress_kind(COMPRESS_NONE);
         pb.set_next_column_unique_id(static_cast<int32_t>(cols.size()) + 1);
+        pb.set_schema_version(schema_version);
         if (sequence_idx >= 0) {
             pb.set_sequence_col_idx(sequence_idx);
         }
@@ -162,9 +223,10 @@ protected:
             pb.add_cluster_key_uids(uid);
         }
         int uid = 1;
-        for (const auto& spec : cols) {
-            ColumnPB* c = pb.add_column();
-            c->set_unique_id(uid++);
+        std::function<void(ColumnPB*, const ColSpec&, int)> fill = [&](ColumnPB* c,
+                                                                       const ColSpec& spec,
+                                                                       int unique_id) {
+            c->set_unique_id(unique_id);
             c->set_name(spec.name);
             c->set_type(spec.type);
             c->set_is_key(spec.key);
@@ -179,6 +241,15 @@ protected:
             if (!spec.aggregation.empty()) {
                 c->set_aggregation(spec.aggregation);
             }
+            if (!spec.default_value.empty()) {
+                c->set_default_value(spec.default_value);
+            }
+            for (const auto& child : spec.children) {
+                fill(c->add_children_columns(), child, -1);
+            }
+        };
+        for (const auto& spec : cols) {
+            fill(pb.add_column(), spec, uid++);
         }
         schema->init_from_pb(pb);
         return schema;
@@ -270,6 +341,8 @@ protected:
             for (size_t c = 0; c < r.size(); ++c) {
                 if (r[c].null) {
                     columns[c]->insert_data(nullptr, 0);
+                } else if (r[c].field.has_value()) {
+                    columns[c]->insert(*r[c].field);
                 } else {
                     columns[c]->insert_data(r[c].b.data(), r[c].b.size());
                 }
@@ -347,6 +420,123 @@ protected:
     // digest of rows written as one rowset
     RestoreDigest digest_rows(const TabletSchemaSPtr& schema, const std::vector<Row>& rows) {
         return digest_of(schema, {write_rowset(schema, rows, 2, 1000, false)});
+    }
+
+
+    // ---------------------------------------------------------------- helpers P2
+    static ColSpec with_children(ColSpec c, std::vector<ColSpec> children) {
+        c.children = std::move(children);
+        return c;
+    }
+
+    // A tablet object for the Merger and the MoR reader; only its meta (keys type) matters.
+    TabletSharedPtr make_meta_tablet(KeysType keys_type, const TabletSchemaSPtr& schema) {
+        std::vector<TColumn> tcols;
+        std::unordered_map<uint32_t, uint32_t> col_ordinal_to_unique_id;
+        for (size_t i = 0; i < schema->num_columns(); ++i) {
+            TColumn col;
+            col.column_type.type = TPrimitiveType::INT;
+            col.__set_column_name(schema->column(i).name());
+            col.__set_is_key(schema->column(i).is_key());
+            tcols.push_back(col);
+            col_ordinal_to_unique_id[i] = schema->column(i).unique_id();
+        }
+        TTabletSchema t_schema;
+        t_schema.__set_short_key_column_count(1);
+        t_schema.__set_schema_hash(3333);
+        t_schema.__set_keys_type(keys_type == UNIQUE_KEYS ? TKeysType::UNIQUE_KEYS
+                                                          : TKeysType::DUP_KEYS);
+        t_schema.__set_storage_type(TStorageType::COLUMN);
+        t_schema.__set_columns(tcols);
+        TabletMetaSharedPtr tablet_meta(new TabletMeta(
+                2, 2, 2, 2, 2, 2, t_schema, 2, col_ordinal_to_unique_id, UniqueId(1, 2),
+                TTabletType::TABLET_TYPE_DISK, TCompressionType::LZ4F, 0, false));
+        TabletSharedPtr tablet(new Tablet(*rd_engine_ref, tablet_meta, _data_dir));
+        static_cast<void>(tablet->init());
+        return tablet;
+    }
+
+    // Merges `inputs` into one rowset of version `out`, the way a compaction does (vertical
+    // merge: the delete predicates among the inputs are applied, unique keys are merged).
+    RowsetSharedPtr compact(const TabletSchemaSPtr& schema, const TabletSharedPtr& tablet,
+                            const std::vector<RowsetSharedPtr>& inputs, Version out,
+                            ReaderType reader_type = ReaderType::READER_BASE_COMPACTION) {
+        std::vector<RowsetReaderSharedPtr> readers;
+        for (const auto& rs : inputs) {
+            RowsetReaderSharedPtr reader;
+            EXPECT_TRUE(rs->create_reader(&reader).ok());
+            readers.push_back(std::move(reader));
+        }
+        auto ctx = make_writer_context(schema, out, false);
+        auto res = RowsetFactory::create_rowset_writer(*rd_engine_ref, ctx, true);
+        EXPECT_TRUE(res.has_value()) << res.error();
+        auto writer = std::move(res).value();
+        Merger::Statistics stats;
+        RowIdConversion rowid_conversion;
+        stats.rowid_conversion = &rowid_conversion;
+        Status st = Merger::vertical_merge_rowsets(tablet, reader_type, *schema, readers,
+                                                   writer.get(), 100, 2, &stats);
+        EXPECT_TRUE(st.ok()) << st;
+        RowsetSharedPtr merged;
+        EXPECT_EQ(Status::OK(), writer->build(merged));
+        return merged;
+    }
+
+    static TCondition cond(const std::string& column, const std::string& op,
+                           std::vector<std::string> values) {
+        TCondition c;
+        c.column_name = column;
+        c.condition_op = op;
+        c.condition_values = std::move(values);
+        return c;
+    }
+
+    // A rowset without rows which carries a DELETE condition (what DELETE FROM ... WHERE writes).
+    RowsetSharedPtr write_delete_rowset(const TabletSchemaSPtr& schema, int64_t version,
+                                        const std::vector<TCondition>& conditions) {
+        DeletePredicatePB pred;
+        Status st = DeleteHandler::generate_delete_predicate(*schema, conditions, &pred);
+        EXPECT_TRUE(st.ok()) << st;
+        auto ctx = make_writer_context(schema, Version(version, version), false);
+        auto res = RowsetFactory::create_rowset_writer(*rd_engine_ref, ctx, true);
+        EXPECT_TRUE(res.has_value()) << res.error();
+        auto writer = std::move(res).value();
+        RowsetSharedPtr rowset;
+        EXPECT_EQ(Status::OK(), writer->build(rowset));
+        rowset->rowset_meta()->set_delete_predicate(std::move(pred));
+        return rowset;
+    }
+
+    RestoreDigest mor_digest(const TabletSchemaSPtr& schema, std::vector<RowsetSharedPtr> rowsets,
+                             const TabletSharedPtr& tablet, int64_t version = 100) {
+        RestoreDigestInput in;
+        in.rowsets = std::move(rowsets);
+        in.schema = schema;
+        in.keys_type = UNIQUE_KEYS;
+        in.enable_mow = false;
+        in.version = version;
+        in.tablet = tablet;
+        RestoreDigest d;
+        Status st = compute_restore_digest(in, &d);
+        EXPECT_TRUE(st.ok()) << st;
+        return d;
+    }
+
+    RestoreDigest threaded_digest(const TabletSchemaSPtr& schema,
+                                  std::vector<RowsetSharedPtr> rowsets, KeysType keys_type,
+                                  bool mow, DeleteBitmapPtr bitmap, int64_t version, int threads) {
+        RestoreDigestInput in;
+        in.rowsets = std::move(rowsets);
+        in.schema = schema;
+        in.keys_type = keys_type;
+        in.enable_mow = mow;
+        in.delete_bitmap = std::move(bitmap);
+        in.version = version;
+        in.threads = threads;
+        RestoreDigest d;
+        Status st = compute_restore_digest(in, &d);
+        EXPECT_TRUE(st.ok()) << st;
+        return d;
     }
 
     std::string _dir;
@@ -827,6 +1017,801 @@ TEST_F(RestoreDigestMowTest, SameVisibleRowsSameDigest) {
     EXPECT_NE(seq_changed.root, seq_other.root);
 }
 
+// ===== 6. delete predicates =================================================================
+
+namespace {
+struct Rec {
+    int k;
+    std::optional<int> v;
+    std::string s;
+};
+} // namespace
+
+class RestoreDigestDeleteTest : public RestoreDigestTest {
+protected:
+    static std::vector<ColSpec> cols() {
+        return {{"k", "INT", true, false, 4},
+                {"v", "INT", false, true, 4},
+                {"s", "VARCHAR", false, true, 16}};
+    }
+    static Row to_row(const Rec& r) {
+        return {V<int32_t>(r.k), r.v.has_value() ? V<int32_t>(*r.v) : N(), S(r.s)};
+    }
+    static std::vector<Row> rows_of(const std::vector<Rec>& recs) {
+        std::vector<Row> out;
+        for (const Rec& r : recs) {
+            out.push_back(to_row(r));
+        }
+        return out;
+    }
+    static std::vector<Rec> concat(std::vector<Rec> a, const std::vector<Rec>& b) {
+        a.insert(a.end(), b.begin(), b.end());
+        return a;
+    }
+};
+
+TEST_F(RestoreDigestDeleteTest, AppliedByVersionAndStableAcrossCompaction) {
+    auto schema = make_schema(DUP_KEYS, cols());
+    std::vector<Rec> a;
+    std::vector<Rec> b;
+    std::vector<Rec> c;
+    std::vector<Rec> e;
+    for (int k = 0; k < 200; ++k) {
+        a.push_back({k, k % 7 == 0 ? std::nullopt : std::optional<int>(k % 10), "a" + std::to_string(k)});
+    }
+    for (int k = 100; k < 260; ++k) { // keys 100..199 exist in `a` as well: duplicates stay
+        b.push_back({k, (k * 3) % 10, "b" + std::to_string(k)});
+    }
+    for (int k = 300; k < 341; ++k) {
+        c.push_back({k, 3, "c" + std::to_string(k)});
+    }
+    for (int k = 400; k < 411; ++k) {
+        e.push_back({k, 7, "e" + std::to_string(k)});
+    }
+    // d4: DELETE WHERE k >= 10 AND v = 3 (version 4), d6: DELETE WHERE v = 7 (version 6)
+    auto d4 = [](const Rec& r) { return r.k >= 10 && r.v.has_value() && *r.v == 3; };
+    auto d6 = [](const Rec& r) { return r.v.has_value() && *r.v == 7; };
+    auto survivors_at = [&](int ver) {
+        std::vector<Rec> out;
+        auto keep_old = [&](const Rec& r) { return !((ver >= 4 && d4(r)) || (ver >= 6 && d6(r))); };
+        for (const Rec& r : a) {
+            if (keep_old(r)) {
+                out.push_back(r);
+            }
+        }
+        for (const Rec& r : b) {
+            if (ver >= 3 && keep_old(r)) {
+                out.push_back(r);
+            }
+        }
+        if (ver >= 5) {
+            for (const Rec& r : c) {
+                if (!(ver >= 6 && d6(r))) {
+                    out.push_back(r);
+                }
+            }
+        }
+        if (ver >= 7) {
+            out.insert(out.end(), e.begin(), e.end());
+        }
+        return out;
+    };
+
+    auto rs2 = write_rowset(schema, rows_of(a), 2, 50, false);
+    auto rs3 = write_rowset(schema, rows_of(b), 3, 37, true);
+    auto rs4 = write_delete_rowset(schema, 4, {cond("k", ">=", {"10"}), cond("v", "=", {"3"})});
+    auto rs5 = write_rowset(schema, rows_of(c), 5, 20, false);
+    auto rs6 = write_delete_rowset(schema, 6, {cond("v", "=", {"7"})});
+    auto rs7 = write_rowset(schema, rows_of(e), 7, 20, false);
+    ASSERT_TRUE(rs4->rowset_meta()->has_delete_predicate());
+    ASSERT_EQ(0, rs4->num_rows());
+
+    // every prefix of the version chain sees the conditions up to its version
+    const std::vector<RowsetSharedPtr> all = {rs2, rs3, rs4, rs5, rs6, rs7};
+    for (int ver = 3; ver <= 7; ++ver) {
+        std::vector<RowsetSharedPtr> prefix(all.begin(), all.begin() + (ver - 1));
+        RestoreDigest d = digest_of(schema, prefix, DUP_KEYS, false, nullptr, ver);
+        auto expect = survivors_at(ver);
+        RestoreDigest ref = digest_rows(schema, rows_of(expect));
+        EXPECT_TRUE(same_digest(ref, d)) << "version " << ver;
+        EXPECT_EQ(expect.size(), d.rows) << "version " << ver;
+        EXPECT_EQ(ver >= 6 ? 2U : (ver >= 4 ? 1U : 0U), d.delete_predicates) << "version " << ver;
+    }
+
+    RestoreDigest with_pred = digest_of(schema, all, DUP_KEYS, false, nullptr, 7);
+    // the same rowsets without the delete conditions give another digest
+    RestoreDigest without_pred = digest_of(schema, {rs2, rs3, rs5, rs7}, DUP_KEYS, false, nullptr, 7);
+    EXPECT_NE(with_pred.root, without_pred.root);
+    EXPECT_GT(without_pred.rows, with_pred.rows);
+
+    // layout: the same rows below the first condition cut into other rowsets and segments
+    {
+        auto ab = concat(a, b);
+        std::mt19937 rng(7);
+        std::shuffle(ab.begin(), ab.end(), rng);
+        std::vector<Rec> h1(ab.begin(), ab.begin() + 170);
+        std::vector<Rec> h2(ab.begin() + 170, ab.end());
+        auto x2 = write_rowset(schema, rows_of(h1), 2, 11, true);
+        auto x3 = write_rowset(schema, rows_of(h2), 3, 1000, false);
+        RestoreDigest d = digest_of(schema, {x2, x3, rs4, rs5, rs6, rs7}, DUP_KEYS, false, nullptr, 7);
+        EXPECT_TRUE(same_digest(with_pred, d));
+    }
+
+    // compaction physically drops the rows; the digest does not move
+    auto tablet = make_meta_tablet(DUP_KEYS, schema);
+    const size_t expect_rows = survivors_at(7).size();
+    auto m24 = compact(schema, tablet, {rs2, rs3, rs4}, Version(2, 4));
+    ASSERT_NE(nullptr, m24);
+    EXPECT_EQ(survivors_at(4).size(), m24->num_rows()) << "compaction did not apply the condition";
+    EXPECT_TRUE(same_digest(with_pred, digest_of(schema, {m24, rs5, rs6, rs7}, DUP_KEYS, false, nullptr, 7)));
+    EXPECT_TRUE(same_digest(digest_rows(schema, rows_of(survivors_at(4))),
+                            digest_of(schema, {m24}, DUP_KEYS, false, nullptr, 4)));
+
+    // a cumulative compaction below the conditions keeps them effective for its rows
+    auto m23 = compact(schema, tablet, {rs2, rs3}, Version(2, 3),
+                       ReaderType::READER_CUMULATIVE_COMPACTION);
+    ASSERT_NE(nullptr, m23);
+    EXPECT_EQ(a.size() + b.size(), m23->num_rows());
+    EXPECT_TRUE(same_digest(with_pred, digest_of(schema, {m23, rs4, rs5, rs6, rs7}, DUP_KEYS, false, nullptr, 7)));
+
+    auto m27 = compact(schema, tablet, {rs2, rs3, rs4, rs5, rs6, rs7}, Version(2, 7));
+    ASSERT_NE(nullptr, m27);
+    EXPECT_EQ(expect_rows, m27->num_rows());
+    RestoreDigest after = digest_of(schema, {m27}, DUP_KEYS, false, nullptr, 7);
+    EXPECT_TRUE(same_digest(with_pred, after));
+    EXPECT_EQ(0U, after.delete_predicates);
+}
+
+TEST_F(RestoreDigestDeleteTest, Operators) {
+    auto schema = make_schema(DUP_KEYS, cols());
+    std::vector<Rec> rows;
+    for (int k = 0; k < 60; ++k) {
+        rows.push_back({k, k % 4 == 0 ? std::nullopt : std::optional<int>(k % 6), "a" + std::to_string(k)});
+    }
+    struct Case {
+        std::string name;
+        std::vector<TCondition> conds;
+        std::function<bool(const Rec&)> deleted;
+    };
+    auto is = [](const Rec& r, int x) { return r.v.has_value() && *r.v == x; };
+    std::vector<Case> cases = {
+            {"v = 3", {cond("v", "=", {"3"})}, [&](const Rec& r) { return is(r, 3); }},
+            {"v != 3", {cond("v", "!=", {"3"})}, [&](const Rec& r) { return r.v.has_value() && *r.v != 3; }},
+            {"v < 2", {cond("v", "<", {"2"})}, [&](const Rec& r) { return r.v.has_value() && *r.v < 2; }},
+            {"v >= 4", {cond("v", ">=", {"4"})}, [&](const Rec& r) { return r.v.has_value() && *r.v >= 4; }},
+            {"v IS NULL", {cond("v", "IS", {"NULL"})}, [&](const Rec& r) { return !r.v.has_value(); }},
+            {"v IS NOT NULL", {cond("v", "IS", {"NOT NULL"})}, [&](const Rec& r) { return r.v.has_value(); }},
+            {"v IN (1,2)", {cond("v", "*=", {"1", "2"})}, [&](const Rec& r) { return is(r, 1) || is(r, 2); }},
+            {"v NOT IN (1,2)", {cond("v", "!*=", {"1", "2"})},
+             [&](const Rec& r) { return r.v.has_value() && !is(r, 1) && !is(r, 2); }},
+            {"k >= 10 AND k < 30 AND v = 1",
+             {cond("k", ">=", {"10"}), cond("k", "<", {"30"}), cond("v", "=", {"1"})},
+             [&](const Rec& r) { return r.k >= 10 && r.k < 30 && is(r, 1); }},
+            {"s = a5", {cond("s", "=", {"a5"})}, [&](const Rec& r) { return r.s == "a5"; }},
+    };
+    std::vector<Rec> first(rows.begin(), rows.begin() + 25);
+    std::vector<Rec> second(rows.begin() + 25, rows.end());
+    for (const Case& cs : cases) {
+        auto rs2 = write_rowset(schema, rows_of(first), 2, 7, true);
+        auto rs3 = write_rowset(schema, rows_of(second), 3, 13, false);
+        auto del = write_delete_rowset(schema, 4, cs.conds);
+        std::vector<Rec> expect;
+        for (const Rec& r : rows) {
+            if (!cs.deleted(r)) {
+                expect.push_back(r);
+            }
+        }
+        RestoreDigest d = digest_of(schema, {rs2, rs3, del}, DUP_KEYS, false, nullptr, 4);
+        EXPECT_TRUE(same_digest(digest_rows(schema, rows_of(expect)), d)) << cs.name;
+        EXPECT_EQ(expect.size(), d.rows) << cs.name;
+        EXPECT_LT(expect.size(), rows.size()) << cs.name << " matched nothing";
+    }
+}
+
+TEST_F(RestoreDigestDeleteTest, MergeOnWriteWithBitmapAndCondition) {
+    std::vector<ColSpec> cols = {{"k", "INT", true, false, 4},
+                                 {"v1", "INT", false, true, 4},
+                                 {DELETE_SIGN, "TINYINT", false, false, 1}};
+    auto schema = make_schema(UNIQUE_KEYS, cols);
+    auto row = [](int k, int v, int del = 0) { return Row {V<int32_t>(k), V<int32_t>(v), V<int8_t>(del)}; };
+    std::vector<Row> r2;
+    for (int k = 1; k <= 10; ++k) {
+        r2.push_back(row(k, k * 10));
+    }
+    auto rs2 = write_rowset(schema, r2, 2, 1000, false);
+    auto rs3 = write_rowset(schema, {row(3, 31)}, 3, 1000, false);
+    auto rs4 = write_delete_rowset(schema, 4, {cond("v1", "=", {"50"})});
+    auto rs5 = write_rowset(schema, {row(5, 50), row(8, 0, 1)}, 5, 1000, false);
+    auto bitmap = std::make_shared<DeleteBitmap>(990010);
+    bitmap->add({rs2->rowset_id(), 0, 3}, 2); // k=3 replaced at v3
+    bitmap->add({rs2->rowset_id(), 0, 5}, 4); // k=5 rewritten at v5 (the old row is also hit by d4)
+    bitmap->add({rs2->rowset_id(), 0, 5}, 7); // k=8 deleted at v5
+
+    auto expect_at = [&](int ver) {
+        std::vector<Row> rows;
+        for (int k = 1; k <= 10; ++k) {
+            int v = k * 10;
+            if (k == 3 && ver >= 3) {
+                v = 31;
+            }
+            if (k == 5) {
+                if (ver >= 5) {
+                    v = 50; // the new row of version 5 is not hit by the condition of version 4
+                } else if (ver >= 4) {
+                    continue; // deleted by v1 = 50
+                }
+            }
+            if (k == 8 && ver >= 5) {
+                continue;
+            }
+            rows.push_back(row(k, v));
+        }
+        return rows;
+    };
+    const std::vector<RowsetSharedPtr> all = {rs2, rs3, rs4, rs5};
+    for (int ver = 3; ver <= 5; ++ver) {
+        std::vector<RowsetSharedPtr> prefix(all.begin(), all.begin() + (ver - 1));
+        RestoreDigest d = digest_of(schema, prefix, UNIQUE_KEYS, true, bitmap, ver);
+        auto expect = expect_at(ver);
+        RestoreDigest ref = digest_of(schema, {write_rowset(schema, expect, 2, 3, true)}, UNIQUE_KEYS,
+                                      true, std::make_shared<DeleteBitmap>(990011), 100);
+        EXPECT_TRUE(same_digest(ref, d)) << "version " << ver;
+        EXPECT_EQ(expect.size(), d.rows) << "version " << ver;
+    }
+}
+
+// ===== 7. unique merge-on-read ===============================================================
+
+class RestoreDigestMorTest : public RestoreDigestTest {
+protected:
+    struct MRow {
+        int k;
+        int v1;
+        std::string v2;
+        int seq;
+        int del;
+    };
+    static std::vector<ColSpec> mor_cols(bool has_seq) {
+        std::vector<ColSpec> c = {{"k", "INT", true, false, 4},
+                                  {"v1", "INT", false, true, 4},
+                                  {"v2", "VARCHAR", false, true, 16}};
+        if (has_seq) {
+            c.push_back({SEQUENCE_COL, "INT", false, false, 4});
+        }
+        c.push_back({DELETE_SIGN, "TINYINT", false, false, 1});
+        return c;
+    }
+    static Row to_row(bool has_seq, const MRow& r) {
+        Row out = {V<int32_t>(r.k), V<int32_t>(r.v1), S(r.v2)};
+        if (has_seq) {
+            out.push_back(V<int32_t>(r.seq));
+        }
+        out.push_back(V<int8_t>(static_cast<int8_t>(r.del)));
+        return out;
+    }
+    static std::vector<Row> rows_of(bool has_seq, const std::vector<MRow>& rs) {
+        std::vector<Row> out;
+        for (const auto& r : rs) {
+            out.push_back(to_row(has_seq, r));
+        }
+        return out;
+    }
+    // the visible rows after the versions `1..n` of `versions` were applied
+    static std::vector<MRow> visible(bool has_seq, const std::vector<std::vector<MRow>>& versions,
+                                     size_t n) {
+        std::map<int, MRow> state;
+        for (size_t i = 0; i < n; ++i) {
+            for (const MRow& r : versions[i]) {
+                auto it = state.find(r.k);
+                if (it == state.end() || !has_seq || r.seq >= it->second.seq) {
+                    state[r.k] = r;
+                }
+            }
+        }
+        std::vector<MRow> out;
+        for (const auto& [k, r] : state) {
+            if (r.del == 0) {
+                out.push_back(r);
+            }
+        }
+        return out;
+    }
+
+    void run(bool has_seq) {
+        auto schema = make_schema(UNIQUE_KEYS, mor_cols(has_seq), has_seq ? 3 : -1);
+        auto tablet = make_meta_tablet(UNIQUE_KEYS, schema);
+        std::vector<std::vector<MRow>> versions(5);
+        for (int k = 1; k <= 10; ++k) {
+            versions[0].push_back({k, k * 10, "a" + std::to_string(k), 1, 0});
+        }
+        versions[1] = {{3, 31, "b3", 2, 0}, {5, 51, "b5", 2, 0}};
+        versions[2] = {{3, 32, "c3", 4, 0}, {7, 0, "", 3, 1}, {11, 110, "n11", 3, 0}};
+        versions[3] = {{7, 70, "d7", 5, 0}, {9, 0, "", 5, 1}};
+        // with a sequence column this row loses against seq 4, without one it is simply newer
+        versions[4] = {{3, 99, "z3", 1, 0}};
+
+        std::vector<RowsetSharedPtr> rowsets;
+        for (size_t i = 0; i < versions.size(); ++i) {
+            rowsets.push_back(write_rowset(schema, rows_of(has_seq, versions[i]),
+                                           static_cast<int64_t>(i) + 2, 4, i % 2 == 0));
+        }
+        std::vector<RestoreDigest> expected;
+        for (size_t n = 1; n <= versions.size(); ++n) {
+            auto vis = visible(has_seq, versions, n);
+            RestoreDigest ref =
+                    mor_digest(schema, {write_rowset(schema, rows_of(has_seq, vis), 2, 1000, false)}, tablet);
+            ASSERT_EQ(vis.size(), ref.rows);
+            expected.push_back(ref);
+            std::vector<RowsetSharedPtr> prefix(rowsets.begin(), rowsets.begin() + n);
+            RestoreDigest d = mor_digest(schema, prefix, tablet, static_cast<int64_t>(n) + 1);
+            EXPECT_TRUE(same_digest(ref, d)) << "has_seq=" << has_seq << " version " << n + 1;
+            EXPECT_EQ(vis.size(), d.rows);
+            EXPECT_EQ(1U, d.threads);
+        }
+        if (has_seq) {
+            // key 3 keeps the row with the highest sequence value, v5 changed nothing
+            EXPECT_TRUE(same_digest(expected[3], expected[4]));
+        } else {
+            EXPECT_FALSE(same_digest(expected[3], expected[4]));
+        }
+
+        // other layout: every version in one rowset per key range, tiny segments
+        {
+            std::vector<RowsetSharedPtr> other;
+            for (size_t i = 0; i < versions.size(); ++i) {
+                other.push_back(write_rowset(schema, rows_of(has_seq, versions[i]),
+                                             static_cast<int64_t>(i) + 2, 1, i % 2 == 1));
+            }
+            EXPECT_TRUE(same_digest(expected[4], mor_digest(schema, other, tablet, 6)));
+        }
+
+        // compaction of a prefix, and of everything
+        auto c24 = compact(schema, tablet, {rowsets[0], rowsets[1], rowsets[2]}, Version(2, 4));
+        ASSERT_NE(nullptr, c24);
+        EXPECT_TRUE(same_digest(expected[4],
+                                mor_digest(schema, {c24, rowsets[3], rowsets[4]}, tablet, 6)));
+        EXPECT_TRUE(same_digest(expected[2], mor_digest(schema, {c24}, tablet, 4)));
+        auto c26 = compact(schema, tablet, rowsets, Version(2, 6));
+        ASSERT_NE(nullptr, c26);
+        EXPECT_TRUE(same_digest(expected[4], mor_digest(schema, {c26}, tablet, 6)));
+        auto c46 = compact(schema, tablet, {rowsets[2], rowsets[3], rowsets[4]}, Version(4, 6),
+                           ReaderType::READER_CUMULATIVE_COMPACTION);
+        ASSERT_NE(nullptr, c46);
+        EXPECT_TRUE(same_digest(expected[4], mor_digest(schema, {rowsets[0], rowsets[1], c46}, tablet, 6)));
+
+        // any change shows: a value, a delete sign, a missing update
+        auto mutate = [&](size_t version_idx, size_t row_idx, const std::function<void(MRow&)>& f) {
+            auto copy = versions;
+            f(copy[version_idx][row_idx]);
+            std::vector<RowsetSharedPtr> rs;
+            for (size_t i = 0; i < copy.size(); ++i) {
+                rs.push_back(write_rowset(schema, rows_of(has_seq, copy[i]), static_cast<int64_t>(i) + 2, 4, false));
+            }
+            return mor_digest(schema, rs, tablet, 6).root;
+        };
+        std::set<std::string> roots {expected[4].root};
+        roots.insert(mutate(0, 0, [](MRow& r) { r.v1 += 1; }));
+        roots.insert(mutate(3, 0, [](MRow& r) { r.v2 = "d7x"; }));
+        roots.insert(mutate(3, 1, [](MRow& r) { r.del = 0; })); // key 9 stays
+        roots.insert(mutate(2, 1, [](MRow& r) { r.del = 0; })); // key 7 deleted -> not deleted: still replaced at v5
+        roots.insert(mutate(1, 1, [](MRow& r) { r.v1 = 52; }));
+        // the last one only matters when the version / sequence order decides
+        EXPECT_GE(roots.size(), 5U);
+    }
+};
+
+TEST_F(RestoreDigestMorTest, MultipleUpdatesEqualFinalRowsWithSequenceColumn) {
+    run(true);
+}
+
+TEST_F(RestoreDigestMorTest, MultipleUpdatesEqualFinalRowsWithoutSequenceColumn) {
+    run(false);
+}
+
+// ===== 8. types added in P2 ==================================================================
+
+class RestoreDigestTypesTest : public RestoreDigestTest {
+protected:
+    static std::vector<ColSpec> type_cols() {
+        return {{"k", "INT", true, false, 4},
+                with_children({"c_arr", "ARRAY", false, true, 24}, {{"item", "INT", false, true, 4}}),
+                with_children({"c_arr_s", "ARRAY", false, true, 24},
+                              {{"item", "VARCHAR", false, true, 16}}),
+                with_children({"c_arr2", "ARRAY", false, true, 24},
+                              {with_children({"item", "ARRAY", false, true, 24},
+                                             {{"item", "INT", false, true, 4}})}),
+                with_children({"c_map", "MAP", false, true, 24},
+                              {{"key", "VARCHAR", false, true, 16}, {"value", "INT", false, true, 4}}),
+                with_children({"c_st", "STRUCT", false, true, 24},
+                              {{"a", "INT", false, true, 4}, {"b", "VARCHAR", false, true, 16}}),
+                {"c_json", "JSONB", false, true, 64},
+                {"c_dec2", "DECIMAL", false, true, 16, 27, 9},
+                {"c_date1", "DATE", false, true, 3},
+                {"c_dt1", "DATETIME", false, true, 8}};
+    }
+    static Field opt(bool null, int v) { return null ? FNull() : FI(v); }
+
+    // Deterministic row; every nullable column, and the elements, are sometimes NULL.
+    static Row typed_row(int i) {
+        auto nul = [&](int c) { return (i + c) % (c + 4) == 0; };
+        Row r;
+        r.push_back(V<int32_t>(i));
+        {
+            Array a;
+            for (int j = 0; j < i % 4; ++j) {
+                a.push_back(opt((i + j) % 5 == 0, i * 10 + j));
+            }
+            r.push_back(nul(1) ? N() : F(FArr(a)));
+        }
+        {
+            Array a;
+            for (int j = 0; j < i % 3; ++j) {
+                a.push_back((i + j) % 4 == 0 ? FNull() : FS(std::string(static_cast<size_t>(j), 'q') + std::to_string(i)));
+            }
+            r.push_back(nul(2) ? N() : F(FArr(a)));
+        }
+        {
+            Array outer;
+            for (int j = 0; j < i % 3; ++j) {
+                Array inner;
+                for (int m = 0; m < (i + j) % 3; ++m) {
+                    inner.push_back(opt(m == 1 && i % 2 == 0, j * 100 + m));
+                }
+                outer.push_back(FArr(inner));
+            }
+            r.push_back(nul(3) ? N() : F(FArr(outer)));
+        }
+        {
+            Array keys;
+            Array values;
+            for (int j = 0; j < i % 3; ++j) {
+                keys.push_back(FS("k" + std::to_string(j)));
+                values.push_back(opt((i + j) % 4 == 0, i + j));
+            }
+            r.push_back(nul(4) ? N() : F(FMap(keys, values)));
+        }
+        {
+            Struct st;
+            st.push_back(opt(i % 3 == 0, i));
+            st.push_back(i % 5 == 0 ? FNull() : FS("s" + std::to_string(i % 11)));
+            r.push_back(nul(5) ? N() : F(FStruct(st)));
+        }
+        r.push_back(nul(6) ? N() : S(jsonb("{\"id\":" + std::to_string(i) + "}")));
+        r.push_back(nul(7) ? N() : V<__int128>(static_cast<__int128>(i) * 1000000007LL));
+        r.push_back(nul(8) ? N() : D1(2000 + i % 30, 1 + i % 12, 1 + i % 28));
+        r.push_back(nul(9) ? N() : D1(2000 + i % 30, 1 + i % 12, 1 + i % 28, i % 24, i % 60, (i * 7) % 60, true));
+        return r;
+    }
+};
+
+TEST_F(RestoreDigestTypesTest, LayoutIndependenceAndCompaction) {
+    auto schema = make_schema(DUP_KEYS, type_cols());
+    std::vector<Row> rows;
+    for (int i = 0; i < 300; ++i) {
+        rows.push_back(typed_row(i));
+    }
+    for (int i = 0; i < 12; ++i) { // exact duplicates
+        rows.push_back(typed_row(i * 5));
+    }
+    RestoreDigest base = digest_of(schema, {write_rowset(schema, rows, 2, 100000, false)});
+    ASSERT_EQ(rows.size(), base.rows);
+
+    std::mt19937 rng(11);
+    auto shuffled = rows;
+    std::shuffle(shuffled.begin(), shuffled.end(), rng);
+    size_t half = shuffled.size() / 2;
+    std::vector<Row> p1(shuffled.begin(), shuffled.begin() + half);
+    std::vector<Row> p2(shuffled.begin() + half, shuffled.end());
+    auto x2 = write_rowset(schema, p1, 2, 33, true);
+    auto x3 = write_rowset(schema, p2, 3, 41, false);
+    EXPECT_TRUE(same_digest(base, digest_of(schema, {x2, x3})));
+    EXPECT_TRUE(same_digest(base, digest_of(schema, {write_rowset(schema, rows, 2, 7, true)})));
+
+    // compaction (vertical merge) of the two rowsets
+    auto tablet = make_meta_tablet(DUP_KEYS, schema);
+    auto merged = compact(schema, tablet, {x2, x3}, Version(2, 3));
+    ASSERT_NE(nullptr, merged);
+    ASSERT_EQ(rows.size(), merged->num_rows());
+    EXPECT_TRUE(same_digest(base, digest_of(schema, {merged})));
+}
+
+TEST_F(RestoreDigestTypesTest, AnyChangeChangesDigest) {
+    auto schema = make_schema(DUP_KEYS, type_cols());
+    auto arr = [](std::vector<Field> v) {
+        Array a;
+        for (auto& f : v) {
+            a.push_back(f);
+        }
+        return F(FArr(a));
+    };
+    auto arr_s = arr;
+    auto st = [](Field a, Field b) {
+        Struct s;
+        s.push_back(std::move(a));
+        s.push_back(std::move(b));
+        return F(FStruct(s));
+    };
+    auto mp = [](std::vector<std::pair<std::string, std::optional<int>>> kv) {
+        Array keys;
+        Array values;
+        for (auto& [k, v] : kv) {
+            keys.push_back(FS(k));
+            values.push_back(v.has_value() ? FI(*v) : FNull());
+        }
+        return F(FMap(keys, values));
+    };
+    auto nested = [](std::vector<std::vector<std::optional<int>>> v) {
+        Array outer;
+        for (auto& in : v) {
+            Array inner;
+            for (auto& e : in) {
+                inner.push_back(e.has_value() ? FI(*e) : FNull());
+            }
+            outer.push_back(FArr(inner));
+        }
+        return F(FArr(outer));
+    };
+    // base: col index -> value
+    auto base_row = [&]() {
+        Row r;
+        r.push_back(V<int32_t>(1));
+        r.push_back(arr({FI(1), FNull(), FI(3)}));
+        r.push_back(arr_s({FS("a"), FS("bc")}));
+        r.push_back(nested({{1}, {2, 3}}));
+        r.push_back(mp({{"x", 1}, {"y", std::nullopt}}));
+        r.push_back(st(FI(5), FS("s")));
+        r.push_back(S(jsonb("{\"a\":1}")));
+        r.push_back(V<__int128>(static_cast<__int128>(12345)));
+        r.push_back(D1(2024, 3, 15));
+        r.push_back(D1(2024, 3, 15, 10, 20, 30, true));
+        return r;
+    };
+    std::vector<std::pair<std::string, Row>> cases;
+    cases.push_back({"base", base_row()});
+    auto add = [&](const std::string& name, size_t col, Cell c) {
+        Row r = base_row();
+        r[col] = std::move(c);
+        cases.push_back({name, std::move(r)});
+    };
+    add("arr [1,NULL,4]", 1, arr({FI(1), FNull(), FI(4)}));
+    add("arr [1,3]", 1, arr({FI(1), FI(3)}));
+    add("arr [1,NULL,3,3]", 1, arr({FI(1), FNull(), FI(3), FI(3)}));
+    add("arr [NULL,1,3]", 1, arr({FNull(), FI(1), FI(3)}));
+    add("arr []", 1, arr({}));
+    add("arr NULL", 1, N());
+    add("arr [0]", 1, arr({FI(0)}));
+    add("arr [NULL]", 1, arr({FNull()}));
+    add("arr_s [ab,c]", 2, arr_s({FS("ab"), FS("c")}));
+    add("arr_s [a,bc,'']", 2, arr_s({FS("a"), FS("bc"), FS("")}));
+    add("arr_s [a,NULL]", 2, arr_s({FS("a"), FNull()}));
+    add("arr_s ['']", 2, arr_s({FS("")}));
+    add("arr_s []", 2, arr_s({}));
+    add("arr2 [[1,2],[3]]", 3, nested({{1, 2}, {3}}));
+    add("arr2 [[1],[2],[3]]", 3, nested({{1}, {2}, {3}}));
+    add("arr2 [[1],[2,3],[]]", 3, nested({{1}, {2, 3}, {}}));
+    add("arr2 [[1],[2,NULL]]", 3, nested({{1}, {2, std::nullopt}}));
+    add("arr2 [[1,2,3]]", 3, nested({{1, 2, 3}}));
+    add("arr2 []", 3, nested({}));
+    add("map x:1,y:2", 4, mp({{"x", 1}, {"y", 2}}));
+    add("map y:NULL,x:1 (order)", 4, mp({{"y", std::nullopt}, {"x", 1}}));
+    add("map x:1", 4, mp({{"x", 1}}));
+    add("map +z:0", 4, mp({{"x", 1}, {"y", std::nullopt}, {"z", 0}}));
+    add("map x:NULL,y:1", 4, mp({{"x", std::nullopt}, {"y", 1}}));
+    add("map xy:1", 4, mp({{"xy", 1}}));
+    add("map {}", 4, mp({}));
+    add("map NULL", 4, N());
+    add("st (5,t)", 5, st(FI(5), FS("t")));
+    add("st (6,s)", 5, st(FI(6), FS("s")));
+    add("st (NULL,s)", 5, st(FNull(), FS("s")));
+    add("st (5,NULL)", 5, st(FI(5), FNull()));
+    add("st (NULL,NULL)", 5, st(FNull(), FNull()));
+    add("st NULL", 5, N());
+    add("json byte", 6, S(jsonb("{\"a\":2}")));
+    add("json longer", 6, S(jsonb("{\"a\":1,\"b\":[1,2]}")));
+    add("json empty obj", 6, S(jsonb("{}")));
+    add("json NULL", 6, N());
+    add("dec +1", 7, V<__int128>(static_cast<__int128>(12346)));
+    add("dec NULL", 7, N());
+    add("date +1 day", 8, D1(2024, 3, 16));
+    add("date other month", 8, D1(2024, 4, 15));
+    add("date NULL", 8, N());
+    add("dt +1 sec", 9, D1(2024, 3, 15, 10, 20, 31, true));
+    add("dt other hour", 9, D1(2024, 3, 15, 11, 20, 30, true));
+    add("dt NULL", 9, N());
+
+    std::vector<std::pair<std::string, std::string>> roots;
+    for (const auto& [name, row] : cases) {
+        roots.push_back({name, digest_rows(schema, {row}).root});
+    }
+    expect_pairwise_different(roots);
+}
+
+TEST_F(RestoreDigestTypesTest, EncodingSpecGolden) {
+    // locks the byte layout of the types added after the first cut
+    auto schema = make_schema(
+            DUP_KEYS,
+            {{"k", "INT", true, false, 4},
+             with_children({"a", "ARRAY", false, true, 24}, {{"item", "INT", false, true, 4}}),
+             with_children({"m", "MAP", false, true, 24},
+                           {{"key", "VARCHAR", false, true, 16}, {"value", "INT", false, true, 4}}),
+             with_children({"st", "STRUCT", false, true, 24},
+                           {{"x", "INT", false, true, 4}, {"y", "VARCHAR", false, true, 16}}),
+             {"d", "DATE", false, true, 3},
+             {"dt", "DATETIME", false, true, 8},
+             {"dec", "DECIMAL", false, true, 16, 27, 9},
+             {"j", "JSONB", false, true, 64}});
+    Array elems = {FI(1), FNull()};
+    Struct fields;
+    fields.push_back(FI(5));
+    fields.push_back(FNull());
+    const std::string json = jsonb("{\"q\":[1,null]}");
+    Row row = {V<int32_t>(1),
+               F(FArr(elems)),
+               F(FMap({FS("x")}, {FI(7)})),
+               F(FStruct(fields)),
+               D1(2024, 3, 15),
+               D1(2024, 3, 15, 10, 20, 30, true),
+               V<__int128>(static_cast<__int128>(123456789012345678LL)),
+               S(json)};
+    RestoreDigest d = digest_rows(schema, {row});
+    ASSERT_EQ(1, d.rows);
+
+    std::string e;
+    auto u32 = [&](uint32_t v) { e.append(reinterpret_cast<const char*>(&v), 4); };
+    auto u64 = [&](uint64_t v) { e.append(reinterpret_cast<const char*>(&v), 8); };
+    auto u16 = [&](uint16_t v) { e.append(reinterpret_cast<const char*>(&v), 2); };
+    e += '\x01';
+    u32(1); // k
+    e += '\x01';
+    u64(2); // a = [1, NULL]
+    e += '\x01';
+    u32(1);
+    e += '\x00';
+    e += '\x01';
+    u64(1); // m = {"x": 7}
+    e += '\x01';
+    u32(1);
+    e += 'x';
+    e += '\x01';
+    u32(7);
+    e += '\x01'; // st = (5, NULL), no count
+    e += '\x01';
+    u32(5);
+    e += '\x00';
+    e += '\x01'; // d = 2024-03-15
+    u16(2024);
+    e += '\x03';
+    e += '\x0f';
+    e += '\x01'; // dt = 2024-03-15 10:20:30
+    u16(2024);
+    e += '\x03';
+    e += '\x0f';
+    e += '\x0a';
+    e += '\x14';
+    e += '\x1e';
+    e += '\x01'; // dec as int128
+    {
+        __int128 v = 123456789012345678LL;
+        e.append(reinterpret_cast<const char*>(&v), 16);
+    }
+    e += '\x01'; // j
+    u32(static_cast<uint32_t>(json.size()));
+    e += json;
+
+    XXH128_hash_t h = XXH3_128bits_withSeed(e.data(), e.size(), 1);
+    auto& expect_bucket = d.buckets[h.high64 >> 56];
+    EXPECT_EQ(1, expect_bucket.count);
+    EXPECT_TRUE(((static_cast<unsigned __int128>(h.high64) << 64) | h.low64) == expect_bucket.sum);
+    EXPECT_EQ(e.size(), d.encoded_bytes);
+}
+
+// ===== 9. light schema change ================================================================
+
+TEST_F(RestoreDigestTest, ColumnAddedByLightSchemaChangeReadsItsDefault) {
+    // rowset 2 was written before the column `c` / `d` were added, rowset 3 after
+    auto old_schema = make_schema(DUP_KEYS, {{"k", "INT", true, false, 4}, {"v", "INT", false, true, 4}});
+    ColSpec c_col("c", "INT", false, true, 4);
+    c_col.default_value = "7";
+    auto new_schema = make_schema(DUP_KEYS,
+                                  {{"k", "INT", true, false, 4},
+                                   {"v", "INT", false, true, 4},
+                                   c_col,
+                                   {"d", "VARCHAR", false, true, 16}},
+                                  -1, {}, 1);
+    std::vector<Row> old_rows;
+    std::vector<Row> old_rows_materialized;
+    for (int i = 0; i < 50; ++i) {
+        old_rows.push_back({V<int32_t>(i), V<int32_t>(i * 2)});
+        old_rows_materialized.push_back({V<int32_t>(i), V<int32_t>(i * 2), V<int32_t>(7), N()});
+    }
+    std::vector<Row> new_rows;
+    for (int i = 100; i < 130; ++i) {
+        new_rows.push_back({V<int32_t>(i), V<int32_t>(i), V<int32_t>(i + 1), S("n")});
+    }
+    auto rs_old = write_rowset(old_schema, old_rows, 2, 20, false);
+    auto rs_new = write_rowset(new_schema, new_rows, 3, 20, false);
+    RestoreDigest lazy = digest_of(new_schema, {rs_old, rs_new});
+
+    // the same data after a compaction (or a reload) has the default materialized
+    auto all = old_rows_materialized;
+    all.insert(all.end(), new_rows.begin(), new_rows.end());
+    RestoreDigest materialized = digest_of(new_schema, {write_rowset(new_schema, all, 2, 1000, false)});
+    EXPECT_TRUE(same_digest(lazy, materialized));
+    EXPECT_EQ(80, lazy.rows);
+
+    // a different default is a different tablet content
+    ColSpec c_col8("c", "INT", false, true, 4);
+    c_col8.default_value = "8";
+    auto new_schema8 = make_schema(DUP_KEYS,
+                                   {{"k", "INT", true, false, 4},
+                                    {"v", "INT", false, true, 4},
+                                    c_col8,
+                                    {"d", "VARCHAR", false, true, 16}},
+                                   -1, {}, 1);
+    RestoreDigest other = digest_of(new_schema8, {rs_old, write_rowset(new_schema8, new_rows, 3, 20, false)});
+    EXPECT_NE(lazy.root, other.root);
+}
+
+// ===== 10. parallel read =====================================================================
+
+TEST_F(RestoreDigestTest, ThreadsDoNotChangeTheDigest) {
+    auto schema = make_schema(DUP_KEYS, wide_cols());
+    std::vector<Row> rows;
+    for (int i = 0; i < 1500; ++i) {
+        rows.push_back(wide_row(i));
+    }
+    std::vector<Row> p1(rows.begin(), rows.begin() + 900);
+    std::vector<Row> p2(rows.begin() + 900, rows.end());
+    auto rs2 = write_rowset(schema, p1, 2, 37, false); // ~25 segments
+    auto rs3 = write_rowset(schema, p2, 3, 50, true);  // 12 overlapping segments
+    auto rs4 = write_rowset(schema, {wide_row(9000)}, 4, 10, false);
+    auto del = write_delete_rowset(schema, 5, {cond("k", ">=", {"600"}), cond("k", "<", {"900"})});
+    auto rs6 = write_rowset(schema, {wide_row(600)}, 6, 10, false); // newer than the condition
+    std::vector<RowsetSharedPtr> rowsets = {rs2, rs3, rs4, del, rs6};
+    RestoreDigest one = threaded_digest(schema, rowsets, DUP_KEYS, false, nullptr, 6, 1);
+    EXPECT_EQ(1U, one.threads);
+    EXPECT_EQ(1500U + 2 - 300, one.rows);
+    for (int threads : {2, 3, 8, 64}) {
+        RestoreDigest d = threaded_digest(schema, rowsets, DUP_KEYS, false, nullptr, 6, threads);
+        EXPECT_TRUE(same_digest(one, d)) << "threads " << threads;
+        EXPECT_EQ(one.rows_scanned, d.rows_scanned);
+        EXPECT_EQ(one.encoded_bytes, d.encoded_bytes);
+        EXPECT_GT(d.threads, 1U);
+    }
+}
+
+TEST_F(RestoreDigestMowTest, ThreadsDoNotChangeTheDigest) {
+    auto schema = make_schema(UNIQUE_KEYS, mow_cols(), 3);
+    auto bitmap = std::make_shared<DeleteBitmap>(990020);
+    std::vector<Row> r2;
+    for (int k = 1; k <= 2000; ++k) {
+        r2.push_back(mow_row(k, k, "v" + std::to_string(k), 1, 0));
+    }
+    auto rs2 = write_rowset(schema, r2, 2, 100, false); // 20 segments, key k is at (k-1)/100, (k-1)%100
+    std::vector<int> updated = {5, 150, 777, 1999, 2000};
+    std::vector<Row> r3;
+    std::vector<Row> final_rows = r2;
+    for (int k : updated) {
+        bitmap->add({rs2->rowset_id(), static_cast<uint32_t>((k - 1) / 100), 3},
+                    static_cast<uint32_t>((k - 1) % 100));
+        r3.push_back(mow_row(k, -k, "upd", 2, 0));
+        final_rows[static_cast<size_t>(k - 1)] = mow_row(k, -k, "upd", 2, 0);
+    }
+    auto rs3 = write_rowset(schema, r3, 3, 2, false);
+    // a deleted key
+    bitmap->add({rs2->rowset_id(), 3, 4}, 0); // key 301
+    auto rs4 = write_rowset(schema, {mow_row(301, 0, "", 3, 1)}, 4, 10, false);
+    final_rows.erase(final_rows.begin() + 300);
+
+    RestoreDigest ref = mow_digest(schema, {write_rowset(schema, final_rows, 2, 333, true)},
+                                   std::make_shared<DeleteBitmap>(990021), 100);
+    for (int threads : {1, 2, 5, 16}) {
+        RestoreDigest d = threaded_digest(schema, {rs2, rs3, rs4}, UNIQUE_KEYS, true, bitmap, 4, threads);
+        EXPECT_TRUE(same_digest(ref, d)) << "threads " << threads;
+        EXPECT_EQ(final_rows.size(), d.rows);
+    }
+}
+
 // ===== 5. not supported ======================================================================
 
 TEST_F(RestoreDigestTest, UnsupportedModelsAndTypes) {
@@ -853,6 +1838,12 @@ TEST_F(RestoreDigestTest, UnsupportedModelsAndTypes) {
                                                    {DELETE_SIGN, "TINYINT", false, false, 1}}),
                         UNIQUE_KEYS, true)
                         .ok());
+    // merge on read is supported since P2
+    EXPECT_TRUE(check_restore_digest_supported(
+                        *make_schema(UNIQUE_KEYS, {{"k", "INT", true, false, 4},
+                                                   {DELETE_SIGN, "TINYINT", false, false, 1}}),
+                        UNIQUE_KEYS, false)
+                        .ok());
 
     // models
     {
@@ -862,17 +1853,24 @@ TEST_F(RestoreDigestTest, UnsupportedModelsAndTypes) {
     }
     auto uniq_cols = base;
     uniq_cols.push_back({DELETE_SIGN, "TINYINT", false, false, 1});
-    expect_unsupported(make_schema(UNIQUE_KEYS, uniq_cols), UNIQUE_KEYS, false, "merge on read");
     expect_unsupported(make_schema(UNIQUE_KEYS, base), UNIQUE_KEYS, true, "no delete sign");
+    expect_unsupported(make_schema(UNIQUE_KEYS, base), UNIQUE_KEYS, false, "mor no delete sign");
     expect_unsupported(make_schema(UNIQUE_KEYS, uniq_cols, -1, {1}), UNIQUE_KEYS, true,
                        "cluster key");
 
     // types
-    for (const char* type :
-         {"DATE", "DATETIME", "DECIMAL", "JSONB", "HLL", "BITMAP", "QUANTILE_STATE"}) {
+    for (const char* type : {"HLL", "BITMAP", "QUANTILE_STATE", "VARIANT"}) {
         auto cols = base;
         cols.push_back({"x", type, false, true, 16});
         expect_unsupported(make_schema(DUP_KEYS, cols), DUP_KEYS, false, type);
+    }
+    // a nested element of an unsupported type
+    {
+        auto cols = base;
+        cols.push_back(with_children({"m", "MAP", false, true, 24},
+                                     {{"key", "VARCHAR", false, true, 16},
+                                      {"value", "HLL", false, true, 16}}));
+        expect_unsupported(make_schema(DUP_KEYS, cols), DUP_KEYS, false, "map<varchar,hll>");
     }
     // unknown hidden column, row binlog column
     {
@@ -886,5 +1884,410 @@ TEST_F(RestoreDigestTest, UnsupportedModelsAndTypes) {
         expect_unsupported(make_schema(DUP_KEYS, cols), DUP_KEYS, false, "row binlog");
     }
 }
+
+
+// ===== 11. tablet level entry =================================================================
+
+namespace {
+struct TabRow {
+    int32_t k;
+    int32_t v;
+    int8_t del = 0;
+};
+
+bool digests_equal(const RestoreDigest& a, const RestoreDigest& b) {
+    if (a.root != b.root || a.rows != b.rows) {
+        return false;
+    }
+    for (size_t i = 0; i < RestoreDigest::kNumBuckets; ++i) {
+        if (a.buckets[i].sum != b.buckets[i].sum || a.buckets[i].count != b.buckets[i].count) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
+// Real tablets created through the engine, rowsets added to them, and the tablet level entry
+// (capture under the header lock, delete bitmap snapshot, schema choice) driven.
+class RestoreDigestTabletTest : public MowTransformTestBase {
+protected:
+    // keys: DUP, UNIQUE (merge on write when `mow`, otherwise merge on read)
+    TabletSharedPtr create_tablet(int64_t tablet_id, bool mow, bool unique = false) {
+        unique = unique || mow;
+        auto request = testutil::create_tablet_request(
+                tablet_id, /*schema_hash=*/1, /*partition_id=*/10, /*short_key_column_count=*/1,
+                unique ? TKeysType::UNIQUE_KEYS : TKeysType::DUP_KEYS,
+                {{"k", TPrimitiveType::INT, true},
+                 {"v", TPrimitiveType::INT, false, false, TAggregationType::NONE, true}});
+        if (unique) {
+            TColumn del;
+            del.column_name = DELETE_SIGN;
+            del.__set_is_key(false);
+            del.__set_is_allow_null(false);
+            del.column_type.type = TPrimitiveType::TINYINT;
+            del.__set_default_value("0");
+            request.tablet_schema.columns.push_back(del);
+            request.tablet_schema.__set_delete_sign_idx(2);
+            request.__set_enable_unique_key_merge_on_write(mow);
+        }
+        RuntimeProfile profile("restore_digest_ut");
+        Status st = _engine->create_tablet(request, &profile);
+        EXPECT_TRUE(st.ok()) << st;
+        return _engine->tablet_manager()->get_tablet(tablet_id);
+    }
+
+    // Writes one rowset, one segment per entry of `segments`; every segment sorted by key.
+    RowsetSharedPtr write(const TabletSharedPtr& tablet, const TabletSchemaSPtr& schema,
+                          int64_t version, const std::vector<std::vector<TabRow>>& segments,
+                          bool overlapping, bool add_to_tablet) {
+        RowsetWriterContext ctx;
+        RowsetId id;
+        id.init(_next_id++);
+        ctx.rowset_id = id;
+        ctx.tablet_id = tablet->tablet_id();
+        ctx.tablet_schema_hash = tablet->schema_hash();
+        ctx.partition_id = tablet->partition_id();
+        ctx.rowset_type = BETA_ROWSET;
+        ctx.tablet_path = tablet->tablet_path();
+        ctx.data_dir = tablet->data_dir();
+        ctx.rowset_state = VISIBLE;
+        ctx.tablet_schema = schema;
+        ctx.version = {version, version};
+        ctx.enable_unique_key_merge_on_write = tablet->enable_unique_key_merge_on_write();
+        ctx.write_type = DataWriteType::TYPE_DIRECT;
+        ctx.tablet = tablet;
+        ctx.segments_overlap = overlapping ? OVERLAPPING : NONOVERLAPPING;
+        ctx.max_rows_per_segment = UINT32_MAX;
+        ctx.enable_segcompaction = false;
+        auto res = RowsetFactory::create_rowset_writer(*_engine, ctx, false);
+        EXPECT_TRUE(res.has_value()) << res.error();
+        auto writer = std::move(res).value();
+        for (const auto& seg : segments) {
+            Block block = schema->create_storage_block();
+            auto cols = std::move(block).mutate_columns();
+            for (const TabRow& r : seg) {
+                size_t c = 0;
+                cols[c++]->insert_data(reinterpret_cast<const char*>(&r.k), sizeof(r.k));
+                cols[c++]->insert_data(reinterpret_cast<const char*>(&r.v), sizeof(r.v));
+                if (c < cols.size()) {
+                    cols[c++]->insert_data(reinterpret_cast<const char*>(&r.del), sizeof(r.del));
+                }
+            }
+            block.set_columns(std::move(cols));
+            EXPECT_TRUE(writer->add_block(&block).ok());
+            EXPECT_TRUE(writer->flush().ok());
+        }
+        RowsetSharedPtr rowset;
+        EXPECT_TRUE(writer->build(rowset).ok());
+        if (add_to_tablet) {
+            EXPECT_TRUE(tablet->add_rowset(rowset).ok());
+        }
+        return rowset;
+    }
+
+    RowsetSharedPtr write_delete(const TabletSharedPtr& tablet, int64_t version,
+                                 const std::vector<TCondition>& conds) {
+        auto schema = tablet->tablet_schema();
+        DeletePredicatePB pred;
+        Status st = DeleteHandler::generate_delete_predicate(*schema, conds, &pred);
+        EXPECT_TRUE(st.ok()) << st;
+        auto rowset = write(tablet, schema, version, {}, false, false);
+        rowset->rowset_meta()->set_delete_predicate(std::move(pred));
+        EXPECT_TRUE(tablet->add_rowset(rowset).ok());
+        return rowset;
+    }
+
+    static TCondition cond(const std::string& column, const std::string& op,
+                           const std::string& value) {
+        TCondition c;
+        c.column_name = column;
+        c.condition_op = op;
+        c.condition_values = {value};
+        return c;
+    }
+
+    // digest of rows written as plain rowsets of a throw away layout, same schema and model
+    RestoreDigest reference(const TabletSharedPtr& tablet, const TabletSchemaSPtr& schema,
+                            const std::vector<TabRow>& rows) {
+        RestoreDigestInput in;
+        in.schema = schema;
+        in.keys_type = tablet->keys_type();
+        in.enable_mow = tablet->enable_unique_key_merge_on_write();
+        if (in.enable_mow) {
+            in.delete_bitmap = std::make_shared<DeleteBitmap>(tablet->tablet_id());
+        }
+        in.version = 100;
+        in.tablet = tablet;
+        std::vector<TabRow> sorted = rows;
+        std::sort(sorted.begin(), sorted.end(), [](const TabRow& a, const TabRow& b) { return a.k < b.k; });
+        in.rowsets.push_back(write(tablet, schema, 2, {sorted}, false, false));
+        RestoreDigest d;
+        Status st = compute_restore_digest(in, &d);
+        EXPECT_TRUE(st.ok()) << st;
+        return d;
+    }
+
+    RestoreDigest tablet_digest(int64_t tablet_id, int64_t version, int threads = 1) {
+        RestoreDigest d;
+        Status st = compute_tablet_restore_digest(*_engine, tablet_id, version, &d, threads);
+        EXPECT_TRUE(st.ok()) << st;
+        return d;
+    }
+
+    int64_t _next_id = 880000;
+};
+
+TEST_F(RestoreDigestTabletTest, MowPartialUpdateConflictRewriteNeedsTheBitmap) {
+    auto tablet = create_tablet(7001, true);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    ASSERT_TRUE(tablet->enable_unique_key_merge_on_write());
+
+    auto rs2 = write(tablet, schema, 2, {{{1, 10}, {2, 20}, {3, 30}, {4, 40}, {5, 50}, {6, 60}}}, false, true);
+    // version 3: a partial column update which hit a concurrent change at publish time. Key 3 was
+    // first written (segment 0) from the old row and then rewritten (segment 1): the same key
+    // twice in one rowset, only the delete bitmap says which row is visible.
+    auto rs3 = write(tablet, schema, 3, {{{3, 31}, {5, 51}}, {{3, 32}}}, true, true);
+    auto& bitmap = tablet->tablet_meta()->delete_bitmap();
+    bitmap.add({rs2->rowset_id(), 0, 3}, 2); // key 3 of version 2
+    bitmap.add({rs2->rowset_id(), 0, 3}, 4); // key 5 of version 2
+    bitmap.add({rs3->rowset_id(), 0, 3}, 0); // key 3, the first write of version 3
+    // version 4: key 6 updated, key 1 deleted (delete sign)
+    auto rs4 = write(tablet, schema, 4, {{{1, 0, 1}, {6, 61}}}, false, true);
+    bitmap.add({rs2->rowset_id(), 0, 4}, 0);
+    bitmap.add({rs2->rowset_id(), 0, 4}, 5);
+
+    std::vector<TabRow> at3 = {{1, 10}, {2, 20}, {3, 32}, {4, 40}, {5, 51}, {6, 60}};
+    std::vector<TabRow> at4 = {{2, 20}, {3, 32}, {4, 40}, {5, 51}, {6, 61}};
+    RestoreDigest d3 = tablet_digest(7001, 3);
+    RestoreDigest d4 = tablet_digest(7001, 4);
+    EXPECT_TRUE(digests_equal(reference(tablet, schema, at3), d3));
+    EXPECT_TRUE(digests_equal(reference(tablet, schema, at4), d4));
+    EXPECT_EQ(at3.size(), d3.rows);
+    EXPECT_EQ(at4.size(), d4.rows);
+    EXPECT_NE(d3.root, d4.root);
+    for (int threads : {2, 4}) {
+        EXPECT_TRUE(digests_equal(d4, tablet_digest(7001, 4, threads))) << threads;
+    }
+
+    // what a reader without the bitmap would see differs: key 3 twice, stale rows included
+    RestoreDigestInput no_bitmap;
+    no_bitmap.rowsets = {rs2, rs3};
+    no_bitmap.schema = schema;
+    no_bitmap.keys_type = UNIQUE_KEYS;
+    no_bitmap.enable_mow = true;
+    no_bitmap.delete_bitmap = std::make_shared<DeleteBitmap>(7999); // get_agg caches by tablet id
+    no_bitmap.version = 3;
+    RestoreDigest stale;
+    ASSERT_TRUE(compute_restore_digest(no_bitmap, &stale).ok());
+    EXPECT_NE(d3.root, stale.root);
+    EXPECT_GT(stale.rows, d3.rows);
+
+    // a version which does not exist is an error, not a digest
+    RestoreDigest none;
+    EXPECT_FALSE(compute_tablet_restore_digest(*_engine, 7001, 9, &none).ok());
+    EXPECT_TRUE(compute_tablet_restore_digest(*_engine, 987654, 3, &none).is<ErrorCode::NOT_FOUND>());
+}
+
+TEST_F(RestoreDigestTabletTest, MergeOnReadMergesVersionsAndDropsDeleteSign) {
+    auto tablet = create_tablet(7004, /*mow=*/false, /*unique=*/true);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    ASSERT_EQ(UNIQUE_KEYS, tablet->keys_type());
+    ASSERT_FALSE(tablet->enable_unique_key_merge_on_write());
+    write(tablet, schema, 2, {{{1, 10}, {2, 20}, {3, 30}, {4, 40}}}, false, true);
+    write(tablet, schema, 3, {{{2, 21}, {3, 31}}}, false, true);
+    write(tablet, schema, 4, {{{1, 0, 1}, {4, 41}, {5, 50}}}, true, true);
+    write(tablet, schema, 5, {{{1, 11}, {3, 0, 1}}}, false, true);
+    // plus a condition on v: DELETE WHERE v = 41 removes the version 4 row of key 4 only
+    write_delete(tablet, 6, {cond("v", "=", "41")});
+    std::vector<std::vector<TabRow>> expect = {
+            {{1, 10}, {2, 20}, {3, 30}, {4, 40}},
+            {{1, 10}, {2, 21}, {3, 31}, {4, 40}},
+            {{2, 21}, {3, 31}, {4, 41}, {5, 50}},
+            {{1, 11}, {2, 21}, {4, 41}, {5, 50}},
+            // the condition is applied to the rows before they are merged: key 4 falls back to
+            // its older row, the way a query on a merge-on-read table reads it
+            {{1, 11}, {2, 21}, {4, 40}, {5, 50}}};
+    for (size_t i = 0; i < expect.size(); ++i) {
+        RestoreDigest d = tablet_digest(7004, static_cast<int64_t>(i) + 2);
+        EXPECT_EQ(expect[i].size(), d.rows) << "version " << i + 2;
+        EXPECT_TRUE(digests_equal(reference(tablet, schema, expect[i]), d)) << "version " << i + 2;
+        EXPECT_EQ(1U, d.threads);
+    }
+}
+
+TEST_F(RestoreDigestTabletTest, DuplicateWithDeleteConditionBeforeAndAfterCompaction) {
+    auto tablet = create_tablet(7002, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    std::vector<TabRow> a;
+    std::vector<TabRow> b;
+    for (int k = 0; k < 100; ++k) {
+        a.push_back({k, k % 10});
+    }
+    for (int k = 50; k < 150; ++k) {
+        b.push_back({k, (k * 7) % 10});
+    }
+    auto rs2 = write(tablet, schema, 2, {a}, false, true);
+    auto rs3 = write(tablet, schema, 3, {std::vector<TabRow>(b.begin(), b.begin() + 40), std::vector<TabRow>(b.begin() + 40, b.end())}, false, true);
+    write_delete(tablet, 4, {cond("v", "=", "3")});
+    std::vector<TabRow> c = {{500, 3}, {501, 4}};
+    write(tablet, schema, 5, {c}, false, true);
+
+    std::vector<TabRow> expect;
+    for (const auto& r : a) {
+        if (r.v != 3) {
+            expect.push_back(r);
+        }
+    }
+    for (const auto& r : b) {
+        if (r.v != 3) {
+            expect.push_back(r);
+        }
+    }
+    expect.insert(expect.end(), c.begin(), c.end());
+    RestoreDigest before = tablet_digest(7002, 5);
+    EXPECT_EQ(1U, before.delete_predicates);
+    EXPECT_EQ(expect.size(), before.rows);
+    EXPECT_TRUE(digests_equal(reference(tablet, schema, expect), before));
+    // version 3 is below the condition: nothing deleted yet
+    std::vector<TabRow> at3 = a;
+    at3.insert(at3.end(), b.begin(), b.end());
+    EXPECT_TRUE(digests_equal(reference(tablet, schema, at3), tablet_digest(7002, 3)));
+
+    // the compaction of versions 2..4: rows are physically gone, the condition rowset too
+    std::vector<RowsetReaderSharedPtr> readers;
+    std::vector<RowsetSharedPtr> inputs;
+    {
+        std::shared_lock lock(tablet->get_header_lock());
+        auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, 4), CaptureRowsetOps {});
+        ASSERT_TRUE(ret.has_value());
+        for (const auto& rs : ret->rowsets) {
+            if (rs->version().first >= 2) {
+                inputs.push_back(rs);
+            }
+        }
+    }
+    ASSERT_EQ(3U, inputs.size());
+    for (const auto& rs : inputs) {
+        RowsetReaderSharedPtr reader;
+        ASSERT_TRUE(rs->create_reader(&reader).ok());
+        readers.push_back(reader);
+    }
+    RowsetWriterContext ctx;
+    RowsetId id;
+    id.init(_next_id++);
+    ctx.rowset_id = id;
+    ctx.tablet_id = tablet->tablet_id();
+    ctx.tablet_schema_hash = tablet->schema_hash();
+    ctx.partition_id = tablet->partition_id();
+    ctx.rowset_type = BETA_ROWSET;
+    ctx.tablet_path = tablet->tablet_path();
+    ctx.data_dir = tablet->data_dir();
+    ctx.rowset_state = VISIBLE;
+    ctx.tablet_schema = schema;
+    ctx.version = {2, 4};
+    ctx.segments_overlap = NONOVERLAPPING;
+    ctx.max_rows_per_segment = UINT32_MAX;
+    ctx.tablet = tablet;
+    auto res = RowsetFactory::create_rowset_writer(*_engine, ctx, true);
+    ASSERT_TRUE(res.has_value()) << res.error();
+    auto writer = std::move(res).value();
+    Merger::Statistics stats;
+    RowIdConversion conversion;
+    stats.rowid_conversion = &conversion;
+    ASSERT_TRUE(Merger::vertical_merge_rowsets(tablet, ReaderType::READER_BASE_COMPACTION, *schema,
+                                               readers, writer.get(), 100, 2, &stats)
+                        .ok());
+    RowsetSharedPtr merged;
+    ASSERT_TRUE(writer->build(merged).ok());
+    EXPECT_EQ(a.size() + b.size() - 20, merged->num_rows()); // 10 rows with v = 3 in a, 10 in b
+    ASSERT_TRUE(tablet->add_rowset(merged).ok());
+
+    RestoreDigest after = tablet_digest(7002, 5);
+    EXPECT_TRUE(digests_equal(before, after));
+    EXPECT_EQ(0U, after.delete_predicates);
+}
+
+TEST_F(RestoreDigestTabletTest, ColumnAddedLaterIsReadAsItsDefault) {
+    auto tablet = create_tablet(7003, false);
+    ASSERT_NE(nullptr, tablet);
+    auto old_schema = tablet->tablet_schema();
+    std::vector<TabRow> rows;
+    for (int k = 0; k < 40; ++k) {
+        rows.push_back({k, k * 3});
+    }
+    write(tablet, old_schema, 2, {rows}, false, true);
+
+    // light schema change: a column c INT DEFAULT 7 is added, the rowset is not rewritten
+    TabletSchemaPB pb;
+    old_schema->to_schema_pb(&pb);
+    pb.set_schema_version(old_schema->schema_version() + 1);
+    ColumnPB* c = pb.add_column();
+    c->set_unique_id(pb.next_column_unique_id());
+    pb.set_next_column_unique_id(pb.next_column_unique_id() + 1);
+    c->set_name("c");
+    c->set_type("INT");
+    c->set_is_key(false);
+    c->set_length(4);
+    c->set_index_length(4);
+    c->set_is_nullable(true);
+    c->set_default_value("7");
+    c->set_aggregation("NONE");
+    auto new_schema = std::make_shared<TabletSchema>();
+    new_schema->init_from_pb(pb);
+    tablet->update_max_version_schema(new_schema);
+
+    RestoreDigest d = tablet_digest(7003, 2);
+    EXPECT_EQ(rows.size(), d.rows);
+
+    // reference: the same rows with the default written out
+    RestoreDigestInput ref_in;
+    ref_in.schema = new_schema;
+    ref_in.keys_type = DUP_KEYS;
+    ref_in.version = 100;
+    {
+        RowsetWriterContext ctx;
+        RowsetId id;
+        id.init(_next_id++);
+        ctx.rowset_id = id;
+        ctx.tablet_id = tablet->tablet_id();
+        ctx.tablet_schema_hash = tablet->schema_hash();
+        ctx.partition_id = tablet->partition_id();
+        ctx.rowset_type = BETA_ROWSET;
+        ctx.tablet_path = tablet->tablet_path();
+        ctx.data_dir = tablet->data_dir();
+        ctx.rowset_state = VISIBLE;
+        ctx.tablet_schema = new_schema;
+        ctx.version = {2, 2};
+        ctx.segments_overlap = NONOVERLAPPING;
+        ctx.max_rows_per_segment = UINT32_MAX;
+        ctx.tablet = tablet;
+        auto res = RowsetFactory::create_rowset_writer(*_engine, ctx, false);
+        ASSERT_TRUE(res.has_value()) << res.error();
+        auto writer = std::move(res).value();
+        Block block = new_schema->create_storage_block();
+        auto cols = std::move(block).mutate_columns();
+        const int32_t seven = 7;
+        for (const TabRow& r : rows) {
+            cols[0]->insert_data(reinterpret_cast<const char*>(&r.k), 4);
+            cols[1]->insert_data(reinterpret_cast<const char*>(&r.v), 4);
+            cols[2]->insert_data(reinterpret_cast<const char*>(&seven), 4);
+        }
+        block.set_columns(std::move(cols));
+        ASSERT_TRUE(writer->add_block(&block).ok());
+        ASSERT_TRUE(writer->flush().ok());
+        RowsetSharedPtr rs;
+        ASSERT_TRUE(writer->build(rs).ok());
+        ref_in.rowsets.push_back(rs);
+    }
+    RestoreDigest ref;
+    ASSERT_TRUE(compute_restore_digest(ref_in, &ref).ok());
+    EXPECT_TRUE(digests_equal(ref, d));
+    EXPECT_EQ(ref.schema_sig, d.schema_sig);
+}
+
 
 } // namespace doris
