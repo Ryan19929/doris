@@ -2849,6 +2849,30 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true, masterOnly = true, description = "The number of concurrent restore tasks per BE.")
     public static int restore_task_concurrency_per_be = 5000;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether to enable partition level reuse of restore: "
+            + "for a non-atomic restore, a local partition that is proved logically equal to the partition in the "
+            + "backup keeps its local data, and its snapshot, download and move are skipped. Disabled by default, "
+            + "the restore behaves as before if disabled.")
+    public static boolean enable_restore_partition_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The default check level of partition level reuse, "
+            + "overridden by the restore property reuse_check_level: off|sample|full|disable. Unique tables do not "
+            + "allow off, it is upgraded to sample.")
+    public static String restore_reuse_default_check_level = "sample";
+
+    @ConfField(mutable = true, masterOnly = true, description = "The ratio of the candidate partitions to compute "
+            + "the digest for in the sample check level, at least one partition.")
+    public static double restore_reuse_sample_ratio = 0.1;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The minimum size (local data size of a single "
+            + "replica, in bytes) of a partition to be considered for partition level reuse, smaller partitions are "
+            + "downloaded. 1 GB by default.")
+    public static long restore_reuse_min_partition_bytes = 1024L * 1024 * 1024;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The timeout (in seconds) of waiting for the digest "
+            + "tasks of partition level reuse, the partitions timed out are downloaded.")
+    public static int restore_digest_timeout_s = 3600;
+
     @ConfField(mutable = true, description = "The time after which a BE is considered unavailable if no heartbeat is "
             + "received.")
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

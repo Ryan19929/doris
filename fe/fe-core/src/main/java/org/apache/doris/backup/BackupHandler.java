@@ -644,6 +644,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             }
         }
 
+        restoreJob.setReuseCheckLevel(command.getReuseCheckLevel());
         env.getEditLog().logRestoreJob(restoreJob);
 
         // must put to dbIdToBackupOrRestoreJob after edit log, otherwise the state of job may be changed.

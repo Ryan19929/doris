@@ -1,0 +1,153 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.backup;
+
+import org.apache.doris.persist.gson.GsonUtils;
+
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.gson.annotations.SerializedName;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * The outcome of partition level reuse in a restore job: which existing partitions keep their local data instead of
+ * being downloaded, and why each candidate partition was kept or downloaded. Fixed when the VERIFYING state ends,
+ * and persisted with the job (the edit log written when the job enters DOWNLOAD, and the later ones).
+ */
+public class RestoreReuseResult {
+    // kept
+    // The partition is kept on the lineage check only (check level off), no digest was computed.
+    public static final String KEPT_L0_ONLY = "KEPT_L0_ONLY";
+    // Every replica of every tablet has the digest of the backup.
+    public static final String KEPT_DIGEST_VERIFIED = "KEPT_DIGEST_VERIFIED";
+    // The partition was not sampled and the sampled partitions are all consistent (check level sample).
+    public static final String KEPT_SAMPLE_PASSED = "KEPT_SAMPLE_PASSED";
+
+    // downloaded
+    // A replica has a digest different from the backup.
+    public static final String DOWNLOAD_ROOT_MISMATCH = "DOWNLOAD_ROOT_MISMATCH";
+    // The digest algorithm version or the schema signature differs from the backup.
+    public static final String DOWNLOAD_SCHEMA_MISMATCH = "DOWNLOAD_SCHEMA_MISMATCH";
+    // The digest task failed, is not supported by the backend, or the backend did not report a digest.
+    public static final String DOWNLOAD_DIGEST_ERROR = "DOWNLOAD_DIGEST_ERROR";
+    // The digest tasks did not finish in time.
+    public static final String DOWNLOAD_TIMEOUT = "DOWNLOAD_TIMEOUT";
+    // The version or a replica of the partition changed while verifying.
+    public static final String DOWNLOAD_CHANGED = "DOWNLOAD_CHANGED";
+    // A sampled partition failed to be verified (a failed task, a timeout), so the partitions not sampled can not
+    // be proved either.
+    public static final String DOWNLOAD_SAMPLE_FAILED = "DOWNLOAD_SAMPLE_FAILED";
+    // The job failed to verify the partition.
+    public static final String DOWNLOAD_VERIFY_ERROR = "DOWNLOAD_VERIFY_ERROR";
+
+    /** The decision of one candidate partition. */
+    public static class Decision {
+        @SerializedName("tid")
+        public long tableId;
+        @SerializedName("pid")
+        public long partitionId;
+        @SerializedName("tn")
+        public String tableName;
+        @SerializedName("pn")
+        public String partitionName;
+        // the version of the backup, equal to the local visible version of a kept partition
+        @SerializedName("v")
+        public long version;
+        // the local data size of a single replica
+        @SerializedName("b")
+        public long bytes;
+        // off|sample|full, the check level the partition was judged with
+        @SerializedName("l")
+        public String level;
+        @SerializedName("k")
+        public boolean kept;
+        @SerializedName("r")
+        public String reason;
+
+        @Override
+        public String toString() {
+            return tableName + "." + partitionName + "(" + tableId + "," + partitionId + ", v" + version + ", "
+                    + level + "): " + (kept ? "KEEP " : "DOWNLOAD ") + reason;
+        }
+    }
+
+    @SerializedName("d")
+    private List<Decision> decisions = Lists.newArrayList();
+    // reason of not being a candidate -> number of partitions
+    @SerializedName("rc")
+    private Map<String, Long> rejected = Maps.newTreeMap();
+
+    public void addDecision(Decision decision) {
+        decisions.add(decision);
+    }
+
+    public void addRejected(String reason) {
+        rejected.merge(reason, 1L, Long::sum);
+    }
+
+    public List<Decision> getDecisions() {
+        return decisions;
+    }
+
+    public Map<String, Long> getRejected() {
+        return rejected;
+    }
+
+    public boolean isEmpty() {
+        return decisions.isEmpty();
+    }
+
+    public boolean isKept(long tableId, long partitionId) {
+        for (Decision decision : decisions) {
+            if (decision.kept && decision.tableId == tableId && decision.partitionId == partitionId) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public List<Decision> getKeptDecisions() {
+        List<Decision> kept = Lists.newArrayList();
+        for (Decision decision : decisions) {
+            if (decision.kept) {
+                kept.add(decision);
+            }
+        }
+        return kept;
+    }
+
+    public long getKeptPartitions() {
+        return decisions.stream().filter(d -> d.kept).count();
+    }
+
+    /** The local data size of a single replica of the kept partitions. */
+    public long getKeptBytesSingleReplica() {
+        return decisions.stream().filter(d -> d.kept).mapToLong(d -> d.bytes).sum();
+    }
+
+    public long getDownloadedPartitions() {
+        return decisions.stream().filter(d -> !d.kept).count();
+    }
+
+    @Override
+    public String toString() {
+        return GsonUtils.GSON.toJson(this);
+    }
+}
