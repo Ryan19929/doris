@@ -196,8 +196,12 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
             logger.info("full compaction of tablet ${tablet.TabletId}: ${code} ${out}")
         }
     }
-    sleep(30000)
-    int after = versionCount(dbName, dupTable)
+    // the version count is refreshed by the tablet report of the backends
+    int after = before
+    for (int i = 0; i < 20 && after >= before; ++i) {
+        sleep(10000)
+        after = versionCount(dbName, dupTable)
+    }
     logger.info("version count of ${dupTable}: ${before} -> ${after}")
     assertTrue(after < before)
     stats = restoreAndWait(dbName, snap1, ts1, "full")
