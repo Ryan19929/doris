@@ -140,4 +140,39 @@ public class BackupCommandTest extends TestWithFeService {
                 false);
         Assertions.assertThrows(AnalysisException.class, () -> invalidCommand.validate(connectContext));
     }
+
+    @Test
+    public void testLogicalDigestProperty() throws Exception {
+        runBefore();
+        connectContext.setSkipAuth(true);
+        AccessControllerManager spyAcm = Mockito.spy(accessControllerManager);
+        Mockito.doReturn(true).when(spyAcm).checkDbPriv(
+                Mockito.nullable(ConnectContext.class), Mockito.anyString(),
+                Mockito.anyString(), Mockito.any(PrivPredicate.class));
+        Deencapsulation.setField(env, "accessManager", spyAcm);
+        LabelNameInfo labelNameInfo = new LabelNameInfo(dbName, "label0");
+
+        // default false
+        BackupCommand command = new BackupCommand(labelNameInfo, "testRepo", new ArrayList<>(),
+                new HashedMap(), false);
+        Assertions.assertDoesNotThrow(() -> command.validate(connectContext));
+        Assertions.assertFalse(command.isLogicalDigest());
+
+        for (String value : new String[] {"true", "TRUE", "false"}) {
+            Map<String, String> properties = new HashedMap();
+            properties.put(BackupCommand.PROP_LOGICAL_DIGEST, value);
+            BackupCommand digestCommand = new BackupCommand(labelNameInfo, "testRepo", new ArrayList<>(),
+                    properties, false);
+            Assertions.assertDoesNotThrow(() -> digestCommand.validate(connectContext));
+            Assertions.assertEquals(Boolean.parseBoolean(value), digestCommand.isLogicalDigest());
+            // independent of manifest_digest
+            Assertions.assertFalse(digestCommand.isManifestDigest());
+        }
+
+        Map<String, String> invalid = new HashedMap();
+        invalid.put(BackupCommand.PROP_LOGICAL_DIGEST, "yes");
+        BackupCommand invalidCommand = new BackupCommand(labelNameInfo, "testRepo", new ArrayList<>(), invalid,
+                false);
+        Assertions.assertThrows(AnalysisException.class, () -> invalidCommand.validate(connectContext));
+    }
 }

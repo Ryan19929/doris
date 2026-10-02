@@ -45,6 +45,7 @@ import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.UploadTask;
 import org.apache.doris.thrift.TBackend;
 import org.apache.doris.thrift.TFinishTaskRequest;
+import org.apache.doris.thrift.TLogicalDigest;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTaskType;
@@ -668,13 +669,25 @@ public class BackupJobTest {
     // The snapshot task reports the root of the manifest written with the snapshot if snapshotRoot, the upload task
     // reports the root of the manifest uploaded to the repository if uploadRoot, as a new backend does.
     private BackupJobInfo runBackupToSavedJobInfo(boolean snapshotRoot, boolean uploadRoot) throws IOException {
+        return runBackupToSavedJobInfo(snapshotRoot, uploadRoot, false, null);
+    }
+
+    // With logicalDigest, the logical_digest property is on and the snapshot task reports `digest` (null: not
+    // reported, as an old backend).
+    private BackupJobInfo runBackupToSavedJobInfo(boolean snapshotRoot, boolean uploadRoot, boolean logicalDigest,
+            TLogicalDigest digest) throws IOException {
         AgentTaskQueue.clearAllTasks();
+        if (logicalDigest) {
+            job.setLogicalDigest(true);
+        }
         job.run();
         Assertions.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
         SnapshotTask snapshotTask = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT,
                 id.get() - 1);
         // a remote repository computes the digests when uploading, not in the snapshot.
         Assertions.assertFalse(snapshotTask.toThrift().isSetComputeDigest());
+        Assertions.assertEquals(logicalDigest, snapshotTask.isComputeLogicalDigest());
+        Assertions.assertEquals(logicalDigest, snapshotTask.toThrift().isSetComputeLogicalDigest());
 
         TBackend tBackend = new TBackend("", 0, 1);
         TStatus ok = new TStatus(TStatusCode.OK);
@@ -684,6 +697,9 @@ public class BackupJobTest {
         request.setSnapshotPath("/path/to/snapshot");
         if (snapshotRoot) {
             request.setManifestRoot(sha('1'));
+        }
+        if (digest != null) {
+            request.setLogicalDigest(digest);
         }
         Assertions.assertTrue(job.finishTabletSnapshotTask(snapshotTask, request));
         job.run();
@@ -742,6 +758,77 @@ public class BackupJobTest {
         String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
         Assertions.assertFalse(json.contains("manifest"), json);
         Assertions.assertFalse(json.contains("digest_algorithm"), json);
+    }
+
+    private static TLogicalDigest reportedDigest(String code) {
+        TLogicalDigest digest = new TLogicalDigest();
+        digest.setStatusCode(code);
+        if ("OK".equals(code)) {
+            digest.setAlgoVersion(1);
+            digest.setSchemaSig(sha('5'));
+            digest.setRoot(sha('B'));
+            digest.setRows(42);
+        } else {
+            digest.setStatusMsg("restore digest: " + code);
+        }
+        return digest;
+    }
+
+    @Test
+    public void testBackupRecordsLogicalDigest() throws IOException {
+        BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, true, reportedDigest("OK"));
+        LogicalDigestInfo digest = jobInfo.getLogicalDigest(tabletId);
+        Assertions.assertNotNull(digest);
+        Assertions.assertTrue(digest.hasDigest());
+        Assertions.assertEquals(1, (int) digest.algoVersion);
+        Assertions.assertEquals(sha('5'), digest.schemaSig);
+        Assertions.assertEquals(sha('b'), digest.root);
+        Assertions.assertNull(digest.reason);
+        BackupJobInfo.BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.values().iterator().next()
+                .partitions.values().iterator().next().indexes.values().iterator().next();
+        Assertions.assertSame(digest, idxInfo.sortedTabletInfoList.get(0).logicalDigest);
+        // the manifest is not affected
+        Assertions.assertEquals(sha('a'), jobInfo.getManifestRoot(tabletId));
+        String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
+        Assertions.assertTrue(json.contains("\"ld\":{\"" + tabletId + "\":{\"a\":1,\"s\":\"" + sha('5')
+                + "\",\"r\":\"" + sha('b') + "\"}}"), json);
+    }
+
+    private void checkNoLogicalDigest(TLogicalDigest reported, String reason) throws IOException {
+        // NOT_SUPPORTED, a failure and no report (an old backend) never fail the backup
+        BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, true, reported);
+        LogicalDigestInfo digest = jobInfo.getLogicalDigest(tabletId);
+        Assertions.assertNotNull(digest);
+        Assertions.assertFalse(digest.hasDigest());
+        Assertions.assertEquals("", digest.root);
+        Assertions.assertEquals(reason, digest.reason);
+        Assertions.assertNull(digest.schemaSig);
+        // the files of the backup are there
+        Assertions.assertTrue(jobInfo.hasManifest());
+    }
+
+    @Test
+    public void testBackupRecordsLogicalDigestNotSupported() throws IOException {
+        checkNoLogicalDigest(reportedDigest("NOT_SUPPORTED"), LogicalDigestInfo.REASON_NOT_SUPPORTED);
+    }
+
+    @Test
+    public void testBackupRecordsLogicalDigestError() throws IOException {
+        checkNoLogicalDigest(reportedDigest("ERROR"), LogicalDigestInfo.REASON_ERROR);
+    }
+
+    @Test
+    public void testBackupRecordsLogicalDigestNoReport() throws IOException {
+        checkNoLogicalDigest(null, LogicalDigestInfo.REASON_NO_REPORT);
+    }
+
+    @Test
+    public void testBackupWithoutLogicalDigestPropertyHasNone() throws IOException {
+        // the backend reports one anyway (it does not, but the job must not record it)
+        BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, false, reportedDigest("OK"));
+        Assertions.assertNull(jobInfo.getLogicalDigest(tabletId));
+        String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
+        Assertions.assertFalse(json.contains("\"ld\""), json);
     }
 
     @Test
