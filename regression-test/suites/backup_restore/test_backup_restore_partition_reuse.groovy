@@ -187,12 +187,19 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
     stats = restoreAndWait(dbName, snap1, ts1, "full")
     assertEquals(0L, downloaded(stats))
     int before = versionCount(dbName, dupTable)
-    sql "ALTER TABLE ${dbName}.${dupTable} COMPACT 'full'"
-    sql "ALTER TABLE ${dbName}.${uniqTable} COMPACT 'full'"
+    for (String tbl : [dupTable, uniqTable]) {
+        def tablets = sql_return_maparray "SHOW TABLETS FROM ${dbName}.${tbl}"
+        for (def tablet : tablets) {
+            String url = (tablet.CompactionStatus as String).replace("compaction/show", "compaction/run") +
+                    "&compact_type=full"
+            def (code, out, err) = curl("POST", url)
+            logger.info("full compaction of tablet ${tablet.TabletId}: ${code} ${out}")
+        }
+    }
     sleep(30000)
     int after = versionCount(dbName, dupTable)
     logger.info("version count of ${dupTable}: ${before} -> ${after}")
-    assertTrue(after <= before)
+    assertTrue(after < before)
     stats = restoreAndWait(dbName, snap1, ts1, "full")
     assertEquals(0L, downloaded(stats))
     assertSameAsSource(dbName)
