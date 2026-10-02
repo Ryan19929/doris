@@ -104,6 +104,9 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
         return timestamp
     }
 
+    // the ReuseEstimate of the last restore job
+    def lastEstimate = null
+
     // returns the DownloadStats of the restore job
     def restoreAndWait = { String db, String snapshot, String timestamp, String level ->
         String levelProp = level == null ? "" : ", \"reuse_check_level\" = \"${level}\""
@@ -120,6 +123,8 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
         assertEquals("FINISHED", job.State)
         def stats = new JsonSlurper().parseText(job.DownloadStats as String)
         logger.info("download stats: ${stats}")
+        lastEstimate = job.ReuseEstimate == null ? null : new JsonSlurper().parseText(job.ReuseEstimate as String)
+        logger.info("reuse estimate: ${lastEstimate}")
         return stats
     }
 
@@ -154,6 +159,15 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
     assertEquals(0L, downloaded(stats))
     assertEquals(0L, stats.downloaded_bytes as long)
     assertSameAsSource(dbName)
+    // the kept data counts in kept_bytes and the reuse ratio, and the estimate shows the actual result
+    assertTrue((stats.kept_bytes as long) > 0)
+    assertEquals(1.0, stats.reuse_ratio as double, 0.001)
+    assertEquals(2 * numPartitions, lastEstimate.kept_partitions as int)
+    assertEquals(2 * numPartitions, lastEstimate.kept_a as int)
+    assertEquals(0, lastEstimate.kept_b as int)
+    assertEquals(0, lastEstimate.kept_c as int)
+    assertTrue((lastEstimate.kept_bytes_single_replica as long) > 0)
+    assertEquals(0, lastEstimate.download_digest_mismatch as int)
     stats = restoreAndWait(dbName, snap1, ts1, null)
     assertEquals(0L, downloaded(stats))
     assertSameAsSource(dbName)
@@ -218,6 +232,8 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
     assertTrue((stats.downloaded_files as long) > 0)
     assertTrue((stats.downloaded_files as long) < baseline)
     assertSameAsSource(dbName)
+    assertTrue((stats.kept_bytes as long) > 0)
+    assertTrue((stats.reuse_ratio as double) < 1.0)
     // the default level (sample) gives the same result
     sql "INSERT INTO ${srcDbName}.${dupTable} VALUES (1005, 'new2')"
     sql "sync"

@@ -108,6 +108,8 @@ suite("test_backup_restore_download_stats", "backup_restore") {
         int replicas = stats.replicas.full_reuse + stats.replicas.partial_reuse + stats.replicas.no_reuse
         assertTrue(replicas > 0 && replicas <= numPartitions * numBuckets)
         assertTrue(stats.downloaded_files + stats.skipped_files > 0)
+        // no partition is kept (partition level reuse is off), so kept_bytes is 0
+        assertEquals(0, stats.kept_bytes)
         double total = stats.skipped_bytes + stats.downloaded_bytes
         assertEquals(stats.skipped_bytes / total, stats.reuse_ratio as double, 0.001)
     }
