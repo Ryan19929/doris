@@ -22,19 +22,31 @@
 #include <glog/logging.h>
 #include <xxh3.h>
 
+#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string_view>
+#include <thread>
 
 #include "common/consts.h"
 #include "common/status.h"
 #include "core/block/block.h"
 #include "core/column/column.h"
+#include "core/column/column_array.h"
+#include "core/column/column_map.h"
 #include "core/column/column_nullable.h"
 #include "core/column/column_string.h"
+#include "core/column/column_struct.h"
+#include "core/value/vdatetime_value.h"
+#include "runtime/memory/mem_tracker_limiter.h"
+#include "runtime/thread_context.h"
+#include "storage/delete/delete_handler.h"
+#include "storage/iterator/block_reader.h"
 #include "storage/olap_common.h"
 #include "storage/rowset/rowset.h"
 #include "storage/rowset/rowset_reader.h"
@@ -44,6 +56,7 @@
 #include "storage/tablet/tablet.h"
 #include "storage/tablet/tablet_manager.h"
 #include "storage/tablet/tablet_meta.h"
+#include "storage/tablet/tablet_reader.h"
 #include "storage/utils.h"
 #include "util/sha.h"
 
@@ -51,25 +64,50 @@ namespace doris {
 
 static_assert(std::endian::native == std::endian::little,
               "restore digest encoding assumes a little endian host");
+static_assert(sizeof(VecDateTimeValue) == 8, "DATE/DATETIME v1 are 8 bytes in memory");
 
 namespace restore_digest_detail {
 
 enum class ColRole : uint8_t { DIGEST, DELETE_SIGN, EXCLUDED };
-enum class ColKind : uint8_t { FIXED, STRING, CHAR };
+enum class ColKind : uint8_t {
+    FIXED,
+    STRING,
+    CHAR,
+    DATE_V1,
+    DATETIME_V1,
+    ARRAY,
+    MAP,
+    STRUCT,
+};
 
 struct ColCodec {
     ColKind kind = ColKind::FIXED;
     uint8_t width = 0; // for FIXED
+    // ARRAY: the element, MAP: key and value, STRUCT: the fields
+    std::vector<ColCodec> children;
 };
 
-// Whether the field type is supported, and how it is encoded.
-bool codec_of(FieldType type, ColCodec* codec) {
+// Whether the column type is supported, and how it is encoded. `path` names the column for the
+// error message (nested elements are reported as a.b).
+Status codec_of(const TabletColumn& col, const std::string& path, ColCodec* codec) {
     auto fixed = [&](uint8_t w) {
         codec->kind = ColKind::FIXED;
         codec->width = w;
-        return true;
+        return Status::OK();
     };
-    switch (type) {
+    auto nested = [&](size_t expect_min, size_t expect_max) -> Status {
+        const auto& subs = col.get_sub_columns();
+        if (subs.size() < expect_min || subs.size() > expect_max) {
+            return Status::NotSupported("restore digest: column {} has {} sub columns", path,
+                                        subs.size());
+        }
+        codec->children.resize(subs.size());
+        for (size_t i = 0; i < subs.size(); ++i) {
+            RETURN_IF_ERROR(codec_of(*subs[i], fmt::format("{}.{}", path, i), &codec->children[i]));
+        }
+        return Status::OK();
+    };
+    switch (col.type()) {
     case FieldType::OLAP_FIELD_TYPE_BOOL:
     case FieldType::OLAP_FIELD_TYPE_TINYINT:
         return fixed(1);
@@ -88,19 +126,54 @@ bool codec_of(FieldType type, ColCodec* codec) {
         return fixed(8);
     case FieldType::OLAP_FIELD_TYPE_LARGEINT:
     case FieldType::OLAP_FIELD_TYPE_DECIMAL128I:
+    case FieldType::OLAP_FIELD_TYPE_DECIMAL: // DECIMALV2, int128 in memory
     case FieldType::OLAP_FIELD_TYPE_IPV6:
         return fixed(16);
     case FieldType::OLAP_FIELD_TYPE_DECIMAL256:
         return fixed(32);
     case FieldType::OLAP_FIELD_TYPE_VARCHAR:
     case FieldType::OLAP_FIELD_TYPE_STRING:
+    case FieldType::OLAP_FIELD_TYPE_JSONB:
         codec->kind = ColKind::STRING;
-        return true;
+        return Status::OK();
     case FieldType::OLAP_FIELD_TYPE_CHAR:
         codec->kind = ColKind::CHAR;
-        return true;
+        return Status::OK();
+    case FieldType::OLAP_FIELD_TYPE_DATE:
+        codec->kind = ColKind::DATE_V1;
+        return Status::OK();
+    case FieldType::OLAP_FIELD_TYPE_DATETIME:
+        codec->kind = ColKind::DATETIME_V1;
+        return Status::OK();
+    case FieldType::OLAP_FIELD_TYPE_ARRAY:
+        codec->kind = ColKind::ARRAY;
+        return nested(1, 1);
+    case FieldType::OLAP_FIELD_TYPE_MAP:
+        codec->kind = ColKind::MAP;
+        return nested(2, 2);
+    case FieldType::OLAP_FIELD_TYPE_STRUCT:
+        codec->kind = ColKind::STRUCT;
+        return nested(1, SIZE_MAX);
     default:
-        return false;
+        return Status::NotSupported("restore digest: column {} has unsupported type {}", path,
+                                    TabletColumn::get_string_by_field_type(col.type()));
+    }
+}
+
+// Part of the schema signature: the type, precision and scale, and for nested types the same
+// for every sub column. Scalars keep the exact text of the first cut.
+void append_type_sig(std::string& sig, const TabletColumn& col) {
+    sig += fmt::format("{}:{}:{}", static_cast<int>(col.type()), col.precision(), col.frac());
+    const auto& subs = col.get_sub_columns();
+    if (!subs.empty()) {
+        sig += '<';
+        for (size_t i = 0; i < subs.size(); ++i) {
+            if (i > 0) {
+                sig += ',';
+            }
+            append_type_sig(sig, *subs[i]);
+        }
+        sig += '>';
     }
 }
 
@@ -124,10 +197,7 @@ Status classify_column(const TabletColumn& col, KeysType keys_type, ColRole* rol
     if (name != SEQUENCE_COL && name != DELETE_SIGN && name.starts_with("__DORIS_")) {
         return Status::NotSupported("restore digest: unknown hidden column {}", name);
     }
-    if (!codec_of(col.type(), codec)) {
-        return Status::NotSupported("restore digest: column {} has unsupported type {}", name,
-                                    TabletColumn::get_string_by_field_type(col.type()));
-    }
+    RETURN_IF_ERROR(codec_of(col, name, codec));
     *role = ColRole::DIGEST;
     return Status::OK();
 }
@@ -144,10 +214,7 @@ Status build_plan(const TabletSchema& schema, KeysType keys_type, bool enable_mo
     if (keys_type == DUP_KEYS) {
         // supported
     } else if (keys_type == UNIQUE_KEYS) {
-        if (!enable_mow) {
-            return Status::NotSupported(
-                    "restore digest: unique key merge-on-read is not supported");
-        }
+        // MoW and MoR are both supported
     } else {
         return Status::NotSupported("restore digest: keys type {} is not supported",
                                     static_cast<int>(keys_type));
@@ -156,6 +223,9 @@ Status build_plan(const TabletSchema& schema, KeysType keys_type, bool enable_mo
         return Status::NotSupported("restore digest: cluster key is not supported");
     }
     if (schema.has_seq_map()) {
+        // The merge of a sequence mapping table (BlockReader::_replace_key_next_block) replaces
+        // value column groups by their own sequence column and does not drop delete sign rows, so
+        // neither the checksum reader nor the MoW direct read gives a defined visible row set.
         return Status::NotSupported("restore digest: sequence mapping is not supported");
     }
     if (schema.binlog_tso_col_idx() != -1 || schema.binlog_lsn_col_idx() != -1 ||
@@ -177,9 +247,10 @@ Status build_plan(const TabletSchema& schema, KeysType keys_type, bool enable_mo
             plan->delete_sign_ordinal = static_cast<int32_t>(i);
         } else if (role == ColRole::DIGEST) {
             plan->digest_ordinals.push_back(i);
-            plan->codecs.push_back(codec);
-            sig_data += fmt::format("|{}:{}:{}:{}", static_cast<int>(col.type()), col.precision(),
-                                    col.frac(), col.is_key() ? 1 : 0);
+            plan->codecs.push_back(std::move(codec));
+            sig_data += '|';
+            append_type_sig(sig_data, col);
+            sig_data += fmt::format(":{}", col.is_key() ? 1 : 0);
         }
     }
     if (keys_type == UNIQUE_KEYS && plan->delete_sign_ordinal < 0) {
@@ -200,6 +271,8 @@ struct ColView {
     const uint8_t* null_map = nullptr;
     const char* data = nullptr;
     const ColumnString* str = nullptr;
+    const IColumn* col = nullptr;      // the column without its top level Nullable wrapper
+    const ColCodec* codec = nullptr;
 };
 
 Status make_view(const ColumnPtr& column, const ColCodec& codec, size_t rows, ColView* view) {
@@ -207,25 +280,38 @@ Status make_view(const ColumnPtr& column, const ColCodec& codec, size_t rows, Co
     view->kind = codec.kind;
     view->width = codec.width;
     view->null_map = nullptr;
+    view->codec = &codec;
     if (const auto* nullable = check_and_get_column<ColumnNullable>(c)) {
         view->null_map = nullable->get_null_map_data().data();
         c = &nullable->get_nested_column();
     }
+    view->col = c;
+    if (c->size() != rows) {
+        return Status::InternalError("restore digest: column {} has {} elements for {} rows",
+                                     c->get_name(), c->size(), rows);
+    }
     if (codec.kind == ColKind::FIXED) {
         // get_raw_data() reports the element count in `size`, not bytes
         StringRef raw = c->get_raw_data();
-        if (raw.size != rows || c->size() != rows) {
+        if (raw.size != rows) {
             return Status::InternalError(
                     "restore digest: column {} has {} elements for {} rows, expect width {}",
                     c->get_name(), raw.size, rows, codec.width);
         }
         view->data = raw.data;
-    } else {
+    } else if (codec.kind == ColKind::STRING || codec.kind == ColKind::CHAR) {
         view->str = check_and_get_column<ColumnString>(c);
         if (view->str == nullptr) {
             return Status::InternalError("restore digest: expect a string column but got {}",
                                          c->get_name());
         }
+    } else if (codec.kind == ColKind::DATE_V1 || codec.kind == ColKind::DATETIME_V1) {
+        StringRef raw = c->get_raw_data();
+        if (raw.size != rows) {
+            return Status::InternalError("restore digest: date column {} has {} raw elements",
+                                         c->get_name(), raw.size);
+        }
+        view->data = raw.data;
     }
     return Status::OK();
 }
@@ -233,12 +319,128 @@ Status make_view(const ColumnPtr& column, const ColCodec& codec, size_t rows, Co
 inline void append_u32(std::string& buf, uint32_t v) {
     buf.append(reinterpret_cast<const char*>(&v), sizeof(v));
 }
+inline void append_u64(std::string& buf, uint64_t v) {
+    buf.append(reinterpret_cast<const char*>(&v), sizeof(v));
+}
 
 constexpr XXH64_hash_t kHashSeed = RestoreDigest::kAlgoVersion;
 
+bool encode_slot(const IColumn& col, const ColCodec& codec, size_t row, std::string& buf);
+
+inline void encode_date_v1(const char* raw8, bool with_time, std::string& buf) {
+    VecDateTimeValue v;
+    std::memcpy(&v, raw8, sizeof(v));
+    const uint16_t year = v.year();
+    buf.append(reinterpret_cast<const char*>(&year), sizeof(year));
+    buf.push_back(static_cast<char>(v.month()));
+    buf.push_back(static_cast<char>(v.day()));
+    if (with_time) {
+        buf.push_back(static_cast<char>(v.hour()));
+        buf.push_back(static_cast<char>(v.minute()));
+        buf.push_back(static_cast<char>(v.second()));
+    }
+}
+
+// Appends the encoding of a non-NULL value (no flag byte). Returns false if the column object is
+// not what the schema promises.
+bool encode_value(const IColumn& col, const ColCodec& codec, size_t row, std::string& buf) {
+    switch (codec.kind) {
+    case ColKind::FIXED: {
+        StringRef raw = col.get_raw_data();
+        if (raw.size <= row) {
+            return false;
+        }
+        buf.append(raw.data + row * codec.width, codec.width);
+        return true;
+    }
+    case ColKind::STRING:
+    case ColKind::CHAR: {
+        StringRef s = col.get_data_at(row);
+        size_t len = s.size;
+        if (codec.kind == ColKind::CHAR) {
+            while (len > 0 && s.data[len - 1] == '\0') {
+                --len;
+            }
+        }
+        append_u32(buf, static_cast<uint32_t>(len));
+        buf.append(s.data, len);
+        return true;
+    }
+    case ColKind::DATE_V1:
+    case ColKind::DATETIME_V1: {
+        StringRef raw = col.get_raw_data();
+        if (raw.size <= row) {
+            return false;
+        }
+        encode_date_v1(raw.data + row * sizeof(VecDateTimeValue), codec.kind == ColKind::DATETIME_V1,
+                       buf);
+        return true;
+    }
+    case ColKind::ARRAY: {
+        const auto* arr = check_and_get_column<ColumnArray>(&col);
+        if (arr == nullptr || codec.children.size() != 1) {
+            return false;
+        }
+        const size_t begin = arr->offset_at(row);
+        const size_t n = arr->size_at(row);
+        append_u64(buf, n);
+        for (size_t i = 0; i < n; ++i) {
+            if (!encode_slot(arr->get_data(), codec.children[0], begin + i, buf)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    case ColKind::MAP: {
+        const auto* map = check_and_get_column<ColumnMap>(&col);
+        if (map == nullptr || codec.children.size() != 2) {
+            return false;
+        }
+        const size_t begin = map->offset_at(row);
+        const size_t n = map->size_at(row);
+        append_u64(buf, n);
+        for (size_t i = 0; i < n; ++i) {
+            if (!encode_slot(map->get_keys(), codec.children[0], begin + i, buf) ||
+                !encode_slot(map->get_values(), codec.children[1], begin + i, buf)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    case ColKind::STRUCT: {
+        const auto* st = check_and_get_column<ColumnStruct>(&col);
+        if (st == nullptr || st->tuple_size() != codec.children.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < codec.children.size(); ++i) {
+            if (!encode_slot(st->get_column(i), codec.children[i], row, buf)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    }
+    return false;
+}
+
+// A nested element: a flag byte, then the value if it is not NULL.
+bool encode_slot(const IColumn& col, const ColCodec& codec, size_t row, std::string& buf) {
+    const IColumn* c = &col;
+    if (const auto* nullable = check_and_get_column<ColumnNullable>(c)) {
+        if (nullable->is_null_at(row)) {
+            buf.push_back('\x00');
+            return true;
+        }
+        c = &nullable->get_nested_column();
+    }
+    buf.push_back('\x01');
+    return encode_value(*c, codec, row, buf);
+}
+
 // Encodes one row, appending to `buf`. The encoding is injective for a fixed schema: every field
-// is a flag byte followed by either a fixed number of bytes or a length-prefixed byte string.
-inline void encode_row(const std::vector<ColView>& views, size_t row, std::string& buf) {
+// is a flag byte followed by either a fixed number of bytes or a length / count prefixed value.
+// Returns false if a column does not have the shape the schema promises.
+inline bool encode_row(const std::vector<ColView>& views, size_t row, std::string& buf) {
     for (const ColView& v : views) {
         if (v.null_map != nullptr && v.null_map[row] != 0) {
             buf.push_back('\x00');
@@ -247,7 +449,7 @@ inline void encode_row(const std::vector<ColView>& views, size_t row, std::strin
         buf.push_back('\x01');
         if (v.kind == ColKind::FIXED) {
             buf.append(v.data + row * v.width, v.width);
-        } else {
+        } else if (v.kind == ColKind::STRING || v.kind == ColKind::CHAR) {
             StringRef s = v.str->get_data_at(row);
             size_t len = s.size;
             if (v.kind == ColKind::CHAR) {
@@ -257,16 +459,253 @@ inline void encode_row(const std::vector<ColView>& views, size_t row, std::strin
             }
             append_u32(buf, static_cast<uint32_t>(len));
             buf.append(s.data, len);
+        } else if (v.kind == ColKind::DATE_V1 || v.kind == ColKind::DATETIME_V1) {
+            encode_date_v1(v.data + row * sizeof(VecDateTimeValue), v.kind == ColKind::DATETIME_V1,
+                           buf);
+        } else if (!encode_value(*v.col, *v.codec, row, buf)) {
+            return false;
         }
+    }
+    return true;
+}
+
+// Hashes the visible rows of blocks into a partial digest. One instance per worker.
+class BlockHasher {
+public:
+    explicit BlockHasher(const ColumnPlan& plan) : _plan(plan), _views(plan.digest_ordinals.size()) {
+        _row_buf.reserve(256);
+    }
+
+    // The block has the digest columns first, then (when the schema has one) the delete sign.
+    Status add_block(const Block& block, RestoreDigest* acc) {
+        const size_t n = block.rows();
+        if (n == 0) {
+            return Status::OK();
+        }
+        const size_t num_digest = _plan.digest_ordinals.size();
+        std::vector<ColumnPtr> keep_alive;
+        keep_alive.reserve(num_digest + 1);
+        for (size_t j = 0; j < num_digest; ++j) {
+            keep_alive.push_back(
+                    block.get_by_position(j).column->convert_to_full_column_if_const());
+            RETURN_IF_ERROR(make_view(keep_alive.back(), _plan.codecs[j], n, &_views[j]));
+        }
+        ColView delete_sign_view;
+        ColCodec delete_sign_codec;
+        delete_sign_codec.kind = ColKind::FIXED;
+        delete_sign_codec.width = 1;
+        const bool has_delete_sign = _plan.delete_sign_ordinal >= 0;
+        if (has_delete_sign) {
+            keep_alive.push_back(
+                    block.get_by_position(num_digest).column->convert_to_full_column_if_const());
+            RETURN_IF_ERROR(make_view(keep_alive.back(), delete_sign_codec, n, &delete_sign_view));
+        }
+        acc->rows_scanned += n;
+        for (size_t row = 0; row < n; ++row) {
+            if (has_delete_sign &&
+                ((delete_sign_view.null_map != nullptr && delete_sign_view.null_map[row] != 0) ||
+                 delete_sign_view.data[row] != 0)) {
+                continue;
+            }
+            _row_buf.clear();
+            if (!encode_row(_views, row, _row_buf)) {
+                return Status::InternalError(
+                        "restore digest: a column does not have the shape its schema type needs");
+            }
+            XXH128_hash_t h = XXH3_128bits_withSeed(_row_buf.data(), _row_buf.size(), kHashSeed);
+            auto& bucket = acc->buckets[h.high64 >> 56];
+            bucket.sum += (static_cast<unsigned __int128>(h.high64) << 64) | h.low64;
+            bucket.count++;
+            acc->rows++;
+            acc->encoded_bytes += _row_buf.size();
+        }
+        return Status::OK();
+    }
+
+private:
+    const ColumnPlan& _plan;
+    std::vector<ColView> _views;
+    std::string _row_buf;
+};
+
+// Bucket sums are plain sums modulo 2^128, so partial digests just add up.
+void merge_partial(const RestoreDigest& part, RestoreDigest* total) {
+    for (size_t i = 0; i < RestoreDigest::kNumBuckets; ++i) {
+        total->buckets[i].sum += part.buckets[i].sum;
+        total->buckets[i].count += part.buckets[i].count;
+    }
+    total->rows += part.rows;
+    total->rows_scanned += part.rows_scanned;
+    total->encoded_bytes += part.encoded_bytes;
+}
+
+// The read schema: all digest columns, then the delete sign column.
+ReadSchemaSPtr make_read_schema(const TabletSchema& schema, const ColumnPlan& plan) {
+    std::vector<ColumnId> read_ordinals(plan.digest_ordinals.begin(), plan.digest_ordinals.end());
+    if (plan.delete_sign_ordinal >= 0) {
+        read_ordinals.push_back(static_cast<ColumnId>(plan.delete_sign_ordinal));
+    }
+    return std::make_shared<ReadSchema>(project_columns_by_ordinal(schema.columns(), read_ordinals));
+}
+
+struct DigestScanTask {
+    size_t rowset_idx = 0;
+    int64_t seg_begin = 0;
+    int64_t seg_end = 0; // [seg_begin, seg_end); the whole rowset when both are 0
+};
+
+// Reads the visible rows of a part of one rowset (no merge) and hashes them.
+Status run_direct_task(const RestoreDigestInput& input, const ColumnPlan& plan,
+                       const std::vector<RowsetMetaSharedPtr>& delete_metas, const DigestScanTask& task,
+                       RestoreDigest* acc) {
+    const RowsetSharedPtr& rowset = input.rowsets[task.rowset_idx];
+    // Every task owns its read schema and delete handler: appending the columns of delete
+    // conditions mutates the schema, and the handler's predicates are not shared across readers
+    // in the query path either.
+    auto read_schema = make_read_schema(*input.schema, plan);
+    DeleteHandler delete_handler;
+    if (!delete_metas.empty()) {
+        std::vector<TabletColumn> dropped_columns;
+        RETURN_IF_ERROR(delete_handler.init(delete_metas, input.version, read_schema,
+                                            &dropped_columns));
+        read_schema->append_dropped_columns(std::move(dropped_columns));
+    }
+    RETURN_IF_ERROR(read_schema->init_from_tablet_schema(*input.schema,
+                                                         /*merge_by_sequence_mapping=*/false,
+                                                         /*map_row_binlog_columns=*/false));
+
+    RowsetReaderSharedPtr reader;
+    RETURN_IF_ERROR(rowset->create_reader(&reader));
+
+    OlapReaderStatistics stats;
+    RowsetReaderContext ctx;
+    ctx.reader_type = ReaderType::READER_CHECKSUM;
+    ctx.version = Version(0, input.version);
+    ctx.need_ordered_result = false;
+    ctx.read_schema = read_schema;
+    ctx.stats = &stats;
+    ctx.use_page_cache = false;
+    ctx.batch_size = input.batch_size;
+    ctx.enable_unique_key_merge_on_write = input.enable_mow;
+    ctx.delete_bitmap = input.delete_bitmap;
+    ctx.delete_handler = delete_handler.empty() ? nullptr : &delete_handler;
+    RowSetSplits splits(reader);
+    splits.segment_offsets = {task.seg_begin, task.seg_end};
+    RETURN_IF_ERROR(reader->init(&ctx, splits));
+
+    BlockHasher hasher(plan);
+    while (true) {
+        Block block = read_schema->create_read_block();
+        Status st = reader->next_batch(&block);
+        RETURN_IF_ERROR(hasher.add_block(block, acc));
+        if (st.is<ErrorCode::END_OF_FILE>()) {
+            return Status::OK();
+        }
+        RETURN_IF_ERROR(st);
     }
 }
 
+// Unique MoR: the rows of all rowsets are merged by key with the reader the checksum task uses
+// (highest version wins, sequence column first, delete sign rows dropped after the merge, delete
+// conditions applied), then hashed. Single threaded: the merge needs all rowsets at once.
+Status run_mor(const RestoreDigestInput& input, const ColumnPlan& plan, RestoreDigest* acc) {
+    if (input.tablet == nullptr) {
+        return Status::InvalidArgument("restore digest: unique MoR needs the tablet");
+    }
+    if (input.rowsets.empty()) {
+        return Status::OK();
+    }
+    TabletReader::ReaderParams params;
+    params.tablet = input.tablet;
+    params.reader_type = ReaderType::READER_CHECKSUM;
+    params.version =
+            Version(input.rowsets.front()->start_version(), input.rowsets.back()->end_version());
+    TabletReadSource read_source;
+    for (const auto& rowset : input.rowsets) {
+        RowsetReaderSharedPtr rs_reader;
+        RETURN_IF_ERROR(rowset->create_reader(&rs_reader));
+        read_source.rs_splits.emplace_back(std::move(rs_reader));
+    }
+    read_source.fill_delete_predicates();
+    params.set_read_source(std::move(read_source), /*skip_delete_bitmap=*/true);
+    params.tablet_schema = input.schema;
+    params.read_schema = make_read_schema(*input.schema, plan);
+
+    BlockReader reader;
+    reader.set_batch_size(input.batch_size);
+    RETURN_IF_ERROR(reader.init(params));
+    Block block = params.read_schema->create_read_block();
+    BlockHasher hasher(plan);
+    bool eof = false;
+    while (!eof) {
+        RETURN_IF_ERROR(reader.next_block_with_aggregation(&block, &eof));
+        RETURN_IF_ERROR(hasher.add_block(block, acc));
+        block.clear_column_data();
+    }
+    return Status::OK();
+}
+
+// Runs `fn` for every task on up to `threads` workers. Each worker accumulates into its own
+// partial digest; the partials are added to `total`.
+template <typename Fn>
+Status run_tasks(const std::vector<DigestScanTask>& tasks, int threads, Fn&& fn, RestoreDigest* total) {
+    if (tasks.empty()) {
+        return Status::OK();
+    }
+    const size_t workers = std::min<size_t>(static_cast<size_t>(std::max(1, threads)), tasks.size());
+    if (workers == 1) {
+        RestoreDigest local;
+        for (const DigestScanTask& task : tasks) {
+            RETURN_IF_ERROR(fn(task, &local));
+        }
+        merge_partial(local, total);
+        return Status::OK();
+    }
+    std::atomic<size_t> next {0};
+    std::atomic<bool> failed {false};
+    std::mutex mu;
+    Status first_error = Status::OK();
+    std::vector<std::unique_ptr<RestoreDigest>> partials(workers);
+    std::shared_ptr<MemTrackerLimiter> tracker = MemTrackerLimiter::create_shared(
+            MemTrackerLimiter::Type::OTHER, "RestoreDigestWorkers");
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    for (size_t w = 0; w < workers; ++w) {
+        partials[w] = std::make_unique<RestoreDigest>();
+        pool.emplace_back([&, w] {
+            SCOPED_ATTACH_TASK(tracker);
+            while (!failed.load(std::memory_order_relaxed)) {
+                size_t i = next.fetch_add(1);
+                if (i >= tasks.size()) {
+                    break;
+                }
+                Status st = fn(tasks[i], partials[w].get());
+                if (!st.ok()) {
+                    std::lock_guard lock(mu);
+                    if (first_error.ok()) {
+                        first_error = st;
+                    }
+                    failed.store(true);
+                    break;
+                }
+            }
+        });
+    }
+    for (auto& t : pool) {
+        t.join();
+    }
+    RETURN_IF_ERROR(first_error);
+    for (const auto& part : partials) {
+        merge_partial(*part, total);
+    }
+    return Status::OK();
+}
+
+
 } // namespace restore_digest_detail
-
-using namespace restore_digest_detail;
-
 Status check_restore_digest_supported(const TabletSchema& schema, KeysType keys_type,
                                       bool enable_mow) {
+    using namespace restore_digest_detail;
     ColumnPlan plan;
     return build_plan(schema, keys_type, enable_mow, &plan);
 }
@@ -292,9 +731,10 @@ std::string RestoreDigest::to_json() const {
     out += fmt::format(
             "{{\"algo_version\":{},\"rows\":{},\"rows_scanned\":{},\"root\":\"{}\","
             "\"schema_sig\":\"{}\",\"rowset_count\":{},\"segment_count\":{},\"bytes_read\":{},"
-            "\"encoded_bytes\":{},\"elapsed_ms\":{},\"buckets\":[",
+            "\"encoded_bytes\":{},\"elapsed_ms\":{},\"threads\":{},\"delete_predicates\":{},"
+            "\"buckets\":[",
             kAlgoVersion, rows, rows_scanned, root, schema_sig, rowset_count, segment_count,
-            bytes_read, encoded_bytes, elapsed_ms);
+            bytes_read, encoded_bytes, elapsed_ms, threads, delete_predicates);
     for (size_t i = 0; i < buckets.size(); ++i) {
         const Bucket& b = buckets[i];
         if (i > 0) {
@@ -309,6 +749,7 @@ std::string RestoreDigest::to_json() const {
 }
 
 Status compute_restore_digest(const RestoreDigestInput& input, RestoreDigest* digest) {
+    using namespace restore_digest_detail;
     if (input.schema == nullptr || digest == nullptr) {
         return Status::InvalidArgument("restore digest: null schema or output");
     }
@@ -318,106 +759,70 @@ Status compute_restore_digest(const RestoreDigestInput& input, RestoreDigest* di
     if (input.enable_mow && input.delete_bitmap == nullptr) {
         return Status::InvalidArgument("restore digest: MoW needs a delete bitmap snapshot");
     }
+    const bool is_mor = input.keys_type == UNIQUE_KEYS && !input.enable_mow;
 
-    *digest = RestoreDigest {};
-    digest->schema_sig = plan.schema_sig;
+    RestoreDigest total;
+    total.schema_sig = plan.schema_sig;
 
-    // The read schema: all digest columns, then the delete sign column for MoW.
-    std::vector<ColumnId> read_ordinals(plan.digest_ordinals.begin(), plan.digest_ordinals.end());
-    const size_t num_digest = plan.digest_ordinals.size();
-    if (plan.delete_sign_ordinal >= 0) {
-        read_ordinals.push_back(static_cast<ColumnId>(plan.delete_sign_ordinal));
-    }
-    auto read_schema = std::make_shared<ReadSchema>(
-            project_columns_by_ordinal(input.schema->columns(), read_ordinals));
-    RETURN_IF_ERROR(read_schema->init_from_tablet_schema(*input.schema,
-                                                         /*merge_by_sequence_mapping=*/false,
-                                                         /*map_row_binlog_columns=*/false));
-
-    ColCodec delete_sign_codec;
-    delete_sign_codec.kind = ColKind::FIXED;
-    delete_sign_codec.width = 1;
-
-    std::vector<ColView> views(num_digest);
-    ColView delete_sign_view;
-    std::string row_buf;
-    row_buf.reserve(256);
-
+    std::vector<RowsetMetaSharedPtr> delete_metas;
     for (const RowsetSharedPtr& rowset : input.rowsets) {
-        digest->rowset_count++;
-        digest->segment_count += static_cast<uint32_t>(rowset->num_segments());
-        digest->bytes_read += rowset->data_disk_size();
-        if (rowset->num_rows() == 0) {
-            continue;
-        }
-        RowsetReaderSharedPtr reader;
-        RETURN_IF_ERROR(rowset->create_reader(&reader));
-
-        OlapReaderStatistics stats;
-        RowsetReaderContext ctx;
-        ctx.reader_type = ReaderType::READER_CHECKSUM;
-        ctx.version = Version(0, input.version);
-        ctx.need_ordered_result = false;
-        ctx.read_schema = read_schema;
-        ctx.stats = &stats;
-        ctx.use_page_cache = false;
-        ctx.batch_size = input.batch_size;
-        ctx.enable_unique_key_merge_on_write = input.enable_mow;
-        ctx.delete_bitmap = input.delete_bitmap;
-        RETURN_IF_ERROR(reader->init(&ctx));
-
-        while (true) {
-            Block block = read_schema->create_read_block();
-            Status st = reader->next_batch(&block);
-            const size_t n = block.rows();
-            if (n > 0) {
-                std::vector<ColumnPtr> keep_alive;
-                keep_alive.reserve(num_digest + 1);
-                for (size_t j = 0; j < num_digest; ++j) {
-                    keep_alive.push_back(
-                            block.get_by_position(j).column->convert_to_full_column_if_const());
-                    RETURN_IF_ERROR(make_view(keep_alive.back(), plan.codecs[j], n, &views[j]));
-                }
-                if (plan.delete_sign_ordinal >= 0) {
-                    keep_alive.push_back(block.get_by_position(num_digest)
-                                                 .column->convert_to_full_column_if_const());
-                    RETURN_IF_ERROR(
-                            make_view(keep_alive.back(), delete_sign_codec, n, &delete_sign_view));
-                }
-                digest->rows_scanned += n;
-                for (size_t row = 0; row < n; ++row) {
-                    if (plan.delete_sign_ordinal >= 0 && ((delete_sign_view.null_map != nullptr &&
-                                                           delete_sign_view.null_map[row] != 0) ||
-                                                          delete_sign_view.data[row] != 0)) {
-                        continue;
-                    }
-                    row_buf.clear();
-                    encode_row(views, row, row_buf);
-                    XXH128_hash_t h =
-                            XXH3_128bits_withSeed(row_buf.data(), row_buf.size(), kHashSeed);
-                    auto& bucket = digest->buckets[h.high64 >> 56];
-                    bucket.sum += (static_cast<unsigned __int128>(h.high64) << 64) | h.low64;
-                    bucket.count++;
-                    digest->rows++;
-                    digest->encoded_bytes += row_buf.size();
-                }
-            }
-            if (st.is<ErrorCode::END_OF_FILE>()) {
-                break;
-            }
-            RETURN_IF_ERROR(st);
+        total.rowset_count++;
+        total.segment_count += static_cast<uint32_t>(rowset->num_segments());
+        total.bytes_read += rowset->data_disk_size();
+        if (rowset->rowset_meta()->has_delete_predicate() &&
+            rowset->version().first <= input.version) {
+            delete_metas.push_back(rowset->rowset_meta());
         }
     }
+    total.delete_predicates = static_cast<uint32_t>(delete_metas.size());
 
-    digest->finalize();
-    digest->elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::steady_clock::now() - start)
-                                 .count();
+    if (is_mor) {
+        total.threads = 1;
+        RETURN_IF_ERROR(run_mor(input, plan, &total));
+    } else {
+        const int threads = std::max(1, input.threads);
+        std::vector<DigestScanTask> tasks;
+        for (size_t i = 0; i < input.rowsets.size(); ++i) {
+            const RowsetSharedPtr& rowset = input.rowsets[i];
+            if (rowset->num_rows() == 0) {
+                continue;
+            }
+            const int64_t n = static_cast<int64_t>(rowset->num_segments());
+            // Cut a rowset into runs of segments. Every task walks the delete bitmap of all the
+            // segments of its rowset once, so the runs are kept long: about 4 tasks per worker.
+            const int64_t chunk =
+                    threads == 1 ? n : std::max<int64_t>(1, (n + threads * 4 - 1) / (threads * 4));
+            for (int64_t b = 0; b < n; b += chunk) {
+                DigestScanTask task;
+                task.rowset_idx = i;
+                const int64_t e = std::min(n, b + chunk);
+                if (!(b == 0 && e == n)) {
+                    task.seg_begin = b;
+                    task.seg_end = e;
+                }
+                tasks.push_back(task);
+            }
+        }
+        total.threads = static_cast<uint32_t>(
+                std::min<size_t>(static_cast<size_t>(threads), std::max<size_t>(1, tasks.size())));
+        RETURN_IF_ERROR(run_tasks(
+                tasks, threads,
+                [&](const DigestScanTask& task, RestoreDigest* acc) {
+                    return run_direct_task(input, plan, delete_metas, task, acc);
+                },
+                &total));
+    }
+
+    total.finalize();
+    total.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+    *digest = std::move(total);
     return Status::OK();
 }
 
 Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
-                                     RestoreDigest* digest) {
+                                     RestoreDigest* digest, int threads) {
     TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(tablet_id);
     if (tablet == nullptr) {
         return Status::NotFound("restore digest: could not find tablet {}", tablet_id);
@@ -433,6 +838,8 @@ Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, i
     input.version = version;
     input.keys_type = tablet->keys_type();
     input.enable_mow = tablet->enable_unique_key_merge_on_write();
+    input.threads = threads;
+    input.tablet = tablet;
     {
         // Rowsets and the delete bitmap snapshot must be taken in the same critical section.
         std::shared_lock rdlock(tablet->get_header_lock());
@@ -454,15 +861,16 @@ Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, i
             return Status::NotSupported("restore digest: remote rowset {} is not supported",
                                         rs->rowset_id().to_string());
         }
-        if (rs->rowset_meta()->has_delete_predicate()) {
-            return Status::NotSupported(
-                    "restore digest: rowset {} carries a delete predicate, not supported",
-                    rs->version().to_string());
-        }
         metas.push_back(rs->rowset_meta());
     }
+    // The newest schema among the rowsets and the tablet itself: after a light schema change the
+    // rowsets may all carry an older schema, and the segments just read the default for the
+    // columns they do not have.
     input.schema = metas.empty() ? tablet->tablet_schema()
                                  : BaseTablet::tablet_schema_with_merged_max_schema_version(metas);
+    if (tablet->tablet_schema()->schema_version() > input.schema->schema_version()) {
+        input.schema = tablet->tablet_schema();
+    }
     return compute_restore_digest(input, digest);
 }
 

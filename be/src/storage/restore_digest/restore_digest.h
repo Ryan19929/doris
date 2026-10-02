@@ -45,7 +45,17 @@ class StorageEngine;
 //       DATEV2/DATETIMEV2: raw u32/u64 bit pattern; scale comes from the schema signature
 //       IPV4/IPV6: u32/u128, little endian
 //       CHAR: trailing '\0' padding stripped, then u32 length + bytes
-//       VARCHAR/STRING: u32 length + bytes
+//       VARCHAR/STRING/JSONB: u32 length + bytes (JSONB: the stored binary, byte for byte)
+//     Types added after the first cut (they do not change the encoding of any type above, so
+//     algo_version stays 1):
+//       DECIMALV2: the in-memory int128 (value * 10^9), little endian; precision / scale are in
+//                  the schema signature
+//       DATE (v1): year u16, month u8, day u8 (fields, never the packed bits)
+//       DATETIME (v1): year u16, month u8, day u8, hour u8, minute u8, second u8
+//       ARRAY: u64 element count, then per element a null flag byte and the element encoding
+//       MAP: u64 entry count, then per entry (key, value), each with a null flag byte, in the
+//            stored order (the entries are not sorted)
+//       STRUCT: per field in declaration order a null flag byte and the field encoding
 //   * The row bytes are hashed with XXH3-128 (seed = algo_version). The high 8 bits of the high
 //     64-bit half pick one of 256 buckets; a bucket keeps the sum (mod 2^128) of the row hashes
 //     and its row count.
@@ -53,8 +63,19 @@ class StorageEngine;
 //   * schema_sig = SHA-256 over the keys type and the (type, precision, scale) of every digest
 //     column. Two digests are comparable only if algo_version and schema_sig are equal.
 //
-// Hidden columns: the delete sign is only used to filter rows (MoW), the sequence column takes
-// part in the digest, version / commit TSO / skip bitmap / row store columns are excluded.
+// Hidden columns: the delete sign is only used to filter rows (MoW and MoR), the sequence column
+// takes part in the digest, version / commit TSO / skip bitmap / row store columns are excluded.
+//
+// Which rows are visible:
+//   * Duplicate: every row, minus the rows removed by DELETE conditions (delete predicates) of
+//     version <= V. A condition of version d removes matching rows of rowsets with end version < d,
+//     the same rule the query path uses, so the digest is the same before and after a compaction
+//     has physically dropped those rows.
+//   * Unique MoW: the rows the delete bitmap snapshot at V leaves, minus delete-sign rows, minus
+//     delete predicates. No merge is needed.
+//   * Unique MoR: rows are merged across rowsets by key (highest version wins, sequence column
+//     first when the table has one) by the same BlockReader the checksum task uses, then
+//     delete-sign rows are dropped.
 struct RestoreDigest {
     static constexpr uint32_t kAlgoVersion = 1;
     static constexpr size_t kNumBuckets = 256;
@@ -75,6 +96,10 @@ struct RestoreDigest {
     uint32_t rowset_count = 0;
     uint32_t segment_count = 0;
     int64_t elapsed_ms = 0;
+    // worker threads actually used (the unique MoR merge is always single threaded)
+    uint32_t threads = 1;
+    // number of delete predicates (rowsets with version <= V) applied to the rows
+    uint32_t delete_predicates = 0;
     std::string schema_sig; // hex
     std::string root;       // hex
 
@@ -94,6 +119,10 @@ struct RestoreDigestInput {
     DeleteBitmapPtr delete_bitmap;
     int64_t version = 0;
     int batch_size = 4096;
+    // Needed for unique MoR only, where the rows of the rowsets are merged by a BlockReader.
+    BaseTabletSPtr tablet;
+    // Worker threads for the rowset / segment parallel read (Duplicate and MoW).
+    int threads = 1;
 };
 
 // Checks that the model and every column are supported by algo_version 1. Returns NotSupported
@@ -107,6 +136,6 @@ Status compute_restore_digest(const RestoreDigestInput& input, RestoreDigest* di
 // Computes the digest of tablet `tablet_id` at (0, version]. The rowsets and (for MoW) the delete
 // bitmap snapshot are taken under the header lock. Read only.
 Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
-                                     RestoreDigest* digest);
+                                     RestoreDigest* digest, int threads = 1);
 
 } // namespace doris
