@@ -19,6 +19,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <string>
 
 #include "common/logging.h"
@@ -52,7 +53,20 @@ void RestoreDigestAction::handle(HttpRequest* req) {
                                 "parameters tablet_id and version are required integers");
         return;
     }
-    LOG(INFO) << "restore digest begin, tablet_id=" << tablet_id << ", version=" << version;
+    int threads = 1;
+    const std::string& threads_str = req->param("threads");
+    if (!threads_str.empty()) {
+        try {
+            threads = std::stoi(threads_str);
+        } catch (...) {
+            HttpChannel::send_reply(req, HttpStatus::BAD_REQUEST,
+                                    "parameter threads must be an integer");
+            return;
+        }
+        threads = std::clamp(threads, 1, 64);
+    }
+    LOG(INFO) << "restore digest begin, tablet_id=" << tablet_id << ", version=" << version
+              << ", threads=" << threads;
 
     RestoreDigest digest;
     Status st;
@@ -61,7 +75,7 @@ void RestoreDigestAction::handle(HttpRequest* req) {
                 MemTrackerLimiter::Type::OTHER,
                 "RestoreDigest#tabletId=" + std::to_string(tablet_id));
         SCOPED_ATTACH_TASK(mem_tracker);
-        st = compute_tablet_restore_digest(_engine, tablet_id, version, &digest);
+        st = compute_tablet_restore_digest(_engine, tablet_id, version, &digest, threads);
     }
     if (st.ok()) {
         LOG(INFO) << "restore digest done, tablet_id=" << tablet_id << ", version=" << version
