@@ -115,21 +115,39 @@ public class RestoreDownloadStats {
 
     // (linked + skipped) / (linked + skipped + downloaded) by bytes, 0 if nothing to download at all.
     public double getReuseRatio() {
-        long total = linkedBytes + skippedBytes + downloadedBytes;
+        return getReuseRatio(0);
+    }
+
+    /**
+     * (linked + skipped + kept) / (linked + skipped + kept + downloaded) by bytes, 0 if there is no data at all.
+     *
+     * @param keptBytes the local data size of the partitions kept by partition level reuse, by replica
+     */
+    public double getReuseRatio(long keptBytes) {
+        long total = linkedBytes + skippedBytes + keptBytes + downloadedBytes;
         if (total <= 0) {
             return 0.0;
         }
-        return Math.round((double) (linkedBytes + skippedBytes) / total * 1000) / 1000.0;
+        return Math.round((double) (linkedBytes + skippedBytes + keptBytes) / total * 1000) / 1000.0;
     }
 
-    // totalReplicas is the replicas to download if the stats are not fixed yet.
     public String toJson(long currentTotalReplicas) {
+        return toJson(currentTotalReplicas, 0);
+    }
+
+    /**
+     * @param currentTotalReplicas the replicas to download if the stats are not fixed yet
+     * @param keptBytes the local data size of the partitions kept by partition level reuse, by replica. It is not
+     *         downloaded and not in the other counts, but is data that needed no download.
+     */
+    public String toJson(long currentTotalReplicas, long keptBytes) {
         long total = isFixed() ? totalReplicas : currentTotalReplicas;
         Map<String, Object> json = new LinkedHashMap<>();
         json.put("linked_bytes", linkedBytes);
         json.put("skipped_bytes", skippedBytes);
+        json.put("kept_bytes", keptBytes);
         json.put("downloaded_bytes", downloadedBytes);
-        json.put("reuse_ratio", getReuseRatio());
+        json.put("reuse_ratio", getReuseRatio(keptBytes));
         json.put("linked_files", linkedFiles);
         json.put("skipped_files", skippedFiles);
         json.put("downloaded_files", downloadedFiles);

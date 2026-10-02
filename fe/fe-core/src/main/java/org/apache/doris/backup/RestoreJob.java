@@ -50,6 +50,7 @@ import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.ResourceMgr;
 import org.apache.doris.catalog.RestoreLineage;
+import org.apache.doris.catalog.RestoreSource;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Tablet;
@@ -248,6 +249,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // 1: the sampled partitions (or all, if there is no sampling), 2: the others, after the sample found a mismatch
     private transient int verifyRound = 0;
     private transient Random sampleRandom = new Random();
+    // What the backup meta carried before it was cleared: backup table name -> its restore source and the restore
+    // lineage of its partitions (by partition name), for the reverse L0 checks.
+    private transient Map<String, BackupStamps> backupStamps = Maps.newHashMap();
 
     private List<ColocatePersistInfo> colocatePersistInfos = Lists.newArrayList();
 
@@ -792,6 +796,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         Preconditions.checkNotNull(backupMeta);
 
         // Must be done before any local partition is modified by this job.
+        captureBackupStamps();
         computeReuseShadowStats(db);
         // The backup meta carries the restore lineage of the source partitions, which must not be inherited.
         clearRestoreLineageInBackupMeta();
@@ -2657,10 +2662,18 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         info.add(status.toString());
         info.add(String.valueOf(timeoutMs / 1000));
         if (!isBrief) {
-            info.add(reuseShadowStats == null ? FeConstants.null_string : reuseShadowStats.toString());
+            info.add(reuseShadowStats == null ? FeConstants.null_string : reuseShadowStats.toJson(reuseResult));
             RestoreManifestCheck check = getManifestCheck();
             info.add(check == null ? FeConstants.null_string : check.toString());
-            info.add(downloadStats == null ? FeConstants.null_string : downloadStats.toJson(snapshotInfos.size()));
+            long keptBytes = reuseResult == null ? 0 : reuseResult.getKeptBytesAllReplicas();
+            if (downloadStats != null) {
+                info.add(downloadStats.toJson(snapshotInfos.size(), keptBytes));
+            } else if (keptBytes > 0) {
+                // everything was kept, nothing was downloaded
+                info.add(new RestoreDownloadStats().toJson(snapshotInfos.size(), keptBytes));
+            } else {
+                info.add(FeConstants.null_string);
+            }
         }
         return info;
     }
@@ -2736,18 +2749,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 localPart.getId())) {
                             continue;
                         }
-                        RestoreReuseJudge.Input in = new RestoreReuseJudge.Input();
-                        in.atomicRestore = isAtomicRestore;
-                        in.allowLoad = allowLoad;
-                        in.cloudMode = Config.isCloudMode();
-                        in.minPartitionBytes = Config.restore_reuse_min_partition_bytes;
-                        in.level = level;
-                        in.jobInfo = jobInfo;
-                        in.backupTable = tblInfo;
-                        in.backupPartition = partEntry.getValue();
-                        in.srcCommitSeq = getSrcCommitSeq(jobInfo, tblInfo.id);
-                        in.localTable = localOlapTbl;
-                        in.localPartition = localPart;
+                        RestoreReuseJudge.Input in = buildReuseInput(tblEntry.getKey(), tblInfo,
+                                partEntry.getKey(), partEntry.getValue(), localOlapTbl, localPart, level);
                         String reject = RestoreReuseJudge.firstReject(in);
                         if (reject != null) {
                             result.addRejected(reject);
@@ -2764,6 +2767,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         candidate.partitionName = partEntry.getKey();
                         candidate.version = in.backupPartition.version;
                         candidate.bytes = in.getSingleReplicaBytes();
+                        candidate.bytesAllReplicas = RestoreReuseShadowStats.getAllReplicasLocalDataSize(localPart);
+                        candidate.l0Path = in.l0Path;
                         candidate.level = level;
                         candidate.backupPartition = in.backupPartition;
                         if (level == CheckLevel.OFF) {
@@ -3112,6 +3117,68 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         return Status.OK;
     }
 
+    // The restore source of a table in the backup meta and the restore lineage of its partitions, as the backup
+    // meta carried them.
+    static class BackupStamps {
+        RestoreSource tableSource;
+        OlapTable table;
+        final Map<String, RestoreLineage> partitionLineage = Maps.newHashMap();
+    }
+
+    /**
+     * Read the restore source and the restore lineage that the backup meta carries, before they are cleared. They
+     * describe the source cluster's own upstream, so they are only used by the reverse L0 checks, and are never
+     * written to the local metadata.
+     */
+    @VisibleForTesting
+    void captureBackupStamps() {
+        backupStamps = Maps.newHashMap();
+        if (backupMeta == null) {
+            return;
+        }
+        for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
+            Table remoteTbl = backupMeta.getTable(tableName);
+            if (!(remoteTbl instanceof OlapTable)) {
+                continue;
+            }
+            OlapTable remoteOlap = (OlapTable) remoteTbl;
+            BackupStamps stamps = new BackupStamps();
+            stamps.tableSource = remoteOlap.getRestoreSource();
+            stamps.table = remoteOlap;
+            for (Partition remotePart : remoteOlap.getAllPartitions()) {
+                if (remotePart.getRestoreLineage() != null) {
+                    stamps.partitionLineage.put(remotePart.getName(), remotePart.getRestoreLineage());
+                }
+            }
+            backupStamps.put(tableName, stamps);
+        }
+    }
+
+    private RestoreReuseJudge.Input buildReuseInput(String backupTableName, BackupOlapTableInfo tblInfo,
+            String partitionName, BackupPartitionInfo partInfo, OlapTable localTbl, Partition localPart,
+            CheckLevel level) {
+        RestoreReuseJudge.Input in = new RestoreReuseJudge.Input();
+        in.atomicRestore = isAtomicRestore;
+        in.allowLoad = allowLoad;
+        in.cloudMode = Config.isCloudMode();
+        in.minPartitionBytes = Config.restore_reuse_min_partition_bytes;
+        in.level = level;
+        in.jobInfo = jobInfo;
+        in.backupTable = tblInfo;
+        in.backupPartition = partInfo;
+        in.srcCommitSeq = getSrcCommitSeq(jobInfo, tblInfo.id);
+        in.localDbId = dbId;
+        in.localTable = localTbl;
+        in.localPartition = localPart;
+        BackupStamps stamps = backupStamps.get(backupTableName);
+        if (stamps != null) {
+            in.backupTableSource = stamps.tableSource;
+            in.backupOlapTable = stamps.table;
+            in.backupLineage = stamps.partitionLineage.get(partitionName);
+        }
+        return in;
+    }
+
     // A candidate partition of partition level reuse, not persisted.
     @VisibleForTesting
     static class ReuseCandidate {
@@ -3122,6 +3189,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // the version of the backup
         long version;
         long bytes;
+        long bytesAllReplicas;
+        String l0Path;
         CheckLevel level;
         BackupPartitionInfo backupPartition;
         // in the sample of the check level sample
@@ -3146,6 +3215,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             decision.partitionName = partitionName;
             decision.version = version;
             decision.bytes = bytes;
+            decision.bytesAllReplicas = bytesAllReplicas;
+            decision.l0Path = l0Path;
             decision.level = level.lower();
             decision.kept = kept;
             decision.reason = reason;
@@ -3161,6 +3232,17 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         ReuseTabletCheck(LogicalDigestInfo expected) {
             this.expected = expected;
         }
+    }
+
+    // The check level the estimate is computed with: the level of the job, as for the actual judgement. If the
+    // feature is off or disabled for the job, the estimate follows the default level, as if it were enabled.
+    private CheckLevel estimateLevel(OlapTable localTbl) {
+        CheckLevel level = CheckLevel.parse(properties.get(PROP_REUSE_CHECK_LEVEL),
+                Config.restore_reuse_default_check_level);
+        if (level == CheckLevel.DISABLE) {
+            level = CheckLevel.OFF;
+        }
+        return RestoreReuseJudge.levelOfTable(level, localTbl.getKeysType());
     }
 
     /**
@@ -3180,7 +3262,6 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
             for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
                 BackupOlapTableInfo tblInfo = tblEntry.getValue();
-                long srcCommitSeq = getSrcCommitSeq(jobInfo, tblInfo.id);
                 Table localTbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
                 if (localTbl == null || localTbl.getType() != TableType.OLAP) {
                     for (int i = 0; i < tblInfo.partitions.size(); i++) {
@@ -3195,8 +3276,20 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
                         BackupPartitionInfo partInfo = partEntry.getValue();
                         Partition localPart = localOlapTbl.getPartition(partEntry.getKey(), false);
-                        RestoreReuseShadowStats.L0Verdict verdict = RestoreReuseShadowStats.checkL0(localPart,
-                                jobInfo.dbId, tblInfo.id, partInfo.id, partInfo.version, srcCommitSeq);
+                        RestoreReuseShadowStats.L0Verdict verdict;
+                        String l0Path = RestoreReuseJudge.L0_FORWARD;
+                        if (localPart == null) {
+                            verdict = RestoreReuseShadowStats.L0Verdict.NO_LOCAL_PARTITION;
+                        } else {
+                            // The estimate follows the L0 checks of the check level of the job, the reverse and
+                            // table level checks count only where a digest would be computed.
+                            RestoreReuseJudge.Input in = buildReuseInput(tblEntry.getKey(), tblInfo,
+                                    partEntry.getKey(), partInfo, localOlapTbl, localPart, estimateLevel(localOlapTbl));
+                            RestoreReuseShadowStats.L0Verdict[] first = new RestoreReuseShadowStats.L0Verdict[1];
+                            String path = RestoreReuseJudge.passedL0(in, first);
+                            verdict = path != null ? RestoreReuseShadowStats.L0Verdict.REUSABLE : first[0];
+                            l0Path = path;
+                        }
                         RestoreReuseShadowStats.Unsupported unsupported = RestoreReuseShadowStats.Unsupported.NONE;
                         long bytes = 0;
                         if (verdict == RestoreReuseShadowStats.L0Verdict.REUSABLE) {
@@ -3204,7 +3297,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                     localPart);
                             bytes = RestoreReuseShadowStats.getSingleReplicaLocalDataSize(localPart);
                         }
-                        stats.add(verdict, unsupported, bytes);
+                        stats.add(verdict, unsupported, bytes, l0Path);
                     }
                 } finally {
                     localOlapTbl.readUnlock();
@@ -3267,6 +3360,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             if (!(remoteTbl instanceof OlapTable)) {
                 continue;
             }
+            ((OlapTable) remoteTbl).setRestoreSource(null);
             for (Partition remotePart : ((OlapTable) remoteTbl).getAllPartitions()) {
                 remotePart.setRestoreLineage(null);
             }
@@ -3291,6 +3385,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
             try {
                 BackupOlapTableInfo tblInfo = tblEntry.getValue();
+                olapTbl.setRestoreSource(new RestoreSource(jobInfo.dbId, tblInfo.id));
                 for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
                     Partition part = olapTbl.getPartition(partEntry.getKey(), false);
                     if (part == null) {

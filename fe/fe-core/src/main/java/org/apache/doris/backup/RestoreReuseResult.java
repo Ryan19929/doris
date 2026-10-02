@@ -76,6 +76,12 @@ public class RestoreReuseResult {
         // off|sample|full, the check level the partition was judged with
         @SerializedName("l")
         public String level;
+        // the local data size of all replicas, what the partition would have downloaded
+        @SerializedName("ab")
+        public long bytesAllReplicas;
+        // the L0 check that let the partition in: a forward, b reverse, c table level
+        @SerializedName("p")
+        public String l0Path;
         @SerializedName("k")
         public boolean kept;
         @SerializedName("r")
@@ -84,7 +90,7 @@ public class RestoreReuseResult {
         @Override
         public String toString() {
             return tableName + "." + partitionName + "(" + tableId + "," + partitionId + ", v" + version + ", "
-                    + level + "): " + (kept ? "KEEP " : "DOWNLOAD ") + reason;
+                    + level + ", L0 " + l0Path + "): " + (kept ? "KEEP " : "DOWNLOAD ") + reason;
         }
     }
 
@@ -140,6 +146,32 @@ public class RestoreReuseResult {
     /** The local data size of a single replica of the kept partitions. */
     public long getKeptBytesSingleReplica() {
         return decisions.stream().filter(d -> d.kept).mapToLong(d -> d.bytes).sum();
+    }
+
+    /** The local data size of all replicas of the kept partitions, the bytes that were not downloaded. */
+    public long getKeptBytesAllReplicas() {
+        return decisions.stream().filter(d -> d.kept).mapToLong(d -> d.bytesAllReplicas).sum();
+    }
+
+    /** The kept partitions that passed L0 by the given check. */
+    public long getKeptByPath(String l0Path) {
+        return decisions.stream().filter(d -> d.kept && l0Path.equals(d.l0Path)).count();
+    }
+
+    /** The candidate partitions that are downloaded for one of the reasons. */
+    public long countReasons(String... reasons) {
+        long count = 0;
+        for (Decision decision : decisions) {
+            if (!decision.kept) {
+                for (String reason : reasons) {
+                    if (reason.equals(decision.reason)) {
+                        count++;
+                        break;
+                    }
+                }
+            }
+        }
+        return count;
     }
 
     public long getDownloadedPartitions() {

@@ -28,6 +28,7 @@ import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.persist.gson.GsonUtils;
 
+import com.google.gson.JsonObject;
 import com.google.gson.annotations.SerializedName;
 
 /**
@@ -58,7 +59,17 @@ public class RestoreReuseShadowStats {
         // The source partition was written after the backup that the local partition was restored from.
         SOURCE_VERSION_CHANGED,
         // The commit seq of the source table is unknown, or goes backwards.
-        COMMIT_SEQ_MISMATCH
+        COMMIT_SEQ_MISMATCH,
+        // The reverse and table level checks are not allowed at the check level off and disable.
+        LEVEL_NOT_ALLOWED,
+        // The source partition in the backup has no restore lineage (reverse check).
+        NO_BACKUP_LINEAGE,
+        // The local table and the backup table have no restore source relation (table level check).
+        NO_TABLE_RELATION,
+        // The partition name or range differs from the backup (table level check).
+        PARTITION_MISMATCH,
+        // The version of the backup differs from the visible version of the local partition.
+        VERSION_MISMATCH
     }
 
     /**
@@ -82,6 +93,13 @@ public class RestoreReuseShadowStats {
     private long reusable = 0;
     @SerializedName("reusable_bytes_single_replica")
     private long reusableBytesSingleReplica = 0;
+    // reusable, by the L0 check that passed: a forward, b reverse, c table level
+    @SerializedName("reusable_a")
+    private long reusableForward = 0;
+    @SerializedName("reusable_b")
+    private long reusableReverse = 0;
+    @SerializedName("reusable_c")
+    private long reusableTable = 0;
     @SerializedName("l0_passed_but_atomic_restore")
     private long l0PassedButAtomicRestore = 0;
     @SerializedName("l0_passed_but_aggregate_table")
@@ -180,6 +198,21 @@ public class RestoreReuseShadowStats {
         return dataSize;
     }
 
+    /** The local data size of all replicas of the partition (what a download of it would write). */
+    public static long getAllReplicasLocalDataSize(Partition partition) {
+        long dataSize = 0;
+        for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            for (Tablet tablet : index.getTablets()) {
+                for (Replica replica : tablet.getReplicas()) {
+                    if (replica.getState() == ReplicaState.NORMAL) {
+                        dataSize += replica.getDataSize();
+                    }
+                }
+            }
+        }
+        return dataSize;
+    }
+
     /**
      * Add a partition.
      *
@@ -189,6 +222,13 @@ public class RestoreReuseShadowStats {
      *         partition is reusable
      */
     public void add(L0Verdict verdict, Unsupported unsupported, long singleReplicaBytes) {
+        add(verdict, unsupported, singleReplicaBytes, RestoreReuseJudge.L0_FORWARD);
+    }
+
+    /**
+     * @param l0Path the L0 check that passed ({@link RestoreReuseJudge#L0_FORWARD} etc), only used if L0 passes
+     */
+    public void add(L0Verdict verdict, Unsupported unsupported, long singleReplicaBytes, String l0Path) {
         partitions++;
         switch (verdict) {
             case REUSABLE:
@@ -205,6 +245,13 @@ public class RestoreReuseShadowStats {
                     default:
                         reusable++;
                         reusableBytesSingleReplica += singleReplicaBytes;
+                        if (RestoreReuseJudge.L0_REVERSE.equals(l0Path)) {
+                            reusableReverse++;
+                        } else if (RestoreReuseJudge.L0_TABLE.equals(l0Path)) {
+                            reusableTable++;
+                        } else {
+                            reusableForward++;
+                        }
                         break;
                 }
                 break;
@@ -241,6 +288,18 @@ public class RestoreReuseShadowStats {
 
     public long getReusableBytesSingleReplica() {
         return reusableBytesSingleReplica;
+    }
+
+    public long getReusableForward() {
+        return reusableForward;
+    }
+
+    public long getReusableReverse() {
+        return reusableReverse;
+    }
+
+    public long getReusableTable() {
+        return reusableTable;
     }
 
     public long getL0PassedButAtomicRestore() {
@@ -282,5 +341,32 @@ public class RestoreReuseShadowStats {
     @Override
     public String toString() {
         return GsonUtils.GSON.toJson(this);
+    }
+
+    /**
+     * The estimate with the actual result of partition level reuse of the job added, for the ReuseEstimate column:
+     * the partitions kept (by the L0 check that let them in) and the bytes of a single replica, and the partitions
+     * that were candidates but are downloaded, by reason.
+     *
+     * @param actual the result of the job, null if there is none (the feature is off, or not decided yet)
+     */
+    public String toJson(RestoreReuseResult actual) {
+        if (actual == null) {
+            return toString();
+        }
+        JsonObject json = GsonUtils.GSON.toJsonTree(this).getAsJsonObject();
+        json.addProperty("kept_partitions", actual.getKeptPartitions());
+        json.addProperty("kept_bytes_single_replica", actual.getKeptBytesSingleReplica());
+        json.addProperty("kept_a", actual.getKeptByPath(RestoreReuseJudge.L0_FORWARD));
+        json.addProperty("kept_b", actual.getKeptByPath(RestoreReuseJudge.L0_REVERSE));
+        json.addProperty("kept_c", actual.getKeptByPath(RestoreReuseJudge.L0_TABLE));
+        json.addProperty("download_digest_mismatch", actual.countReasons(
+                RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH));
+        json.addProperty("download_timeout", actual.countReasons(RestoreReuseResult.DOWNLOAD_TIMEOUT));
+        json.addProperty("download_not_supported", actual.countReasons(RestoreReuseResult.DOWNLOAD_DIGEST_ERROR));
+        json.addProperty("download_sample_failed", actual.countReasons(RestoreReuseResult.DOWNLOAD_SAMPLE_FAILED));
+        json.addProperty("download_other", actual.countReasons(RestoreReuseResult.DOWNLOAD_CHANGED,
+                RestoreReuseResult.DOWNLOAD_VERIFY_ERROR));
+        return GsonUtils.GSON.toJson(json);
     }
 }

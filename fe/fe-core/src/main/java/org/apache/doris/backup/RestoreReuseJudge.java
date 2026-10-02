@@ -27,8 +27,12 @@ import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionInfo;
+import org.apache.doris.catalog.PartitionItem;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
+import org.apache.doris.catalog.RestoreLineage;
+import org.apache.doris.catalog.RestoreSource;
 import org.apache.doris.catalog.Tablet;
 
 import com.google.common.collect.ImmutableList;
@@ -107,8 +111,17 @@ public final class RestoreReuseJudge {
         public BackupOlapTableInfo backupTable;
         public BackupPartitionInfo backupPartition;
         public long srcCommitSeq;
+        public long localDbId;
         public OlapTable localTable;
         public Partition localPartition;
+        // What the backup meta carried before it was cleared (see RestoreJob#clearRestoreLineageInBackupMeta), for
+        // the reverse L0 checks. The source partition's own restore lineage, the source table's own restore source,
+        // and the source table itself for the partition range. Null if the backup has none.
+        public RestoreLineage backupLineage;
+        public RestoreSource backupTableSource;
+        public OlapTable backupOlapTable;
+        // Set by checkL0: the L0 check that passed, null if none did.
+        public String l0Path;
         private long singleReplicaBytes = -1;
 
         /** The local data size of a single replica of the partition, computed once. */
@@ -126,15 +139,125 @@ public final class RestoreReuseJudge {
     }
 
     /** A way to pass L0, the partition passes if any of them does. */
-    public interface L0Check {
-        RestoreReuseShadowStats.L0Verdict check(Input in);
+    public abstract static class L0Check {
+        final String name;
+
+        L0Check(String name) {
+            this.name = name;
+        }
+
+        abstract RestoreReuseShadowStats.L0Verdict check(Input in);
     }
 
-    /** The forward L0 check: the local partition has the lineage of the source partition of this backup. */
-    public static final L0Check FORWARD_L0 = in -> RestoreReuseShadowStats.checkL0(in.localPartition,
-            in.jobInfo.dbId, in.backupTable.id, in.backupPartition.id, in.backupPartition.version, in.srcCommitSeq);
+    public static final String L0_FORWARD = "a";
+    public static final String L0_REVERSE = "b";
+    public static final String L0_TABLE = "c";
 
-    public static final List<L0Check> L0_CHECKS = ImmutableList.of(FORWARD_L0);
+    /** a. forward: the local partition has the lineage of the source partition of this backup. */
+    public static final L0Check FORWARD_L0 = new L0Check(L0_FORWARD) {
+        @Override
+        RestoreReuseShadowStats.L0Verdict check(Input in) {
+            return RestoreReuseShadowStats.checkL0(in.localPartition, in.jobInfo.dbId, in.backupTable.id,
+                    in.backupPartition.id, in.backupPartition.version, in.srcCommitSeq);
+        }
+    };
+
+    /**
+     * b. reverse: the source partition in the backup carries the lineage that points to this local partition, and
+     * the versions are equal. Only used when a digest is computed.
+     */
+    public static final L0Check REVERSE_L0 = new L0Check(L0_REVERSE) {
+        @Override
+        RestoreReuseShadowStats.L0Verdict check(Input in) {
+            if (in.level == CheckLevel.OFF || in.level == CheckLevel.DISABLE) {
+                return RestoreReuseShadowStats.L0Verdict.LEVEL_NOT_ALLOWED;
+            }
+            if (in.localPartition == null) {
+                return RestoreReuseShadowStats.L0Verdict.NO_LOCAL_PARTITION;
+            }
+            if (in.backupLineage == null) {
+                return RestoreReuseShadowStats.L0Verdict.NO_BACKUP_LINEAGE;
+            }
+            if (!in.backupLineage.isSameSource(in.localDbId, in.localTable.getId(), in.localPartition.getId())) {
+                return RestoreReuseShadowStats.L0Verdict.LINEAGE_MISMATCH;
+            }
+            if (in.backupPartition.version != in.localPartition.getVisibleVersion()) {
+                return RestoreReuseShadowStats.L0Verdict.VERSION_MISMATCH;
+            }
+            return RestoreReuseShadowStats.L0Verdict.REUSABLE;
+        }
+    };
+
+    /**
+     * c. table level relation: the local table and the backup table are the same replicated table (the source of one
+     * is the other, in either direction), the partitions have the same name and range, and the versions are equal.
+     * Only used when a digest is computed.
+     */
+    public static final L0Check TABLE_L0 = new L0Check(L0_TABLE) {
+        @Override
+        RestoreReuseShadowStats.L0Verdict check(Input in) {
+            if (in.level == CheckLevel.OFF || in.level == CheckLevel.DISABLE) {
+                return RestoreReuseShadowStats.L0Verdict.LEVEL_NOT_ALLOWED;
+            }
+            if (in.localPartition == null) {
+                return RestoreReuseShadowStats.L0Verdict.NO_LOCAL_PARTITION;
+            }
+            RestoreSource localSource = in.localTable.getRestoreSource();
+            boolean forward = localSource != null && localSource.isSameSource(in.jobInfo.dbId, in.backupTable.id);
+            boolean reverse = in.backupTableSource != null
+                    && in.backupTableSource.isSameSource(in.localDbId, in.localTable.getId());
+            if (!forward && !reverse) {
+                return RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION;
+            }
+            if (!sameRange(in)) {
+                return RestoreReuseShadowStats.L0Verdict.PARTITION_MISMATCH;
+            }
+            if (in.backupPartition.version != in.localPartition.getVisibleVersion()) {
+                return RestoreReuseShadowStats.L0Verdict.VERSION_MISMATCH;
+            }
+            return RestoreReuseShadowStats.L0Verdict.REUSABLE;
+        }
+    };
+
+    // The partition name is the same by the way the local partition is found, compare the partition types and ranges
+    // of the two tables. Unknown is not the same.
+    private static boolean sameRange(Input in) {
+        if (in.backupOlapTable == null) {
+            return false;
+        }
+        Partition backupPart = in.backupOlapTable.getPartition(in.localPartition.getName(), false);
+        if (backupPart == null) {
+            return false;
+        }
+        PartitionInfo localInfo = in.localTable.getPartitionInfo();
+        PartitionInfo backupInfo = in.backupOlapTable.getPartitionInfo();
+        if (localInfo == null || backupInfo == null || localInfo.getType() != backupInfo.getType()) {
+            return false;
+        }
+        PartitionItem localItem = localInfo.getItem(in.localPartition.getId());
+        PartitionItem backupItem = backupInfo.getItem(backupPart.getId());
+        return localItem != null && localItem.equals(backupItem);
+    }
+
+    public static final List<L0Check> L0_CHECKS = ImmutableList.of(FORWARD_L0, REVERSE_L0, TABLE_L0);
+
+    /**
+     * The first L0 check that passes, null if none does. At the check level off only the forward check is used.
+     *
+     * @param first if not null, [0] receives the verdict of the forward check
+     */
+    static String passedL0(Input in, RestoreReuseShadowStats.L0Verdict[] first) {
+        for (L0Check check : L0_CHECKS) {
+            RestoreReuseShadowStats.L0Verdict verdict = check.check(in);
+            if (first != null && first[0] == null) {
+                first[0] = verdict;
+            }
+            if (verdict == RestoreReuseShadowStats.L0Verdict.REUSABLE) {
+                return check.name;
+            }
+        }
+        return null;
+    }
 
     public static final List<Condition> CONDITIONS = ImmutableList.of(
             RestoreReuseJudge::checkMode,
@@ -172,17 +295,12 @@ public final class RestoreReuseJudge {
 
     // 2. L0: the lineage and the versions.
     static String checkL0(Input in) {
-        RestoreReuseShadowStats.L0Verdict first = null;
-        for (L0Check check : L0_CHECKS) {
-            RestoreReuseShadowStats.L0Verdict verdict = check.check(in);
-            if (verdict == RestoreReuseShadowStats.L0Verdict.REUSABLE) {
-                return null;
-            }
-            if (first == null) {
-                first = verdict;
-            }
+        RestoreReuseShadowStats.L0Verdict[] first = new RestoreReuseShadowStats.L0Verdict[1];
+        in.l0Path = passedL0(in, first);
+        if (in.l0Path != null) {
+            return null;
         }
-        return "L0_" + (first == null ? "FAILED" : first.name());
+        return "L0_" + (first[0] == null ? "FAILED" : first[0].name());
     }
 
     // 3. cases that the first version does not cover.
