@@ -33,6 +33,7 @@
 #include <string_view>
 #include <thread>
 
+#include "common/config.h"
 #include "common/consts.h"
 #include "common/status.h"
 #include "core/block/block.h"
@@ -821,8 +822,12 @@ Status compute_restore_digest(const RestoreDigestInput& input, RestoreDigest* di
     return Status::OK();
 }
 
-Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
-                                     RestoreDigest* digest, int threads) {
+namespace {
+
+// Captures the rowsets (and the delete bitmap snapshot for MoW) and the schema of a tablet at
+// (0, version].
+Status prepare_tablet_input(StorageEngine& engine, int64_t tablet_id, int64_t version, int threads,
+                            RestoreDigestInput* input) {
     TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(tablet_id);
     if (tablet == nullptr) {
         return Status::NotFound("restore digest: could not find tablet {}", tablet_id);
@@ -834,12 +839,11 @@ Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, i
         return Status::NotSupported("restore digest: tablet with cooldown data is not supported");
     }
 
-    RestoreDigestInput input;
-    input.version = version;
-    input.keys_type = tablet->keys_type();
-    input.enable_mow = tablet->enable_unique_key_merge_on_write();
-    input.threads = threads;
-    input.tablet = tablet;
+    input->version = version;
+    input->keys_type = tablet->keys_type();
+    input->enable_mow = tablet->enable_unique_key_merge_on_write();
+    input->threads = threads;
+    input->tablet = tablet;
     {
         // Rowsets and the delete bitmap snapshot must be taken in the same critical section.
         std::shared_lock rdlock(tablet->get_header_lock());
@@ -848,15 +852,15 @@ Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, i
         if (!ret) {
             return std::move(ret.error());
         }
-        input.rowsets = std::move(ret->rowsets);
-        if (input.enable_mow) {
-            input.delete_bitmap = std::make_shared<DeleteBitmap>(
+        input->rowsets = std::move(ret->rowsets);
+        if (input->enable_mow) {
+            input->delete_bitmap = std::make_shared<DeleteBitmap>(
                     tablet->tablet_meta()->delete_bitmap().snapshot(version));
         }
     }
     std::vector<RowsetMetaSharedPtr> metas;
-    metas.reserve(input.rowsets.size());
-    for (const auto& rs : input.rowsets) {
+    metas.reserve(input->rowsets.size());
+    for (const auto& rs : input->rowsets) {
         if (!rs->is_local()) {
             return Status::NotSupported("restore digest: remote rowset {} is not supported",
                                         rs->rowset_id().to_string());
@@ -866,12 +870,123 @@ Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, i
     // The newest schema among the rowsets and the tablet itself: after a light schema change the
     // rowsets may all carry an older schema, and the segments just read the default for the
     // columns they do not have.
-    input.schema = metas.empty() ? tablet->tablet_schema()
-                                 : BaseTablet::tablet_schema_with_merged_max_schema_version(metas);
-    if (tablet->tablet_schema()->schema_version() > input.schema->schema_version()) {
-        input.schema = tablet->tablet_schema();
+    input->schema = metas.empty() ? tablet->tablet_schema()
+                                  : BaseTablet::tablet_schema_with_merged_max_schema_version(metas);
+    if (tablet->tablet_schema()->schema_version() > input->schema->schema_version()) {
+        input->schema = tablet->tablet_schema();
     }
+    return Status::OK();
+}
+
+} // namespace
+
+Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
+                                     RestoreDigest* digest, int threads) {
+    RestoreDigestInput input;
+    RETURN_IF_ERROR(prepare_tablet_input(engine, tablet_id, version, threads, &input));
     return compute_restore_digest(input, digest);
+}
+
+Status compute_restore_digest_schema_sig(const TabletSchema& schema, KeysType keys_type,
+                                         bool enable_mow, std::string* schema_sig) {
+    using namespace restore_digest_detail;
+    ColumnPlan plan;
+    RETURN_IF_ERROR(build_plan(schema, keys_type, enable_mow, &plan));
+    *schema_sig = std::move(plan.schema_sig);
+    return Status::OK();
+}
+
+size_t RestoreDigestCache::KeyHash::operator()(const Key& k) const {
+    size_t h = std::hash<std::string>()(k.schema_sig);
+    auto mix = [&h](uint64_t v) {
+        h ^= std::hash<uint64_t>()(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    };
+    mix(static_cast<uint64_t>(k.tablet_id));
+    mix(static_cast<uint64_t>(k.version));
+    mix(k.algo_version);
+    return h;
+}
+
+RestoreDigestCache* RestoreDigestCache::instance() {
+    static RestoreDigestCache cache;
+    return &cache;
+}
+
+int64_t RestoreDigestCache::capacity() const {
+    return _capacity > 0 ? _capacity : config::restore_digest_cache_capacity;
+}
+
+bool RestoreDigestCache::lookup(const Key& key, LogicalDigestResult* out) {
+    std::lock_guard lock(_mtx);
+    auto it = _map.find(key);
+    if (it == _map.end()) {
+        ++_misses;
+        return false;
+    }
+    _lru.splice(_lru.begin(), _lru, it->second);
+    *out = it->second->second;
+    out->from_cache = true;
+    ++_hits;
+    return true;
+}
+
+void RestoreDigestCache::insert(const Key& key, const LogicalDigestResult& value) {
+    const int64_t cap = capacity();
+    std::lock_guard lock(_mtx);
+    auto it = _map.find(key);
+    if (it != _map.end()) {
+        it->second->second = value;
+        _lru.splice(_lru.begin(), _lru, it->second);
+    } else if (cap > 0) {
+        _lru.emplace_front(key, value);
+        _map[key] = _lru.begin();
+    }
+    while (!_lru.empty() && static_cast<int64_t>(_lru.size()) > std::max<int64_t>(cap, 0)) {
+        _map.erase(_lru.back().first);
+        _lru.pop_back();
+    }
+}
+
+size_t RestoreDigestCache::size() const {
+    std::lock_guard lock(_mtx);
+    return _lru.size();
+}
+
+void RestoreDigestCache::clear() {
+    std::lock_guard lock(_mtx);
+    _lru.clear();
+    _map.clear();
+}
+
+Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
+                                 int threads, RestoreDigestCache* cache,
+                                 LogicalDigestResult* result) {
+    if (threads <= 0) {
+        threads = std::max(1, config::restore_digest_threads);
+    }
+    RestoreDigestInput input;
+    RETURN_IF_ERROR(prepare_tablet_input(engine, tablet_id, version, threads, &input));
+    RestoreDigestCache::Key key;
+    key.tablet_id = tablet_id;
+    key.version = version;
+    key.algo_version = RestoreDigest::kAlgoVersion;
+    // NotSupported schemas are reported here, before anything is scanned or cached.
+    RETURN_IF_ERROR(compute_restore_digest_schema_sig(*input.schema, input.keys_type,
+                                                      input.enable_mow, &key.schema_sig));
+    if (cache != nullptr && cache->lookup(key, result)) {
+        return Status::OK();
+    }
+    RestoreDigest digest;
+    RETURN_IF_ERROR(compute_restore_digest(input, &digest));
+    result->algo_version = RestoreDigest::kAlgoVersion;
+    result->schema_sig = digest.schema_sig;
+    result->root = digest.root;
+    result->rows = digest.rows;
+    result->from_cache = false;
+    if (cache != nullptr) {
+        cache->insert(key, *result);
+    }
+    return Status::OK();
 }
 
 } // namespace doris

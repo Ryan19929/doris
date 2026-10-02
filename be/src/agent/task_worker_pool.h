@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <gen_cpp/MasterService_types.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -139,6 +141,14 @@ void alter_inverted_index_callback(StorageEngine& engine, const TAgentTaskReques
 void alter_cloud_index_callback(CloudStorageEngine& engine, const TAgentTaskRequest& req);
 
 void check_consistency_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+// Computes the logical digest of the tablet at (0, version] (through the digest cache) and converts
+// the outcome to thrift: failures and NOT_SUPPORTED are in status_code / status_msg, root is empty.
+// threads <= 0 means config::restore_digest_threads.
+TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,
+                                               int64_t version, int threads);
+
+void restore_digest_callback(StorageEngine& engine, const TAgentTaskRequest& req);
 
 void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 

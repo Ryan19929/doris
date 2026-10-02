@@ -19,7 +19,10 @@
 
 #include <array>
 #include <cstdint>
+#include <list>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/status.h"
@@ -137,5 +140,69 @@ Status compute_restore_digest(const RestoreDigestInput& input, RestoreDigest* di
 // bitmap snapshot are taken under the header lock. Read only.
 Status compute_tablet_restore_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
                                      RestoreDigest* digest, int threads = 1);
+
+// The part of a digest which is reported to the FE and kept in the cache.
+struct LogicalDigestResult {
+    uint32_t algo_version = RestoreDigest::kAlgoVersion;
+    std::string schema_sig; // hex
+    std::string root;       // hex
+    uint64_t rows = 0;
+    bool from_cache = false;
+};
+
+// In-memory LRU cache of tablet digests. A digest of a tablet at a version never changes, so the key
+// is (tablet_id, version, algo_version, schema_sig). The cache is lost when the BE restarts.
+class RestoreDigestCache {
+public:
+    struct Key {
+        int64_t tablet_id = 0;
+        int64_t version = 0;
+        uint32_t algo_version = 0;
+        std::string schema_sig;
+        bool operator==(const Key& o) const {
+            return tablet_id == o.tablet_id && version == o.version &&
+                   algo_version == o.algo_version && schema_sig == o.schema_sig;
+        }
+    };
+
+    // capacity <= 0 means "use config::restore_digest_cache_capacity (checked at every insert)".
+    explicit RestoreDigestCache(int64_t capacity = 0) : _capacity(capacity) {}
+
+    static RestoreDigestCache* instance();
+
+    bool lookup(const Key& key, LogicalDigestResult* out);
+    void insert(const Key& key, const LogicalDigestResult& value);
+    size_t size() const;
+    uint64_t hits() const { return _hits; }
+    uint64_t misses() const { return _misses; }
+    void clear();
+
+private:
+    struct KeyHash {
+        size_t operator()(const Key& k) const;
+    };
+    using Entry = std::pair<Key, LogicalDigestResult>;
+
+    int64_t capacity() const;
+
+    int64_t _capacity;
+    mutable std::mutex _mtx;
+    std::list<Entry> _lru; // front = most recently used
+    std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> _map;
+    uint64_t _hits = 0;
+    uint64_t _misses = 0;
+};
+
+// Computes the schema_sig a digest of this schema would have. NotSupported if the digest does not
+// support the model or a column.
+Status compute_restore_digest_schema_sig(const TabletSchema& schema, KeysType keys_type,
+                                         bool enable_mow, std::string* schema_sig);
+
+// The digest of tablet `tablet_id` at (0, version] for backup / restore: looks `cache` up first (by
+// the schema_sig of the tablet) and computes + caches on a miss. threads <= 0 means
+// config::restore_digest_threads. `cache` may be null (no caching).
+Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
+                                 int threads, RestoreDigestCache* cache,
+                                 LogicalDigestResult* result);
 
 } // namespace doris

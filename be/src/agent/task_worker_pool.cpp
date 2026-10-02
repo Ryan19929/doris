@@ -36,6 +36,7 @@
 #include <ctime>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
@@ -70,6 +71,7 @@
 #include "runtime/fragment_mgr.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "runtime/memory/global_memory_arbitrator.h"
+#include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/snapshot_loader.h"
 #include "runtime/user_function_cache.h"
 #include "service/backend_options.h"
@@ -79,6 +81,7 @@
 #include "storage/data_dir.h"
 #include "storage/olap_common.h"
 #include "storage/rowset/rowset_meta.h"
+#include "storage/restore_digest/restore_digest.h"
 #include "storage/snapshot/snapshot_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/storage_policy.h"
@@ -438,6 +441,7 @@ bvar::LatencyRecorder g_publish_version_latency("doris_pk", "publish_version");
 
 bvar::Adder<uint64_t> ALTER_INVERTED_INDEX_count("task", "ALTER_INVERTED_INDEX");
 bvar::Adder<uint64_t> CHECK_CONSISTENCY_count("task", "CHECK_CONSISTENCY");
+bvar::Adder<uint64_t> RESTORE_DIGEST_count("task", "RESTORE_DIGEST");
 bvar::Adder<uint64_t> UPLOAD_count("task", "UPLOAD");
 bvar::Adder<uint64_t> DOWNLOAD_count("task", "DOWNLOAD");
 bvar::Adder<uint64_t> MAKE_SNAPSHOT_count("task", "MAKE_SNAPSHOT");
@@ -470,6 +474,7 @@ void add_task_count(const TAgentTaskRequest& task, int n) {
         return;
     ADD_TASK_COUNT(ALTER_INVERTED_INDEX)
     ADD_TASK_COUNT(CHECK_CONSISTENCY)
+    ADD_TASK_COUNT(RESTORE_DIGEST)
     ADD_TASK_COUNT(UPLOAD)
     ADD_TASK_COUNT(DOWNLOAD)
     ADD_TASK_COUNT(MAKE_SNAPSHOT)
@@ -1437,6 +1442,63 @@ void download_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTas
     }
 }
 
+// Computes the logical digest of a tablet for a snapshot / RESTORE_DIGEST task and converts the
+// outcome to the thrift struct. NOT_SUPPORTED and failures are reported through status_code and
+// status_msg (root is left empty), the caller decides whether they fail the task.
+TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,
+                                                      int64_t version, int threads) {
+    LogicalDigestResult result;
+    Status st;
+    {
+        auto mem_tracker = MemTrackerLimiter::create_shared(
+                MemTrackerLimiter::Type::OTHER,
+                "RestoreDigest#tabletId=" + std::to_string(tablet_id));
+        SCOPED_ATTACH_TASK(mem_tracker);
+        st = get_tablet_logical_digest(engine, tablet_id, version, threads,
+                                       RestoreDigestCache::instance(), &result);
+    }
+    TLogicalDigest digest;
+    digest.__set_algo_version(static_cast<int32_t>(RestoreDigest::kAlgoVersion));
+    if (st.ok()) {
+        digest.__set_schema_sig(result.schema_sig);
+        digest.__set_root(result.root);
+        digest.__set_rows(static_cast<int64_t>(result.rows));
+        digest.__set_status_code("OK");
+        LOG(INFO) << "logical digest done, tablet_id=" << tablet_id << ", version=" << version
+                  << ", rows=" << result.rows << ", root=" << result.root
+                  << ", from_cache=" << result.from_cache;
+    } else {
+        digest.__set_status_code(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>() ? "NOT_SUPPORTED"
+                                                                           : "ERROR");
+        digest.__set_status_msg(st.to_string());
+        LOG(WARNING) << "logical digest not available, tablet_id=" << tablet_id
+                     << ", version=" << version << ", status=" << st;
+    }
+    return digest;
+}
+
+void restore_digest_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
+    const auto& digest_req = req.restore_digest_req;
+    LOG(INFO) << "get restore digest task. signature=" << req.signature
+              << ", tablet_id=" << digest_req.tablet_id << ", version=" << digest_req.version;
+    int threads = digest_req.__isset.threads ? digest_req.threads : 0;
+    TLogicalDigest digest = compute_logical_digest_for_task(engine, digest_req.tablet_id,
+                                                            digest_req.version, threads);
+
+    // The task itself succeeds as long as the digest was asked and answered; NOT_SUPPORTED and
+    // errors are carried in the digest.
+    TFinishTaskRequest finish_task_request;
+    finish_task_request.__set_backend(BackendOptions::get_local_backend());
+    finish_task_request.__set_task_type(req.task_type);
+    finish_task_request.__set_signature(req.signature);
+    finish_task_request.__set_task_status(Status::OK().to_thrift());
+    finish_task_request.__set_request_version(digest_req.version);
+    finish_task_request.__set_logical_digest(digest);
+
+    finish_task(finish_task_request);
+    remove_task_info(req.task_type, req.signature);
+}
+
 void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
     const auto& snapshot_request = req.snapshot_req;
 
@@ -1489,6 +1551,20 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
             }
         }
     }
+    // The digest never fails the snapshot task: NOT_SUPPORTED and errors are reported in it.
+    std::optional<TLogicalDigest> logical_digest;
+    if (status.ok() && snapshot_request.__isset.compute_logical_digest &&
+        snapshot_request.compute_logical_digest) {
+        if (snapshot_request.__isset.version) {
+            logical_digest = compute_logical_digest_for_task(
+                    engine, snapshot_request.tablet_id, snapshot_request.version, 0);
+        } else {
+            TLogicalDigest digest;
+            digest.__set_status_code("ERROR");
+            digest.__set_status_msg("the snapshot request has no version");
+            logical_digest = digest;
+        }
+    }
     if (!status.ok()) {
         LOG_WARNING("failed to make snapshot")
                 .tag("signature", req.signature)
@@ -1511,6 +1587,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     finish_task_request.__set_snapshot_files(snapshot_files);
     if (status.ok() && snapshot_request.__isset.list_files) {
         finish_task_request.__set_manifest_root(manifest_root);
+    }
+    if (logical_digest.has_value()) {
+        finish_task_request.__set_logical_digest(*logical_digest);
     }
     finish_task_request.__set_task_status(status.to_thrift());
 

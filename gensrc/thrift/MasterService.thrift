@@ -78,6 +78,19 @@ struct TDownloadStats {
     13: optional i64 unmatched_version_mismatch
 }
 
+// Result of the logical digest computation of a tablet, see TSnapshotRequest.compute_logical_digest and
+// TRestoreDigestReq. root is empty unless status_code is OK.
+struct TLogicalDigest {
+    1: optional i32 algo_version
+    2: optional string schema_sig
+    // hex of the root digest
+    3: optional string root
+    4: optional i64 rows
+    // OK / NOT_SUPPORTED / ERROR
+    5: optional string status_code
+    6: optional string status_msg
+}
+
 struct TFinishTaskRequest {
     1: required Types.TBackend backend
     2: required Types.TTaskType task_type
@@ -110,6 +123,8 @@ struct TFinishTaskRequest {
     24: optional bool manifest_digest_checked
     // download task: how much of the data was reused locally instead of downloaded
     25: optional TDownloadStats download_stats
+    // snapshot task (compute_logical_digest) and restore digest task: the logical digest of the tablet
+    26: optional TLogicalDigest logical_digest
 }
 
 struct TTablet {

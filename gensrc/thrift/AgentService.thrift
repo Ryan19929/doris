@@ -475,6 +475,17 @@ struct TSnapshotRequest {
     14: optional Types.TTabletId ref_tablet_id
     // record the SHA-256 of each snapshot file in the manifest file of the snapshot
     15: optional bool compute_digest
+    // after the snapshot is made, compute the logical digest of the tablet over (0, version] and report it
+    16: optional bool compute_logical_digest
+}
+
+// compute the logical digest (order independent digest of the visible rows) of a tablet at a version
+struct TRestoreDigestReq {
+    1: required Types.TTabletId tablet_id
+    2: required Types.TSchemaHash schema_hash
+    3: required Types.TVersion version
+    // worker threads of the task, <= 0 means the BE config restore_digest_threads
+    4: optional i32 threads
 }
 
 struct TReleaseSnapshotRequest {
@@ -650,6 +661,7 @@ struct TAgentTaskRequest {
     35: optional TVisibleVersionReq visible_version_req
     36: optional TCleanUDFCacheReq clean_udf_cache_req
     37: optional TPushIndexPolicyReq push_index_policy_req
+    38: optional TRestoreDigestReq restore_digest_req
 
     // For cloud
     1000: optional TCalcDeleteBitmapRequest calc_delete_bitmap_req

@@ -283,6 +283,13 @@ DEFINE_mBool(enable_group_commit_streamload_be_forward, "false");
 DEFINE_mBool(enable_download_md5sum_check, "false");
 DEFINE_mBool(restore_manifest_check, "true");
 DEFINE_mBool(restore_manifest_digest_check, "false");
+// number of RESTORE_DIGEST tasks (logical digest of a tablet, see storage/restore_digest) run at the
+// same time on this BE
+DEFINE_Int32(restore_digest_task_concurrency, "2");
+// worker threads of one logical digest computation, used when the request does not carry a value
+DEFINE_mInt32(restore_digest_threads, "4");
+// max number of entries of the in-memory logical digest cache, 0 disables the cache
+DEFINE_mInt64(restore_digest_cache_capacity, "100000");
 // download binlog meta timeout, default 30s
 DEFINE_mInt32(download_binlog_meta_timeout_ms, "30000");
 // the interval time(seconds) for agent report index policy to FE

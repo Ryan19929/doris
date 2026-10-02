@@ -40,6 +40,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "agent/task_worker_pool.h"
 #include "common/config.h"
 #include "common/status.h"
 #include "core/block/block.h"
@@ -2289,5 +2290,156 @@ TEST_F(RestoreDigestTabletTest, ColumnAddedLaterIsReadAsItsDefault) {
     EXPECT_EQ(ref.schema_sig, d.schema_sig);
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Backup / restore side: the digest cache and the digest of the snapshot and RESTORE_DIGEST tasks.
+// ---------------------------------------------------------------------------------------------
+
+TEST_F(RestoreDigestTabletTest, LogicalDigestIsCachedByTabletVersionAndSchema) {
+    auto tablet = create_tablet(7101, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    write(tablet, schema, 2, {{{1, 10}, {2, 20}, {3, 30}}}, false, true);
+    write(tablet, schema, 3, {{{4, 40}, {5, 50}}}, false, true);
+
+    RestoreDigestCache cache(/*capacity=*/16);
+    LogicalDigestResult first;
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7101, 3, 2, &cache, &first).ok());
+    EXPECT_FALSE(first.from_cache);
+    EXPECT_EQ(5U, first.rows);
+    EXPECT_EQ(RestoreDigest::kAlgoVersion, first.algo_version);
+    EXPECT_EQ(1U, cache.size());
+    EXPECT_EQ(0U, cache.hits());
+    // same as the digest the debug endpoint computes
+    RestoreDigest direct = tablet_digest(7101, 3);
+    EXPECT_EQ(direct.root, first.root);
+    EXPECT_EQ(direct.schema_sig, first.schema_sig);
+
+    LogicalDigestResult second;
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7101, 3, 1, &cache, &second).ok());
+    EXPECT_TRUE(second.from_cache);
+    EXPECT_EQ(first.root, second.root);
+    EXPECT_EQ(first.schema_sig, second.schema_sig);
+    EXPECT_EQ(first.rows, second.rows);
+    EXPECT_EQ(1U, cache.hits());
+
+    // another version is another entry
+    LogicalDigestResult v2;
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7101, 2, 1, &cache, &v2).ok());
+    EXPECT_FALSE(v2.from_cache);
+    EXPECT_EQ(3U, v2.rows);
+    EXPECT_NE(first.root, v2.root);
+    EXPECT_EQ(2U, cache.size());
+
+    // no cache: always computed
+    LogicalDigestResult nocache;
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7101, 3, 1, nullptr, &nocache).ok());
+    EXPECT_FALSE(nocache.from_cache);
+    EXPECT_EQ(first.root, nocache.root);
+}
+
+TEST(RestoreDigestCacheTest, LruEvictionAndKey) {
+    RestoreDigestCache cache(/*capacity=*/2);
+    auto key = [](int64_t tablet, int64_t version, uint32_t algo, const std::string& sig) {
+        RestoreDigestCache::Key k;
+        k.tablet_id = tablet;
+        k.version = version;
+        k.algo_version = algo;
+        k.schema_sig = sig;
+        return k;
+    };
+    auto value = [](const std::string& root) {
+        LogicalDigestResult r;
+        r.root = root;
+        r.schema_sig = "sig";
+        r.rows = 1;
+        return r;
+    };
+    cache.insert(key(1, 5, 1, "a"), value("r1"));
+    cache.insert(key(2, 5, 1, "a"), value("r2"));
+    LogicalDigestResult out;
+    // touch 1 so that 2 is the eviction victim
+    ASSERT_TRUE(cache.lookup(key(1, 5, 1, "a"), &out));
+    EXPECT_EQ("r1", out.root);
+    EXPECT_TRUE(out.from_cache);
+    cache.insert(key(3, 5, 1, "a"), value("r3"));
+    EXPECT_EQ(2U, cache.size());
+    EXPECT_FALSE(cache.lookup(key(2, 5, 1, "a"), &out));
+    EXPECT_TRUE(cache.lookup(key(3, 5, 1, "a"), &out));
+    // every field of the key matters
+    EXPECT_FALSE(cache.lookup(key(1, 6, 1, "a"), &out));
+    EXPECT_FALSE(cache.lookup(key(1, 5, 2, "a"), &out));
+    EXPECT_FALSE(cache.lookup(key(1, 5, 1, "b"), &out));
+    EXPECT_TRUE(cache.lookup(key(1, 5, 1, "a"), &out));
+    // overwriting does not grow the cache
+    cache.insert(key(1, 5, 1, "a"), value("r1x"));
+    EXPECT_EQ(2U, cache.size());
+    ASSERT_TRUE(cache.lookup(key(1, 5, 1, "a"), &out));
+    EXPECT_EQ("r1x", out.root);
+    cache.clear();
+    EXPECT_EQ(0U, cache.size());
+}
+
+// What the snapshot task (compute_logical_digest) and the RESTORE_DIGEST task report.
+TEST_F(RestoreDigestTabletTest, TaskReportsTheDigestAndHitsTheCache) {
+    auto tablet = create_tablet(7102, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    write(tablet, schema, 2, {{{1, 10}, {2, 20}}}, false, true);
+    write(tablet, schema, 3, {{{3, 30}}}, false, true);
+    RestoreDigestCache::instance()->clear();
+    const uint64_t hits_before = RestoreDigestCache::instance()->hits();
+
+    TLogicalDigest d = compute_logical_digest_for_task(*_engine, 7102, 3, /*threads=*/0);
+    EXPECT_EQ("OK", d.status_code);
+    EXPECT_TRUE(d.__isset.root);
+    EXPECT_EQ(3, d.rows);
+    EXPECT_EQ(static_cast<int32_t>(RestoreDigest::kAlgoVersion), d.algo_version);
+    RestoreDigest direct = tablet_digest(7102, 3);
+    EXPECT_EQ(direct.root, d.root);
+    EXPECT_EQ(direct.schema_sig, d.schema_sig);
+    EXPECT_FALSE(d.__isset.status_msg);
+    EXPECT_EQ(hits_before, RestoreDigestCache::instance()->hits());
+
+    // the second request (e.g. the RESTORE_DIGEST task after the snapshot task) is a cache hit
+    TLogicalDigest again = compute_logical_digest_for_task(*_engine, 7102, 3, /*threads=*/2);
+    EXPECT_EQ("OK", again.status_code);
+    EXPECT_EQ(d.root, again.root);
+    EXPECT_EQ(hits_before + 1, RestoreDigestCache::instance()->hits());
+}
+
+TEST_F(RestoreDigestTabletTest, TaskReportsNotSupportedAndErrors) {
+    // aggregate keys: NOT_SUPPORTED, no root
+    auto request = testutil::create_tablet_request(
+            7103, /*schema_hash=*/1, /*partition_id=*/10, /*short_key_column_count=*/1,
+            TKeysType::AGG_KEYS,
+            {{"k", TPrimitiveType::INT, true},
+             {"v", TPrimitiveType::INT, false, false, TAggregationType::SUM, true}});
+    RuntimeProfile profile("restore_digest_ut");
+    ASSERT_TRUE(_engine->create_tablet(request, &profile).ok());
+    ASSERT_NE(nullptr, _engine->tablet_manager()->get_tablet(7103));
+    RestoreDigestCache::instance()->clear();
+    TLogicalDigest d = compute_logical_digest_for_task(*_engine, 7103, 1, 0);
+    EXPECT_EQ("NOT_SUPPORTED", d.status_code);
+    EXPECT_FALSE(d.__isset.root);
+    EXPECT_TRUE(d.__isset.status_msg);
+    EXPECT_FALSE(d.status_msg.empty());
+    // a failure is not cached
+    EXPECT_EQ(0U, RestoreDigestCache::instance()->size());
+
+    // unknown tablet: ERROR
+    TLogicalDigest missing = compute_logical_digest_for_task(*_engine, 7199, 2, 0);
+    EXPECT_EQ("ERROR", missing.status_code);
+    EXPECT_FALSE(missing.__isset.root);
+    EXPECT_FALSE(missing.status_msg.empty());
+
+    // a version the tablet does not have: ERROR
+    auto tablet = create_tablet(7104, false);
+    ASSERT_NE(nullptr, tablet);
+    write(tablet, tablet->tablet_schema(), 2, {{{1, 10}}}, false, true);
+    TLogicalDigest bad_version = compute_logical_digest_for_task(*_engine, 7104, 9, 0);
+    EXPECT_EQ("ERROR", bad_version.status_code);
+    EXPECT_FALSE(bad_version.__isset.root);
+}
 
 } // namespace doris
