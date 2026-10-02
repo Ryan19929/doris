@@ -22,6 +22,7 @@ import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupTabletInfo;
 import org.apache.doris.backup.RestoreFileMapping.IdChain;
+import org.apache.doris.backup.RestoreReuseJudge.CheckLevel;
 import org.apache.doris.backup.Status.ErrCode;
 import org.apache.doris.catalog.BinlogConfig;
 import org.apache.doris.catalog.DataProperty;
@@ -76,6 +77,7 @@ import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.persist.gson.GsonUtilsBase;
 import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.resource.Tag;
+import org.apache.doris.system.Backend;
 import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentBoundedBatchTask;
 import org.apache.doris.task.AgentTask;
@@ -114,9 +116,11 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -130,6 +134,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     private static final String PROP_CLEAN_TABLES = RestoreCommand.PROP_CLEAN_TABLES;
     private static final String PROP_CLEAN_PARTITIONS = RestoreCommand.PROP_CLEAN_PARTITIONS;
     private static final String PROP_ATOMIC_RESTORE = RestoreCommand.PROP_ATOMIC_RESTORE;
+    private static final String PROP_REUSE_CHECK_LEVEL = RestoreCommand.PROP_REUSE_CHECK_LEVEL;
     private static final String PROP_FORCE_REPLACE = RestoreCommand.PROP_FORCE_REPLACE;
     private static final String ATOMIC_RESTORE_TABLE_PREFIX = "__doris_atomic_restore_prefix__";
 
@@ -140,7 +145,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         PENDING, // Job is newly created. Check and prepare meta in catalog. Create replica if necessary.
                  // Waiting for replica creation finished synchronously, then sending snapshot tasks.
                  // then transfer to CREATING.
-        CREATING, // Creating replica on BE. Transfer to SNAPSHOTING after all replicas created.
+        CREATING, // Creating replica on BE. Transfer to VERIFYING (if some existing partitions are candidates of
+                  // partition level reuse) or SNAPSHOTING after all replicas created.
+        VERIFYING, // Computing the logical digest of the local replicas of the candidate partitions, to decide which
+                   // partitions keep their local data. Nothing local is changed. Not persisted, a job restarted
+                   // in this state is redone from PENDING. Transfer to SNAPSHOTING.
         SNAPSHOTING, // Waiting for snapshot finished. Than transfer to DOWNLOAD.
         DOWNLOAD, // Send download tasks.
         DOWNLOADING, // Waiting for download finished.
@@ -224,6 +233,21 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     @SerializedName("dls")
     private RestoreDownloadStats downloadStats;
     private Set<Pair<Long, Long>> manifestDigestCheckedReplicas = Sets.newHashSet();
+
+    // The outcome of partition level reuse: the partitions that keep their local data, and the reason of each
+    // decision. Null if partition level reuse is not enabled. Fixed when VERIFYING ends (it is in the edit log
+    // written when entering DOWNLOAD), kept after the job finishes.
+    @SerializedName("rru")
+    private RestoreReuseResult reuseResult;
+    // The working state of partition level reuse while PENDING..VERIFYING, never persisted: the job is redone
+    // from PENDING after a restart or a master switch.
+    private transient List<ReuseCandidate> reuseCandidates = Lists.newArrayList();
+    // signature of a digest task -> the digest reported, or none() if the task failed
+    private transient Map<Long, LogicalDigestInfo> digestResults = Maps.newHashMap();
+    private transient long verifyRoundStartMs = 0;
+    // 1: the sampled partitions (or all, if there is no sampling), 2: the others, after the sample found a mismatch
+    private transient int verifyRound = 0;
+    private transient Random sampleRandom = new Random();
 
     private List<ColocatePersistInfo> colocatePersistInfos = Lists.newArrayList();
 
@@ -313,6 +337,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         this.backupMeta = backupMeta;
     }
 
+    /** The check level of partition level reuse, null means the default of the FE config. */
+    public void setReuseCheckLevel(String level) {
+        if (level != null) {
+            properties.put(PROP_REUSE_CHECK_LEVEL, level);
+        }
+    }
+
     public boolean isFromLocalSnapshot() {
         return repoId == Repository.KEEP_ON_LOCAL_REPO_ID;
     }
@@ -371,8 +402,26 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
 
     // The finish report of a RESTORE_DIGEST task: the logical digest of one local replica, see
-    // TFinishTaskRequest.logical_digest. Nothing uses it yet. Returns true to remove the task from AgentTaskQueue.
+    // TFinishTaskRequest.logical_digest. A failed task, or a report without a valid digest, is recorded as a replica
+    // without digest, and the partition is downloaded. Returns true to remove the task from AgentTaskQueue.
     public synchronized boolean finishRestoreDigestTask(RestoreDigestTask task, TFinishTaskRequest request) {
+        if (state != RestoreJobState.VERIFYING || task.getJobId() != jobId) {
+            // the job moved on (e.g. the task timed out), or a task of another job
+            return true;
+        }
+        Long tabletId = unfinishedSignatureToId.remove(task.getSignature());
+        if (tabletId == null || tabletId != task.getTabletId()) {
+            LOG.warn("unknown restore digest task: {}. {}", task, this);
+            return true;
+        }
+        LogicalDigestInfo digest;
+        if (request.getTaskStatus().getStatusCode() != TStatusCode.OK) {
+            LOG.warn("restore digest task failed: {}, status: {}. {}", task, request.getTaskStatus(), this);
+            digest = LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR);
+        } else {
+            digest = LogicalDigestInfo.fromThrift(request.isSetLogicalDigest() ? request.getLogicalDigest() : null);
+        }
+        digestResults.put(task.getSignature(), digest);
         return true;
     }
 
@@ -635,6 +684,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     break;
                 case CREATING:
                     waitingAllReplicasCreated();
+                    break;
+                case VERIFYING:
+                    waitingAllDigestsFinished();
                     break;
                 case SNAPSHOTING:
                     waitingAllSnapshotsFinished();
@@ -1193,7 +1245,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // the data it describes, e.g. if the job is cancelled after some tablets are moved in COMMITTING.
         // This is persisted with the DOWNLOAD edit log (replayed by replayCheckAndPrepareMeta), which is
         // written before any tablet data is moved, and the lineage is written again in allTabletCommitted.
-        invalidateRestoreLineageOfOverwrittenPartitions(db);
+        // The candidates of partition level reuse keep their lineage until they are decided in VERIFYING, nothing
+        // local is changed before that.
+        Set<Pair<Long, Long>> candidateKeys = selectReuseCandidates(db);
+        invalidateRestoreLineageOfOverwrittenPartitions(db, candidateKeys);
 
         // check and restore resources
         checkAndRestoreResources();
@@ -1359,6 +1414,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         LOG.info("finished to prepare meta. {}", this);
 
         if (jobInfo.content == null || jobInfo.content == BackupCommand.BackupContent.ALL) {
+            if (!reuseCandidates.isEmpty()) {
+                // The snapshots of the partitions that keep their data are not needed, decide them first.
+                metaPreparedTime = System.currentTimeMillis();
+                startVerifying(db);
+                return;
+            }
             prepareAndSendSnapshotTaskForOlapTable(db);
         }
 
@@ -2286,6 +2347,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     protected void commit() {
+        // Fail before any tablet is moved if a partition that keeps its data was written.
+        Status keptStatus = checkKeptPartitions();
+        if (!keptStatus.ok()) {
+            status = keptStatus;
+            return;
+        }
+
         // Send task to move the download dir
         unfinishedSignatureToId.clear();
         taskProgress.clear();
@@ -2328,6 +2396,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         Database db = env.getInternalCatalog().getDbNullable(dbId);
         if (db == null) {
             return new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
+        }
+
+        // The partitions that keep their local data must not have been written, or the restored data is not
+        // consistent with the backup. Never commit silently.
+        if (!isReplay) {
+            Status keptStatus = checkKeptPartitions();
+            if (!keptStatus.ok()) {
+                return keptStatus;
+            }
         }
 
         // replace the origin tables in atomic.
@@ -2606,6 +2683,486 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 getSrcCommitSeq(jobInfo, tblInfo.id), jobInfo.backupTime, restoreTime);
     }
 
+    public RestoreReuseResult getReuseResult() {
+        return reuseResult;
+    }
+
+    private void clearReuseWorkingState() {
+        reuseCandidates.clear();
+        digestResults.clear();
+        verifyRound = 0;
+    }
+
+    /**
+     * Select the existing partitions that may keep their local data, by the chain of conditions in
+     * {@link RestoreReuseJudge}. Only the partitions of the A1 branch (existing partition, see restoredVersionInfo)
+     * are looked at, so it must be called after the meta is prepared and before the lineage of the overwritten
+     * partitions is invalidated. The candidates are kept in reuseCandidates, those that need no digest (check level
+     * off) are decided here. Never fails the job: any problem selects nothing.
+     *
+     * @return the (table id, partition id) of the candidates
+     */
+    @VisibleForTesting
+    Set<Pair<Long, Long>> selectReuseCandidates(Database db) {
+        reuseCandidates.clear();
+        reuseResult = null;
+        Set<Pair<Long, Long>> keys = Sets.newHashSet();
+        if (!Config.enable_restore_partition_reuse || Config.isCloudMode() || isAtomicRestore
+                || !(jobInfo.content == null || jobInfo.content == BackupCommand.BackupContent.ALL)) {
+            return keys;
+        }
+        CheckLevel jobLevel = CheckLevel.parse(properties.get(PROP_REUSE_CHECK_LEVEL),
+                Config.restore_reuse_default_check_level);
+        if (jobLevel == CheckLevel.DISABLE) {
+            LOG.info("partition level reuse is disabled by the property of the job {}", jobId);
+            return keys;
+        }
+        try {
+            RestoreReuseResult result = new RestoreReuseResult();
+            List<ReuseCandidate> candidates = Lists.newArrayList();
+            for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
+                BackupOlapTableInfo tblInfo = tblEntry.getValue();
+                Table localTbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
+                if (localTbl == null || localTbl.getType() != TableType.OLAP) {
+                    continue;
+                }
+                OlapTable localOlapTbl = (OlapTable) localTbl;
+                CheckLevel level = RestoreReuseJudge.levelOfTable(jobLevel, localOlapTbl.getKeysType());
+                localOlapTbl.readLock();
+                try {
+                    for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
+                        Partition localPart = localOlapTbl.getPartition(partEntry.getKey(), false);
+                        if (localPart == null || !restoredVersionInfo.contains(localOlapTbl.getId(),
+                                localPart.getId())) {
+                            continue;
+                        }
+                        RestoreReuseJudge.Input in = new RestoreReuseJudge.Input();
+                        in.atomicRestore = isAtomicRestore;
+                        in.allowLoad = allowLoad;
+                        in.cloudMode = Config.isCloudMode();
+                        in.minPartitionBytes = Config.restore_reuse_min_partition_bytes;
+                        in.level = level;
+                        in.jobInfo = jobInfo;
+                        in.backupTable = tblInfo;
+                        in.backupPartition = partEntry.getValue();
+                        in.srcCommitSeq = getSrcCommitSeq(jobInfo, tblInfo.id);
+                        in.localTable = localOlapTbl;
+                        in.localPartition = localPart;
+                        String reject = RestoreReuseJudge.firstReject(in);
+                        if (reject != null) {
+                            result.addRejected(reject);
+                            if (!reject.startsWith("L0_")) {
+                                LOG.info("restore reuse: partition {}.{} is not a candidate: {}, job: {}",
+                                        localOlapTbl.getName(), partEntry.getKey(), reject, jobId);
+                            }
+                            continue;
+                        }
+                        ReuseCandidate candidate = new ReuseCandidate();
+                        candidate.tableId = localOlapTbl.getId();
+                        candidate.partitionId = localPart.getId();
+                        candidate.tableName = localOlapTbl.getName();
+                        candidate.partitionName = partEntry.getKey();
+                        candidate.version = in.backupPartition.version;
+                        candidate.bytes = in.getSingleReplicaBytes();
+                        candidate.level = level;
+                        candidate.backupPartition = in.backupPartition;
+                        if (level == CheckLevel.OFF) {
+                            candidate.decide(true, RestoreReuseResult.KEPT_L0_ONLY);
+                        }
+                        candidates.add(candidate);
+                    }
+                } finally {
+                    localOlapTbl.readUnlock();
+                }
+            }
+            reuseResult = result;
+            reuseCandidates = candidates;
+            for (ReuseCandidate candidate : candidates) {
+                keys.add(Pair.of(candidate.tableId, candidate.partitionId));
+            }
+            LOG.info("restore reuse: {} candidate partitions, check level {}, not candidates: {}, job: {}",
+                    candidates.size(), jobLevel.lower(), result.getRejected(), jobId);
+        } catch (Exception e) {
+            LOG.warn("failed to select the candidate partitions of restore reuse, download all. job: {}", jobId, e);
+            reuseCandidates.clear();
+            reuseResult = null;
+            keys.clear();
+        }
+        return keys;
+    }
+
+    /**
+     * Start deciding the candidates: send the digest tasks of the sampled partitions (all partitions of the check
+     * level full), and enter VERIFYING. Without any digest to compute, decide at once.
+     */
+    private void startVerifying(Database db) {
+        digestResults.clear();
+        unfinishedSignatureToId.clear();
+        taskProgress.clear();
+        taskErrMsg.clear();
+        List<ReuseCandidate> toDigest = Lists.newArrayList();
+        List<ReuseCandidate> samplePool = Lists.newArrayList();
+        for (ReuseCandidate candidate : reuseCandidates) {
+            if (candidate.decided) {
+                continue;
+            }
+            if (candidate.level == CheckLevel.FULL) {
+                toDigest.add(candidate);
+            } else {
+                samplePool.add(candidate);
+            }
+        }
+        for (ReuseCandidate candidate : RestoreReuseJudge.pickSample(samplePool,
+                Config.restore_reuse_sample_ratio, sampleRandom)) {
+            candidate.sampled = true;
+            toDigest.add(candidate);
+        }
+        verifyRound = 1;
+        LOG.info("restore reuse: verify {} of {} candidate partitions ({} sampled). {}", toDigest.size(),
+                reuseCandidates.size(), toDigest.size() - (int) toDigest.stream()
+                        .filter(c -> c.level == CheckLevel.FULL).count(), this);
+        if (toDigest.isEmpty()) {
+            finishVerifying(db);
+            return;
+        }
+        sendDigestRound(db, toDigest);
+    }
+
+    private void sendDigestRound(Database db, List<ReuseCandidate> candidates) {
+        AgentBoundedBatchTask batchTask = new AgentBoundedBatchTask(
+                Config.backup_restore_batch_task_num_per_rpc, Config.restore_task_concurrency_per_be);
+        for (ReuseCandidate candidate : candidates) {
+            try {
+                prepareDigestTasks(db, candidate, batchTask);
+            } catch (Exception e) {
+                LOG.warn("failed to prepare the digest tasks of partition {}.{}, download it. {}",
+                        candidate.tableName, candidate.partitionName, this, e);
+                candidate.decide(false, RestoreReuseResult.DOWNLOAD_VERIFY_ERROR);
+            }
+        }
+        AgentTaskExecutor.submit(batchTask);
+        verifyRoundStartMs = System.currentTimeMillis();
+        setState(RestoreJobState.VERIFYING);
+        // No log here, a restart redoes the job from PENDING
+        LOG.info("restore reuse: sent {} digest tasks of round {}. {}", batchTask.getTaskNum(), verifyRound, this);
+    }
+
+    // One digest task for each local replica of the partition, at the visible version, which is the version of the
+    // backup. All or none of the tasks of the partition are added.
+    private void prepareDigestTasks(Database db, ReuseCandidate candidate, AgentBoundedBatchTask batchTask) {
+        OlapTable tbl = (OlapTable) db.getTableNullable(candidate.tableId);
+        if (tbl == null) {
+            candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
+            return;
+        }
+        List<ReuseTabletCheck> checks = Lists.newArrayList();
+        List<RestoreDigestTask> tasks = Lists.newArrayList();
+        Map<Long, LogicalDigestInfo> immediateResults = Maps.newHashMap();
+        tbl.readLock();
+        try {
+            Partition part = tbl.getPartition(candidate.partitionId);
+            if (part == null || part.getVisibleVersion() != candidate.version) {
+                candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
+                return;
+            }
+            for (MaterializedIndex index : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                BackupIndexInfo backupIdx = candidate.backupPartition.getIdx(tbl.getIndexNameById(index.getId()));
+                if (backupIdx == null || backupIdx.sortedTabletInfoList.size() != index.getTablets().size()) {
+                    candidate.decide(false, RestoreReuseResult.DOWNLOAD_VERIFY_ERROR);
+                    return;
+                }
+                int schemaHash = tbl.getSchemaHashByIndexId(index.getId());
+                for (int i = 0; i < index.getTablets().size(); i++) {
+                    Tablet tablet = index.getTablets().get(i);
+                    ReuseTabletCheck check = new ReuseTabletCheck(
+                            jobInfo.getLogicalDigest(backupIdx.sortedTabletInfoList.get(i).id));
+                    for (Replica replica : tablet.getReplicas()) {
+                        if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.version)) {
+                            candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
+                            return;
+                        }
+                        long signature = env.getNextId();
+                        long beId = replica.getBackendIdWithoutException();
+                        check.signatures.add(signature);
+                        Backend backend = Env.getCurrentSystemInfo().getBackend(beId);
+                        if (backend == null || !backend.isAlive()) {
+                            immediateResults.put(signature, LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR));
+                            continue;
+                        }
+                        tasks.add(new RestoreDigestTask(beId, signature, jobId, dbId, tbl.getId(), part.getId(),
+                                index.getId(), tablet.getId(), schemaHash, candidate.version, 0));
+                    }
+                    checks.add(check);
+                }
+            }
+        } finally {
+            tbl.readUnlock();
+        }
+        candidate.tablets = checks;
+        digestResults.putAll(immediateResults);
+        for (RestoreDigestTask task : tasks) {
+            batchTask.addTask(task);
+            unfinishedSignatureToId.put(task.getSignature(), task.getTabletId());
+        }
+    }
+
+    protected void waitingAllDigestsFinished() {
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
+        if (db == null) {
+            status = new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
+            return;
+        }
+        if (!unfinishedSignatureToId.isEmpty()) {
+            boolean timedOut = System.currentTimeMillis() - verifyRoundStartMs
+                    > Config.restore_digest_timeout_s * 1000L;
+            if (!timedOut) {
+                LOG.info("waiting {} digest tasks to finish. {}", unfinishedSignatureToId.size(), this);
+                return;
+            }
+            LOG.warn("{} digest tasks timed out after {} s, download the partitions of them. {}",
+                    unfinishedSignatureToId.size(), Config.restore_digest_timeout_s, this);
+            for (Long signature : unfinishedSignatureToId.keySet()) {
+                AgentTaskQueue.removeTaskOfType(TTaskType.RESTORE_DIGEST, signature);
+            }
+            unfinishedSignatureToId.clear();
+        }
+
+        judgeDigestRound();
+
+        if (verifyRound == 1) {
+            // The sample decides the rest: a mismatch means the local partitions are not what the lineage says,
+            // so every other candidate is verified too; an uncertain sample (a failed task, a timeout) proves
+            // nothing, so the rest is downloaded.
+            boolean mismatch = false;
+            boolean uncertain = false;
+            for (ReuseCandidate candidate : reuseCandidates) {
+                if (!candidate.sampled || !candidate.decided || candidate.kept) {
+                    continue;
+                }
+                if (RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH.equals(candidate.reason)
+                        || RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH.equals(candidate.reason)) {
+                    mismatch = true;
+                } else {
+                    uncertain = true;
+                }
+            }
+            List<ReuseCandidate> rest = Lists.newArrayList();
+            for (ReuseCandidate candidate : reuseCandidates) {
+                if (!candidate.decided) {
+                    rest.add(candidate);
+                }
+            }
+            if (!rest.isEmpty() && (mismatch || uncertain)) {
+                if (mismatch) {
+                    LOG.info("restore reuse: a sampled partition is not consistent, verify the other {} "
+                            + "candidates too. {}", rest.size(), this);
+                    verifyRound = 2;
+                    for (ReuseCandidate candidate : rest) {
+                        candidate.level = CheckLevel.FULL;
+                    }
+                    sendDigestRound(db, rest);
+                    return;
+                }
+                for (ReuseCandidate candidate : rest) {
+                    candidate.decide(false, RestoreReuseResult.DOWNLOAD_SAMPLE_FAILED);
+                }
+            }
+        }
+        // The sampled partitions are all consistent: the partitions that were not sampled are kept.
+        for (ReuseCandidate candidate : reuseCandidates) {
+            if (!candidate.decided) {
+                candidate.decide(true, RestoreReuseResult.KEPT_SAMPLE_PASSED);
+            }
+        }
+        finishVerifying(db);
+    }
+
+    // Judge the partitions of the round that are not decided: all digests of a partition are in, or the round timed
+    // out.
+    private void judgeDigestRound() {
+        for (ReuseCandidate candidate : reuseCandidates) {
+            if (candidate.decided || candidate.tablets == null) {
+                continue;
+            }
+            String reason = null;
+            boolean complete = true;
+            for (ReuseTabletCheck check : candidate.tablets) {
+                List<LogicalDigestInfo> actual = Lists.newArrayList();
+                for (long signature : check.signatures) {
+                    LogicalDigestInfo digest = digestResults.get(signature);
+                    if (digest == null) {
+                        complete = false;
+                        break;
+                    }
+                    actual.add(digest);
+                }
+                if (!complete) {
+                    break;
+                }
+                reason = RestoreReuseJudge.compareTablet(check.expected, actual);
+                if (reason != null) {
+                    break;
+                }
+            }
+            if (!complete) {
+                candidate.decide(false, RestoreReuseResult.DOWNLOAD_TIMEOUT);
+            } else if (reason == null) {
+                candidate.decide(true, RestoreReuseResult.KEPT_DIGEST_VERIFIED);
+            } else {
+                candidate.decide(false, reason);
+            }
+        }
+    }
+
+    /**
+     * Fix the decisions: the partitions that keep their data are taken out of the restore (no file mapping, no
+     * restoredVersionInfo, so no snapshot, download or move task, and the lineage is kept), and the lineage of the
+     * other overwritten partitions is invalidated, then go on to SNAPSHOTING.
+     */
+    @VisibleForTesting
+    void finishVerifying(Database db) {
+        RestoreReuseResult result = reuseResult != null ? reuseResult : new RestoreReuseResult();
+        Set<Pair<Long, Long>> kept = Sets.newHashSet();
+        for (ReuseCandidate candidate : reuseCandidates) {
+            if (candidate.kept && !isStillAtVersion(db, candidate)) {
+                candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
+            }
+            result.addDecision(candidate.toDecision());
+            LOG.info("restore reuse: partition {}, job: {}", candidate.toDecision(), jobId);
+            if (candidate.kept) {
+                kept.add(Pair.of(candidate.tableId, candidate.partitionId));
+                restoredVersionInfo.remove(candidate.tableId, candidate.partitionId);
+            }
+        }
+        fileMapping.removePartitions(kept);
+        reuseResult = result;
+        // The data of the partitions to download is about to change.
+        invalidateRestoreLineageOfOverwrittenPartitions(db);
+        clearReuseWorkingState();
+        LOG.info("restore reuse: keep {} partitions ({} bytes of a single replica), download {} of the candidates, "
+                + "job: {}", result.getKeptPartitions(), result.getKeptBytesSingleReplica(),
+                result.getDownloadedPartitions(), jobId);
+
+        prepareAndSendSnapshotTaskForOlapTable(db);
+        setState(RestoreJobState.SNAPSHOTING);
+    }
+
+    private boolean isStillAtVersion(Database db, ReuseCandidate candidate) {
+        OlapTable tbl = (OlapTable) db.getTableNullable(candidate.tableId);
+        if (tbl == null) {
+            return false;
+        }
+        tbl.readLock();
+        try {
+            Partition part = tbl.getPartition(candidate.partitionId);
+            if (part == null || part.getVisibleVersion() != candidate.version) {
+                return false;
+            }
+            for (MaterializedIndex index : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                for (Tablet tablet : index.getTablets()) {
+                    for (Replica replica : tablet.getReplicas()) {
+                        if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.version)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        } finally {
+            tbl.readUnlock();
+        }
+    }
+
+    /**
+     * The partitions that keep their local data must still be at the version of the backup, which no write is
+     * allowed to change while the table is in the RESTORE state. A different version means a write that should not
+     * have happened, the job fails with the reason rather than commit data that is not the backup.
+     */
+    @VisibleForTesting
+    Status checkKeptPartitions() {
+        if (reuseResult == null || reuseResult.getKeptPartitions() == 0) {
+            return Status.OK;
+        }
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
+        if (db == null) {
+            return new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
+        }
+        for (RestoreReuseResult.Decision decision : reuseResult.getKeptDecisions()) {
+            Table tbl = db.getTableNullable(decision.tableId);
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                return new Status(ErrCode.NOT_FOUND, "table " + decision.tableName + " of the kept partition "
+                        + decision.partitionName + " has been dropped");
+            }
+            try {
+                Partition part = ((OlapTable) tbl).getPartition(decision.partitionId);
+                if (part == null) {
+                    return new Status(ErrCode.NOT_FOUND, "the kept partition " + decision.tableName + "."
+                            + decision.partitionName + " has been dropped");
+                }
+                if (part.getVisibleVersion() != decision.version) {
+                    return new Status(ErrCode.COMMON_ERROR, "the visible version of the partition "
+                            + decision.tableName + "." + decision.partitionName + " that keeps its local data changed"
+                            + " from " + decision.version + " to " + part.getVisibleVersion()
+                            + " during the restore, the local data is not the backup any more");
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+        return Status.OK;
+    }
+
+    // A candidate partition of partition level reuse, not persisted.
+    @VisibleForTesting
+    static class ReuseCandidate {
+        long tableId;
+        long partitionId;
+        String tableName;
+        String partitionName;
+        // the version of the backup
+        long version;
+        long bytes;
+        CheckLevel level;
+        BackupPartitionInfo backupPartition;
+        // in the sample of the check level sample
+        boolean sampled = false;
+        boolean decided = false;
+        boolean kept = false;
+        String reason;
+        // the digest tasks of the partition, null before they are sent
+        List<ReuseTabletCheck> tablets;
+
+        void decide(boolean kept, String reason) {
+            this.decided = true;
+            this.kept = kept;
+            this.reason = reason;
+        }
+
+        RestoreReuseResult.Decision toDecision() {
+            RestoreReuseResult.Decision decision = new RestoreReuseResult.Decision();
+            decision.tableId = tableId;
+            decision.partitionId = partitionId;
+            decision.tableName = tableName;
+            decision.partitionName = partitionName;
+            decision.version = version;
+            decision.bytes = bytes;
+            decision.level = level.lower();
+            decision.kept = kept;
+            decision.reason = reason;
+            return decision;
+        }
+    }
+
+    // The digest of a tablet in the backup, and the signatures of the digest tasks of its local replicas.
+    static class ReuseTabletCheck {
+        final LogicalDigestInfo expected;
+        final List<Long> signatures = Lists.newArrayList();
+
+        ReuseTabletCheck(LogicalDigestInfo expected) {
+            this.expected = expected;
+        }
+    }
+
     /**
      * Judge each partition to restore by the lineage check (L0), and count the partitions and bytes that
      * could be kept locally instead of downloading. It only records the result, and never fails the job.
@@ -2669,6 +3226,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     void invalidateRestoreLineageOfOverwrittenPartitions(Database db) {
+        invalidateRestoreLineageOfOverwrittenPartitions(db, Collections.emptySet());
+    }
+
+    /**
+     * @param skipped the (table id, partition id) of the partitions whose lineage is kept, because they are
+     *         candidates of partition level reuse that are not decided yet
+     */
+    @VisibleForTesting
+    void invalidateRestoreLineageOfOverwrittenPartitions(Database db, Set<Pair<Long, Long>> skipped) {
         for (long tblId : restoredVersionInfo.rowKeySet()) {
             Table tbl = db.getTableNullable(tblId);
             if (!(tbl instanceof OlapTable)) {
@@ -2680,6 +3246,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
             try {
                 for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    if (skipped.contains(Pair.of(tblId, partId))) {
+                        continue;
+                    }
                     Partition part = olapTbl.getPartition(partId);
                     if (part != null) {
                         part.setRestoreLineage(null);
@@ -2765,6 +3334,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // We need to clean the residual due to current state
         if (!isReplay) {
             switch (state) {
+                case VERIFYING:
+                    // remove all digest tasks in AgentTaskQueue. Nothing local was changed, nothing else to undo.
+                    for (Long signature : unfinishedSignatureToId.keySet()) {
+                        AgentTaskQueue.removeTaskOfType(TTaskType.RESTORE_DIGEST, signature);
+                    }
+                    break;
                 case SNAPSHOTING:
                     // remove all snapshot tasks in AgentTaskQueue
                     for (Long taskId : unfinishedSignatureToId.keySet()) {
@@ -2794,6 +3369,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             restoredPartitions.clear();
             restoredTbls.clear();
             restoredResources.clear();
+            clearReuseWorkingState();
 
             // backupMeta is useless
             backupMeta = null;
