@@ -153,6 +153,26 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
     assertTrue(baseline > 0)
     assertSameAsSource(dbName)
 
+    // the data size of the replicas is known by the report of the backends, kept_bytes counts it
+    def waitDataSize = { String db ->
+        for (int i = 0; i < 30; ++i) {
+            boolean ready = true
+            for (String tbl : [dupTable, uniqTable]) {
+                def tablets = sql_return_maparray "SHOW TABLETS FROM ${db}.${tbl}"
+                // the rows of the table are all reported, and every tablet with rows has a size
+                if (tablets.sum { it.RowCount as long } != numPartitions * numBatches * 20
+                        || tablets.any { (it.LocalDataSize as long) == 0 && (it.RowCount as long) > 0 }) {
+                    ready = false
+                }
+            }
+            if (ready) {
+                return
+            }
+            sleep(5000)
+        }
+    }
+    waitDataSize(dbName)
+
     // 2. the same backup again: every partition is kept, nothing is downloaded, and the data is the same as the
     // source and as a full download.
     stats = restoreAndWait(dbName, snap1, ts1, "full")
