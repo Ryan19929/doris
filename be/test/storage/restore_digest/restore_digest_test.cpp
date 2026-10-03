@@ -3530,10 +3530,7 @@ protected:
         bool allow = false;
         EXPECT_TRUE(_engine->snapshot_mgr()->make_snapshot(req, &path, &allow).ok());
         std::string dir = fmt::format("{}/{}/{}", path, target->tablet_id(), target->schema_hash());
-        EXPECT_TRUE(io::global_local_filesystem()
-                            ->rename(fmt::format("{}/{}.hdr", dir, src->tablet_id()),
-                                     fmt::format("{}/{}.hdr", dir, target->tablet_id()))
-                            .ok());
+        // the tablet meta of the snapshot is named by the target tablet
         SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
         Status st = loader.move(dir, target, true);
         EXPECT_TRUE(st.ok()) << st;
