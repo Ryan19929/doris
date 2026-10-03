@@ -158,7 +158,7 @@ TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t ta
                                                int64_t version, int threads,
                                                PrefixDigestOutput* prefix = nullptr);
 
-void restore_digest_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+void restore_digest_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 
 void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 

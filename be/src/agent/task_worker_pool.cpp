@@ -1362,6 +1362,9 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
             if (download_request.__isset.manifest_roots) {
                 loader->set_manifest_roots(download_request.manifest_roots);
             }
+            if (download_request.__isset.incremental_ranges) {
+                loader->set_incremental_ranges(download_request.incremental_ranges);
+            }
             status = loader->download(download_request.src_dest_map, &downloaded_tablet_ids);
         }
         manifest_verified_tablets = loader->manifest_verified_tablets();
@@ -1548,13 +1551,98 @@ void write_snapshot_prefix_digest(const std::string& snapshot_path, int64_t tabl
     LOG(INFO) << "no decomposed digest, tablet_id=" << tablet_id << ", reason: " << reason;
 }
 
-void restore_digest_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
+// The incremental restore: compares the digest of the tablet at `version` (already computed in `digest`) with the one
+// composed from the decomposed digest file of the backup at the same version, and checks that the backup can be cut
+// there. Sets prefix_verdict (and prefix_msg) of `digest`.
+void verify_prefix_digest(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req,
+                          TLogicalDigest* digest) {
+    const auto& digest_req = req.restore_digest_req;
+    const auto& source = digest_req.prefix_source;
+    auto fail = [&](const char* verdict, const std::string& msg) {
+        digest->__set_prefix_verdict(verdict);
+        digest->__set_prefix_msg(msg);
+        LOG(WARNING) << "restore digest prefix check of tablet " << digest_req.tablet_id
+                     << " at version " << digest_req.version << ": " << verdict << ", " << msg;
+    };
+    if (digest->status_code != "OK") {
+        fail("ERROR", "the digest of the local tablet is not available: " + digest->status_msg);
+        return;
+    }
+    RestoreDigestDecomposed decomposed;
+    Status st;
+    if (source.__isset.remote_tablet_snapshot) {
+        st = fetch_prefix_digest_from_remote_be(source.remote_tablet_snapshot, source.root,
+                                                &decomposed);
+    } else if (source.__isset.remote_path && source.__isset.location) {
+        TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(digest_req.tablet_id);
+        if (tablet == nullptr) {
+            fail("ERROR", "the local tablet is not found");
+            return;
+        }
+        // the temporary file of the download is put in the snapshot dir of the store
+        std::string tmp_dir = fmt::format("{}/{}", tablet->data_dir()->path(), SNAPSHOT_PREFIX);
+        st = io::global_local_filesystem()->create_directory(tmp_dir);
+        if (st.ok()) {
+            SnapshotLoader loader(engine, env, 0, req.signature, source.broker_addr,
+                                  source.broker_prop);
+            SCOPED_ATTACH_TASK(loader.resource_ctx());
+            st = loader.init(source.__isset.storage_backend ? source.storage_backend
+                                                            : TStorageBackendType::type::BROKER,
+                             source.location);
+            if (st.ok()) {
+                st = loader.fetch_prefix_digest_to_dir(source.remote_path, tmp_dir,
+                                                       source.remote_tablet_id, source.root,
+                                                       &decomposed);
+            }
+        }
+    } else {
+        st = Status::InvalidArgument("the prefix source has neither a remote path nor a snapshot");
+    }
+    if (!st.ok()) {
+        fail("ERROR", "failed to read the decomposed digest of the backup: " + st.to_string());
+        return;
+    }
+    if (decomposed.algo_version != static_cast<uint32_t>(digest->algo_version) ||
+        decomposed.schema_sig != digest->schema_sig) {
+        fail("SCHEMA_MISMATCH", "the algorithm version or the schema signature differs");
+        return;
+    }
+    if (decomposed.base_version != source.end_version) {
+        fail("ERROR", fmt::format("the decomposed digest is at version {}, expected {}",
+                                  decomposed.base_version, source.end_version));
+        return;
+    }
+    if (!decomposed.is_boundary(digest_req.version)) {
+        fail("NOT_BOUNDARY", fmt::format("version {} is not the end version of a rowset of the backup",
+                                         digest_req.version));
+        return;
+    }
+    RestoreDigest composed;
+    st = decomposed.compose(digest_req.version, &composed);
+    if (!st.ok()) {
+        fail("ERROR", "failed to compose the digest of the backup: " + st.to_string());
+        return;
+    }
+    if (composed.root != digest->root) {
+        fail("MISMATCH", fmt::format("the digest of the backup at version {} is {}, the local one is {}",
+                                     digest_req.version, composed.root, digest->root));
+        return;
+    }
+    digest->__set_prefix_verdict("OK");
+    LOG(INFO) << "restore digest prefix check of tablet " << digest_req.tablet_id << " at version "
+              << digest_req.version << ": OK, root " << digest->root;
+}
+
+void restore_digest_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req) {
     const auto& digest_req = req.restore_digest_req;
     LOG(INFO) << "get restore digest task. signature=" << req.signature
               << ", tablet_id=" << digest_req.tablet_id << ", version=" << digest_req.version;
     int threads = digest_req.__isset.threads ? digest_req.threads : 0;
     TLogicalDigest digest = compute_logical_digest_for_task(engine, digest_req.tablet_id,
                                                             digest_req.version, threads);
+    if (digest_req.__isset.prefix_source) {
+        verify_prefix_digest(engine, env, req, &digest);
+    }
 
     // The task itself succeeds as long as the digest was asked and answered; NOT_SUPPORTED and
     // errors are carried in the digest.
@@ -1746,7 +1834,11 @@ void move_dir_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
     } else {
         SnapshotLoader loader(engine, env, move_dir_req.job_id, move_dir_req.tablet_id);
         SCOPED_ATTACH_TASK(loader.resource_ctx());
-        status = loader.move(move_dir_req.src, tablet, true);
+        if (move_dir_req.__isset.incremental) {
+            status = loader.append_increment(move_dir_req.src, tablet, move_dir_req.incremental);
+        } else {
+            status = loader.move(move_dir_req.src, tablet, true);
+        }
     }
 
     if (!status.ok()) {

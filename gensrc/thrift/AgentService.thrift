@@ -426,6 +426,14 @@ struct TUploadReq {
     6: optional string location // root path
 }
 
+// The versions (base_version, end_version] of a remote tablet snapshot to append to a local tablet whose
+// version is base_version (the incremental restore): only the rowsets of these versions are downloaded
+// (into an empty snapshot dir), and moved onto the local tablet instead of replacing it.
+struct TRestoreIncrementalRange {
+    1: required Types.TVersion base_version
+    2: required Types.TVersion end_version
+}
+
 struct TRemoteTabletSnapshot {
     1: optional i64 local_tablet_id
     2: optional string local_snapshot_path
@@ -438,6 +446,8 @@ struct TRemoteTabletSnapshot {
     // manifest is fetched from "<parent of remote_snapshot_path>/manifest", the files are downloaded by it
     // and the downloaded tablet snapshot is checked against it.
     8: optional string manifest_root
+    // download only this range of the remote tablet snapshot, see TRestoreIncrementalRange
+    9: optional TRestoreIncrementalRange incremental
 }
 
 struct TDownloadReq {
@@ -454,6 +464,9 @@ struct TDownloadReq {
     // chars of the SHA-256>", the files are downloaded by it and the downloaded tablet snapshot is checked
     // against it.
     9: optional map<string, string> manifest_roots
+    // src path (same key as src_dest_map) -> the range to download, see TRestoreIncrementalRange. Only for
+    // a repository, the range of a http path is in remote_tablet_snapshots.
+    10: optional map<string, TRestoreIncrementalRange> incremental_ranges
 }
 
 struct TSnapshotRequest {
@@ -477,6 +490,26 @@ struct TSnapshotRequest {
     15: optional bool compute_digest
     // after the snapshot is made, compute the logical digest of the tablet over (0, version] and report it
     16: optional bool compute_logical_digest
+    // restore only: make an empty snapshot dir, to download the increment of the incremental restore into
+    17: optional bool restore_incremental
+}
+
+// Where to read the decomposed digest file (rdigest) of the tablet of a backup, for the incremental restore
+struct TRestoreDigestPrefixSource {
+    // the backup is in a repository
+    1: optional Types.TNetworkAddress broker_addr
+    2: optional map<string, string> broker_prop
+    3: optional Types.TStorageBackendType storage_backend
+    4: optional string location
+    // the path of the tablet snapshot in the repository, the same as the src of the download
+    5: optional string remote_path
+    // the backup is kept on local: the remote tablet snapshot (the remote fields are used)
+    6: optional TRemoteTabletSnapshot remote_tablet_snapshot
+    7: required Types.TTabletId remote_tablet_id
+    // SHA-256 of the decomposed digest file, recorded in the job info
+    8: required string root
+    // the version of the backup (V_b): the end version of the last rowset of the decomposed digest
+    9: required Types.TVersion end_version
 }
 
 // compute the logical digest (order independent digest of the visible rows) of a tablet at a version
@@ -486,6 +519,9 @@ struct TRestoreDigestReq {
     3: required Types.TVersion version
     // worker threads of the task, <= 0 means the BE config restore_digest_threads
     4: optional i32 threads
+    // if set, also compare the digest of the tablet at `version` with the one composed from the decomposed digest
+    // file of the backup, and check that the backup can be cut at `version`, see TRestoreDigestPrefixSource
+    5: optional TRestoreDigestPrefixSource prefix_source
 }
 
 struct TReleaseSnapshotRequest {
@@ -513,6 +549,8 @@ struct TMoveDirReq {
     3: required string src
     4: required i64 job_id
     5: required bool overwrite
+    // append the downloaded rowsets of this range to the tablet, instead of replacing the tablet
+    6: optional TRestoreIncrementalRange incremental
 }
 
 enum TAgentServiceVersion {

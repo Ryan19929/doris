@@ -76,6 +76,11 @@ struct TDownloadStats {
     11: optional i64 unmatched_no_source_rowset_id
     12: optional i64 unmatched_source_not_in_snapshot
     13: optional i64 unmatched_version_mismatch
+    // tablets restored incrementally (only the rowsets of the increment are downloaded), and the files and bytes
+    // downloaded for them, which are also counted in downloaded_files / downloaded_bytes
+    14: optional i64 tablets_incremental
+    15: optional i64 incremental_files
+    16: optional i64 incremental_bytes
 }
 
 // Result of the logical digest computation of a tablet, see TSnapshotRequest.compute_logical_digest and
@@ -96,6 +101,10 @@ struct TLogicalDigest {
     7: optional string prefix_root
     8: optional string prefix_msg
     9: optional i64 prefix_bytes
+    // restore digest task with prefix_source: OK if the digest of the tablet at the version equals the one composed
+    // from the decomposed digest file of the backup and the backup can be cut at the version; otherwise
+    // NOT_BOUNDARY / MISMATCH / SCHEMA_MISMATCH / ERROR (prefix_msg says why)
+    10: optional string prefix_verdict
 }
 
 struct TFinishTaskRequest {

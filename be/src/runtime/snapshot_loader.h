@@ -171,6 +171,11 @@ struct SnapshotDownloadStats {
     int64_t unmatched_no_source_rowset_id = 0;
     int64_t unmatched_source_not_in_snapshot = 0;
     int64_t unmatched_version_mismatch = 0;
+    // tablets downloaded as an increment (see select_incremental_rowsets), and the files and bytes of them,
+    // which are also in downloaded_files / downloaded_bytes
+    int64_t tablets_incremental = 0;
+    int64_t incremental_files = 0;
+    int64_t incremental_bytes = 0;
 
     // Count the stats of one tablet as full / partial / no reuse by its files, nothing if it has no file.
     void classify_tablet();
@@ -178,6 +183,28 @@ struct SnapshotDownloadStats {
     std::string to_string() const;
     TDownloadStats to_thrift() const;
 };
+
+// The increment (base_version, end_version] of a remote tablet snapshot, to append to a local tablet at
+// base_version (the incremental restore). The remote tablet meta is cut to the rowsets of the increment: the
+// rowsets with a start version after base_version, which must form a chain from base_version + 1 to end_version
+// (otherwise the backup can not be cut at base_version). The stale rowsets, the incremental rowsets (deprecated)
+// and the delete bitmap are dropped, the delete bitmap of a merge-on-write tablet is calculated again when the
+// rowsets are appended. Rowsets in a remote storage are not supported.
+//
+// rowset_ids receives the id (as in the names of the segment files) of the selected rowsets, in version order.
+Status select_incremental_rowsets(const TabletMetaPB& remote, int64_t base_version,
+                                  int64_t end_version, TabletMetaPB* increment,
+                                  std::vector<std::string>* rowset_ids);
+
+// Whether a file of a tablet snapshot dir is a data file of the rowset: "<rowset_id>_<...>".
+bool is_rowset_file(const std::string& file_name, const std::string& rowset_id);
+
+// Cut the manifest of the remote tablet snapshot to the increment: the tablet meta file and the files of the
+// selected rowsets, and check that every rowset has all its segments (the number of ".dat" files is
+// num_segments).
+Status cut_manifest_to_increment(const SnapshotManifest& manifest, const TabletMetaPB& increment,
+                                 const std::vector<std::string>& rowset_ids,
+                                 SnapshotManifest* cut);
 
 // Count the rowsets of the remote tablet which have no lineage match in the local tablet, with the reason.
 // A remote rowset matches if a local rowset has it as source_rowset_id, or it has a local rowset as
@@ -275,6 +302,18 @@ public:
         _manifest_roots = std::move(manifest_roots);
     }
 
+    // The increment to download of each tablet, by the remote path (same key as src_to_dest_path of
+    // download()); the other tablets are downloaded as a whole.
+    void set_incremental_ranges(std::map<std::string, TRestoreIncrementalRange> ranges) {
+        _incremental_ranges = std::move(ranges);
+    }
+
+    // Append the rowsets of the increment, downloaded into the snapshot dir, to the tablet whose max version is
+    // range.base_version, which then has the max version range.end_version. All or nothing: on failure the
+    // tablet (rowsets, delete bitmap, files) is as before. Idempotent per snapshot dir.
+    Status append_increment(const std::string& snapshot_path, TabletSharedPtr tablet,
+                            const TRestoreIncrementalRange& range);
+
     // The manifest root of each tablet uploaded by upload().
     const std::map<int64_t, std::string>& uploaded_manifest_roots() const {
         return _uploaded_manifest_roots;
@@ -298,6 +337,11 @@ public:
     Status fetch_prefix_digest(const std::string& remote_path, const std::string& local_path,
                                int64_t remote_tablet_id, const std::string& root,
                                RestoreDigestDecomposed* digest);
+
+    // Same as fetch_prefix_digest, the temporary file is put in tmp_dir.
+    Status fetch_prefix_digest_to_dir(const std::string& remote_path, const std::string& tmp_dir,
+                                      int64_t remote_tablet_id, const std::string& root,
+                                      RestoreDigestDecomposed* digest);
 
     // The data reused and downloaded by the tablets downloaded so far.
     const SnapshotDownloadStats& download_stats() const { return _download_stats; }
@@ -340,6 +384,14 @@ private:
     Status _upload_prefix_digest(const std::string& src_path, const std::string& dest_path,
                                  int64_t tablet_id, std::string* root);
 
+    // Download only the increment of the tablet, see select_incremental_rowsets.
+    Status _download_tablet_incremental(const std::string& remote_path,
+                                        const std::string& local_path, int64_t local_tablet_id,
+                                        int64_t remote_tablet_id, const std::string& manifest_root,
+                                        const TRestoreIncrementalRange& range, int* report_counter,
+                                        int finished_num, int total_num,
+                                        SnapshotDownloadStats* stats);
+
     // Delete all the files in a local tablet snapshot dir, so that it can be downloaded again
     // without reusing any local file.
     Status _clear_local_snapshot_files(const std::string& local_path);
@@ -372,6 +424,7 @@ private:
     size_t _http_download_files_num;
 
     std::map<std::string, std::string> _manifest_roots;
+    std::map<std::string, TRestoreIncrementalRange> _incremental_ranges;
     std::map<int64_t, std::string> _uploaded_manifest_roots;
     std::map<int64_t, std::string> _uploaded_prefix_digest_roots;
     std::vector<int64_t> _manifest_verified_tablets;

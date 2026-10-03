@@ -500,6 +500,12 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
     string snapshot_id;
     RETURN_IF_ERROR(io::global_local_filesystem()->canonicalize(snapshot_id_path, &snapshot_id));
 
+    if (request.__isset.restore_incremental && request.restore_incremental) {
+        // the dir to download the increment of the incremental restore into: no rowset, no tablet meta
+        *snapshot_path = snapshot_id;
+        return Status::OK();
+    }
+
     std::vector<RowsetSharedPtr> consistent_rowsets;
     do {
         TabletMetaSharedPtr new_tablet_meta(new (nothrow) TabletMeta());
