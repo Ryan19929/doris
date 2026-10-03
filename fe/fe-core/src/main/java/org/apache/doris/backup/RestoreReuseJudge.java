@@ -449,10 +449,8 @@ public final class RestoreReuseJudge {
         KeysType keysType = in.localTable.getKeysType();
         if (keysType == KeysType.DUP_KEYS
                 || (keysType == KeysType.UNIQUE_KEYS && in.localTable.getEnableUniqueKeyMergeOnWrite())) {
-            // the binlog of the appended rowsets would be missing
-            if (in.localTable.getBinlogConfig() != null && in.localTable.getBinlogConfig().getEnable()) {
-                return "INCREMENTAL_BINLOG";
-            }
+            // A table with binlog is fine: a restore never carries the binlog of the snapshot, the whole download
+            // does not either.
             return null;
         }
         return "INCREMENTAL_MODEL_" + keysType.name();
