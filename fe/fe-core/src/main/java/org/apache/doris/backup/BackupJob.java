@@ -367,6 +367,10 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         if (task.isComputeLogicalDigest()) {
             info.setLogicalDigest(LogicalDigestInfo.fromThrift(
                     request.isSetLogicalDigest() ? request.getLogicalDigest() : null));
+            // the decomposed digest file is optional: a tablet without one (unique MoR, ...) just has no root
+            if (request.isSetLogicalDigest() && request.getLogicalDigest().isSetPrefixRoot()) {
+                info.setPrefixDigestRoot(request.getLogicalDigest().getPrefixRoot());
+            }
         }
 
         snapshotInfos.put(task.getTabletId(), info);
@@ -430,6 +434,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             // the root of the manifest uploaded next to the files. Absent if the backend is an old version, then the
             // job has no manifest.
             info.setManifestRoot(request.isSetManifestRoots() ? request.getManifestRoots().get(tabletId) : null);
+            // the decomposed digest file uploaded next to the files, only a tablet which had one has a root.
+            if (info.getPrefixDigestRoot() != null) {
+                info.setPrefixDigestRoot(request.isSetPrefixDigestRoots()
+                        ? request.getPrefixDigestRoots().get(tabletId) : null);
+            }
         }
 
         taskProgress.remove(task.getSignature());
@@ -1012,6 +1021,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 int withDigest = jobInfo.buildLogicalDigests(filteredSnapshotInfos);
                 LOG.info("backup logical digest: {} of {} tablets have a digest. {}", withDigest,
                         filteredSnapshotInfos.size(), this);
+                int withPrefix = jobInfo.buildPrefixDigests(filteredSnapshotInfos);
+                LOG.info("backup decomposed digest: {} of {} tablets have a decomposed digest file. {}",
+                        withPrefix, filteredSnapshotInfos.size(), this);
             }
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);

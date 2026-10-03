@@ -130,6 +130,8 @@ public class BackupJobInfo implements GsonPostProcessable {
     private Map<Long, String> manifestRootIndex;
     // tablet id -> logical digest, built on demand, not persisted.
     private Map<Long, LogicalDigestInfo> logicalDigestIndex;
+    // tablet id -> decomposed digest root, built on demand, not persisted.
+    private Map<Long, String> prefixDigestRootIndex;
 
     public static class ExtraInfo {
         public static class NetworkAddrss {
@@ -186,6 +188,7 @@ public class BackupJobInfo implements GsonPostProcessable {
                         BackupTabletInfo backupTabletInfo = new BackupTabletInfo(tabletId, files);
                         backupTabletInfo.manifestRoot = backupIndexInfo.getManifestRoot(tabletId);
                         backupTabletInfo.logicalDigest = backupIndexInfo.getLogicalDigest(tabletId);
+                        backupTabletInfo.prefixDigestRoot = backupIndexInfo.getPrefixDigestRoot(tabletId);
                         backupIndexInfo.sortedTabletInfoList.add(backupTabletInfo);
                     }
                 }
@@ -448,6 +451,11 @@ public class BackupJobInfo implements GsonPostProcessable {
         // logical digest (the logical_digest property is off, or an old version). Not written if null.
         @SerializedName("ld")
         public Map<Long, LogicalDigestInfo> logicalDigests;
+        // tablet id -> the SHA-256 (lower case hex) of the decomposed digest file of the tablet snapshot, from which
+        // the logical digest at any rowset boundary version can be composed. The file itself is kept next to the
+        // data, only tablets which have one are listed. Null if no tablet has one. Not written if null.
+        @SerializedName("rd")
+        public Map<Long, String> prefixDigestRoots;
         public List<BackupTabletInfo> sortedTabletInfoList = Lists.newArrayList();
 
         public List<String> getTabletFiles(long tabletId) {
@@ -460,6 +468,10 @@ public class BackupJobInfo implements GsonPostProcessable {
 
         public LogicalDigestInfo getLogicalDigest(long tabletId) {
             return logicalDigests == null ? null : logicalDigests.get(tabletId);
+        }
+
+        public String getPrefixDigestRoot(long tabletId) {
+            return prefixDigestRoots == null ? null : prefixDigestRoots.get(tabletId);
         }
 
         private List<Long> getSortedTabletIds() {
@@ -486,6 +498,9 @@ public class BackupJobInfo implements GsonPostProcessable {
         // The logical digest of the tablet snapshot, null if the backup has none.
         // Persisted in BackupIndexInfo.logicalDigests, this is a view of it.
         public LogicalDigestInfo logicalDigest;
+        // The root of the decomposed digest file of the tablet snapshot, null if there is none.
+        // Persisted in BackupIndexInfo.prefixDigestRoots, this is a view of it.
+        public String prefixDigestRoot;
 
         public BackupTabletInfo(long id, List<String> files) {
             this.id = id;
@@ -801,6 +816,71 @@ public class BackupJobInfo implements GsonPostProcessable {
         return withDigest;
     }
 
+    /**
+     * Record the root of the decomposed digest file of every tablet which has one, see
+     * SnapshotInfo.getPrefixDigestRoot(). Per tablet and optional: a tablet without a file records nothing, and
+     * the other tablets are not affected.
+     *
+     * @param snapshotInfos tablet id -> snapshot info
+     * @return the number of tablets with a decomposed digest file
+     */
+    public int buildPrefixDigests(Map<Long, SnapshotInfo> snapshotInfos) {
+        clearPrefixDigests();
+        if (content == BackupContent.METADATA_ONLY) {
+            return 0;
+        }
+        int count = 0;
+        for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    Map<Long, String> roots = Maps.newHashMap();
+                    for (Long tabletId : idxInfo.tablets.keySet()) {
+                        SnapshotInfo info = snapshotInfos.get(tabletId);
+                        String root = info == null ? null : info.getPrefixDigestRoot();
+                        if (isValidManifestRoot(root)) {
+                            roots.put(tabletId, root.toLowerCase());
+                        }
+                    }
+                    count += roots.size();
+                    idxInfo.prefixDigestRoots = roots.isEmpty() ? null : roots;
+                }
+            }
+        }
+        return count;
+    }
+
+    // Returns the root of the decomposed digest file of a tablet in the backup, null if the tablet has none.
+    public String getPrefixDigestRoot(long tabletId) {
+        if (prefixDigestRootIndex == null) {
+            Map<Long, String> index = Maps.newHashMap();
+            for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+                if (tblInfo == null) {
+                    continue;
+                }
+                for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                    for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                        if (idxInfo.prefixDigestRoots != null) {
+                            index.putAll(idxInfo.prefixDigestRoots);
+                        }
+                    }
+                }
+            }
+            prefixDigestRootIndex = index;
+        }
+        return prefixDigestRootIndex.get(tabletId);
+    }
+
+    private void clearPrefixDigests() {
+        prefixDigestRootIndex = null;
+        for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    idxInfo.prefixDigestRoots = null;
+                }
+            }
+        }
+    }
+
     // Returns the logical digest of a tablet in the backup, null if the backup has none for the tablet.
     public LogicalDigestInfo getLogicalDigest(long tabletId) {
         if (logicalDigestIndex == null) {
@@ -1001,16 +1081,19 @@ public class BackupJobInfo implements GsonPostProcessable {
                         tabletInfo.files.clear();
                         tabletInfo.manifestRoot = null;
                         tabletInfo.logicalDigest = null;
+                        tabletInfo.prefixDigestRoot = null;
                     }
                     // The manifest roots are only needed for downloading. Keep manifest_version and
                     // digest_algorithm, they are shown in SHOW RESTORE.
                     indexInfo.manifestRoots = null;
                     indexInfo.logicalDigests = null;
+                    indexInfo.prefixDigestRoots = null;
                 }
             }
         }
         manifestRootIndex = null;
         logicalDigestIndex = null;
+        prefixDigestRootIndex = null;
     }
 
     @Override

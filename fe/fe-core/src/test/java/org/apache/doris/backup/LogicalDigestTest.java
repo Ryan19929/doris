@@ -255,4 +255,56 @@ public class LogicalDigestTest {
         // independent of the manifest digest
         Assertions.assertFalse(req.isSetComputeDigest());
     }
+
+    @Test
+    public void testPrefixDigestRoots() {
+        BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2, TABLET_3);
+        Map<Long, SnapshotInfo> infos = Maps.newHashMap();
+        SnapshotInfo i1 = snapshotInfo(TABLET_1, LogicalDigestInfo.of(1, hex('5'), hex('a')));
+        i1.setPrefixDigestRoot(hex('B'));
+        infos.put(TABLET_1, i1);
+        // no decomposed digest (unique MoR, ...)
+        infos.put(TABLET_2, snapshotInfo(TABLET_2, LogicalDigestInfo.of(1, hex('5'), hex('c'))));
+        // a root which is not a SHA-256 is not recorded
+        SnapshotInfo i3 = snapshotInfo(TABLET_3, LogicalDigestInfo.of(1, hex('5'), hex('d')));
+        i3.setPrefixDigestRoot("abc");
+        infos.put(TABLET_3, i3);
+        Assertions.assertEquals(1, jobInfo.buildPrefixDigests(infos));
+        // lower case
+        Assertions.assertEquals(hex('b'), jobInfo.getPrefixDigestRoot(TABLET_1));
+        Assertions.assertNull(jobInfo.getPrefixDigestRoot(TABLET_2));
+        Assertions.assertNull(jobInfo.getPrefixDigestRoot(TABLET_3));
+
+        String json = jobInfo.toJson(false);
+        // short and stable name, next to "ld"
+        Assertions.assertTrue(json.contains("\"rd\":{\"101\":\"" + hex('b') + "\"}"), json);
+        BackupJobInfo read = BackupJobInfo.genFromJson(json);
+        Assertions.assertEquals(hex('b'), read.getPrefixDigestRoot(TABLET_1));
+        Assertions.assertEquals(hex('b'), index(read).sortedTabletInfoList.get(0).prefixDigestRoot);
+        Assertions.assertNull(index(read).sortedTabletInfoList.get(1).prefixDigestRoot);
+        Assertions.assertEquals(json, read.toJson(false));
+        read.releaseSnapshotInfo();
+        Assertions.assertNull(read.getPrefixDigestRoot(TABLET_1));
+        Assertions.assertFalse(read.toJson(false).contains("\"rd\""));
+
+        // nobody has one: nothing is written
+        Assertions.assertEquals(0, jobInfo.buildPrefixDigests(Maps.newHashMap()));
+        Assertions.assertFalse(jobInfo.toJson(false).contains("\"rd\""));
+        // metadata only: no files, no digests
+        jobInfo.content = BackupContent.METADATA_ONLY;
+        Assertions.assertEquals(0, jobInfo.buildPrefixDigests(infos));
+
+        // the snapshot info keeps it in the journal, an old one has none
+        SnapshotInfo withRoot = snapshotInfo(TABLET_1, null);
+        withRoot.setPrefixDigestRoot(hex('b'));
+        String infoJson = com.google.gson.JsonParser.parseString(
+                org.apache.doris.persist.gson.GsonUtils.GSON.toJson(withRoot)).toString();
+        Assertions.assertTrue(infoJson.contains("\"rd\":\"" + hex('b') + "\""), infoJson);
+        Assertions.assertEquals(hex('b'),
+                org.apache.doris.persist.gson.GsonUtils.GSON.fromJson(infoJson, SnapshotInfo.class)
+                        .getPrefixDigestRoot());
+        Assertions.assertNull(org.apache.doris.persist.gson.GsonUtils.GSON.fromJson(
+                "{\"tab\":101,\"be\":10001,\"sh\":5,\"path\":\"/path\",\"f\":[\"1.dat\"]}",
+                SnapshotInfo.class).getPrefixDigestRoot());
+    }
 }
