@@ -50,6 +50,9 @@
 #include "core/value/vdatetime_value.h"
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
+#include "runtime/snapshot_loader.h"
+#include "storage/snapshot/snapshot_manager.h"
+#include "util/debug_points.h"
 #include "storage/data_dir.h"
 #include "storage/delete/delete_handler.h"
 #include "storage/merger.h"
@@ -3353,6 +3356,310 @@ TEST_F(RestoreDigestTabletTest, TaskProducesTheDecomposedDigest) {
     EXPECT_EQ("OK", md.status_code);
     EXPECT_FALSE(none.produced);
     EXPECT_FALSE(none.reason.empty());
+}
+
+// ===== 14. incremental restore: append the rowsets after the local version =====================
+
+namespace {
+TabletMetaPB make_meta(const std::vector<std::pair<int64_t, int64_t>>& versions,
+                       bool remote_last = false) {
+    TabletMetaPB pb;
+    pb.set_tablet_id(1);
+    int n = 0;
+    for (auto [s, e] : versions) {
+        auto* rs = pb.add_rs_metas();
+        rs->set_start_version(s);
+        rs->set_end_version(e);
+        rs->set_rowset_id_v2(fmt::format("0200000000000000{:016x}", 1000 + n));
+        rs->set_num_segments(1);
+        if (remote_last && n + 1 == static_cast<int>(versions.size())) {
+            rs->set_resource_id("remote");
+        }
+        ++n;
+    }
+    pb.add_stale_rs_metas()->set_start_version(5);
+    pb.mutable_delete_bitmap()->add_rowset_ids("x");
+    return pb;
+}
+} // namespace
+
+TEST(RestoreIncrementalTest, SelectRowsetsAfterTheBaseVersion) {
+    TabletMetaPB inc;
+    std::vector<std::string> ids;
+    // [0-1] [2-3] [4-4] [5-6]: cut at 3 gives [4-4] [5-6]
+    auto pb = make_meta({{0, 1}, {2, 3}, {4, 4}, {5, 6}});
+    ASSERT_TRUE(select_incremental_rowsets(pb, 3, 6, &inc, &ids).ok());
+    ASSERT_EQ(2, inc.rs_metas_size());
+    EXPECT_EQ(4, inc.rs_metas(0).start_version());
+    EXPECT_EQ(6, inc.rs_metas(1).end_version());
+    EXPECT_EQ(0, inc.stale_rs_metas_size());
+    EXPECT_FALSE(inc.has_delete_bitmap());
+    EXPECT_EQ(2U, ids.size());
+    // a rowset crosses the base version
+    EXPECT_FALSE(select_incremental_rowsets(pb, 2, 6, &inc, &ids).ok());
+    // nothing after the base version, or the chain does not reach the end version
+    EXPECT_FALSE(select_incremental_rowsets(pb, 6, 6, &inc, &ids).ok());
+    EXPECT_FALSE(select_incremental_rowsets(pb, 3, 7, &inc, &ids).ok());
+    // a gap
+    EXPECT_FALSE(select_incremental_rowsets(make_meta({{0, 1}, {2, 3}, {5, 6}}), 3, 6, &inc, &ids).ok());
+    // a remote storage rowset
+    EXPECT_FALSE(select_incremental_rowsets(make_meta({{0, 3}, {4, 6}}, true), 3, 6, &inc, &ids).ok());
+}
+
+TEST(RestoreIncrementalTest, CutManifestKeepsTheFilesOfTheRowsets) {
+    auto pb = make_meta({{0, 1}, {2, 3}, {4, 4}});
+    TabletMetaPB inc;
+    std::vector<std::string> ids;
+    ASSERT_TRUE(select_incremental_rowsets(pb, 3, 4, &inc, &ids).ok());
+    const std::string id0 = pb.rs_metas(0).rowset_id_v2();
+    SnapshotManifest m;
+    m.tablet_id = 1;
+    for (const std::string& n : {std::string("1.hdr"), id0 + "_0.dat", id0 + "_0.idx", ids[0] + "_0.dat",
+                                 ids[0] + "_0_5.idx", ids[0] + "_1.dat"}) {
+        SnapshotManifestFile f;
+        f.name = n;
+        f.size = 10;
+        m.files.push_back(f);
+    }
+    SnapshotManifest cut;
+    // one segment file expected, the manifest has two: mismatch
+    EXPECT_TRUE(cut_manifest_to_increment(m, inc, ids, &cut).is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
+    m.files.pop_back();
+    ASSERT_TRUE(cut_manifest_to_increment(m, inc, ids, &cut).ok());
+    ASSERT_EQ(3U, cut.files.size()); // hdr, dat, idx
+    EXPECT_TRUE(is_rowset_file(ids[0] + "_0.dat", ids[0]));
+    EXPECT_FALSE(is_rowset_file(ids[0] + "x_0.dat", ids[0]));
+    // a missing segment file
+    m.files.erase(m.files.begin() + 3);
+    EXPECT_FALSE(cut_manifest_to_increment(m, inc, ids, &cut).ok());
+}
+
+// A source tablet with rowsets of versions 2..6, a local tablet equal to it at version 3 but laid out
+// differently, the snapshot dir of the increment as the download makes it, and the append.
+class RestoreIncrementalAppendTest : public RestoreDigestTabletTest {
+protected:
+    // the rowsets after version 3 of the source tablet, and the marks of the merge-on-write bitmap
+    void build_source(const TabletSharedPtr& src, bool mow) {
+        auto schema = src->tablet_schema();
+        if (mow) {
+            auto rs2 = write(src, schema, 2, {{{1, 10}, {2, 20}, {3, 30}, {4, 40}, {5, 50}, {6, 60}}}, false, true);
+            auto rs3 = write(src, schema, 3, {{{3, 31}, {5, 51}}}, false, true);
+            auto& bitmap = src->tablet_meta()->delete_bitmap();
+            bitmap.add({rs2->rowset_id(), 0, 3}, 2);
+            bitmap.add({rs2->rowset_id(), 0, 3}, 4);
+            auto rs4 = write(src, schema, 4, {{{1, 0, 1}, {6, 61}}}, false, true);
+            bitmap.add({rs2->rowset_id(), 0, 4}, 0);
+            bitmap.add({rs2->rowset_id(), 0, 4}, 5);
+            auto rs5 = write(src, schema, 5, {{{2, 21}, {7, 70}}}, false, true);
+            bitmap.add({rs2->rowset_id(), 0, 5}, 1);
+            auto rs6 = write(src, schema, 6, {{{2, 0, 1}}}, false, true);
+            bitmap.add({rs5->rowset_id(), 0, 6}, 0);
+            (void)rs3;
+            (void)rs4;
+            (void)rs6;
+        } else {
+            write(src, schema, 2, {{{1, 10}, {2, 20}, {3, 30}}}, false, true);
+            write(src, schema, 3, {{{4, 40}, {5, 50}}}, false, true);
+            write(src, schema, 4, {{{6, 60}, {7, 70}}}, false, true);
+            write_delete(src, 5, {cond("v", "=", "20")});
+            write(src, schema, 6, {{{8, 80}, {1, 11}}}, false, true);
+        }
+    }
+
+    // equal to the source at version 3, as one rowset of version 2 and an empty one of version 3
+    void build_local(const TabletSharedPtr& local, bool mow) {
+        auto schema = local->tablet_schema();
+        if (mow) {
+            write(local, schema, 2, {{{1, 10}, {2, 20}, {3, 31}, {4, 40}, {5, 51}, {6, 60}}}, false, true);
+        } else {
+            write(local, schema, 2, {{{1, 10}, {2, 20}, {3, 30}, {4, 40}, {5, 50}}}, false, true);
+        }
+        write(local, schema, 3, {}, false, true);
+    }
+
+    // The snapshot dir of the local tablet with the increment of the source tablet at (base, end], as the
+    // download task leaves it.
+    std::string make_increment_dir(const TabletSharedPtr& src, const TabletSharedPtr& local,
+                                   int64_t base, int64_t end) {
+        TSnapshotRequest empty_req;
+        empty_req.__set_tablet_id(local->tablet_id());
+        empty_req.__set_schema_hash(local->schema_hash());
+        empty_req.__set_restore_incremental(true);
+        std::string empty_path;
+        bool allow = false;
+        EXPECT_TRUE(_engine->snapshot_mgr()->make_snapshot(empty_req, &empty_path, &allow).ok());
+        std::string dir = fmt::format("{}/{}/{}", empty_path, local->tablet_id(), local->schema_hash());
+        // a full snapshot of the source tablet, as the backup keeps it
+        TSnapshotRequest req;
+        req.__set_tablet_id(src->tablet_id());
+        req.__set_schema_hash(src->schema_hash());
+        req.__set_version(end);
+        std::string src_path;
+        EXPECT_TRUE(_engine->snapshot_mgr()->make_snapshot(req, &src_path, &allow).ok());
+        std::string src_dir = fmt::format("{}/{}/{}", src_path, src->tablet_id(), src->schema_hash());
+        TabletMetaPB remote;
+        EXPECT_TRUE(TabletMeta::load_from_file(fmt::format("{}/{}.hdr", src_dir, src->tablet_id()), &remote).ok());
+        TabletMetaPB inc;
+        std::vector<std::string> ids;
+        Status st = select_incremental_rowsets(remote, base, end, &inc, &ids);
+        EXPECT_TRUE(st.ok()) << st;
+        std::vector<io::FileInfo> files;
+        bool exists = false;
+        EXPECT_TRUE(io::global_local_filesystem()->list(src_dir, true, &files, &exists).ok());
+        for (const auto& f : files) {
+            for (const auto& id : ids) {
+                if (is_rowset_file(f.file_name, id)) {
+                    EXPECT_TRUE(io::global_local_filesystem()
+                                        ->link_file(src_dir + "/" + f.file_name, dir + "/" + f.file_name)
+                                        .ok());
+                }
+            }
+        }
+        EXPECT_TRUE(TabletMeta::save(fmt::format("{}/{}.hdr", dir, local->tablet_id()), inc).ok());
+        return dir;
+    }
+
+    // The whole download: the full snapshot of the source tablet moved onto a tablet.
+    void whole_restore(const TabletSharedPtr& src, const TabletSharedPtr& target, int64_t end) {
+        TSnapshotRequest req;
+        req.__set_tablet_id(target->tablet_id());
+        req.__set_schema_hash(target->schema_hash());
+        req.__set_ref_tablet_id(src->tablet_id());
+        req.__set_version(end);
+        std::string path;
+        bool allow = false;
+        EXPECT_TRUE(_engine->snapshot_mgr()->make_snapshot(req, &path, &allow).ok());
+        std::string dir = fmt::format("{}/{}/{}", path, target->tablet_id(), target->schema_hash());
+        EXPECT_TRUE(io::global_local_filesystem()
+                            ->rename(fmt::format("{}/{}.hdr", dir, src->tablet_id()),
+                                     fmt::format("{}/{}.hdr", dir, target->tablet_id()))
+                            .ok());
+        SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+        Status st = loader.move(dir, target, true);
+        EXPECT_TRUE(st.ok()) << st;
+    }
+
+    std::vector<std::string> tablet_files(const TabletSharedPtr& tablet) {
+        std::vector<io::FileInfo> files;
+        bool exists = false;
+        EXPECT_TRUE(io::global_local_filesystem()->list(tablet->tablet_path(), true, &files, &exists).ok());
+        std::vector<std::string> names;
+        for (const auto& f : files) {
+            names.push_back(f.file_name);
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
+    void run_append(bool mow, int64_t base_id) {
+        _next_id = 940000 + base_id;
+        auto src = create_tablet(base_id, mow);
+        auto local = create_tablet(base_id + 1, mow);
+        auto whole = create_tablet(base_id + 2, mow);
+        ASSERT_NE(nullptr, src);
+        ASSERT_NE(nullptr, local);
+        ASSERT_NE(nullptr, whole);
+        build_source(src, mow);
+        build_local(local, mow);
+        // the local data equals the source at the base version, laid out differently
+        EXPECT_TRUE(digests_equal(tablet_digest(src->tablet_id(), 3), tablet_digest(local->tablet_id(), 3)));
+        RestoreDigest local_before = tablet_digest(local->tablet_id(), 3);
+
+        std::string dir = make_increment_dir(src, local, 3, 6);
+        SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+        TRestoreIncrementalRange range;
+        range.base_version = 3;
+        range.end_version = 6;
+        Status st = loader.append_increment(dir, local, range);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(6, local->max_version_unlocked());
+
+        whole_restore(src, whole, 6);
+        ASSERT_EQ(6, whole->max_version_unlocked());
+        RestoreDigest appended = tablet_digest(local->tablet_id(), 6);
+        // the same as the whole download, and the source
+        EXPECT_TRUE(digests_equal(tablet_digest(whole->tablet_id(), 6), appended));
+        EXPECT_TRUE(digests_equal(tablet_digest(src->tablet_id(), 6), appended));
+        // every version up to the base is still the local data, and the versions in between are right too
+        EXPECT_TRUE(digests_equal(local_before, tablet_digest(local->tablet_id(), 3)));
+        for (int64_t v = 4; v <= 6; ++v) {
+            EXPECT_TRUE(digests_equal(tablet_digest(src->tablet_id(), v), tablet_digest(local->tablet_id(), v)))
+                    << v;
+        }
+        EXPECT_NE(local_before.root, appended.root);
+        // idempotent: the same snapshot dir again is a no-op
+        EXPECT_TRUE(loader.append_increment(dir, local, range).ok());
+        EXPECT_EQ(6, local->max_version_unlocked());
+        // a digest of 7 rows (dup: 5 rows deleted by the condition...) is not the point; the rows are there
+        EXPECT_GT(appended.rows, 0U);
+    }
+};
+
+TEST_F(RestoreIncrementalAppendTest, DuplicateEqualsWholeDownload) {
+    run_append(false, 7401);
+}
+
+TEST_F(RestoreIncrementalAppendTest, MergeOnWriteWithUpdatesAndDeletesEqualsWholeDownload) {
+    run_append(true, 7411);
+}
+
+TEST_F(RestoreIncrementalAppendTest, WrongBaseVersionIsRefusedAndNothingChanges) {
+    _next_id = 950000;
+    auto src = create_tablet(7421, false);
+    auto local = create_tablet(7422, false);
+    build_source(src, false);
+    build_local(local, false);
+    std::string dir = make_increment_dir(src, local, 3, 6);
+    auto files_before = tablet_files(local);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    TRestoreIncrementalRange range;
+    range.base_version = 2; // the tablet is at 3
+    range.end_version = 6;
+    EXPECT_FALSE(loader.append_increment(dir, local, range).ok());
+    EXPECT_EQ(3, local->max_version_unlocked());
+    EXPECT_EQ(files_before, tablet_files(local));
+}
+
+TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
+    _next_id = 960000;
+    config::enable_debug_points = true;
+    Defer defer([]() {
+        DebugPoints::instance()->clear();
+        config::enable_debug_points = false;
+    });
+    auto src = create_tablet(7431, true);
+    auto local = create_tablet(7432, true);
+    auto whole = create_tablet(7433, true);
+    build_source(src, true);
+    build_local(local, true);
+    std::string dir = make_increment_dir(src, local, 3, 6);
+    auto files_before = tablet_files(local);
+    RestoreDigest before = tablet_digest(7432, 3);
+    auto bitmap_count_before = local->tablet_meta()->delete_bitmap().get_delete_bitmap_count();
+    auto bitmap_card_before = local->tablet_meta()->delete_bitmap().cardinality();
+    size_t rowsets_before = local->tablet_meta()->all_rs_metas().size();
+
+    DebugPoints::instance()->add_with_params("Tablet.revise_tablet_meta_fail", {{"tablet_id", "7432"}});
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    TRestoreIncrementalRange range;
+    range.base_version = 3;
+    range.end_version = 6;
+    EXPECT_FALSE(loader.append_increment(dir, local, range).ok());
+    // nothing of the increment is in the tablet: version, rowsets, delete bitmap, files
+    EXPECT_EQ(3, local->max_version_unlocked());
+    EXPECT_EQ(rowsets_before, local->tablet_meta()->all_rs_metas().size());
+    EXPECT_EQ(bitmap_count_before, local->tablet_meta()->delete_bitmap().get_delete_bitmap_count());
+    EXPECT_EQ(bitmap_card_before, local->tablet_meta()->delete_bitmap().cardinality());
+    EXPECT_EQ(files_before, tablet_files(local));
+    EXPECT_TRUE(digests_equal(before, tablet_digest(7432, 3)));
+    EXPECT_FALSE(compute_tablet_restore_digest(*_engine, 7432, 4, &before).ok());
+
+    // the failure is gone: appending the same dir again works and equals the whole download
+    DebugPoints::instance()->clear();
+    Status st = loader.append_increment(dir, local, range);
+    ASSERT_TRUE(st.ok()) << st;
+    whole_restore(src, whole, 6);
+    EXPECT_TRUE(digests_equal(tablet_digest(7433, 6), tablet_digest(7432, 6)));
 }
 
 } // namespace doris
