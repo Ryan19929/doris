@@ -3462,7 +3462,7 @@ protected:
             write(src, schema, 3, {{{4, 40}, {5, 50}}}, false, true);
             write(src, schema, 4, {{{6, 60}, {7, 70}}}, false, true);
             write_delete(src, 5, {cond("v", "=", "20")});
-            write(src, schema, 6, {{{8, 80}, {1, 11}}}, false, true);
+            write(src, schema, 6, {{{1, 11}, {8, 80}}}, false, true);
         }
     }
 
