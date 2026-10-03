@@ -411,6 +411,20 @@ std::string SnapshotManifest::remote_file_name(int64_t tablet_id, std::string_vi
     return fmt::format("__manifest__{}.{}", tablet_id, root.substr(0, 32));
 }
 
+std::string prefix_digest_remote_file_name(int64_t tablet_id, std::string_view root) {
+    return fmt::format("__rdigest__{}.{}", tablet_id, root.substr(0, 32));
+}
+
+Status write_prefix_digest_file(const std::string& content, const std::string& path,
+                                std::string* root) {
+    io::FileWriterPtr writer;
+    RETURN_IF_ERROR(io::global_local_filesystem()->create_file(path, &writer));
+    RETURN_IF_ERROR(writer->append(Slice(content)));
+    RETURN_IF_ERROR(writer->close());
+    *root = sha256_hex(content);
+    return Status::OK();
+}
+
 Status write_snapshot_manifest(SnapshotManifest& manifest, const std::string& path,
                                std::string* root) {
     std::string content = manifest.serialize();
@@ -435,6 +449,28 @@ static Status read_local_file(const std::string& path, std::string* content) {
                                content->size());
     }
     return Status::OK();
+}
+
+Status fetch_prefix_digest_from_remote_be(const TRemoteTabletSnapshot& remote_tablet_snapshot,
+                                          const std::string& root, RestoreDigestDecomposed* digest) {
+    // <storage_root>/snapshot/<time>.<seq>.<timeout>/<tablet_id>/rdigest, next to the manifest
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(remote_tablet_snapshot.remote_snapshot_path, &remote_parent));
+    const auto& addr = remote_tablet_snapshot.remote_be_addr;
+    std::string url = fmt::format(
+            "http://{}:{}/api/_tablet/_download?token={}&channel=ingest_binlog&file={}/{}",
+            addr.hostname, addr.port, remote_tablet_snapshot.remote_token, remote_parent,
+            RestoreDigestDecomposed::kLocalFileName);
+    std::string content;
+    auto fetch_cb = [&url, &content](HttpClient* client) {
+        content.clear();
+        RETURN_IF_ERROR(client->init(url));
+        client->set_timeout_ms(config::download_binlog_meta_timeout_ms);
+        return client->execute(&content);
+    };
+    RETURN_IF_ERROR(HttpClient::execute_with_retry(3, 1, fetch_cb));
+    return RestoreDigestDecomposed::parse(content, root, remote_tablet_snapshot.remote_tablet_id,
+                                          digest);
 }
 
 void SnapshotDownloadStats::classify_tablet() {
@@ -1440,8 +1476,15 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
         RETURN_IF_ERROR(_upload_manifest(src_path, dest_path, tablet_id, std::move(manifest_files),
                                          &manifest_root));
 
+        // 2.5 and the decomposed digest, if the snapshot has one
+        std::string prefix_root;
+        RETURN_IF_ERROR(_upload_prefix_digest(src_path, dest_path, tablet_id, &prefix_root));
+
         tablet_files->emplace(tablet_id, local_files_with_checksum);
         _uploaded_manifest_roots.emplace(tablet_id, std::move(manifest_root));
+        if (!prefix_root.empty()) {
+            _uploaded_prefix_digest_roots.emplace(tablet_id, std::move(prefix_root));
+        }
         finished_num++;
         LOG(INFO) << "finished to write tablet to remote. local path: " << src_path
                   << ", remote path: " << dest_path;
@@ -1724,6 +1767,59 @@ Status SnapshotLoader::_upload_manifest(const std::string& src_path, const std::
     LOG(INFO) << "uploaded the manifest of tablet " << tablet_id << " to " << remote_parent << "/"
               << remote_name << ", root: " << *root;
     return Status::OK();
+}
+
+Status SnapshotLoader::_upload_prefix_digest(const std::string& src_path,
+                                             const std::string& dest_path, int64_t tablet_id,
+                                             std::string* root) {
+    // local: <snapshot>/<tablet_id>/<schema_hash> -> <snapshot>/<tablet_id>/rdigest
+    // remote: .../__idx_<id>/__<tablet_id> -> .../__idx_<id>/__rdigest__<tablet_id>.<root prefix>
+    std::string local_parent;
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(src_path, &local_parent));
+    RETURN_IF_ERROR(parent_path_of(dest_path, &remote_parent));
+    std::string local_file =
+            fmt::format("{}/{}", local_parent, RestoreDigestDecomposed::kLocalFileName);
+    bool exists = false;
+    RETURN_IF_ERROR(io::global_local_filesystem()->exists(local_file, &exists));
+    if (!exists) {
+        root->clear();
+        return Status::OK();
+    }
+    std::string content;
+    RETURN_IF_ERROR(read_local_file(local_file, &content));
+    *root = sha256_hex(content);
+    std::string remote_name = prefix_digest_remote_file_name(tablet_id, *root);
+    size_t dot = remote_name.find_last_of('.');
+    RETURN_IF_ERROR(upload_with_checksum(*_remote_fs, local_file,
+                                         remote_parent + "/" + remote_name.substr(0, dot),
+                                         remote_name.substr(dot + 1)));
+    LOG(INFO) << "uploaded the decomposed digest of tablet " << tablet_id << " to " << remote_parent
+              << "/" << remote_name << ", root: " << *root;
+    return Status::OK();
+}
+
+Status SnapshotLoader::fetch_prefix_digest(const std::string& remote_path,
+                                           const std::string& local_path,
+                                           int64_t remote_tablet_id, const std::string& root,
+                                           RestoreDigestDecomposed* digest) {
+    if (!_remote_fs) {
+        return Status::InternalError("Storage backend not initialized.");
+    }
+    std::string remote_parent;
+    std::string local_parent;
+    RETURN_IF_ERROR(parent_path_of(remote_path, &remote_parent));
+    RETURN_IF_ERROR(parent_path_of(local_path, &local_parent));
+    std::string remote_file =
+            remote_parent + "/" + prefix_digest_remote_file_name(remote_tablet_id, root);
+    // download to a tmp file next to the local snapshot dir, never into it.
+    std::string local_file = fmt::format("{}/rdigest.{}.download", local_parent, _task_id);
+    RETURN_IF_ERROR(_remote_fs->download(remote_file, local_file));
+    std::string content;
+    Status st = read_local_file(local_file, &content);
+    static_cast<void>(io::global_local_filesystem()->delete_file(local_file));
+    RETURN_IF_ERROR(st);
+    return RestoreDigestDecomposed::parse(content, root, remote_tablet_id, digest);
 }
 
 Status SnapshotLoader::_fetch_remote_manifest(const std::string& remote_path,

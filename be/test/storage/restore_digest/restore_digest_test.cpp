@@ -3328,4 +3328,31 @@ TEST_F(RestoreDigestTabletTest, LogicalDigestComesFromTheDecomposedDigest) {
     EXPECT_EQ(2U, mor_result.rows);
 }
 
+TEST_F(RestoreDigestTabletTest, TaskProducesTheDecomposedDigest) {
+    _next_id = 930000; // not the ids of another test, see the segment cache
+    auto tablet = create_tablet(7221, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    write(tablet, schema, 2, {{{1, 10}, {2, 20}}}, false, true);
+    write(tablet, schema, 3, {{{3, 30}}}, false, true);
+    RestoreDigestCache::instance()->clear();
+    PrefixDigestOutput prefix;
+    TLogicalDigest d = compute_logical_digest_for_task(*_engine, 7221, 3, 0, &prefix);
+    EXPECT_EQ("OK", d.status_code);
+    EXPECT_TRUE(prefix.produced) << prefix.reason;
+    EXPECT_EQ(d.root, prefix.digest.root);
+    EXPECT_EQ(7221, prefix.digest.tablet_id);
+    EXPECT_GE(prefix.digest.rowsets.size(), 2U);
+
+    // merge on read: the logical digest is fine, there is no decomposed digest
+    auto mor = create_tablet(7222, /*mow=*/false, /*unique=*/true);
+    ASSERT_NE(nullptr, mor);
+    write(mor, mor->tablet_schema(), 2, {{{1, 10}}}, false, true);
+    PrefixDigestOutput none;
+    TLogicalDigest md = compute_logical_digest_for_task(*_engine, 7222, 2, 0, &none);
+    EXPECT_EQ("OK", md.status_code);
+    EXPECT_FALSE(none.produced);
+    EXPECT_FALSE(none.reason.empty());
+}
+
 } // namespace doris

@@ -38,6 +38,7 @@
 #include <memory>
 #include <optional>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <sstream>
 #include <string>
@@ -1316,6 +1317,9 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     finish_task_request.__set_tablet_files(tablet_files);
     if (status.ok()) {
         finish_task_request.__set_manifest_roots(loader->uploaded_manifest_roots());
+        if (!loader->uploaded_prefix_digest_roots().empty()) {
+            finish_task_request.__set_prefix_digest_roots(loader->uploaded_prefix_digest_roots());
+        }
     }
 
     finish_task(finish_task_request);
@@ -1444,18 +1448,29 @@ void download_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTas
 
 // Computes the logical digest of a tablet for a snapshot / RESTORE_DIGEST task and converts the
 // outcome to the thrift struct. NOT_SUPPORTED and failures are reported through status_code and
-// status_msg (root is left empty), the caller decides whether they fail the task.
+// status_msg (root is left empty), the caller decides whether they fail the task. If `prefix` is
+// not null, the decomposed digest is produced as well (prefix->produced tells), from the same pass.
 TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,
-                                                      int64_t version, int threads) {
+                                               int64_t version, int threads,
+                                               PrefixDigestOutput* prefix) {
     LogicalDigestResult result;
     Status st;
+    Status prefix_status = Status::OK();
     {
         auto mem_tracker = MemTrackerLimiter::create_shared(
                 MemTrackerLimiter::Type::OTHER,
                 "RestoreDigest#tabletId=" + std::to_string(tablet_id));
         SCOPED_ATTACH_TASK(mem_tracker);
         st = get_tablet_logical_digest(engine, tablet_id, version, threads,
-                                       RestoreDigestCache::instance(), &result);
+                                       RestoreDigestCache::instance(), &result,
+                                       prefix != nullptr ? &prefix->digest : nullptr,
+                                       &prefix_status);
+    }
+    if (prefix != nullptr) {
+        prefix->produced = st.ok() && prefix_status.ok();
+        if (!prefix->produced) {
+            prefix->reason = st.ok() ? prefix_status.to_string() : st.to_string();
+        }
     }
     TLogicalDigest digest;
     digest.__set_algo_version(static_cast<int32_t>(RestoreDigest::kAlgoVersion));
@@ -1475,6 +1490,62 @@ TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t ta
                      << ", version=" << version << ", status=" << st;
     }
     return digest;
+}
+
+// The rowsets of the snapshot, from the tablet meta in the snapshot dir, as (start, end) versions.
+Status snapshot_rowset_versions(const std::string& hdr_path,
+                                std::set<std::pair<int64_t, int64_t>>* versions) {
+    TabletMetaPB pb;
+    RETURN_IF_ERROR(TabletMeta::load_from_file(hdr_path, &pb));
+    for (const auto& rs : pb.rs_metas()) {
+        versions->emplace(rs.start_version(), rs.end_version());
+    }
+    return Status::OK();
+}
+
+// Writes the decomposed digest next to the manifest of the snapshot, and records the outcome in
+// `digest`: prefix_root if the file is written, prefix_msg otherwise. Never fails the snapshot.
+void write_snapshot_prefix_digest(const std::string& snapshot_path, int64_t tablet_id,
+                                  int32_t schema_hash, PrefixDigestOutput& prefix,
+                                  TLogicalDigest* digest) {
+    std::string reason = prefix.reason;
+    if (prefix.produced) {
+        // The digest was computed on the live tablet after the snapshot was made. If a compaction
+        // has changed the rowsets in between, its boundaries are not those of the snapshot files.
+        std::set<std::pair<int64_t, int64_t>> in_snapshot;
+        Status st = snapshot_rowset_versions(
+                fmt::format("{}/{}/{}/{}.hdr", snapshot_path, tablet_id, schema_hash, tablet_id),
+                &in_snapshot);
+        std::set<std::pair<int64_t, int64_t>> in_digest;
+        for (const auto& rs : prefix.digest.rowsets) {
+            in_digest.emplace(rs.start_version, rs.end_version);
+        }
+        if (!st.ok()) {
+            reason = fmt::format("failed to read the tablet meta of the snapshot: {}", st.to_string());
+        } else if (in_snapshot != in_digest) {
+            reason = "the rowsets of the tablet changed after the snapshot was made";
+        } else {
+            std::string content = prefix.digest.serialize();
+            std::string root;
+            st = write_prefix_digest_file(
+                    content,
+                    fmt::format("{}/{}/{}", snapshot_path, tablet_id,
+                                RestoreDigestDecomposed::kLocalFileName),
+                    &root);
+            if (st.ok()) {
+                digest->__set_prefix_root(root);
+                digest->__set_prefix_bytes(static_cast<int64_t>(content.size()));
+                LOG(INFO) << "decomposed digest written, tablet_id=" << tablet_id
+                          << ", rowsets=" << prefix.digest.rowsets.size()
+                          << ", marks=" << prefix.digest.marks.size() << ", bytes=" << content.size()
+                          << ", root=" << root;
+                return;
+            }
+            reason = fmt::format("failed to write the decomposed digest: {}", st.to_string());
+        }
+    }
+    digest->__set_prefix_msg(reason);
+    LOG(INFO) << "no decomposed digest, tablet_id=" << tablet_id << ", reason: " << reason;
 }
 
 void restore_digest_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
@@ -1556,8 +1627,15 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     if (status.ok() && snapshot_request.__isset.compute_logical_digest &&
         snapshot_request.compute_logical_digest) {
         if (snapshot_request.__isset.version) {
+            PrefixDigestOutput prefix;
+            const bool with_prefix = config::restore_digest_prefix_enabled;
             logical_digest = compute_logical_digest_for_task(
-                    engine, snapshot_request.tablet_id, snapshot_request.version, 0);
+                    engine, snapshot_request.tablet_id, snapshot_request.version, 0,
+                    with_prefix ? &prefix : nullptr);
+            if (with_prefix && logical_digest->status_code == "OK") {
+                write_snapshot_prefix_digest(snapshot_path, snapshot_request.tablet_id,
+                                             snapshot_request.schema_hash, prefix, &*logical_digest);
+            }
         } else {
             TLogicalDigest digest;
             digest.__set_status_code("ERROR");

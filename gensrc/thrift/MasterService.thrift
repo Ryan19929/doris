@@ -89,6 +89,13 @@ struct TLogicalDigest {
     // OK / NOT_SUPPORTED / ERROR
     5: optional string status_code
     6: optional string status_msg
+    // snapshot task with compute_logical_digest: SHA-256 of the decomposed digest file (rdigest) written next
+    // to the manifest of the snapshot, from which the digest at any rowset boundary version of the snapshot
+    // can be composed. Unset if the file was not written, prefix_msg then says why (it is not an error:
+    // unique MoR and a few other models have no decomposed digest).
+    7: optional string prefix_root
+    8: optional string prefix_msg
+    9: optional i64 prefix_bytes
 }
 
 struct TFinishTaskRequest {
@@ -125,6 +132,9 @@ struct TFinishTaskRequest {
     25: optional TDownloadStats download_stats
     // snapshot task (compute_logical_digest) and restore digest task: the logical digest of the tablet
     26: optional TLogicalDigest logical_digest
+    // upload task: SHA-256 of the decomposed digest file (rdigest) uploaded next to the files of each tablet,
+    // only the tablets which have one
+    27: optional map<Types.TTabletId, string> prefix_digest_roots
 }
 
 struct TTablet {

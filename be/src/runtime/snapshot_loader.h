@@ -31,6 +31,7 @@
 
 #include "common/status.h"
 #include "runtime/workload_management/resource_context.h"
+#include "storage/restore_digest/restore_digest.h"
 #include "storage/tablet/tablet_fwd.h"
 
 namespace doris {
@@ -99,6 +100,36 @@ struct SnapshotManifest {
 // Write a manifest to a local file, returns the root (SHA-256 of the content).
 Status write_snapshot_manifest(SnapshotManifest& manifest, const std::string& path,
                                std::string* root);
+
+// The decomposed digest file of a tablet snapshot (see RestoreDigestDecomposed) is kept the same way as
+// the manifest: next to the tablet snapshot dir, one level up, so that an old BE never sees it. In a
+// repository its object name is "__rdigest__<tablet_id>.<first 32 hex chars of the root>".
+std::string prefix_digest_remote_file_name(int64_t tablet_id, std::string_view root);
+
+// Write the content of a decomposed digest file to a local file, returns its root (SHA-256).
+Status write_prefix_digest_file(const std::string& content, const std::string& path,
+                                std::string* root);
+
+// Fetch the decomposed digest file of a tablet of a snapshot kept on a remote BE (a backup kept on
+// local), over the BE http download of the snapshot, then check it against `root` and parse it.
+// remote_tablet_snapshot.remote_snapshot_path is the tablet snapshot dir, the file is next to it.
+Status fetch_prefix_digest_from_remote_be(const TRemoteTabletSnapshot& remote_tablet_snapshot,
+                                          const std::string& root, RestoreDigestDecomposed* digest);
+
+// The decomposed digest file of a tablet snapshot (see RestoreDigestDecomposed) is kept the same way as
+// the manifest: next to the tablet snapshot dir, one level up, so that an old BE never sees it. In a
+// repository its object name is "__rdigest__<tablet_id>.<first 32 hex chars of the root>".
+std::string prefix_digest_remote_file_name(int64_t tablet_id, std::string_view root);
+
+// Write the content of a decomposed digest file to a local file, returns its root (SHA-256).
+Status write_prefix_digest_file(const std::string& content, const std::string& path,
+                                std::string* root);
+
+// Fetch the decomposed digest file of a tablet of a snapshot kept on a remote BE (a backup kept on
+// local), over the BE http download of the snapshot, then check it against `root` and parse it.
+// remote_tablet_snapshot.remote_snapshot_path is the tablet snapshot dir, the file is next to it.
+Status fetch_prefix_digest_from_remote_be(const TRemoteTabletSnapshot& remote_tablet_snapshot,
+                                          const std::string& root, RestoreDigestDecomposed* digest);
 
 // Returns the parent dir of a path (without the trailing '/'), or an error if it has none.
 Status parent_path_of(const std::string& path, std::string* parent);
@@ -254,6 +285,20 @@ public:
         return _manifest_verified_tablets;
     }
 
+    // The decomposed digest (rdigest) root of each tablet uploaded by upload(), only the tablets
+    // which have one.
+    const std::map<int64_t, std::string>& uploaded_prefix_digest_roots() const {
+        return _uploaded_prefix_digest_roots;
+    }
+
+    // Fetch the decomposed digest file of a tablet from the repository, check it against the root
+    // recorded in the job info and parse it. The incremental restore composes the digest of the
+    // remote tablet at a version from it: digest->compose(version, &d). remote_path and local_path
+    // are the same as the ones of download(); local_path only decides where the temporary file is.
+    Status fetch_prefix_digest(const std::string& remote_path, const std::string& local_path,
+                               int64_t remote_tablet_id, const std::string& root,
+                               RestoreDigestDecomposed* digest);
+
     // The data reused and downloaded by the tablets downloaded so far.
     const SnapshotDownloadStats& download_stats() const { return _download_stats; }
 
@@ -290,6 +335,11 @@ private:
                             int64_t tablet_id, std::vector<SnapshotManifestFile> files,
                             std::string* root);
 
+    // Upload the decomposed digest file of a tablet next to its dir in the repository, if the
+    // snapshot has one (<snapshot>/<tablet_id>/rdigest), returns its root; empty if there is none.
+    Status _upload_prefix_digest(const std::string& src_path, const std::string& dest_path,
+                                 int64_t tablet_id, std::string* root);
+
     // Delete all the files in a local tablet snapshot dir, so that it can be downloaded again
     // without reusing any local file.
     Status _clear_local_snapshot_files(const std::string& local_path);
@@ -323,6 +373,7 @@ private:
 
     std::map<std::string, std::string> _manifest_roots;
     std::map<int64_t, std::string> _uploaded_manifest_roots;
+    std::map<int64_t, std::string> _uploaded_prefix_digest_roots;
     std::vector<int64_t> _manifest_verified_tablets;
     size_t _manifest_digest_checked_num = 0;
     SnapshotDownloadStats _download_stats;

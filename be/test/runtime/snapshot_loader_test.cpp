@@ -875,6 +875,77 @@ TEST_F(SnapshotLoaderTest, HttpDownloadCheckManifest) {
     EXPECT_FALSE(exists);
 }
 
+// The decomposed digest (rdigest) of a snapshot kept on a remote BE: next to the manifest, fetched
+// over the BE http download and checked against the root of the job info.
+TEST_F(SnapshotLoaderTest, FetchPrefixDigestFromRemoteBe) {
+    const int64_t tablet_id = 2111;
+    RestoreDigestDecomposed digest;
+    digest.schema_sig = std::string(64, 'a');
+    digest.tablet_id = tablet_id;
+    digest.base_version = 3;
+    digest.root = std::string(64, 'b');
+    digest.rows = 2;
+    for (int64_t v = 1; v <= 3; ++v) {
+        RestoreDigestRowsetPart part;
+        part.rowset_id = fmt::format("rowset{}", v);
+        part.start_version = part.end_version = v;
+        part.buckets[static_cast<size_t>(v)].count = static_cast<uint64_t>(v);
+        part.buckets[static_cast<size_t>(v)].sum = static_cast<unsigned __int128>(v) << 100;
+        digest.rowsets.push_back(std::move(part));
+    }
+    RestoreDigestMarkPart mark;
+    mark.mark_version = 3;
+    mark.buckets[1].count = 1;
+    mark.buckets[1].sum = static_cast<unsigned __int128>(1) << 100;
+    digest.marks.push_back(std::move(mark));
+
+    std::string remote_dir = fmt::format("{}/remote_prefix_{}", storage_root_path, tablet_id);
+    std::string remote_tablet_path = fmt::format("{}/{}/{}", remote_dir, tablet_id, 777);
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(remote_tablet_path).ok());
+    std::string root;
+    ASSERT_TRUE(write_prefix_digest_file(digest.serialize(),
+                                         fmt::format("{}/{}/{}", remote_dir, tablet_id,
+                                                     RestoreDigestDecomposed::kLocalFileName),
+                                         &root)
+                        .ok());
+    EXPECT_EQ(digest.file_root(), root);
+    EXPECT_EQ("__rdigest__2111." + root.substr(0, 32), prefix_digest_remote_file_name(tablet_id, root));
+
+    TRemoteTabletSnapshot remote_snapshot;
+    remote_snapshot.__set_remote_tablet_id(tablet_id);
+    remote_snapshot.__set_remote_snapshot_path(remote_tablet_path);
+    TNetworkAddress addr;
+    addr.hostname = "127.0.0.1";
+    addr.port = 1234;
+    remote_snapshot.__set_remote_be_addr(addr);
+    remote_snapshot.__set_remote_token("fake_token");
+
+    RestoreDigestDecomposed fetched;
+    auto st = fetch_prefix_digest_from_remote_be(remote_snapshot, root, &fetched);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(digest.serialize(), fetched.serialize());
+    RestoreDigest composed;
+    ASSERT_TRUE(fetched.compose(2, &composed).ok());
+    EXPECT_EQ(3U, composed.rows);
+    ASSERT_TRUE(fetched.compose(3, &composed).ok());
+    EXPECT_EQ(5U, composed.rows);
+    EXPECT_TRUE(fetched.compose(0, &composed).is<ErrorCode::NOT_IMPLEMENTED_ERROR>());
+
+    // not the file recorded in the job info
+    st = fetch_prefix_digest_from_remote_be(remote_snapshot, std::string(64, '0'), &fetched);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+    // the file of another tablet
+    remote_snapshot.__set_remote_tablet_id(tablet_id + 1);
+    st = fetch_prefix_digest_from_remote_be(remote_snapshot, root, &fetched);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+    // no file next to the snapshot (a tablet without a decomposed digest)
+    remote_snapshot.__set_remote_tablet_id(tablet_id);
+    remote_snapshot.__set_remote_snapshot_path(
+            fmt::format("{}/remote_prefix_none/{}/{}", storage_root_path, tablet_id, 777));
+    st = fetch_prefix_digest_from_remote_be(remote_snapshot, root, &fetched);
+    EXPECT_FALSE(st.ok());
+}
+
 TEST_F(SnapshotLoaderTest, HttpDownloadWithoutManifestOrCheckDisabled) {
     TRemoteTabletSnapshot remote_snapshot;
     prepare_http_snapshots(1201, 1202, 1203, 1211, 1212, &remote_snapshot);
