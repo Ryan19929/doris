@@ -108,6 +108,7 @@ public class RestoreReuseTest {
     private String origLevel;
     private double origRatio;
     private long origMinBytes;
+    private boolean origForceFull;
     private int origTimeout;
 
     @BeforeEach
@@ -117,6 +118,7 @@ public class RestoreReuseTest {
         origRatio = Config.restore_reuse_sample_ratio;
         origMinBytes = Config.restore_reuse_min_partition_bytes;
         origTimeout = Config.restore_digest_timeout_s;
+        origForceFull = Config.restore_reuse_force_full_for_relation;
         Config.enable_restore_partition_reuse = true;
         Config.restore_reuse_default_check_level = "full";
         Config.restore_reuse_min_partition_bytes = 100;
@@ -180,6 +182,7 @@ public class RestoreReuseTest {
         Config.restore_reuse_sample_ratio = origRatio;
         Config.restore_reuse_min_partition_bytes = origMinBytes;
         Config.restore_digest_timeout_s = origTimeout;
+        Config.restore_reuse_force_full_for_relation = origForceFull;
         if (mockedExecutor != null) {
             mockedExecutor.close();
         }
@@ -635,6 +638,11 @@ public class RestoreReuseTest {
     // partitions in the backup meta carry the lineage that is set by the given function.
     private RestoreJob prepareJobWithBackupStamps(String level,
             java.util.function.Consumer<OlapTable> backupTableStamps) {
+        return prepareJobWithBackupStamps(level, backupTableStamps, false);
+    }
+
+    private RestoreJob prepareJobWithBackupStamps(String level,
+            java.util.function.Consumer<OlapTable> backupTableStamps, boolean keepP1Forward) {
         BackupJobInfo info = selfBackupJobInfo();
         OlapTable remoteTbl = tbl2.selectiveCopy(null, IndexExtState.VISIBLE, true);
         backupTableStamps.accept(remoteTbl);
@@ -643,7 +651,9 @@ public class RestoreReuseTest {
                 false, new ReplicaAllocation((short) 3), 100000, -1, false, false, false, false, false, false,
                 false, false, env, Repository.KEEP_ON_LOCAL_REPO_ID, meta);
         job.setReuseCheckLevel(level);
-        p1().setRestoreLineage(null);
+        if (!keepP1Forward) {
+            p1().setRestoreLineage(null);
+        }
         p2().setRestoreLineage(null);
         Deencapsulation.invoke(job, "checkAndPrepareMeta");
         Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
@@ -732,6 +742,128 @@ public class RestoreReuseTest {
         // the partition with the mismatch is downloaded, and its lineage is gone
         Assertions.assertTrue(versionInfo(job).contains(tbl2.getId(), p1().getId()));
         Assertions.assertNull(p1().getRestoreLineage());
+    }
+
+    // p1 is a candidate by the forward path (a), p2 by the reverse path (b)
+    private RestoreJob prepareMixedJob(String level) {
+        return prepareJobWithBackupStamps(level, remote -> {
+            remote.getPartition(p2().getName()).setRestoreLineage(lineageToLocal(p2(), V1));
+        }, true);
+    }
+
+    @Test
+    public void testReversePathIsDigestedInSampleLevel() {
+        Config.restore_reuse_force_full_for_relation = true;
+        Config.restore_reuse_sample_ratio = 0.1;
+        RestoreJob job = prepareMixedJob("sample");
+        Assertions.assertEquals(1, job.getReuseShadowStats().getReusableForward());
+        Assertions.assertEquals(1, job.getReuseShadowStats().getReusableReverse());
+        toVerifying(job);
+        // the b partition is digested although it is not sampled, and the a partition is the one sampled
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        reportAll(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        for (RestoreReuseResult.Decision decision : job.getReuseResult().getDecisions()) {
+            Assertions.assertTrue(decision.kept);
+            Assertions.assertEquals(RestoreReuseResult.KEPT_DIGEST_VERIFIED, decision.reason);
+        }
+    }
+
+    @Test
+    public void testTableLevelPathsAreNotSampled() {
+        Config.restore_reuse_force_full_for_relation = true;
+        Config.restore_reuse_sample_ratio = 0.1;
+        // both partitions are candidates by c, none is sampled
+        tbl2.setRestoreSource(new RestoreSource(db.getId(), tbl2.getId()));
+        RestoreJob job = prepareJobWithBackupStamps("sample", remote -> {
+            for (Partition part : remote.getAllPartitions()) {
+                part.setRestoreLineage(null);
+            }
+        });
+        Assertions.assertEquals(2, job.getReuseShadowStats().getReusableTable());
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        reportAll(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        for (RestoreReuseResult.Decision decision : job.getReuseResult().getDecisions()) {
+            Assertions.assertEquals(RestoreReuseResult.KEPT_DIGEST_VERIFIED, decision.reason);
+        }
+    }
+
+    @Test
+    public void testForwardIsStillSampledWhenRelationIsForced() {
+        Config.restore_reuse_force_full_for_relation = true;
+        Config.restore_reuse_sample_ratio = 0.1;
+        // both are forward: a is sampled, one partition only
+        RestoreJob job = prepareJob("sample");
+        toVerifying(job);
+        Assertions.assertEquals(replicasOf(p1()), newDigestTasks().size());
+    }
+
+    @Test
+    public void testRelationDigestMismatchDownloads() {
+        Config.restore_reuse_force_full_for_relation = true;
+        Config.restore_reuse_sample_ratio = 0.1;
+        RestoreJob job = prepareMixedJob("sample");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        // the b partition p2 has another digest, p1 (a) is consistent
+        Map<Long, TFinishTaskRequest> faulty = Maps.newHashMap();
+        faulty.put(tasks.stream().filter(t -> t.getPartitionId() == p2().getId()).findFirst().get().getSignature(),
+                okReport("ffff", SIG, 1));
+        reportAll(job, tasks, faulty);
+        waitDigests(job);
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertTrue(result.isKept(tbl2.getId(), p1().getId()));
+        Assertions.assertFalse(result.isKept(tbl2.getId(), p2().getId()));
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, result.getDecisions().stream()
+                .filter(d -> d.partitionId == p2().getId()).findFirst().get().reason);
+        Assertions.assertTrue(versionInfo(job).contains(tbl2.getId(), p2().getId()));
+    }
+
+    @Test
+    public void testRelationIsSampledIfNotForced() {
+        Config.restore_reuse_force_full_for_relation = false;
+        Config.restore_reuse_sample_ratio = 0.1;
+        RestoreJob job = prepareMixedJob("sample");
+        toVerifying(job);
+        // one of the two is sampled, the other is kept by the sample
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()), tasks.size());
+        long sampledPart = tasks.get(0).getPartitionId();
+        reportAll(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getKeptPartitions());
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertEquals(decision.partitionId == sampledPart ? RestoreReuseResult.KEPT_DIGEST_VERIFIED
+                    : RestoreReuseResult.KEPT_SAMPLE_PASSED, decision.reason);
+        }
+    }
+
+    @Test
+    public void testOffLevelStillRejectsRelationWhenForced() {
+        Config.restore_reuse_force_full_for_relation = true;
+        RestoreJob job = prepareMixedJob("off");
+        // only the forward partition is a candidate at the level off, and it is kept without any digest
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        Assertions.assertTrue(newDigestTasks().isEmpty());
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertEquals(1, job.getReuseResult().getKeptByPath(RestoreReuseJudge.L0_FORWARD));
+        Assertions.assertEquals(1, job.getReuseResult().getDecisions().size());
+    }
+
+    @Test
+    public void testNeedsFullDigest() {
+        Assertions.assertFalse(RestoreReuseJudge.needsFullDigest(RestoreReuseJudge.L0_FORWARD, true));
+        Assertions.assertTrue(RestoreReuseJudge.needsFullDigest(RestoreReuseJudge.L0_REVERSE, true));
+        Assertions.assertTrue(RestoreReuseJudge.needsFullDigest(RestoreReuseJudge.L0_TABLE, true));
+        Assertions.assertFalse(RestoreReuseJudge.needsFullDigest(RestoreReuseJudge.L0_REVERSE, false));
+        Assertions.assertFalse(RestoreReuseJudge.needsFullDigest(null, true));
     }
 
     @Test

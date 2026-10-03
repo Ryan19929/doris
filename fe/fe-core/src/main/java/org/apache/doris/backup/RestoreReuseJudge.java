@@ -239,6 +239,15 @@ public final class RestoreReuseJudge {
         return localItem != null && localItem.equals(backupItem);
     }
 
+    /**
+     * Whether the candidate of the L0 path must have its digest computed, whatever the sample says: the partitions
+     * that came in by the reverse or the table level relation are only proved by the relation and the version,
+     * which is weaker than the lineage stamp of the forward path.
+     */
+    public static boolean needsFullDigest(String l0Path, boolean forceFullForRelation) {
+        return forceFullForRelation && (L0_REVERSE.equals(l0Path) || L0_TABLE.equals(l0Path));
+    }
+
     public static final List<L0Check> L0_CHECKS = ImmutableList.of(FORWARD_L0, REVERSE_L0, TABLE_L0);
 
     /**

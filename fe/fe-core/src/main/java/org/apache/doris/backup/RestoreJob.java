@@ -2811,7 +2811,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             if (candidate.decided) {
                 continue;
             }
-            if (candidate.level == CheckLevel.FULL) {
+            if (candidate.level == CheckLevel.FULL || RestoreReuseJudge.needsFullDigest(candidate.l0Path,
+                    Config.restore_reuse_force_full_for_relation)) {
                 toDigest.add(candidate);
             } else {
                 samplePool.add(candidate);
@@ -2824,8 +2825,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         verifyRound = 1;
         LOG.info("restore reuse: verify {} of {} candidate partitions ({} sampled). {}", toDigest.size(),
-                reuseCandidates.size(), toDigest.size() - (int) toDigest.stream()
-                        .filter(c -> c.level == CheckLevel.FULL).count(), this);
+                reuseCandidates.size(), (int) toDigest.stream().filter(c -> c.sampled).count(), this);
         if (toDigest.isEmpty()) {
             finishVerifying(db);
             return;

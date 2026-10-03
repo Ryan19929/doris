@@ -2864,6 +2864,12 @@ public class Config extends ConfigBase {
             + "the digest for in the sample check level, at least one partition.")
     public static double restore_reuse_sample_ratio = 0.1;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the candidate partitions that come in by the "
+            + "reverse or the table level relation (not by the lineage stamp of the local partition) are always "
+            + "verified by the digest, whatever the check level is. They are neither sampled nor kept because the "
+            + "sample passed. If false, they are sampled as the others in the check level sample.")
+    public static boolean restore_reuse_force_full_for_relation = true;
+
     @ConfField(mutable = true, masterOnly = true, description = "The minimum size (local data size of a single "
             + "replica, in bytes) of a partition to be considered for partition level reuse, smaller partitions are "
             + "downloaded. 1 GB by default.")
