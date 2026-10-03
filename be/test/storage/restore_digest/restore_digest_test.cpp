@@ -3572,7 +3572,8 @@ protected:
         EXPECT_EQ(6, local->max_version_unlocked());
 
         whole_restore(src, whole, 6);
-        ASSERT_EQ(6, whole->max_version_unlocked());
+        // the move reloads the tablet, the old object is stale
+        ASSERT_EQ(6, _engine->tablet_manager()->get_tablet(whole->tablet_id())->max_version_unlocked());
         RestoreDigest appended = tablet_digest(local->tablet_id(), 6);
         // the same as the whole download, and the source
         EXPECT_TRUE(digests_equal(tablet_digest(whole->tablet_id(), 6), appended));
