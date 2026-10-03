@@ -129,6 +129,26 @@ suite("test_backup_restore_partition_reuse_reverse", "backup_restore") {
     long baseline = stats.downloaded_files as long
     assertSame(dbA, dbB)
 
+    // the data size of the replicas is known by the report of the backends, kept_bytes counts it
+    def waitDataSize = { String db ->
+        for (int i = 0; i < 30; ++i) {
+            boolean ready = true
+            for (String tbl : [dupTable, uniqTable]) {
+                def tablets = sql_return_maparray "SHOW TABLETS FROM ${db}.${tbl}"
+                if (tablets.sum { it.RowCount as long } != numPartitions * 3 * 20
+                        || tablets.any { (it.LocalDataSize as long) == 0 && (it.RowCount as long) > 0 }) {
+                    ready = false
+                }
+            }
+            if (ready) {
+                return
+            }
+            sleep(5000)
+        }
+    }
+    waitDataSize(dbA)
+    waitDataSize(dbB)
+
     // 2. B -> A, nothing changed: every partition of A is kept through the lineage in the backup of B (b).
     String snapB1 = "${suiteName}_from_b1"
     String tsB1 = backupAndWait(dbB, snapB1)
