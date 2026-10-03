@@ -42,6 +42,8 @@ public class SnapshotTask extends AgentTask {
     private boolean computeDigest = false;
     // Whether the backend computes the logical digest of the tablet over (0, version] after the snapshot is made.
     private boolean computeLogicalDigest = false;
+    // Restore only: the backend makes an empty snapshot dir, for the increment of the incremental restore.
+    private boolean restoreIncremental = false;
 
     public SnapshotTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId, long tableId,
             long partitionId, long indexId, long tabletId, long version, int schemaHash, long timeoutMs,
@@ -119,6 +121,14 @@ public class SnapshotTask extends AgentTask {
         return computeLogicalDigest;
     }
 
+    public void setRestoreIncremental(boolean restoreIncremental) {
+        this.restoreIncremental = restoreIncremental;
+    }
+
+    public boolean isRestoreIncremental() {
+        return restoreIncremental;
+    }
+
     public void setRefTabletId(long refTabletId) {
         assert refTabletId > 0;
         this.refTabletId = refTabletId;
@@ -141,6 +151,9 @@ public class SnapshotTask extends AgentTask {
         }
         if (computeLogicalDigest) {
             request.setComputeLogicalDigest(true);
+        }
+        if (restoreIncremental) {
+            request.setRestoreIncremental(true);
         }
         return request;
     }

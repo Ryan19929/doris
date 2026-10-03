@@ -122,6 +122,12 @@ public final class RestoreReuseJudge {
         public OlapTable backupOlapTable;
         // Set by checkL0: the L0 check that passed, null if none did.
         public String l0Path;
+        // The incremental append is allowed (the FE configs enable_restore_incremental_append and
+        // enable_restore_partition_reuse), see firstRejectIncremental.
+        public boolean incrementalEnabled;
+        // The L0 checks look at the relation of the partitions only, not the versions: the local partition is
+        // behind the backup. Only set while the incremental conditions are judged.
+        public boolean relationOnly;
         private long singleReplicaBytes = -1;
 
         /** The local data size of a single replica of the partition, computed once. */
@@ -157,6 +163,10 @@ public final class RestoreReuseJudge {
     public static final L0Check FORWARD_L0 = new L0Check(L0_FORWARD) {
         @Override
         RestoreReuseShadowStats.L0Verdict check(Input in) {
+            if (in.relationOnly) {
+                return RestoreReuseShadowStats.checkL0Relation(in.localPartition, in.jobInfo.dbId,
+                        in.backupTable.id, in.backupPartition.id, in.srcCommitSeq);
+            }
             return RestoreReuseShadowStats.checkL0(in.localPartition, in.jobInfo.dbId, in.backupTable.id,
                     in.backupPartition.id, in.backupPartition.version, in.srcCommitSeq);
         }
@@ -181,7 +191,7 @@ public final class RestoreReuseJudge {
             if (!in.backupLineage.isSameSource(in.localDbId, in.localTable.getId(), in.localPartition.getId())) {
                 return RestoreReuseShadowStats.L0Verdict.LINEAGE_MISMATCH;
             }
-            if (in.backupPartition.version != in.localPartition.getVisibleVersion()) {
+            if (!in.relationOnly && in.backupPartition.version != in.localPartition.getVisibleVersion()) {
                 return RestoreReuseShadowStats.L0Verdict.VERSION_MISMATCH;
             }
             return RestoreReuseShadowStats.L0Verdict.REUSABLE;
@@ -212,7 +222,7 @@ public final class RestoreReuseJudge {
             if (!sameRange(in)) {
                 return RestoreReuseShadowStats.L0Verdict.PARTITION_MISMATCH;
             }
-            if (in.backupPartition.version != in.localPartition.getVisibleVersion()) {
+            if (!in.relationOnly && in.backupPartition.version != in.localPartition.getVisibleVersion()) {
                 return RestoreReuseShadowStats.L0Verdict.VERSION_MISMATCH;
             }
             return RestoreReuseShadowStats.L0Verdict.REUSABLE;
@@ -351,8 +361,11 @@ public final class RestoreReuseJudge {
     // 6. every replica is healthy and has the version of the backup, so the digest of each is computed on that
     // version, and the replicas are the same as after a download.
     static String checkReplicas(Input in) {
-        long version = in.backupPartition.version;
-        for (MaterializedIndex index : in.localPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+        return replicasUnhealthyAt(in.localPartition, in.backupPartition.version);
+    }
+
+    private static String replicasUnhealthyAt(Partition localPartition, long version) {
+        for (MaterializedIndex index : localPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
             for (Tablet tablet : index.getTablets()) {
                 if (tablet.getReplicas().isEmpty()) {
                     return "REPLICA_UNHEALTHY";
@@ -365,6 +378,112 @@ public final class RestoreReuseJudge {
             }
         }
         return null;
+    }
+
+    // ---- incremental append ----
+
+    /**
+     * The conditions of the incremental append, cheap ones first: the local partition is behind the partition in the
+     * backup, is related to it (any of the L0 checks, versions aside), and every replica is at the same version, so
+     * the digest of the local data at that version can be compared with the backup. Whether the data is the same
+     * and the backup can be cut there is proved by the digest tasks, not here.
+     */
+    public static final List<Condition> INCREMENTAL_CONDITIONS = ImmutableList.of(
+            RestoreReuseJudge::checkIncrementalEnabled,
+            RestoreReuseJudge::checkMode,
+            RestoreReuseJudge::checkIncrementalLevel,
+            RestoreReuseJudge::checkIncrementalRelation,
+            RestoreReuseJudge::checkSupported,
+            RestoreReuseJudge::checkIncrementalModel,
+            RestoreReuseJudge::checkDigestPresent,
+            RestoreReuseJudge::checkIncrementalSources,
+            RestoreReuseJudge::checkSize,
+            RestoreReuseJudge::checkReplicasAtLocalVersion);
+
+    /** Returns the reason that the partition is not a candidate of the incremental append, null if it is. */
+    public static String firstRejectIncremental(Input in) {
+        boolean saved = in.relationOnly;
+        in.relationOnly = true;
+        try {
+            for (Condition condition : INCREMENTAL_CONDITIONS) {
+                String reason = condition.check(in);
+                if (reason != null) {
+                    return reason;
+                }
+            }
+            return null;
+        } finally {
+            in.relationOnly = saved;
+        }
+    }
+
+    static String checkIncrementalEnabled(Input in) {
+        return in.incrementalEnabled ? null : "INCREMENTAL_DISABLED";
+    }
+
+    // The digest is the only proof of the local data, so it is not for the level off and disable.
+    static String checkIncrementalLevel(Input in) {
+        if (in.level == CheckLevel.OFF || in.level == CheckLevel.DISABLE) {
+            return "INCREMENTAL_LEVEL_" + in.level.name();
+        }
+        return null;
+    }
+
+    // The relation by L0 (versions aside), and the local partition is behind the backup.
+    static String checkIncrementalRelation(Input in) {
+        RestoreReuseShadowStats.L0Verdict[] first = new RestoreReuseShadowStats.L0Verdict[1];
+        in.l0Path = passedL0(in, first);
+        if (in.l0Path == null) {
+            return "L0_" + (first[0] == null ? "FAILED" : first[0].name());
+        }
+        long localVersion = in.localPartition.getVisibleVersion();
+        if (localVersion >= in.backupPartition.version) {
+            return localVersion == in.backupPartition.version ? "INCREMENTAL_SAME_VERSION"
+                    : "INCREMENTAL_LOCAL_AHEAD";
+        }
+        return null;
+    }
+
+    // Duplicate and unique merge-on-write: the models whose digest can be composed by rowset.
+    static String checkIncrementalModel(Input in) {
+        KeysType keysType = in.localTable.getKeysType();
+        if (keysType == KeysType.DUP_KEYS
+                || (keysType == KeysType.UNIQUE_KEYS && in.localTable.getEnableUniqueKeyMergeOnWrite())) {
+            // the binlog of the appended rowsets would be missing
+            if (in.localTable.getBinlogConfig() != null && in.localTable.getBinlogConfig().getEnable()) {
+                return "INCREMENTAL_BINLOG";
+            }
+            return null;
+        }
+        return "INCREMENTAL_MODEL_" + keysType.name();
+    }
+
+    // The backup has the manifest (to download only some files and check them) and the decomposed digest file
+    // (to compose the digest at the local version) of every tablet.
+    static String checkIncrementalSources(Input in) {
+        if (!in.jobInfo.hasManifest()) {
+            return "NO_MANIFEST";
+        }
+        for (MaterializedIndex localIdx : in.localPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            BackupIndexInfo backupIdx = in.backupPartition.getIdx(in.localTable.getIndexNameById(localIdx.getId()));
+            if (backupIdx == null) {
+                return "INDEX_MISMATCH";
+            }
+            for (BackupTabletInfo backupTablet : backupIdx.sortedTabletInfoList) {
+                if (backupTablet.manifestRoot == null || backupTablet.manifestRoot.isEmpty()) {
+                    return "NO_MANIFEST";
+                }
+                if (backupTablet.prefixDigestRoot == null || backupTablet.prefixDigestRoot.isEmpty()) {
+                    return "NO_PREFIX_DIGEST";
+                }
+            }
+        }
+        return null;
+    }
+
+    // Every replica is healthy and at the visible version of the local partition, the version of the increment.
+    static String checkReplicasAtLocalVersion(Input in) {
+        return replicasUnhealthyAt(in.localPartition, in.localPartition.getVisibleVersion());
     }
 
     public static boolean isReplicaHealthyAt(Replica replica, long version) {
@@ -410,6 +529,48 @@ public final class RestoreReuseJudge {
                 reason = RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH;
             } else if (!expected.root.equalsIgnoreCase(actual.root) && reason == null) {
                 reason = RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH;
+            }
+        }
+        return reason;
+    }
+
+    /**
+     * Judge the digest tasks of a tablet of the incremental append: every local replica must report a digest and the
+     * verdict OK of the comparison with the decomposed digest of the backup at its version.
+     *
+     * @param replicaDigests the digest reported by each local replica, null for a replica without a result
+     * @return null if every replica passed, otherwise the reason (a DOWNLOAD_ constant of {@link RestoreReuseResult})
+     */
+    public static String compareIncrementalTablet(List<LogicalDigestInfo> replicaDigests) {
+        if (replicaDigests.isEmpty()) {
+            return RestoreReuseResult.DOWNLOAD_DIGEST_ERROR;
+        }
+        String reason = null;
+        for (LogicalDigestInfo actual : replicaDigests) {
+            if (actual == null || !actual.hasDigest() || actual.prefixVerdict == null) {
+                // an old backend, a failed task, an unsupported tablet
+                return RestoreReuseResult.DOWNLOAD_DIGEST_ERROR;
+            }
+            String one;
+            switch (actual.prefixVerdict) {
+                case LogicalDigestInfo.PREFIX_OK:
+                    one = null;
+                    break;
+                case LogicalDigestInfo.PREFIX_NOT_BOUNDARY:
+                    one = RestoreReuseResult.DOWNLOAD_NOT_BOUNDARY;
+                    break;
+                case LogicalDigestInfo.PREFIX_MISMATCH:
+                    one = RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH;
+                    break;
+                case LogicalDigestInfo.PREFIX_SCHEMA_MISMATCH:
+                    one = RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH;
+                    break;
+                default:
+                    one = RestoreReuseResult.DOWNLOAD_PREFIX_ERROR;
+                    break;
+            }
+            if (one != null && reason == null) {
+                reason = one;
             }
         }
         return reason;

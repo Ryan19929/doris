@@ -19,6 +19,7 @@ package org.apache.doris.task;
 
 import org.apache.doris.thrift.TMoveDirReq;
 import org.apache.doris.thrift.TResourceInfo;
+import org.apache.doris.thrift.TRestoreIncrementalRange;
 import org.apache.doris.thrift.TTaskType;
 
 public class DirMoveTask extends AgentTask {
@@ -27,6 +28,8 @@ public class DirMoveTask extends AgentTask {
     private String src;
     private int schemaHash;
     private boolean overwrite;
+    // Append the rowsets of the range to the tablet instead of replacing it, null for the plain restore.
+    private TRestoreIncrementalRange incrementalRange;
 
     public DirMoveTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId,
             long tableId, long partitionId, long indexId, long tabletId, String src, int schemaHash,
@@ -54,8 +57,19 @@ public class DirMoveTask extends AgentTask {
         return overwrite;
     }
 
+    public void setIncrementalRange(long baseVersion, long endVersion) {
+        this.incrementalRange = new TRestoreIncrementalRange(baseVersion, endVersion);
+    }
+
+    public TRestoreIncrementalRange getIncrementalRange() {
+        return incrementalRange;
+    }
+
     public TMoveDirReq toThrift() {
         TMoveDirReq req = new TMoveDirReq(tabletId, schemaHash, src, jobId, overwrite);
+        if (incrementalRange != null) {
+            req.setIncremental(incrementalRange);
+        }
         return req;
     }
 

@@ -2879,6 +2879,13 @@ public class Config extends ConfigBase {
             + "tasks of partition level reuse, the partitions timed out are downloaded.")
     public static int restore_digest_timeout_s = 3600;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether to enable the incremental append of restore "
+            + "(needs enable_restore_partition_reuse too): a local partition that is behind the partition in the "
+            + "backup, and whose data up to its version is proved logically equal to the backup at that version, "
+            + "downloads only the rowsets of the versions after it and appends them to the local tablets, instead of "
+            + "being downloaded as a whole. Disabled by default, the restore behaves as before if disabled.")
+    public static boolean enable_restore_incremental_append = false;
+
     @ConfField(mutable = true, description = "The time after which a BE is considered unavailable if no heartbeat is "
             + "received.")
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

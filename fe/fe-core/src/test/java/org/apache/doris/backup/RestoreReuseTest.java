@@ -52,10 +52,12 @@ import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskExecutor;
 import org.apache.doris.task.DirMoveTask;
+import org.apache.doris.task.DownloadTask;
 import org.apache.doris.task.RestoreDigestTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TLogicalDigest;
+import org.apache.doris.thrift.TRemoteTabletSnapshot;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 
@@ -105,6 +107,7 @@ public class RestoreReuseTest {
     private OlapTable tbl2;
 
     private boolean origEnable;
+    private boolean origIncremental;
     private String origLevel;
     private double origRatio;
     private long origMinBytes;
@@ -114,6 +117,7 @@ public class RestoreReuseTest {
     @BeforeEach
     public void setUp() throws Exception {
         origEnable = Config.enable_restore_partition_reuse;
+        origIncremental = Config.enable_restore_incremental_append;
         origLevel = Config.restore_reuse_default_check_level;
         origRatio = Config.restore_reuse_sample_ratio;
         origMinBytes = Config.restore_reuse_min_partition_bytes;
@@ -178,6 +182,7 @@ public class RestoreReuseTest {
     @AfterEach
     public void tearDown() {
         Config.enable_restore_partition_reuse = origEnable;
+        Config.enable_restore_incremental_append = origIncremental;
         Config.restore_reuse_default_check_level = origLevel;
         Config.restore_reuse_sample_ratio = origRatio;
         Config.restore_reuse_min_partition_bytes = origMinBytes;
@@ -1569,5 +1574,436 @@ public class RestoreReuseTest {
         // the follower trusts the master
         Status st = job.allTabletCommitted(true);
         Assertions.assertTrue(st.ok(), st.toString());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // incremental append
+    // ---------------------------------------------------------------------------------------------
+
+    private static final long V2 = V1 + 4;
+
+    // The backup of test_tbl2 taken at V2 (the local partitions are at V1), kept on local, with the manifest and the
+    // decomposed digest of every tablet.
+    private BackupJobInfo incrementalJobInfo() {
+        BackupJobInfo info = selfBackupJobInfo();
+        info.manifestVersion = BackupJobInfo.MANIFEST_VERSION;
+        info.extraInfo = new BackupJobInfo.ExtraInfo();
+        info.extraInfo.token = "token";
+        BackupJobInfo.ExtraInfo.NetworkAddrss addr = new BackupJobInfo.ExtraInfo.NetworkAddrss();
+        addr.ip = "127.0.0.1";
+        addr.port = 8040;
+        info.extraInfo.beNetworkMap.put(1L, addr);
+        BackupOlapTableInfo tblInfo = info.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME);
+        for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+            partInfo.version = V2;
+            for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                idxInfo.manifestRoots = Maps.newHashMap();
+                idxInfo.prefixDigestRoots = Maps.newHashMap();
+                for (BackupTabletInfo tablet : idxInfo.sortedTabletInfoList) {
+                    tablet.manifestRoot = "m" + tablet.id;
+                    tablet.prefixDigestRoot = "p" + tablet.id;
+                    idxInfo.manifestRoots.put(tablet.id, tablet.manifestRoot);
+                    idxInfo.prefixDigestRoots.put(tablet.id, tablet.prefixDigestRoot);
+                    info.tabletBeMap.put(tablet.id, 1L);
+                    info.tabletSnapshotPathMap.put(tablet.id, "/snapshot/ss");
+                }
+            }
+        }
+        return info;
+    }
+
+    private RestoreJob prepareIncrementalJob(String level) {
+        Config.enable_restore_incremental_append = true;
+        RestoreJob job = newJob(incrementalJobInfo(), level);
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+        return job;
+    }
+
+    private static TFinishTaskRequest prefixReport(String verdict) {
+        TFinishTaskRequest request = okReport("cc33", SIG, 1);
+        request.getLogicalDigest().setPrefixVerdict(verdict);
+        return request;
+    }
+
+    private void reportPrefix(RestoreJob job, List<RestoreDigestTask> tasks, Map<Long, String> verdictOfPartition) {
+        for (RestoreDigestTask task : tasks) {
+            String verdict = verdictOfPartition.getOrDefault(task.getPartitionId(), "OK");
+            Assertions.assertTrue(job.finishRestoreDigestTask(task, prefixReport(verdict)));
+        }
+    }
+
+    private RestoreReuseJudge.Input incrementalInput(CheckLevel level) {
+        RestoreReuseJudge.Input in = input(level);
+        in.backupPartition.version = V2;
+        in.jobInfo = incrementalJobInfo();
+        in.backupTable = in.jobInfo.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME);
+        in.backupPartition = in.backupTable.getPartInfo(CatalogMocker.TEST_PARTITION1_NAME);
+        in.incrementalEnabled = true;
+        return in;
+    }
+
+    @Test
+    public void testIncrementalConditions() {
+        Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
+        Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.SAMPLE)));
+        // the plain chain rejects it: the versions differ
+        Assertions.assertNotNull(RestoreReuseJudge.firstReject(incrementalInput(CheckLevel.FULL)));
+
+        RestoreReuseJudge.Input in = incrementalInput(CheckLevel.FULL);
+        in.incrementalEnabled = false;
+        Assertions.assertEquals("INCREMENTAL_DISABLED", RestoreReuseJudge.firstRejectIncremental(in));
+
+        in = incrementalInput(CheckLevel.OFF);
+        Assertions.assertEquals("INCREMENTAL_LEVEL_OFF", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.DISABLE);
+        Assertions.assertEquals("INCREMENTAL_LEVEL_DISABLE", RestoreReuseJudge.firstRejectIncremental(in));
+
+        in = incrementalInput(CheckLevel.FULL);
+        in.atomicRestore = true;
+        Assertions.assertEquals("ATOMIC_RESTORE", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.FULL);
+        in.allowLoad = true;
+        Assertions.assertEquals("ALLOW_LOAD", RestoreReuseJudge.firstRejectIncremental(in));
+
+        // the same version, or the local partition is ahead
+        in = incrementalInput(CheckLevel.FULL);
+        in.backupPartition.version = V1;
+        Assertions.assertEquals("INCREMENTAL_SAME_VERSION", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.FULL);
+        in.backupPartition.version = V1 - 1;
+        Assertions.assertEquals("INCREMENTAL_LOCAL_AHEAD", RestoreReuseJudge.firstRejectIncremental(in));
+
+        // no relation at all
+        in = incrementalInput(CheckLevel.FULL);
+        p1().setRestoreLineage(null);
+        Assertions.assertEquals("L0_NO_LINEAGE", RestoreReuseJudge.firstRejectIncremental(in));
+        p1().setRestoreLineage(lineage(selfBackupJobInfo(), p1()));
+        // another source partition
+        in = incrementalInput(CheckLevel.FULL);
+        in.jobInfo.dbId = in.jobInfo.dbId + 1;
+        Assertions.assertEquals("L0_LINEAGE_MISMATCH", RestoreReuseJudge.firstRejectIncremental(in));
+        // the commit seq goes backwards
+        in = incrementalInput(CheckLevel.FULL);
+        in.srcCommitSeq = COMMIT_SEQ - 1;
+        Assertions.assertEquals("L0_COMMIT_SEQ_MISMATCH", RestoreReuseJudge.firstRejectIncremental(in));
+
+        // the model: duplicate and merge-on-write only
+        in = incrementalInput(CheckLevel.FULL);
+        Deencapsulation.setField(tbl2, "keysType", KeysType.AGG_KEYS);
+        Assertions.assertEquals("AGGREGATE_TABLE", RestoreReuseJudge.firstRejectIncremental(in));
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        Assertions.assertEquals("INCREMENTAL_MODEL_UNIQUE_KEYS", RestoreReuseJudge.firstRejectIncremental(in));
+        Deencapsulation.setField(tbl2, "keysType", KeysType.DUP_KEYS);
+
+        // the backup must have the manifest and the decomposed digest of every tablet
+        in = incrementalInput(CheckLevel.FULL);
+        in.jobInfo.manifestVersion = null;
+        Assertions.assertEquals("NO_MANIFEST", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.FULL);
+        in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()))
+                .sortedTabletInfoList.get(0).prefixDigestRoot = null;
+        Assertions.assertEquals("NO_PREFIX_DIGEST", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.FULL);
+        in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()))
+                .sortedTabletInfoList.get(0).manifestRoot = null;
+        Assertions.assertEquals("NO_MANIFEST", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.FULL);
+        in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId())).logicalDigests.clear();
+        Assertions.assertEquals("NO_DIGEST", RestoreReuseJudge.firstRejectIncremental(in));
+
+        // small partition, unhealthy replica
+        in = incrementalInput(CheckLevel.FULL);
+        in.minPartitionBytes = 1000000;
+        Assertions.assertEquals("TOO_SMALL", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.FULL);
+        Replica replica = p1().getBaseIndex().getTablets().get(0).getReplicas().get(0);
+        replica.updateVersionForRestore(V1 - 1);
+        Assertions.assertEquals("REPLICA_UNHEALTHY", RestoreReuseJudge.firstRejectIncremental(in));
+        replica.updateVersionForRestore(V1);
+
+        // the relation flag is restored, the plain chain still looks at the versions
+        in = incrementalInput(CheckLevel.FULL);
+        RestoreReuseJudge.firstRejectIncremental(in);
+        Assertions.assertFalse(in.relationOnly);
+    }
+
+    @Test
+    public void testCompareIncrementalTablet() {
+        LogicalDigestInfo ok = LogicalDigestInfo.of(1, SIG, "aa");
+        ok.prefixVerdict = "OK";
+        Assertions.assertNull(RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList(ok, ok)));
+        LogicalDigestInfo bad = LogicalDigestInfo.of(1, SIG, "aa");
+        bad.prefixVerdict = "NOT_BOUNDARY";
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_NOT_BOUNDARY,
+                RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList(ok, bad)));
+        bad.prefixVerdict = "MISMATCH";
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH,
+                RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList(ok, bad)));
+        bad.prefixVerdict = "SCHEMA_MISMATCH";
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH,
+                RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList(bad, ok)));
+        bad.prefixVerdict = "ERROR";
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_PREFIX_ERROR,
+                RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList(ok, bad)));
+        // an old backend: no verdict
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_DIGEST_ERROR,
+                RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList(LogicalDigestInfo.of(1, SIG, "aa"))));
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_DIGEST_ERROR,
+                RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList(
+                        LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR))));
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_DIGEST_ERROR,
+                RestoreReuseJudge.compareIncrementalTablet(Lists.newArrayList()));
+    }
+
+    @Test
+    public void testSwitchOffKeepsTheBehaviorOfALaggingPartition() {
+        // the backup is ahead, but the switch is off: no digest task, everything is downloaded as before
+        Config.enable_restore_incremental_append = false;
+        RestoreJob job = newJob(incrementalJobInfo(), "full");
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Assertions.assertTrue(job.getStatus().ok());
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertTrue(digestTasks(submitted).isEmpty());
+        Assertions.assertTrue(submitted.stream().noneMatch(t -> t instanceof SnapshotTask
+                && ((SnapshotTask) t).isRestoreIncremental()));
+        Assertions.assertTrue(job.getReuseResult() == null || job.getReuseResult().getDecisions().isEmpty());
+        Assertions.assertEquals(2, versionInfo(job).size());
+        // reuse is off too: also nothing
+        Config.enable_restore_incremental_append = true;
+        Config.enable_restore_partition_reuse = false;
+        submitted.clear();
+        job = newJob(incrementalJobInfo(), "full");
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertTrue(digestTasks(submitted).isEmpty());
+    }
+
+    @Test
+    public void testIncrementalFlowToCommit() throws Exception {
+        RestoreJob job = prepareIncrementalJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        for (RestoreDigestTask task : tasks) {
+            // the digest is compared at the local version, with the decomposed digest of the backup
+            Assertions.assertEquals(V1, task.getVersion());
+            Assertions.assertNotNull(task.getPrefixSource());
+            Assertions.assertEquals(V2, task.getPrefixSource().getEndVersion());
+            Assertions.assertEquals("p" + task.getTabletId(), task.getPrefixSource().getRoot());
+            Assertions.assertTrue(task.getPrefixSource().isSetRemoteTabletSnapshot());
+            Assertions.assertTrue(task.toThrift().isSetPrefixSource());
+        }
+        reportPrefix(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(0, result.getKeptPartitions());
+        Assertions.assertEquals(2, result.getIncrementalPartitions());
+        Assertions.assertEquals(0, result.getDownloadedPartitions());
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertTrue(decision.incremental);
+            Assertions.assertFalse(decision.kept);
+            Assertions.assertEquals(V1, decision.version);
+            Assertions.assertEquals(V2, decision.targetVersion);
+            Assertions.assertEquals(RestoreReuseResult.INCREMENTAL_VERIFIED, decision.reason);
+        }
+        // the partitions are still restored: version info, file mapping, and the lineage is invalidated
+        Assertions.assertEquals(2, versionInfo(job).size());
+        Assertions.assertEquals(V2, versionInfo(job).get(tbl2.getId(), p1().getId()));
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), fileMapping(job).getMapping().size());
+        Assertions.assertNull(p1().getRestoreLineage());
+        // the snapshot is an empty dir to download the increment into
+        List<SnapshotTask> snapshotTasks = submitted.stream().filter(t -> t instanceof SnapshotTask)
+                .map(t -> (SnapshotTask) t).collect(Collectors.toList());
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), snapshotTasks.size());
+        Assertions.assertTrue(snapshotTasks.stream().allMatch(SnapshotTask::isRestoreIncremental));
+        Assertions.assertTrue(snapshotTasks.get(0).toThrift().isRestoreIncremental());
+        for (SnapshotTask task : snapshotTasks) {
+            TFinishTaskRequest report = new TFinishTaskRequest();
+            report.setTaskStatus(new TStatus(TStatusCode.OK));
+            report.setSnapshotPath("/path/snapshot");
+            Assertions.assertTrue(job.finishTabletSnapshotTask(task, report));
+        }
+
+        // the download asks for the increment (V1, V2] of every tablet
+        submitted.clear();
+        Deencapsulation.invoke(job, "downloadSnapshots");
+        List<DownloadTask> downloads = submitted.stream().filter(t -> t instanceof DownloadTask)
+                .map(t -> (DownloadTask) t).collect(Collectors.toList());
+        int remotes = 0;
+        for (DownloadTask download : downloads) {
+            for (TRemoteTabletSnapshot remote : download.getRemoteTabletSnapshots()) {
+                Assertions.assertTrue(remote.isSetIncremental());
+                Assertions.assertEquals(V1, remote.getIncremental().getBaseVersion());
+                Assertions.assertEquals(V2, remote.getIncremental().getEndVersion());
+                Assertions.assertTrue(remote.isSetManifestRoot());
+                remotes++;
+            }
+        }
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), remotes);
+
+        // the move appends instead of replacing
+        submitted.clear();
+        Deencapsulation.setField(job, "state", RestoreJobState.COMMIT);
+        job.commit();
+        List<DirMoveTask> moves = submitted.stream().filter(t -> t instanceof DirMoveTask)
+                .map(t -> (DirMoveTask) t).collect(Collectors.toList());
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), moves.size());
+        for (DirMoveTask move : moves) {
+            Assertions.assertEquals(V1, move.getIncrementalRange().getBaseVersion());
+            Assertions.assertEquals(V2, move.getIncrementalRange().getEndVersion());
+            Assertions.assertTrue(move.toThrift().isSetIncremental());
+        }
+
+        // persisted and replayed
+        RestoreJob replayed = writeAndRead(job);
+        Assertions.assertEquals(2, replayed.getReuseResult().getIncrementalPartitions());
+        Assertions.assertEquals(V2, replayed.getReuseResult().getIncrementalDecisions().get(0).targetVersion);
+
+        // commit: the backup version, as a whole download, and the lineage of this restore
+        Status st = job.allTabletCommitted(false);
+        Assertions.assertTrue(st.ok(), st.toString());
+        for (Partition part : Lists.newArrayList(p1(), p2())) {
+            Assertions.assertEquals(V2, part.getVisibleVersion());
+            Assertions.assertEquals(V2, part.getRestoreLineage().getSrcVersion());
+            for (Replica replica : part.getBaseIndex().getTablets().get(0).getReplicas()) {
+                Assertions.assertEquals(V2, replica.getVersion());
+            }
+        }
+        Assertions.assertEquals(OlapTableState.NORMAL, tbl2.getState());
+        // observable
+        String estimate = job.getFullInfo().stream().filter(x -> x.contains("incremental_partitions"))
+                .findFirst().orElse("");
+        Assertions.assertTrue(estimate.contains("\"incremental_partitions\":2"), estimate);
+        Assertions.assertTrue(job.getReuseResult().toString().contains("INCREMENTAL_VERIFIED"));
+    }
+
+    @Test
+    public void testIncrementalFailuresDownloadThePartition() {
+        RestoreJob job = prepareIncrementalJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Map<Long, String> verdicts = Maps.newHashMap();
+        verdicts.put(p2().getId(), "NOT_BOUNDARY");
+        reportPrefix(job, tasks, verdicts);
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(1, result.getIncrementalPartitions());
+        Assertions.assertNotNull(result.getIncremental(tbl2.getId(), p1().getId()));
+        Assertions.assertNull(result.getIncremental(tbl2.getId(), p2().getId()));
+        Assertions.assertEquals(1, result.getDownloadedPartitions());
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            if (decision.partitionId == p2().getId()) {
+                Assertions.assertFalse(decision.incremental);
+                Assertions.assertFalse(decision.kept);
+                Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_NOT_BOUNDARY, decision.reason);
+                Assertions.assertEquals(V2, decision.version);
+            }
+        }
+        // p2 is a plain download: its snapshot is a real snapshot
+        for (AgentTask task : submitted) {
+            if (task instanceof SnapshotTask) {
+                Assertions.assertEquals(task.getPartitionId() == p1().getId(),
+                        ((SnapshotTask) task).isRestoreIncremental());
+            }
+        }
+    }
+
+    private void assertWholeDownloadFor(String verdict) {
+        RestoreJob other = prepareIncrementalJob("full");
+        toVerifying(other);
+        for (RestoreDigestTask task : newDigestTasks()) {
+            TFinishTaskRequest report = verdict == null ? failedReport() : prefixReport(verdict);
+            other.finishRestoreDigestTask(task, report);
+        }
+        waitDigests(other);
+        Assertions.assertEquals(0, other.getReuseResult().getIncrementalPartitions(), String.valueOf(verdict));
+        Assertions.assertEquals(2, other.getReuseResult().getDownloadedPartitions(), String.valueOf(verdict));
+        Assertions.assertTrue(submitted.stream().noneMatch(t -> t instanceof SnapshotTask
+                && ((SnapshotTask) t).isRestoreIncremental()));
+    }
+
+    @Test
+    public void testIncrementalMismatchDownloads() {
+        assertWholeDownloadFor("MISMATCH");
+    }
+
+    @Test
+    public void testIncrementalErrorDownloads() {
+        assertWholeDownloadFor("ERROR");
+    }
+
+    @Test
+    public void testIncrementalSchemaMismatchDownloads() {
+        assertWholeDownloadFor("SCHEMA_MISMATCH");
+    }
+
+    @Test
+    public void testIncrementalFailedTaskDownloads() {
+        assertWholeDownloadFor(null);
+    }
+
+    @Test
+    public void testIncrementalIsVerifiedEvenInTheSampleLevel() {
+        Config.restore_reuse_sample_ratio = 0.0;
+        RestoreJob job = prepareIncrementalJob("sample");
+        toVerifying(job);
+        // all partitions are digested, the sample does not apply to the increments
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), newDigestTasks().size());
+    }
+
+    @Test
+    public void testIncrementalRecheckBeforeCommit() {
+        RestoreJob job = prepareIncrementalJob("full");
+        toVerifying(job);
+        reportPrefix(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(2, job.getReuseResult().getIncrementalPartitions());
+        // a write that should never happen
+        p1().updateVersionForRestore(V1 + 1);
+        Status st = job.allTabletCommitted(false);
+        Assertions.assertFalse(st.ok());
+        Assertions.assertTrue(st.getErrMsg().contains("changed from " + V1 + " to " + (V1 + 1)), st.getErrMsg());
+        Assertions.assertTrue(st.getErrMsg().contains("appending the increment"), st.getErrMsg());
+        // before any tablet is moved
+        Deencapsulation.setField(job, "state", RestoreJobState.COMMIT);
+        job.commit();
+        Assertions.assertFalse(job.getStatus().ok());
+        Assertions.assertTrue(submitted.stream().noneMatch(t -> t instanceof DirMoveTask));
+    }
+
+    @Test
+    public void testIncrementalCancelWhileVerifyingChangesNothingLocal() {
+        RestoreJob job = prepareIncrementalJob("full");
+        toVerifying(job);
+        newDigestTasks();
+        job.cancel();
+        Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertEquals(V1, p1().getVisibleVersion());
+        Assertions.assertNotNull(p1().getRestoreLineage());
+        Assertions.assertEquals(OlapTableState.NORMAL, tbl2.getState());
+    }
+
+    @Test
+    public void testIncrementalDownloadStatsAreObservable() {
+        RestoreDownloadStats stats = new RestoreDownloadStats();
+        org.apache.doris.thrift.TDownloadStats reported = new org.apache.doris.thrift.TDownloadStats();
+        reported.setDownloadedFiles(4);
+        reported.setDownloadedBytes(400);
+        reported.setTabletsIncremental(2);
+        reported.setIncrementalFiles(4);
+        reported.setIncrementalBytes(400);
+        stats.add(reported, 2);
+        Assertions.assertEquals(400, stats.getIncrementalBytes());
+        Assertions.assertEquals(2, stats.getIncrementalTablets());
+        String json = stats.toJson(2, 0);
+        Assertions.assertTrue(json.contains("\"incremental_tablets\":2"), json);
+        Assertions.assertTrue(json.contains("\"incremental_bytes\":400"), json);
+        // off: unchanged output for the jobs without an increment
+        Assertions.assertFalse(new RestoreDownloadStats().toJson(0, 0).contains("incremental"));
     }
 }

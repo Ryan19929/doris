@@ -19,6 +19,7 @@
 package org.apache.doris.task;
 
 import org.apache.doris.thrift.TResourceInfo;
+import org.apache.doris.thrift.TRestoreDigestPrefixSource;
 import org.apache.doris.thrift.TRestoreDigestReq;
 import org.apache.doris.thrift.TTaskType;
 
@@ -33,6 +34,9 @@ public class RestoreDigestTask extends AgentTask {
     private final long version;
     // worker threads of the backend for this task, <= 0 means the backend config restore_digest_threads
     private final int threads;
+    // Where the backend reads the decomposed digest of the backup, to compare it with the digest of the replica at
+    // the version (the incremental restore). Null for the plain digest.
+    private TRestoreDigestPrefixSource prefixSource;
 
     public RestoreDigestTask(long backendId, long signature, long jobId, long dbId, long tableId, long partitionId,
             long indexId, long tabletId, int schemaHash, long version, int threads) {
@@ -60,10 +64,21 @@ public class RestoreDigestTask extends AgentTask {
         return threads;
     }
 
+    public void setPrefixSource(TRestoreDigestPrefixSource prefixSource) {
+        this.prefixSource = prefixSource;
+    }
+
+    public TRestoreDigestPrefixSource getPrefixSource() {
+        return prefixSource;
+    }
+
     public TRestoreDigestReq toThrift() {
         TRestoreDigestReq request = new TRestoreDigestReq(tabletId, schemaHash, version);
         if (threads > 0) {
             request.setThreads(threads);
+        }
+        if (prefixSource != null) {
+            request.setPrefixSource(prefixSource);
         }
         return request;
     }

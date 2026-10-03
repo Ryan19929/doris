@@ -46,6 +46,17 @@ public class LogicalDigestInfo {
     @SerializedName("e")
     public String reason;
 
+    // The verdict of a restore digest task with a prefix source (see TLogicalDigest.prefix_verdict), not persisted.
+    public static final String PREFIX_OK = "OK";
+    public static final String PREFIX_NOT_BOUNDARY = "NOT_BOUNDARY";
+    public static final String PREFIX_MISMATCH = "MISMATCH";
+    public static final String PREFIX_SCHEMA_MISMATCH = "SCHEMA_MISMATCH";
+    public static final String PREFIX_ERROR = "ERROR";
+
+    // null if the digest was not compared with the decomposed digest of a backup
+    public transient String prefixVerdict;
+    public transient String prefixMsg;
+
     public LogicalDigestInfo() {
         // for persist
     }
@@ -73,10 +84,19 @@ public class LogicalDigestInfo {
         String code = digest.isSetStatusCode() ? digest.getStatusCode() : "";
         boolean hasDigest = "OK".equals(code) && digest.isSetRoot() && !digest.getRoot().isEmpty()
                 && digest.isSetSchemaSig() && !digest.getSchemaSig().isEmpty() && digest.isSetAlgoVersion();
+        LogicalDigestInfo info;
         if (hasDigest) {
-            return of(digest.getAlgoVersion(), digest.getSchemaSig(), digest.getRoot().toLowerCase());
+            info = of(digest.getAlgoVersion(), digest.getSchemaSig(), digest.getRoot().toLowerCase());
+        } else {
+            info = none("NOT_SUPPORTED".equals(code) ? REASON_NOT_SUPPORTED : REASON_ERROR);
         }
-        return none("NOT_SUPPORTED".equals(code) ? REASON_NOT_SUPPORTED : REASON_ERROR);
+        if (digest.isSetPrefixVerdict()) {
+            info.prefixVerdict = digest.getPrefixVerdict();
+        }
+        if (digest.isSetPrefixMsg()) {
+            info.prefixMsg = digest.getPrefixMsg();
+        }
+        return info;
     }
 
     public boolean hasDigest() {

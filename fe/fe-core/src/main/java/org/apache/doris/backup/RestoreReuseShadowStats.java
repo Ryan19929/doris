@@ -26,6 +26,7 @@ import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.common.Config;
 import org.apache.doris.persist.gson.GsonUtils;
 
 import com.google.gson.JsonObject;
@@ -153,6 +154,30 @@ public class RestoreReuseShadowStats {
             return L0Verdict.SOURCE_VERSION_CHANGED;
         }
         // 4. both backups come from the same monotonic commit seq of the source table.
+        if (lineage.getSrcCommitSeq() == RestoreLineage.UNKNOWN_COMMIT_SEQ
+                || srcCommitSeq == RestoreLineage.UNKNOWN_COMMIT_SEQ
+                || srcCommitSeq < lineage.getSrcCommitSeq()) {
+            return L0Verdict.COMMIT_SEQ_MISMATCH;
+        }
+        return L0Verdict.REUSABLE;
+    }
+
+    /**
+     * The forward L0 check without the versions: the local partition was restored from the same source partition, and
+     * the commit seq does not go backwards. Used by the incremental append, where the versions differ.
+     */
+    public static L0Verdict checkL0Relation(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
+            long srcCommitSeq) {
+        if (localPart == null) {
+            return L0Verdict.NO_LOCAL_PARTITION;
+        }
+        RestoreLineage lineage = localPart.getRestoreLineage();
+        if (lineage == null) {
+            return L0Verdict.NO_LINEAGE;
+        }
+        if (!lineage.isSameSource(srcDbId, srcTableId, srcPartitionId)) {
+            return L0Verdict.LINEAGE_MISMATCH;
+        }
         if (lineage.getSrcCommitSeq() == RestoreLineage.UNKNOWN_COMMIT_SEQ
                 || srcCommitSeq == RestoreLineage.UNKNOWN_COMMIT_SEQ
                 || srcCommitSeq < lineage.getSrcCommitSeq()) {
@@ -367,6 +392,13 @@ public class RestoreReuseShadowStats {
         json.addProperty("download_sample_failed", actual.countReasons(RestoreReuseResult.DOWNLOAD_SAMPLE_FAILED));
         json.addProperty("download_other", actual.countReasons(RestoreReuseResult.DOWNLOAD_CHANGED,
                 RestoreReuseResult.DOWNLOAD_VERIFY_ERROR));
+        if (Config.enable_restore_incremental_append || actual.getIncrementalPartitions() > 0) {
+            // the partitions that download only the rowsets after the local version, and the local data they keep
+            json.addProperty("incremental_partitions", actual.getIncrementalPartitions());
+            json.addProperty("incremental_local_bytes_all_replicas", actual.getIncrementalLocalBytesAllReplicas());
+            json.addProperty("download_not_boundary", actual.countReasons(RestoreReuseResult.DOWNLOAD_NOT_BOUNDARY));
+            json.addProperty("download_prefix_error", actual.countReasons(RestoreReuseResult.DOWNLOAD_PREFIX_ERROR));
+        }
         return GsonUtils.GSON.toJson(json);
     }
 }

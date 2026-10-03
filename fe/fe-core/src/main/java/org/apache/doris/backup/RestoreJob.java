@@ -93,6 +93,8 @@ import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TRemoteTabletSnapshot;
+import org.apache.doris.thrift.TRestoreDigestPrefixSource;
+import org.apache.doris.thrift.TRestoreIncrementalRange;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TStorageType;
@@ -1549,6 +1551,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     if (entry.getValue().hasRefTabletId()) {
                         task.setRefTabletId(entry.getValue().getRefTabletId());
                     }
+                    if (isIncrementalPartition(tbl.getId(), part.getId())) {
+                        // an empty dir, only the increment is downloaded into it
+                        task.setRestoreIncremental(true);
+                    }
                     batchTask.addTask(task);
                     unfinishedSignatureToId.put(signature, tablet.getId());
                     bePathsMap.put(beId, replica.getPathHash());
@@ -2088,6 +2094,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     for (int index = 0; index < totalNum; index += taskNumPerBatch) {
                         Map<String, String> srcToDest = Maps.newHashMap();
                         Map<String, String> manifestRoots = Maps.newHashMap();
+                        Map<String, TRestoreIncrementalRange> incrementalRanges = Maps.newHashMap();
                         for (int j = 0; j < taskNumPerBatch && index + j < totalNum; j++) {
                             SnapshotInfo info = beSnapshotInfos.get(index + j);
                             Table tbl = db.getTableNullable(info.getTblId());
@@ -2121,6 +2128,18 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 if (manifestRoot != null) {
                                     manifestRoots.put(src, manifestRoot);
                                 }
+                                RestoreReuseResult.Decision incremental = getIncrementalDecision(info.getTblId(),
+                                        info.getPartitionId());
+                                if (incremental != null) {
+                                    if (manifestRoot == null) {
+                                        status = new Status(ErrCode.COMMON_ERROR, "the manifest of tablet "
+                                                + result.second.getTabletId() + " is required by the incremental "
+                                                + "restore");
+                                        return;
+                                    }
+                                    incrementalRanges.put(src, new TRestoreIncrementalRange(incremental.version,
+                                            incremental.targetVersion));
+                                }
                                 if (LOG.isDebugEnabled()) {
                                     LOG.debug("create download src path: {}, dest path: {}", src, dest);
                                 }
@@ -2134,6 +2153,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 brokerAddrs.get(0));
                         if (!manifestRoots.isEmpty()) {
                             task.setManifestRoots(manifestRoots);
+                        }
+                        if (!incrementalRanges.isEmpty()) {
+                            task.setIncrementalRanges(incrementalRanges);
                         }
                         batchTask.addTask(task);
                         unfinishedSignatureToId.put(signature, beId);
@@ -2258,6 +2280,17 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 if (manifestRoot != null) {
                                     remoteTabletSnapshot.setManifestRoot(manifestRoot);
                                 }
+                                RestoreReuseResult.Decision incremental = getIncrementalDecision(info.getTblId(),
+                                        info.getPartitionId());
+                                if (incremental != null) {
+                                    if (manifestRoot == null) {
+                                        status = new Status(ErrCode.COMMON_ERROR, "the manifest of tablet "
+                                                + remoteTabletId + " is required by the incremental restore");
+                                        return;
+                                    }
+                                    remoteTabletSnapshot.setIncremental(new TRestoreIncrementalRange(
+                                            incremental.version, incremental.targetVersion));
+                                }
 
                                 remoteTabletSnapshots.add(remoteTabletSnapshot);
                             } finally {
@@ -2281,6 +2314,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         // No edit log here
         LOG.info("finished to send download tasks to BE. num: {}. {}", batchTask.getTaskNum(), this);
+    }
+
+    /** The decision of the partition if it is restored by appending the increment, otherwise null. */
+    private RestoreReuseResult.Decision getIncrementalDecision(long tblId, long partId) {
+        return reuseResult == null ? null : reuseResult.getIncremental(tblId, partId);
+    }
+
+    private boolean isIncrementalPartition(long tblId, long partId) {
+        return getIncrementalDecision(tblId, partId) != null;
     }
 
     protected DownloadTask createDownloadTask(long beId, long signature, long jobId, long dbId,
@@ -2372,6 +2414,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             DirMoveTask task = new DirMoveTask(null, cell.getColumnKey(), signature, jobId, dbId, info.getTblId(),
                     info.getPartitionId(), info.getTabletId(), cell.getRowKey(), info.getTabletPath(),
                     info.getSchemaHash(), true /* need reload tablet header */);
+            RestoreReuseResult.Decision incremental = getIncrementalDecision(info.getTblId(), info.getPartitionId());
+            if (incremental != null) {
+                task.setIncrementalRange(incremental.version, incremental.targetVersion);
+            }
             batchTask.addTask(task);
             unfinishedSignatureToId.put(signature, info.getTabletId());
         }
@@ -2752,26 +2798,41 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         RestoreReuseJudge.Input in = buildReuseInput(tblEntry.getKey(), tblInfo,
                                 partEntry.getKey(), partEntry.getValue(), localOlapTbl, localPart, level);
                         String reject = RestoreReuseJudge.firstReject(in);
+                        boolean incremental = false;
                         if (reject != null) {
-                            result.addRejected(reject);
-                            if (!reject.startsWith("L0_")) {
-                                LOG.info("restore reuse: partition {}.{} is not a candidate: {}, job: {}",
-                                        localOlapTbl.getName(), partEntry.getKey(), reject, jobId);
+                            // a partition that is behind the backup may download only the rowsets after its version
+                            String incrementalReject = in.incrementalEnabled
+                                    ? RestoreReuseJudge.firstRejectIncremental(in) : reject;
+                            if (incrementalReject != null) {
+                                result.addRejected(reject);
+                                if (!reject.startsWith("L0_") || (in.incrementalEnabled
+                                        && !incrementalReject.startsWith("L0_")
+                                        && !incrementalReject.startsWith("INCREMENTAL_SAME_VERSION"))) {
+                                    LOG.info("restore reuse: partition {}.{} is not a candidate: {}, incremental: {}, "
+                                            + "job: {}", localOlapTbl.getName(), partEntry.getKey(), reject,
+                                            incrementalReject, jobId);
+                                }
+                                continue;
                             }
-                            continue;
+                            incremental = true;
                         }
                         ReuseCandidate candidate = new ReuseCandidate();
                         candidate.tableId = localOlapTbl.getId();
                         candidate.partitionId = localPart.getId();
                         candidate.tableName = localOlapTbl.getName();
                         candidate.partitionName = partEntry.getKey();
+                        candidate.incrementalCandidate = incremental;
+                        candidate.backupTableId = tblInfo.id;
                         candidate.version = in.backupPartition.version;
+                        // the version the digests are computed at: the local one for the incremental append
+                        candidate.digestVersion = incremental ? localPart.getVisibleVersion()
+                                : in.backupPartition.version;
                         candidate.bytes = in.getSingleReplicaBytes();
                         candidate.bytesAllReplicas = RestoreReuseShadowStats.getAllReplicasLocalDataSize(localPart);
                         candidate.l0Path = in.l0Path;
                         candidate.level = level;
                         candidate.backupPartition = in.backupPartition;
-                        if (level == CheckLevel.OFF) {
+                        if (level == CheckLevel.OFF && !incremental) {
                             candidate.decide(true, RestoreReuseResult.KEPT_L0_ONLY);
                         }
                         candidates.add(candidate);
@@ -2811,7 +2872,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             if (candidate.decided) {
                 continue;
             }
-            if (candidate.level == CheckLevel.FULL || RestoreReuseJudge.needsFullDigest(candidate.l0Path,
+            if (candidate.incrementalCandidate) {
+                // the digest is the only proof of the local data, always computed
+                toDigest.add(candidate);
+            } else if (candidate.level == CheckLevel.FULL || RestoreReuseJudge.needsFullDigest(candidate.l0Path,
                     Config.restore_reuse_force_full_for_relation)) {
                 toDigest.add(candidate);
             } else {
@@ -2866,7 +2930,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         tbl.readLock();
         try {
             Partition part = tbl.getPartition(candidate.partitionId);
-            if (part == null || part.getVisibleVersion() != candidate.version) {
+            if (part == null || part.getVisibleVersion() != candidate.digestVersion) {
                 candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
                 return;
             }
@@ -2879,10 +2943,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 int schemaHash = tbl.getSchemaHashByIndexId(index.getId());
                 for (int i = 0; i < index.getTablets().size(); i++) {
                     Tablet tablet = index.getTablets().get(i);
-                    ReuseTabletCheck check = new ReuseTabletCheck(
-                            jobInfo.getLogicalDigest(backupIdx.sortedTabletInfoList.get(i).id));
+                    BackupTabletInfo backupTablet = backupIdx.sortedTabletInfoList.get(i);
+                    ReuseTabletCheck check = new ReuseTabletCheck(jobInfo.getLogicalDigest(backupTablet.id));
                     for (Replica replica : tablet.getReplicas()) {
-                        if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.version)) {
+                        if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.digestVersion)) {
                             candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
                             return;
                         }
@@ -2894,8 +2958,18 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             immediateResults.put(signature, LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR));
                             continue;
                         }
-                        tasks.add(new RestoreDigestTask(beId, signature, jobId, dbId, tbl.getId(), part.getId(),
-                                index.getId(), tablet.getId(), schemaHash, candidate.version, 0));
+                        RestoreDigestTask task = new RestoreDigestTask(beId, signature, jobId, dbId, tbl.getId(),
+                                part.getId(), index.getId(), tablet.getId(), schemaHash, candidate.digestVersion, 0);
+                        if (candidate.incrementalCandidate) {
+                            TRestoreDigestPrefixSource source = buildPrefixSource(candidate, backupIdx, backupTablet,
+                                    beId);
+                            if (source == null) {
+                                immediateResults.put(signature, LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR));
+                                continue;
+                            }
+                            task.setPrefixSource(source);
+                        }
+                        tasks.add(task);
                     }
                     checks.add(check);
                 }
@@ -2909,6 +2983,83 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             batchTask.addTask(task);
             unfinishedSignatureToId.put(task.getSignature(), task.getTabletId());
         }
+    }
+
+    /**
+     * Where a backend reads the decomposed digest of a tablet of the backup: the repository path, or the remote tablet
+     * snapshot kept on a backend. Null if it can not be told, the digest of that replica is then an error and the
+     * partition is downloaded.
+     */
+    private TRestoreDigestPrefixSource buildPrefixSource(ReuseCandidate candidate, BackupIndexInfo backupIdx,
+            BackupTabletInfo backupTablet, long beId) {
+        try {
+            String root = backupTablet.prefixDigestRoot;
+            if (root == null || root.isEmpty()) {
+                return null;
+            }
+            TRestoreDigestPrefixSource source = new TRestoreDigestPrefixSource(backupTablet.id, root,
+                    candidate.version);
+            if (isFromLocalSnapshot()) {
+                TRemoteTabletSnapshot remote = buildRemoteTabletSnapshot(backupTablet.id, candidate.backupTableId,
+                        candidate.backupPartition.id, backupIdx.id);
+                if (remote == null) {
+                    return null;
+                }
+                source.setRemoteTabletSnapshot(remote);
+                return source;
+            }
+            List<FsBroker> brokerAddrs = Lists.newArrayList();
+            Status st = repo.getBrokerAddress(beId, env, brokerAddrs);
+            if (!st.ok() || brokerAddrs.size() != 1) {
+                LOG.warn("failed to get the broker of backend {} for the incremental restore: {}", beId, st);
+                return null;
+            }
+            IdChain ids = new IdChain(candidate.backupTableId, candidate.backupPartition.id, backupIdx.id,
+                    backupTablet.id, -1L, -1L);
+            String src = repo.getRepoPath(label, jobInfo.getFilePath(ids));
+            if (src == null) {
+                return null;
+            }
+            source.setBrokerAddr(new TNetworkAddress(brokerAddrs.get(0).host, brokerAddrs.get(0).port));
+            source.setBrokerProp(repo.getFileSystemDescriptor().getBackendConfigProperties());
+            source.setStorageBackend(repo.getFileSystemDescriptor().getThriftStorageType().toThrift());
+            source.setLocation(repo.getLocation());
+            source.setRemotePath(src);
+            return source;
+        } catch (Exception e) {
+            LOG.warn("failed to build the prefix digest source of tablet {} of the backup. {}", backupTablet.id,
+                    this, e);
+            return null;
+        }
+    }
+
+    /**
+     * The remote tablet snapshot of a tablet of a backup kept on a backend (the fields of the local side are not
+     * set), null if the job info does not tell where it is.
+     */
+    private TRemoteTabletSnapshot buildRemoteTabletSnapshot(long remoteTabletId, long remoteTblId,
+            long remotePartId, long remoteIdxId) {
+        Long remoteBeId = jobInfo.getBeId(remoteTabletId);
+        String remoteSnapshotPath = jobInfo.getTabletSnapshotPath(remoteTabletId);
+        Long schemaHash = jobInfo.getSchemaHash(remoteTblId, remotePartId, remoteIdxId);
+        if (remoteBeId == null || remoteSnapshotPath == null || schemaHash == null) {
+            return null;
+        }
+        TNetworkAddress remoteBeAddr = jobInfo.getBeAddr(remoteBeId);
+        if (remoteBeAddr == null) {
+            return null;
+        }
+        TRemoteTabletSnapshot remote = new TRemoteTabletSnapshot();
+        remote.setRemoteTabletId(remoteTabletId);
+        remote.setRemoteBeId(remoteBeId);
+        remote.setRemoteBeAddr(remoteBeAddr);
+        remote.setRemoteSnapshotPath(String.format("%s/%d/%d", remoteSnapshotPath, remoteTabletId, schemaHash));
+        remote.setRemoteToken(jobInfo.getToken());
+        String manifestRoot = getExpectedManifestRoot(remoteTabletId);
+        if (manifestRoot != null) {
+            remote.setManifestRoot(manifestRoot);
+        }
+        return remote;
     }
 
     protected void waitingAllDigestsFinished() {
@@ -3004,13 +3155,16 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 if (!complete) {
                     break;
                 }
-                reason = RestoreReuseJudge.compareTablet(check.expected, actual);
+                reason = candidate.incrementalCandidate ? RestoreReuseJudge.compareIncrementalTablet(actual)
+                        : RestoreReuseJudge.compareTablet(check.expected, actual);
                 if (reason != null) {
                     break;
                 }
             }
             if (!complete) {
                 candidate.decide(false, RestoreReuseResult.DOWNLOAD_TIMEOUT);
+            } else if (reason == null && candidate.incrementalCandidate) {
+                candidate.decideIncremental();
             } else if (reason == null) {
                 candidate.decide(true, RestoreReuseResult.KEPT_DIGEST_VERIFIED);
             } else {
@@ -3029,7 +3183,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         RestoreReuseResult result = reuseResult != null ? reuseResult : new RestoreReuseResult();
         Set<Pair<Long, Long>> kept = Sets.newHashSet();
         for (ReuseCandidate candidate : reuseCandidates) {
-            if (candidate.kept && !isStillAtVersion(db, candidate)) {
+            if ((candidate.kept || candidate.incremental) && !isStillAtVersion(db, candidate)) {
                 candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
             }
             result.addDecision(candidate.toDecision());
@@ -3044,8 +3198,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // The data of the partitions to download is about to change.
         invalidateRestoreLineageOfOverwrittenPartitions(db);
         clearReuseWorkingState();
-        LOG.info("restore reuse: keep {} partitions ({} bytes of a single replica), download {} of the candidates, "
-                + "job: {}", result.getKeptPartitions(), result.getKeptBytesSingleReplica(),
+        LOG.info("restore reuse: keep {} partitions ({} bytes of a single replica), append the increment to {}, "
+                + "download {} of the candidates, job: {}", result.getKeptPartitions(),
+                result.getKeptBytesSingleReplica(), result.getIncrementalPartitions(),
                 result.getDownloadedPartitions(), jobId);
 
         prepareAndSendSnapshotTaskForOlapTable(db);
@@ -3060,13 +3215,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         tbl.readLock();
         try {
             Partition part = tbl.getPartition(candidate.partitionId);
-            if (part == null || part.getVisibleVersion() != candidate.version) {
+            if (part == null || part.getVisibleVersion() != candidate.digestVersion) {
                 return false;
             }
             for (MaterializedIndex index : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
                 for (Tablet tablet : index.getTablets()) {
                     for (Replica replica : tablet.getReplicas()) {
-                        if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.version)) {
+                        if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.digestVersion)) {
                             return false;
                         }
                     }
@@ -3085,14 +3240,17 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     Status checkKeptPartitions() {
-        if (reuseResult == null || reuseResult.getKeptPartitions() == 0) {
+        if (reuseResult == null || (reuseResult.getKeptPartitions() == 0
+                && reuseResult.getIncrementalPartitions() == 0)) {
             return Status.OK;
         }
         Database db = env.getInternalCatalog().getDbNullable(dbId);
         if (db == null) {
             return new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
         }
-        for (RestoreReuseResult.Decision decision : reuseResult.getKeptDecisions()) {
+        List<RestoreReuseResult.Decision> toCheck = Lists.newArrayList(reuseResult.getKeptDecisions());
+        toCheck.addAll(reuseResult.getIncrementalDecisions());
+        for (RestoreReuseResult.Decision decision : toCheck) {
             Table tbl = db.getTableNullable(decision.tableId);
             if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
                 return new Status(ErrCode.NOT_FOUND, "table " + decision.tableName + " of the kept partition "
@@ -3106,9 +3264,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 }
                 if (part.getVisibleVersion() != decision.version) {
                     return new Status(ErrCode.COMMON_ERROR, "the visible version of the partition "
-                            + decision.tableName + "." + decision.partitionName + " that keeps its local data changed"
-                            + " from " + decision.version + " to " + part.getVisibleVersion()
-                            + " during the restore, the local data is not the backup any more");
+                            + decision.tableName + "." + decision.partitionName + " that "
+                            + (decision.incremental ? "is restored by appending the increment" : "keeps its local data")
+                            + " changed from " + decision.version + " to " + part.getVisibleVersion()
+                            + " during the restore, the local data is not what was verified any more");
                 }
             } finally {
                 tbl.writeUnlock();
@@ -3162,6 +3321,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         in.allowLoad = allowLoad;
         in.cloudMode = Config.isCloudMode();
         in.minPartitionBytes = Config.restore_reuse_min_partition_bytes;
+        in.incrementalEnabled = Config.enable_restore_incremental_append && Config.enable_restore_partition_reuse;
         in.level = level;
         in.jobInfo = jobInfo;
         in.backupTable = tblInfo;
@@ -3193,6 +3353,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         String l0Path;
         CheckLevel level;
         BackupPartitionInfo backupPartition;
+        // The local partition is behind the backup: if the digest tasks pass, it is restored by appending the rowsets
+        // of the versions after digestVersion (the local version) up to version (the backup).
+        boolean incrementalCandidate = false;
+        long digestVersion;
+        long backupTableId;
+        // the outcome: restored incrementally
+        boolean incremental = false;
         // in the sample of the check level sample
         boolean sampled = false;
         boolean decided = false;
@@ -3205,6 +3372,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             this.decided = true;
             this.kept = kept;
             this.reason = reason;
+            this.incremental = false;
+        }
+
+        void decideIncremental() {
+            this.decided = true;
+            this.kept = false;
+            this.incremental = true;
+            this.reason = RestoreReuseResult.INCREMENTAL_VERIFIED;
         }
 
         RestoreReuseResult.Decision toDecision() {
@@ -3213,12 +3388,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             decision.partitionId = partitionId;
             decision.tableName = tableName;
             decision.partitionName = partitionName;
-            decision.version = version;
+            // an incremental partition: the local version, and the backup in targetVersion
+            decision.version = incremental ? digestVersion : version;
+            decision.targetVersion = incremental ? version : 0;
             decision.bytes = bytes;
             decision.bytesAllReplicas = bytesAllReplicas;
             decision.l0Path = l0Path;
             decision.level = level.lower();
             decision.kept = kept;
+            decision.incremental = incremental;
             decision.reason = reason;
             return decision;
         }
@@ -3451,6 +3629,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     // remove all dir move tasks in AgentTaskQueue
                     for (Long taskId : unfinishedSignatureToId.keySet()) {
                         AgentTaskQueue.removeTaskOfType(TTaskType.MOVE, taskId);
+                    }
+                    if (reuseResult != null && reuseResult.getIncrementalPartitions() > 0) {
+                        // The append of a tablet is all or nothing, but the tablets of a partition are not. Say so,
+                        // restoring again downloads the partition as a whole, since its replicas differ.
+                        LOG.warn("restore job {} is cancelled while appending the increments, the tablets of the "
+                                + "incremental partitions {} may be appended in part; restore again to repair them",
+                                jobId, reuseResult.getIncrementalDecisions());
+                        status = new Status(status.getErrCode(), status.getErrMsg()
+                                + " (incremental partitions may be partially appended, restore again to repair)");
                     }
                     break;
                 default:

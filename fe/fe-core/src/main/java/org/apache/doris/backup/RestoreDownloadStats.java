@@ -17,6 +17,7 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.common.Config;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.thrift.TDownloadStats;
 
@@ -52,6 +53,14 @@ public class RestoreDownloadStats {
     private long tabletsPartialReuse;
     @SerializedName("none")
     private long tabletsNoReuse;
+    // the tablets restored by appending the increment, and the files and bytes downloaded for them (they are also in
+    // the downloaded counts)
+    @SerializedName("it")
+    private long incrementalTablets;
+    @SerializedName("if")
+    private long incrementalFiles;
+    @SerializedName("ib")
+    private long incrementalBytes;
     @SerializedName("um")
     private long unmatchedRowsets;
     @SerializedName("ums")
@@ -82,6 +91,9 @@ public class RestoreDownloadStats {
         tabletsFullReuse += stats.getTabletsFullReuse();
         tabletsPartialReuse += stats.getTabletsPartialReuse();
         tabletsNoReuse += stats.getTabletsNoReuse();
+        incrementalTablets += stats.getTabletsIncremental();
+        incrementalFiles += stats.getIncrementalFiles();
+        incrementalBytes += stats.getIncrementalBytes();
         unmatchedRowsets += stats.getUnmatchedRowsets();
         unmatchedNoSourceRowsetId += stats.getUnmatchedNoSourceRowsetId();
         unmatchedSourceNotInSnapshot += stats.getUnmatchedSourceNotInSnapshot();
@@ -107,6 +119,14 @@ public class RestoreDownloadStats {
 
     public long getDownloadedBytes() {
         return downloadedBytes;
+    }
+
+    public long getIncrementalBytes() {
+        return incrementalBytes;
+    }
+
+    public long getIncrementalTablets() {
+        return incrementalTablets;
     }
 
     public long getReportedReplicas() {
@@ -147,6 +167,10 @@ public class RestoreDownloadStats {
         json.put("skipped_bytes", skippedBytes);
         json.put("kept_bytes", keptBytes);
         json.put("downloaded_bytes", downloadedBytes);
+        if (Config.enable_restore_incremental_append || incrementalTablets > 0) {
+            json.put("incremental_tablets", incrementalTablets);
+            json.put("incremental_bytes", incrementalBytes);
+        }
         json.put("reuse_ratio", getReuseRatio(keptBytes));
         json.put("linked_files", linkedFiles);
         json.put("skipped_files", skippedFiles);

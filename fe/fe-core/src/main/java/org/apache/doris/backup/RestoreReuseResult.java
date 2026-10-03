@@ -40,7 +40,17 @@ public class RestoreReuseResult {
     // The partition was not sampled and the sampled partitions are all consistent (check level sample).
     public static final String KEPT_SAMPLE_PASSED = "KEPT_SAMPLE_PASSED";
 
+    // incremental append (see Decision#incremental): the local partition is behind the backup, its data up to its own
+    // version was proved equal to the backup at that version on every replica, and the backup can be cut there, so
+    // only the rowsets after it are downloaded and appended.
+    public static final String INCREMENTAL_VERIFIED = "INCREMENTAL_VERIFIED";
+
     // downloaded
+    // The version of the local partition is not the end version of a rowset of the backup, which can not be cut
+    // there (a compaction merged the versions across it).
+    public static final String DOWNLOAD_NOT_BOUNDARY = "DOWNLOAD_NOT_BOUNDARY";
+    // The backup has no decomposed digest the backend could read, or it does not match the job info.
+    public static final String DOWNLOAD_PREFIX_ERROR = "DOWNLOAD_PREFIX_ERROR";
     // A replica has a digest different from the backup.
     public static final String DOWNLOAD_ROOT_MISMATCH = "DOWNLOAD_ROOT_MISMATCH";
     // The digest algorithm version or the schema signature differs from the backup.
@@ -84,13 +94,21 @@ public class RestoreReuseResult {
         public String l0Path;
         @SerializedName("k")
         public boolean kept;
+        // The partition is restored by appending the rowsets of the versions (version, targetVersion] of the backup
+        // to the local tablets, "version" is then the visible version of the local partition. Not kept.
+        @SerializedName("i")
+        public boolean incremental;
+        // the version of the backup, only for an incremental partition (otherwise "version" is the one)
+        @SerializedName("tv")
+        public long targetVersion;
         @SerializedName("r")
         public String reason;
 
         @Override
         public String toString() {
-            return tableName + "." + partitionName + "(" + tableId + "," + partitionId + ", v" + version + ", "
-                    + level + ", L0 " + l0Path + "): " + (kept ? "KEEP " : "DOWNLOAD ") + reason;
+            return tableName + "." + partitionName + "(" + tableId + "," + partitionId + ", v" + version
+                    + (incremental ? "->v" + targetVersion : "") + ", " + level + ", L0 " + l0Path + "): "
+                    + (kept ? "KEEP " : incremental ? "INCREMENTAL " : "DOWNLOAD ") + reason;
         }
     }
 
@@ -129,6 +147,35 @@ public class RestoreReuseResult {
         return false;
     }
 
+    /** The decision of the partition if it is restored incrementally, otherwise null. */
+    public Decision getIncremental(long tableId, long partitionId) {
+        for (Decision decision : decisions) {
+            if (decision.incremental && decision.tableId == tableId && decision.partitionId == partitionId) {
+                return decision;
+            }
+        }
+        return null;
+    }
+
+    public List<Decision> getIncrementalDecisions() {
+        List<Decision> result = Lists.newArrayList();
+        for (Decision decision : decisions) {
+            if (decision.incremental) {
+                result.add(decision);
+            }
+        }
+        return result;
+    }
+
+    public long getIncrementalPartitions() {
+        return decisions.stream().filter(d -> d.incremental).count();
+    }
+
+    /** The local data size of all replicas of the incremental partitions, what a download of them would write. */
+    public long getIncrementalLocalBytesAllReplicas() {
+        return decisions.stream().filter(d -> d.incremental).mapToLong(d -> d.bytesAllReplicas).sum();
+    }
+
     public List<Decision> getKeptDecisions() {
         List<Decision> kept = Lists.newArrayList();
         for (Decision decision : decisions) {
@@ -162,7 +209,7 @@ public class RestoreReuseResult {
     public long countReasons(String... reasons) {
         long count = 0;
         for (Decision decision : decisions) {
-            if (!decision.kept) {
+            if (!decision.kept && !decision.incremental) {
                 for (String reason : reasons) {
                     if (reason.equals(decision.reason)) {
                         count++;
@@ -174,8 +221,9 @@ public class RestoreReuseResult {
         return count;
     }
 
+    /** The candidate partitions that are downloaded as a whole (neither kept nor incremental). */
     public long getDownloadedPartitions() {
-        return decisions.stream().filter(d -> !d.kept).count();
+        return decisions.stream().filter(d -> !d.kept && !d.incremental).count();
     }
 
     @Override
