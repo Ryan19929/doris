@@ -37,6 +37,9 @@ public:
     void handle(HttpRequest* req) override;
 
 private:
+    void handle_prefix_file(HttpRequest* req, int64_t tablet_id, int64_t version,
+                            const std::string& path, const std::string& root);
+
     StorageEngine& _engine;
 };
 

@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -71,6 +72,7 @@
 #include "util/defer_op.h"
 #include "util/jsonb_parser_simd.h"
 #include "util/jsonb_writer.h"
+#include "util/sha.h"
 
 namespace doris {
 using namespace ErrorCode;
@@ -358,7 +360,8 @@ protected:
     // split; with `overlapping` the rows are dealt round-robin to the segments, otherwise the
     // rowset is globally sorted by key and cut into consecutive segments.
     RowsetSharedPtr write_rowset(const TabletSchemaSPtr& schema, std::vector<Row> rows,
-                                 int64_t version, size_t rows_per_segment, bool overlapping) {
+                                 int64_t version, size_t rows_per_segment, bool overlapping,
+                                 int64_t start_version = -1) {
         auto by_key = [](const Row& a, const Row& b) { return key_of(a) < key_of(b); };
         std::vector<std::vector<Row>> segments;
         if (overlapping) {
@@ -375,7 +378,8 @@ protected:
                                       std::make_move_iterator(rows.begin() + end));
             }
         }
-        auto ctx = make_writer_context(schema, Version(version, version), overlapping);
+        auto ctx = make_writer_context(
+                schema, Version(start_version < 0 ? version : start_version, version), overlapping);
         auto res = RowsetFactory::create_rowset_writer(*rd_engine_ref, ctx, true);
         EXPECT_TRUE(res.has_value()) << res.error();
         auto writer = std::move(res).value();
@@ -2440,6 +2444,888 @@ TEST_F(RestoreDigestTabletTest, TaskReportsNotSupportedAndErrors) {
     TLogicalDigest bad_version = compute_logical_digest_for_task(*_engine, 7104, 9, 0);
     EXPECT_EQ("ERROR", bad_version.status_code);
     EXPECT_FALSE(bad_version.__isset.root);
+}
+
+
+// ===== 12. decomposed digest: compose(V) == the digest computed at V ==========================
+
+namespace {
+std::atomic<int64_t> g_prefix_bitmap_tablet_id {5000000};
+int64_t next_bitmap_tablet_id() {
+    return g_prefix_bitmap_tablet_id.fetch_add(1);
+}
+constexpr int64_t kPrefixTabletId = 777;
+constexpr int64_t kNever = INT64_MAX;
+
+struct MRow {
+    int k;
+    int v;
+    int seq;
+    int del;
+};
+struct MBatch {
+    RowsetSharedPtr rs;
+    int64_t start = 0;
+    int64_t version = 0;
+    std::vector<MRow> rows;
+    std::vector<std::pair<int, int>> loc; // segment, row id of every row
+    std::vector<int64_t> death;           // the lowest version at which the bitmap marks the row
+};
+} // namespace
+
+class RestoreDigestPrefixTest : public RestoreDigestTest {
+protected:
+    void SetUp() override {
+        RestoreDigestTest::SetUp();
+        // The segment cache is keyed by the rowset id and outlives the test: never reuse the ids of
+        // the other tests, whose files have other contents.
+        static std::atomic<int64_t> next_base {20000000};
+        _next_rowset_id = next_base.fetch_add(1000000);
+    }
+
+    static std::vector<ColSpec> dup_cols() {
+        return {{"k", "INT", true, false, 4},
+                {"v", "INT", false, true, 4},
+                {"s", "VARCHAR", false, true, 16}};
+    }
+    static std::vector<ColSpec> mow_cols() {
+        return {{"k", "INT", true, false, 4},
+                {"v1", "INT", false, true, 4},
+                {"v2", "VARCHAR", false, true, 16},
+                {SEQUENCE_COL, "INT", false, false, 4},
+                {DELETE_SIGN, "TINYINT", false, false, 1}};
+    }
+    static Row dup_row(int k, std::optional<int> v) {
+        return {V<int32_t>(k), v.has_value() ? V<int32_t>(*v) : N(),
+                S("s" + std::to_string(k % 13))};
+    }
+    static Row mow_row(const MRow& r) {
+        return {V<int32_t>(r.k), V<int32_t>(r.v), S("m" + std::to_string(r.v % 7)),
+                V<int32_t>(r.seq), V<int8_t>(r.del)};
+    }
+
+    RestoreDigestDecomposed decompose(const TabletSchemaSPtr& schema,
+                                      const std::vector<RowsetSharedPtr>& chain, KeysType keys_type,
+                                      bool mow, const DeleteBitmapPtr& bitmap, int threads = 1) {
+        RestoreDigestInput in;
+        in.rowsets = chain;
+        in.schema = schema;
+        in.keys_type = keys_type;
+        in.enable_mow = mow;
+        in.delete_bitmap = bitmap;
+        in.version = chain.back()->end_version();
+        in.threads = threads;
+        RestoreDigestDecomposed d;
+        Status st = decompose_restore_digest(in, kPrefixTabletId, &d);
+        EXPECT_TRUE(st.ok()) << st;
+        return d;
+    }
+
+    // compose(V) at every rowset boundary is bucket by bucket the digest computed at V; also through
+    // a serialize / parse round trip.
+    void expect_compose_equals_direct(const TabletSchemaSPtr& schema,
+                                      const std::vector<RowsetSharedPtr>& chain, KeysType keys_type,
+                                      bool mow, const DeleteBitmapPtr& bitmap,
+                                      const RestoreDigestDecomposed& dec, const std::string& what,
+                                      std::map<int64_t, RestoreDigest>* directs = nullptr) {
+        ASSERT_EQ(chain.size(), dec.rowsets.size()) << what;
+        std::string content = dec.serialize();
+        RestoreDigestDecomposed parsed;
+        Status pst = RestoreDigestDecomposed::parse(content, dec.file_root(), kPrefixTabletId, &parsed);
+        ASSERT_TRUE(pst.ok()) << pst << " " << what;
+        EXPECT_EQ(content, parsed.serialize()) << what;
+        for (size_t i = 0; i < chain.size(); ++i) {
+            const int64_t v = chain[i]->end_version();
+            std::vector<RowsetSharedPtr> prefix(chain.begin(), chain.begin() + i + 1);
+            RestoreDigest direct = digest_of(schema, prefix, keys_type, mow, bitmap, v);
+            const RestoreDigestDecomposed* both[] = {&dec, &parsed};
+            for (const RestoreDigestDecomposed* d : both) {
+                ASSERT_TRUE(d->is_boundary(v)) << what << " version " << v;
+                RestoreDigest composed;
+                Status st = d->compose(v, &composed);
+                ASSERT_TRUE(st.ok()) << st << " " << what << " version " << v;
+                EXPECT_TRUE(same_digest(direct, composed)) << what << " version " << v;
+                EXPECT_EQ(direct.root, composed.root) << what << " version " << v;
+                EXPECT_EQ(direct.rows, composed.rows) << what << " version " << v;
+                EXPECT_EQ(direct.schema_sig, composed.schema_sig) << what;
+            }
+            if (directs != nullptr) {
+                (*directs)[v] = direct;
+            }
+        }
+        // the digest recorded in the file is the one at the base version
+        RestoreDigest base;
+        ASSERT_TRUE(dec.compose(dec.base_version, &base).ok());
+        EXPECT_EQ(base.root, dec.root) << what;
+        EXPECT_EQ(base.rows, dec.rows) << what;
+    }
+
+    static std::vector<std::pair<int, int>> locate(const std::vector<int>& keys, size_t rps,
+                                                   bool overlapping) {
+        std::vector<std::pair<int, int>> loc(keys.size());
+        if (keys.empty()) {
+            return loc;
+        }
+        if (overlapping) {
+            const size_t segs = std::max<size_t>(1, (keys.size() + rps - 1) / rps);
+            std::vector<std::vector<size_t>> by_seg(segs);
+            for (size_t i = 0; i < keys.size(); ++i) {
+                by_seg[i % segs].push_back(i);
+            }
+            for (size_t s = 0; s < segs; ++s) {
+                auto& idx = by_seg[s];
+                std::stable_sort(idx.begin(), idx.end(),
+                                 [&](size_t a, size_t b) { return keys[a] < keys[b]; });
+                for (size_t r = 0; r < idx.size(); ++r) {
+                    loc[idx[r]] = {static_cast<int>(s), static_cast<int>(r)};
+                }
+            }
+        } else {
+            std::vector<size_t> idx(keys.size());
+            for (size_t i = 0; i < idx.size(); ++i) {
+                idx[i] = i;
+            }
+            std::stable_sort(idx.begin(), idx.end(),
+                             [&](size_t a, size_t b) { return keys[a] < keys[b]; });
+            for (size_t p = 0; p < idx.size(); ++p) {
+                loc[idx[p]] = {static_cast<int>(p / rps), static_cast<int>(p % rps)};
+            }
+        }
+        return loc;
+    }
+
+    // ---- duplicate
+
+    struct DupChain {
+        TabletSchemaSPtr schema;
+        std::vector<RowsetSharedPtr> chain;
+        std::vector<bool> is_delete;
+    };
+
+    // `deletes`: also write DELETE conditions among the batches.
+    DupChain make_dup_chain(unsigned seed, int batches, bool deletes) {
+        std::mt19937 rng(seed);
+        DupChain out;
+        out.schema = make_schema(DUP_KEYS, dup_cols());
+        int64_t version = 2;
+        for (int b = 0; b < batches; ++b) {
+            if (deletes && b > 0 && rng() % 3 == 0) {
+                std::vector<TCondition> conds;
+                switch (rng() % 3) {
+                case 0:
+                    conds = {cond("v", "=", {std::to_string(rng() % 6)})};
+                    break;
+                case 1:
+                    conds = {cond("k", ">=", {std::to_string(20 + rng() % 20)}),
+                             cond("v", "<=", {std::to_string(rng() % 6)})};
+                    break;
+                default:
+                    conds = {cond("k", "<", {std::to_string(rng() % 8)})};
+                    break;
+                }
+                out.chain.push_back(write_delete_rowset(out.schema, version++, conds));
+                out.is_delete.push_back(true);
+                continue;
+            }
+            const size_t n = rng() % 5 == 0 ? 0 : 1 + rng() % 60;
+            std::vector<Row> rows;
+            for (size_t i = 0; i < n; ++i) {
+                std::optional<int> v;
+                if (rng() % 7 != 0) {
+                    v = static_cast<int>(rng() % 6);
+                }
+                rows.push_back(dup_row(static_cast<int>(rng() % 50), v));
+            }
+            static const size_t kSegRows[] = {3, 7, 1000};
+            out.chain.push_back(write_rowset(out.schema, rows, version++, kSegRows[rng() % 3],
+                                             rng() % 2 == 0));
+            out.is_delete.push_back(false);
+        }
+        return out;
+    }
+
+    // ---- merge on write
+
+    struct MowChain {
+        TabletSchemaSPtr schema;
+        std::vector<MBatch> batches;
+        DeleteBitmapPtr bitmap;
+        std::vector<RowsetSharedPtr> chain() const {
+            std::vector<RowsetSharedPtr> c;
+            for (const auto& b : batches) {
+                c.push_back(b.rs);
+            }
+            return c;
+        }
+        // the number of visible rows at `version` by the model
+        uint64_t visible_at(int64_t version) const {
+            uint64_t n = 0;
+            for (const auto& b : batches) {
+                if (b.version > version) {
+                    break;
+                }
+                for (size_t i = 0; i < b.rows.size(); ++i) {
+                    n += b.rows[i].del == 0 && b.death[i] > version ? 1 : 0;
+                }
+            }
+            return n;
+        }
+    };
+
+    MowChain make_mow_chain(unsigned seed, int batches) {
+        std::mt19937 rng(seed);
+        MowChain out;
+        out.schema = make_schema(UNIQUE_KEYS, mow_cols(), 3);
+        out.bitmap = std::make_shared<DeleteBitmap>(next_bitmap_tablet_id());
+        std::map<int, std::pair<size_t, size_t>> latest; // key -> (batch, row)
+        int64_t version = 2;
+        for (int b = 0; b < batches; ++b) {
+            MBatch batch;
+            batch.version = batch.start = version++;
+            const size_t n = rng() % 6 == 0 ? 0 : 1 + rng() % 24;
+            std::set<int> used;
+            for (size_t i = 0; i < n; ++i) {
+                int k = static_cast<int>(rng() % 30);
+                if (!used.insert(k).second) {
+                    continue;
+                }
+                batch.rows.push_back({k, static_cast<int>(rng() % 1000),
+                                      static_cast<int>(batch.version), rng() % 5 == 0 ? 1 : 0});
+            }
+            // overlapping rowset with segments of two rows, and a key written twice in it: the
+            // first write is marked at the version of the rowset itself
+            const bool overlapping = batch.rows.size() >= 3 && rng() % 3 == 0;
+            const size_t rps = overlapping ? 2 : (rng() % 2 == 0 ? 4 : 1000);
+            int self_dup = -1;
+            if (overlapping) {
+                self_dup = static_cast<int>(rng() % (batch.rows.size() - 1));
+                MRow again = batch.rows[static_cast<size_t>(self_dup)];
+                again.v += 1;
+                again.del = 0;
+                batch.rows.insert(batch.rows.begin() + self_dup + 1, again);
+            }
+            std::vector<int> keys;
+            for (const auto& r : batch.rows) {
+                keys.push_back(r.k);
+            }
+            batch.loc = locate(keys, rps, overlapping);
+            batch.death.assign(batch.rows.size(), kNever);
+
+            const size_t bi = out.batches.size();
+            std::vector<Row> rows;
+            for (const auto& r : batch.rows) {
+                rows.push_back(mow_row(r));
+            }
+            batch.rs = write_rowset(out.schema, rows, batch.version, rps, overlapping);
+            // marks
+            const int64_t mark_version = batch.version;
+            auto mark = [&](MBatch& target, size_t row) {
+                out.bitmap->add({target.rs->rowset_id(), static_cast<uint32_t>(target.loc[row].first),
+                                 static_cast<uint64_t>(mark_version)},
+                                static_cast<uint32_t>(target.loc[row].second));
+                target.death[row] = std::min(target.death[row], mark_version);
+            };
+            out.batches.push_back(std::move(batch));
+            MBatch& cur = out.batches.back();
+            if (self_dup >= 0) {
+                mark(cur, static_cast<size_t>(self_dup));
+            }
+            for (size_t i = 0; i < cur.rows.size(); ++i) {
+                if (static_cast<int>(i) == self_dup) {
+                    continue;
+                }
+                auto it = latest.find(cur.rows[i].k);
+                if (it != latest.end()) {
+                    MBatch& old = out.batches[it->second.first];
+                    const size_t old_row = it->second.second;
+                    // a delete sign row is hidden anyway, whether it is marked or not
+                    if (old.rows[old_row].del == 0 || rng() % 4 != 0) {
+                        mark(old, old_row);
+                    }
+                }
+                latest[cur.rows[i].k] = {bi, i};
+            }
+            // noise: a row which is dead already is marked again at a later version
+            if (bi > 1 && rng() % 6 == 0) {
+                MBatch& old = out.batches[rng() % (bi - 1)];
+                for (size_t i = 0; i < old.rows.size(); ++i) {
+                    if (old.death[i] < mark_version) {
+                        mark(old, i);
+                        break;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    // Merges the batches [a, b] into one rowset with the version range [start of a, end of b]: the
+    // rows alive at the end version are kept (also the delete sign rows), the marks of later
+    // versions follow them. Returns the chain after the compaction.
+    MowChain compact_mow(const MowChain& in, size_t a, size_t b, unsigned seed) {
+        std::mt19937 rng(seed);
+        const int64_t end = in.batches[b].version;
+        struct Kept {
+            MRow row;
+            int64_t death;
+        };
+        std::vector<Kept> kept;
+        for (size_t i = a; i <= b; ++i) {
+            for (size_t r = 0; r < in.batches[i].rows.size(); ++r) {
+                if (in.batches[i].death[r] > end) {
+                    kept.push_back({in.batches[i].rows[r], in.batches[i].death[r]});
+                }
+            }
+        }
+        const bool overlapping = false;
+        const size_t rps = rng() % 2 == 0 ? 5 : 1000;
+        std::vector<int> keys;
+        for (const auto& k : kept) {
+            keys.push_back(k.row.k);
+        }
+        MBatch merged;
+        merged.start = in.batches[a].start;
+        merged.version = end;
+        merged.loc = locate(keys, rps, overlapping);
+        std::vector<Row> rows;
+        for (const auto& k : kept) {
+            merged.rows.push_back(k.row);
+            merged.death.push_back(k.death);
+            rows.push_back(mow_row(k.row));
+        }
+        MowChain out;
+        out.schema = in.schema;
+        out.bitmap = std::make_shared<DeleteBitmap>(next_bitmap_tablet_id());
+        merged.rs = write_rowset(in.schema, rows, end, rps, overlapping, merged.start);
+        for (size_t i = 0; i < merged.rows.size(); ++i) {
+            if (merged.death[i] != kNever) {
+                out.bitmap->add({merged.rs->rowset_id(), static_cast<uint32_t>(merged.loc[i].first),
+                                 merged.death[i]},
+                                static_cast<uint32_t>(merged.loc[i].second));
+            }
+        }
+        for (size_t i = 0; i < in.batches.size(); ++i) {
+            if (i == a) {
+                out.batches.push_back(merged);
+            }
+            if (i >= a && i <= b) {
+                continue;
+            }
+            out.batches.push_back(in.batches[i]);
+            for (size_t r = 0; r < in.batches[i].rows.size(); ++r) {
+                if (in.batches[i].death[r] != kNever) {
+                    out.bitmap->add({in.batches[i].rs->rowset_id(),
+                                     static_cast<uint32_t>(in.batches[i].loc[r].first),
+                                     in.batches[i].death[r]},
+                                    static_cast<uint32_t>(in.batches[i].loc[r].second));
+                }
+            }
+        }
+        return out;
+    }
+};
+
+TEST_F(RestoreDigestPrefixTest, DuplicateComposeEqualsDirectAtEveryBoundary) {
+    for (unsigned seed : {1U, 2U, 3U, 4U, 5U, 6U}) {
+        auto c = make_dup_chain(seed, 10, /*deletes=*/false);
+        auto dec = decompose(c.schema, c.chain, DUP_KEYS, false, nullptr);
+        ASSERT_EQ(10U, dec.rowsets.size());
+        EXPECT_TRUE(dec.marks.empty()) << "a duplicate table without conditions has no marks";
+        EXPECT_FALSE(dec.mow);
+        expect_compose_equals_direct(c.schema, c.chain, DUP_KEYS, false, nullptr, dec,
+                                     "seed " + std::to_string(seed));
+        // the worker threads do not change a byte
+        EXPECT_EQ(dec.serialize(),
+                  decompose(c.schema, c.chain, DUP_KEYS, false, nullptr, 3).serialize());
+        // not a boundary: nothing can be composed
+        RestoreDigest d;
+        for (int64_t v : {int64_t(0), int64_t(1), int64_t(100)}) {
+            EXPECT_FALSE(dec.is_boundary(v));
+            Status st = dec.compose(v, &d);
+            EXPECT_TRUE(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>()) << st;
+        }
+    }
+}
+
+TEST_F(RestoreDigestPrefixTest, DuplicateWithDeleteConditions) {
+    bool any_marks = false;
+    for (unsigned seed : {11U, 12U, 13U, 14U, 15U, 16U, 17U, 18U}) {
+        auto c = make_dup_chain(seed, 12, /*deletes=*/true);
+        auto dec = decompose(c.schema, c.chain, DUP_KEYS, false, nullptr);
+        any_marks = any_marks || !dec.marks.empty();
+        // a mark version is the version of a DELETE condition
+        for (const auto& mark : dec.marks) {
+            bool is_condition = false;
+            for (size_t i = 0; i < c.chain.size(); ++i) {
+                is_condition = is_condition || (c.is_delete[i] && c.chain[i]->end_version() == mark.mark_version);
+            }
+            EXPECT_TRUE(is_condition) << "mark version " << mark.mark_version;
+        }
+        expect_compose_equals_direct(c.schema, c.chain, DUP_KEYS, false, nullptr, dec,
+                                     "seed " + std::to_string(seed));
+        EXPECT_EQ(dec.serialize(),
+                  decompose(c.schema, c.chain, DUP_KEYS, false, nullptr, 4).serialize());
+    }
+    EXPECT_TRUE(any_marks) << "no DELETE condition matched a row, the test covers nothing";
+}
+
+TEST_F(RestoreDigestPrefixTest, DuplicateStaysComposableAfterCompaction) {
+    for (bool deletes : {false, true}) {
+        for (unsigned seed : {21U, 22U, 23U, 24U}) {
+            auto c = make_dup_chain(seed, 9, deletes);
+            auto schema = c.schema;
+            auto tablet = make_meta_tablet(DUP_KEYS, schema);
+            auto before = decompose(schema, c.chain, DUP_KEYS, false, nullptr);
+            std::map<int64_t, RestoreDigest> directs;
+            expect_compose_equals_direct(schema, c.chain, DUP_KEYS, false, nullptr, before, "before",
+                                         &directs);
+            // A base compaction covers the rowsets from the start of the chain (the DELETE
+            // conditions inside are applied for good). A cumulative compaction takes a run of data
+            // rowsets: the conditions after it stay effective for its rows.
+            struct Run {
+                size_t first;
+                size_t last;
+                ReaderType type;
+            };
+            std::vector<Run> runs = {{0, 4, ReaderType::READER_BASE_COMPACTION},
+                                     {0, 7, ReaderType::READER_BASE_COMPACTION}};
+            for (size_t i = 0; i + 1 < c.chain.size(); ++i) {
+                if (!c.is_delete[i] && !c.is_delete[i + 1] && c.chain[i]->num_rows() > 0) {
+                    size_t j = i + 1;
+                    while (j + 1 < c.chain.size() && !c.is_delete[j + 1] && j - i < 3) {
+                        ++j;
+                    }
+                    runs.push_back({i, j, ReaderType::READER_CUMULATIVE_COMPACTION});
+                    break;
+                }
+            }
+            for (const Run& run : runs) {
+                std::vector<RowsetSharedPtr> inputs(c.chain.begin() + run.first,
+                                                    c.chain.begin() + run.last + 1);
+                auto merged = compact(schema, tablet, inputs,
+                                      Version(inputs.front()->start_version(),
+                                              inputs.back()->end_version()),
+                                      run.type);
+                ASSERT_NE(nullptr, merged);
+                std::vector<RowsetSharedPtr> chain(c.chain.begin(), c.chain.begin() + run.first);
+                chain.push_back(merged);
+                chain.insert(chain.end(), c.chain.begin() + run.last + 1, c.chain.end());
+                auto dec = decompose(schema, chain, DUP_KEYS, false, nullptr);
+                const std::string what = std::string(deletes ? "deletes " : "") + "seed " +
+                                         std::to_string(seed) + " run " + std::to_string(run.first) +
+                                         "-" + std::to_string(run.last);
+                expect_compose_equals_direct(schema, chain, DUP_KEYS, false, nullptr, dec, what);
+                // the versions which are still boundaries give the digests of before the compaction
+                for (const auto& rs : chain) {
+                    RestoreDigest composed;
+                    ASSERT_TRUE(dec.compose(rs->end_version(), &composed).ok());
+                    EXPECT_TRUE(same_digest(directs.at(rs->end_version()), composed))
+                            << what << " version " << rs->end_version();
+                }
+                // the versions inside the merged rowset are not
+                for (int64_t v = merged->start_version(); v < merged->end_version(); ++v) {
+                    EXPECT_FALSE(dec.is_boundary(v)) << what << " version " << v;
+                    RestoreDigest composed;
+                    EXPECT_TRUE(dec.compose(v, &composed).is<ErrorCode::NOT_IMPLEMENTED_ERROR>());
+                }
+            }
+        }
+    }
+}
+
+TEST_F(RestoreDigestPrefixTest, MergeOnWriteComposeEqualsDirectAtEveryBoundary) {
+    for (unsigned seed : {31U, 32U, 33U, 34U, 35U, 36U, 37U, 38U}) {
+        auto c = make_mow_chain(seed, 12);
+        auto chain = c.chain();
+        auto dec = decompose(c.schema, chain, UNIQUE_KEYS, true, c.bitmap);
+        EXPECT_TRUE(dec.mow);
+        EXPECT_FALSE(dec.marks.empty());
+        // the simulation itself: what the model says is visible is what the digest reads
+        for (const auto& b : c.batches) {
+            RestoreDigest composed;
+            ASSERT_TRUE(dec.compose(b.version, &composed).ok());
+            EXPECT_EQ(c.visible_at(b.version), composed.rows) << "seed " << seed << " version " << b.version;
+        }
+        expect_compose_equals_direct(c.schema, chain, UNIQUE_KEYS, true, c.bitmap, dec,
+                                     "seed " + std::to_string(seed));
+        EXPECT_EQ(dec.serialize(),
+                  decompose(c.schema, chain, UNIQUE_KEYS, true, c.bitmap, 3).serialize());
+        // marks only at versions of the chain, never at a version of the base or below
+        for (const auto& mark : dec.marks) {
+            EXPECT_GT(mark.mark_version, 2);
+            EXPECT_LE(mark.mark_version, dec.base_version);
+        }
+    }
+}
+
+TEST_F(RestoreDigestPrefixTest, MergeOnWriteIgnoresMarksAboveTheBaseVersion) {
+    auto c = make_mow_chain(41, 10);
+    auto chain = c.chain();
+    // the backup is taken at version 7: later marks must not leak into any part
+    std::vector<RowsetSharedPtr> prefix;
+    for (const auto& b : c.batches) {
+        if (b.version <= 7) {
+            prefix.push_back(b.rs);
+        }
+    }
+    auto dec = decompose(c.schema, prefix, UNIQUE_KEYS, true, c.bitmap);
+    EXPECT_EQ(7, dec.base_version);
+    expect_compose_equals_direct(c.schema, prefix, UNIQUE_KEYS, true, c.bitmap, dec, "base 7");
+    for (const auto& mark : dec.marks) {
+        EXPECT_LE(mark.mark_version, 7);
+    }
+}
+
+TEST_F(RestoreDigestPrefixTest, MergeOnWriteStaysComposableAfterCompaction) {
+    for (unsigned seed : {51U, 52U, 53U, 54U, 55U, 56U}) {
+        auto c = make_mow_chain(seed, 12);
+        auto chain = c.chain();
+        auto before = decompose(c.schema, chain, UNIQUE_KEYS, true, c.bitmap);
+        std::map<int64_t, RestoreDigest> directs;
+        expect_compose_equals_direct(c.schema, chain, UNIQUE_KEYS, true, c.bitmap, before, "before",
+                                     &directs);
+        // compact twice in a row: [2, 5] first, then the result with its successor
+        MowChain once = compact_mow(c, 1, 4, seed);
+        MowChain twice = compact_mow(once, 0, 1, seed + 1);
+        for (const MowChain* after : {&once, &twice}) {
+            auto after_chain = after->chain();
+            auto dec = decompose(after->schema, after_chain, UNIQUE_KEYS, true, after->bitmap);
+            const std::string what = "seed " + std::to_string(seed);
+            expect_compose_equals_direct(after->schema, after_chain, UNIQUE_KEYS, true, after->bitmap,
+                                         dec, what);
+            for (const auto& b : after->batches) {
+                RestoreDigest composed;
+                ASSERT_TRUE(dec.compose(b.version, &composed).ok());
+                EXPECT_TRUE(same_digest(directs.at(b.version), composed))
+                        << what << " version " << b.version;
+                EXPECT_EQ(after->visible_at(b.version), composed.rows) << what;
+            }
+            for (const auto& b : after->batches) {
+                for (int64_t v = b.start; v < b.version; ++v) {
+                    EXPECT_FALSE(dec.is_boundary(v)) << what << " version " << v;
+                }
+            }
+        }
+    }
+}
+
+TEST_F(RestoreDigestPrefixTest, DeleteSignRowsAndTheirMarksAreNotCounted) {
+    auto schema = make_schema(UNIQUE_KEYS, mow_cols(), 3);
+    auto bitmap = std::make_shared<DeleteBitmap>(next_bitmap_tablet_id());
+    // v2: keys 1..4. v3: key 2 deleted (delete sign), key 3 updated. v4: key 2 written again, and
+    // the delete sign row of v3 is marked (or not, both are legal), key 3 deleted.
+    auto rs2 = write_rowset(schema,
+                            {mow_row({1, 10, 1, 0}), mow_row({2, 20, 1, 0}), mow_row({3, 30, 1, 0}),
+                             mow_row({4, 40, 1, 0})},
+                            2, 1000, false);
+    auto rs3 = write_rowset(schema, {mow_row({2, 0, 3, 1}), mow_row({3, 31, 3, 0})}, 3, 1000, false);
+    bitmap->add({rs2->rowset_id(), 0, 3}, 1); // key 2
+    bitmap->add({rs2->rowset_id(), 0, 3}, 2); // key 3
+    auto rs4 = write_rowset(schema, {mow_row({2, 21, 4, 0}), mow_row({3, 0, 4, 1})}, 4, 1000, false);
+    bitmap->add({rs3->rowset_id(), 0, 4}, 0); // the delete sign row of key 2
+    bitmap->add({rs3->rowset_id(), 0, 4}, 1); // key 3 of v3
+    std::vector<RowsetSharedPtr> chain = {rs2, rs3, rs4};
+    auto dec = decompose(schema, chain, UNIQUE_KEYS, true, bitmap);
+    // rowset parts hold the rows without the delete sign: 4 + 1 + 1
+    uint64_t counted = 0;
+    for (const auto& rs : dec.rowsets) {
+        for (const auto& b : rs.buckets) {
+            counted += b.count;
+        }
+    }
+    EXPECT_EQ(6U, counted);
+    // marks: v3 kills keys 2 and 3 of v2; v4 kills only key 3 of v3 (the delete sign row is not counted)
+    ASSERT_EQ(2U, dec.marks.size());
+    EXPECT_EQ(3, dec.marks[0].mark_version);
+    EXPECT_EQ(4, dec.marks[1].mark_version);
+    auto marked_rows = [](const RestoreDigestMarkPart& m) {
+        uint64_t n = 0;
+        for (const auto& b : m.buckets) {
+            n += b.count;
+        }
+        return n;
+    };
+    EXPECT_EQ(2U, marked_rows(dec.marks[0]));
+    EXPECT_EQ(1U, marked_rows(dec.marks[1]));
+    expect_compose_equals_direct(schema, chain, UNIQUE_KEYS, true, bitmap, dec, "delete sign");
+    RestoreDigest at4;
+    ASSERT_TRUE(dec.compose(4, &at4).ok());
+    EXPECT_EQ(3U, at4.rows); // keys 1 and 4 of v2, key 2 of v4
+}
+
+TEST_F(RestoreDigestPrefixTest, UnsupportedCasesAndBadVersions) {
+    // unique merge on read
+    {
+        auto schema = make_schema(UNIQUE_KEYS, mow_cols(), 3);
+        auto rs = write_rowset(schema, {mow_row({1, 1, 1, 0})}, 2, 100, false);
+        RestoreDigestInput in;
+        in.rowsets = {rs};
+        in.schema = schema;
+        in.keys_type = UNIQUE_KEYS;
+        in.enable_mow = false;
+        in.version = 2;
+        RestoreDigestDecomposed d;
+        Status st = decompose_restore_digest(in, kPrefixTabletId, &d);
+        EXPECT_TRUE(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>()) << st;
+        EXPECT_NE(std::string::npos, st.to_string().find("merge on read")) << st;
+    }
+    // unique merge on write with a DELETE condition
+    {
+        auto schema = make_schema(UNIQUE_KEYS, mow_cols(), 3);
+        auto bitmap = std::make_shared<DeleteBitmap>(next_bitmap_tablet_id());
+        auto rs2 = write_rowset(schema, {mow_row({1, 1, 1, 0}), mow_row({2, 2, 1, 0})}, 2, 100, false);
+        auto rs3 = write_delete_rowset(schema, 3, {cond("v1", "=", {"1"})});
+        RestoreDigestInput in;
+        in.rowsets = {rs2, rs3};
+        in.schema = schema;
+        in.keys_type = UNIQUE_KEYS;
+        in.enable_mow = true;
+        in.delete_bitmap = bitmap;
+        in.version = 3;
+        RestoreDigestDecomposed d;
+        Status st = decompose_restore_digest(in, kPrefixTabletId, &d);
+        EXPECT_TRUE(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>()) << st;
+        EXPECT_NE(std::string::npos, st.to_string().find("delete conditions")) << st;
+    }
+    // too many extra scans
+    {
+        auto c = make_dup_chain(61, 12, /*deletes=*/true);
+        int deletes = 0;
+        for (bool is_delete : c.is_delete) {
+            deletes += is_delete ? 1 : 0;
+        }
+        ASSERT_GT(deletes, 0);
+        const int32_t saved = config::restore_digest_prefix_max_scans;
+        config::restore_digest_prefix_max_scans = 1;
+        RestoreDigestInput in;
+        in.rowsets = c.chain;
+        in.schema = c.schema;
+        in.keys_type = DUP_KEYS;
+        in.version = c.chain.back()->end_version();
+        RestoreDigestDecomposed d;
+        Status st = decompose_restore_digest(in, kPrefixTabletId, &d);
+        config::restore_digest_prefix_max_scans = saved;
+        EXPECT_TRUE(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>()) << st;
+        EXPECT_NE(std::string::npos, st.to_string().find("extra scans")) << st;
+    }
+    // the base version must be the end of the last rowset
+    {
+        auto c = make_dup_chain(62, 3, false);
+        RestoreDigestInput in;
+        in.rowsets = c.chain;
+        in.schema = c.schema;
+        in.keys_type = DUP_KEYS;
+        in.version = c.chain.back()->end_version() + 1;
+        RestoreDigestDecomposed d;
+        EXPECT_TRUE(decompose_restore_digest(in, kPrefixTabletId, &d).is<ErrorCode::INVALID_ARGUMENT>());
+    }
+}
+
+TEST_F(RestoreDigestPrefixTest, FileIsCheckedAgainstItsRoot) {
+    auto c = make_dup_chain(71, 6, true);
+    auto dec = decompose(c.schema, c.chain, DUP_KEYS, false, nullptr);
+    const std::string content = dec.serialize();
+    const std::string root = dec.file_root();
+    EXPECT_EQ(64U, root.size());
+    RestoreDigestDecomposed out;
+    EXPECT_TRUE(RestoreDigestDecomposed::parse(content, root, kPrefixTabletId, &out).ok());
+    // wrong root, wrong tablet
+    EXPECT_TRUE(RestoreDigestDecomposed::parse(content, std::string(64, '0'), kPrefixTabletId, &out)
+                        .is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
+    EXPECT_TRUE(RestoreDigestDecomposed::parse(content, root, kPrefixTabletId + 1, &out)
+                        .is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
+    // a flipped byte, a truncated file, trailing bytes: the root catches them, and a file whose root
+    // was recomputed over bad content is rejected by the parser
+    auto sha = [](const std::string& data) {
+        SHA256Digest d;
+        d.reset(data.data(), data.size());
+        return std::string(d.digest());
+    };
+    for (size_t pos : {size_t(0), size_t(5), content.size() / 2, content.size() - 1}) {
+        std::string bad = content;
+        bad[pos] = static_cast<char>(bad[pos] ^ 0x5A);
+        EXPECT_TRUE(RestoreDigestDecomposed::parse(bad, root, kPrefixTabletId, &out)
+                            .is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
+        Status st = RestoreDigestDecomposed::parse(bad, sha(bad), kPrefixTabletId, &out);
+        // a flip inside a bucket value is a valid file with other numbers; anything structural is not
+        if (!st.ok()) {
+            EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+        }
+    }
+    for (std::string bad : {content.substr(0, content.size() - 3), content + "x", std::string(),
+                            content.substr(0, 10)}) {
+        EXPECT_TRUE(RestoreDigestDecomposed::parse(bad, sha(bad), kPrefixTabletId, &out)
+                            .is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
+    }
+    // sparse: a rowset with few rows takes few bytes
+    EXPECT_LT(content.size(), 6 * (RestoreDigest::kNumBuckets * 26 + 64) + 4096);
+}
+
+// A digest of a different shape (complex columns, a wide schema) decomposes the same way.
+TEST_F(RestoreDigestPrefixTest, WideSchemaComposes) {
+    auto schema = make_schema(DUP_KEYS, wide_cols());
+    std::vector<RowsetSharedPtr> chain;
+    int next = 0;
+    for (int64_t v = 2; v <= 5; ++v) {
+        std::vector<Row> rows;
+        for (int i = 0; i < 40; ++i) {
+            rows.push_back(wide_row(next++ % 90));
+        }
+        chain.push_back(write_rowset(schema, rows, v, 17, v % 2 == 0));
+    }
+    auto dec = decompose(schema, chain, DUP_KEYS, false, nullptr, 2);
+    expect_compose_equals_direct(schema, chain, DUP_KEYS, false, nullptr, dec, "wide");
+}
+
+// ===== 13. decomposed digest of real tablets ==================================================
+
+TEST_F(RestoreDigestTabletTest, DecomposedDigestOfMowAndDuplicateTablets) {
+    _next_id = 910000; // not the ids of another test, see the segment cache
+    // unique merge on write: the scenario of the partial update test, with versions 2..4
+    auto mow = create_tablet(7201, true);
+    ASSERT_NE(nullptr, mow);
+    auto schema = mow->tablet_schema();
+    auto rs2 = write(mow, schema, 2, {{{1, 10}, {2, 20}, {3, 30}, {4, 40}, {5, 50}, {6, 60}}}, false, true);
+    auto rs3 = write(mow, schema, 3, {{{3, 31}, {5, 51}}, {{3, 32}}}, true, true);
+    auto& bitmap = mow->tablet_meta()->delete_bitmap();
+    bitmap.add({rs2->rowset_id(), 0, 3}, 2);
+    bitmap.add({rs2->rowset_id(), 0, 3}, 4);
+    bitmap.add({rs3->rowset_id(), 0, 3}, 0);
+    auto rs4 = write(mow, schema, 4, {{{1, 0, 1}, {6, 61}}}, false, true);
+    bitmap.add({rs2->rowset_id(), 0, 4}, 0);
+    bitmap.add({rs2->rowset_id(), 0, 4}, 5);
+    (void)rs4;
+
+    RestoreDigestDecomposed dec;
+    ASSERT_TRUE(compute_tablet_restore_digest_decomposed(*_engine, 7201, 4, 2, &dec).ok());
+    EXPECT_EQ(7201, dec.tablet_id);
+    EXPECT_EQ(4, dec.base_version);
+    EXPECT_TRUE(dec.mow);
+    for (int64_t v : {int64_t(1), int64_t(2), int64_t(3), int64_t(4)}) {
+        RestoreDigest composed;
+        ASSERT_TRUE(dec.compose(v, &composed).ok()) << v;
+        EXPECT_TRUE(digests_equal(tablet_digest(7201, v), composed)) << "version " << v;
+    }
+    // the base version of the backup may be below the head of the tablet
+    RestoreDigestDecomposed at3;
+    ASSERT_TRUE(compute_tablet_restore_digest_decomposed(*_engine, 7201, 3, 1, &at3).ok());
+    EXPECT_EQ(3, at3.base_version);
+    RestoreDigest c3;
+    RestoreDigest c3_of_head;
+    ASSERT_TRUE(at3.compose(3, &c3).ok());
+    ASSERT_TRUE(dec.compose(3, &c3_of_head).ok());
+    EXPECT_TRUE(digests_equal(c3_of_head, c3));
+    EXPECT_FALSE(at3.is_boundary(4));
+
+    // duplicate with a DELETE condition
+    auto dup = create_tablet(7202, false);
+    ASSERT_NE(nullptr, dup);
+    auto dschema = dup->tablet_schema();
+    std::vector<TabRow> a;
+    std::vector<TabRow> b;
+    for (int k = 0; k < 100; ++k) {
+        a.push_back({k, k % 10});
+    }
+    for (int k = 50; k < 150; ++k) {
+        b.push_back({k, (k * 7) % 10});
+    }
+    write(dup, dschema, 2, {a}, false, true);
+    write(dup, dschema, 3, {b}, false, true);
+    write_delete(dup, 4, {cond("v", "=", "3")});
+    write(dup, dschema, 5, {{{500, 3}, {501, 4}}}, false, true);
+    write_delete(dup, 6, {cond("k", "<", "20")});
+    RestoreDigestDecomposed ddec;
+    ASSERT_TRUE(compute_tablet_restore_digest_decomposed(*_engine, 7202, 6, 3, &ddec).ok());
+    EXPECT_FALSE(ddec.mow);
+    ASSERT_EQ(2U, ddec.marks.size());
+    EXPECT_EQ(4, ddec.marks[0].mark_version);
+    EXPECT_EQ(6, ddec.marks[1].mark_version);
+    for (int64_t v : {int64_t(1), int64_t(2), int64_t(3), int64_t(4), int64_t(5), int64_t(6)}) {
+        RestoreDigest composed;
+        ASSERT_TRUE(ddec.compose(v, &composed).ok()) << v;
+        EXPECT_TRUE(digests_equal(tablet_digest(7202, v), composed)) << "version " << v;
+    }
+
+    // not supported: merge on read, with the reason
+    auto mor = create_tablet(7203, /*mow=*/false, /*unique=*/true);
+    ASSERT_NE(nullptr, mor);
+    write(mor, mor->tablet_schema(), 2, {{{1, 10}}}, false, true);
+    RestoreDigestDecomposed none;
+    Status st = compute_tablet_restore_digest_decomposed(*_engine, 7203, 2, 1, &none);
+    EXPECT_TRUE(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>()) << st;
+}
+
+TEST_F(RestoreDigestTabletTest, LogicalDigestComesFromTheDecomposedDigest) {
+    _next_id = 920000; // not the ids of another test, see the segment cache
+    auto tablet = create_tablet(7211, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    write(tablet, schema, 2, {{{1, 10}, {2, 20}, {3, 30}}}, false, true);
+    write(tablet, schema, 3, {{{4, 40}, {5, 50}}}, false, true);
+    RestoreDigest direct = tablet_digest(7211, 3);
+
+    // a miss: one pass, the digest is composed from the parts and cached
+    RestoreDigestCache cache(/*capacity=*/16);
+    LogicalDigestResult first;
+    RestoreDigestDecomposed dec;
+    Status dec_status = Status::InternalError("not set");
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7211, 3, 2, &cache, &first, &dec, &dec_status).ok());
+    EXPECT_TRUE(dec_status.ok()) << dec_status;
+    EXPECT_FALSE(first.from_cache);
+    EXPECT_EQ(direct.root, first.root);
+    EXPECT_EQ(direct.schema_sig, first.schema_sig);
+    EXPECT_EQ(direct.rows, first.rows);
+    EXPECT_EQ(1U, cache.size());
+    EXPECT_EQ(first.root, dec.root);
+    EXPECT_EQ(3, dec.base_version);
+
+    // a hit with the same root: the decomposed digest is produced all the same
+    LogicalDigestResult second;
+    RestoreDigestDecomposed dec2;
+    dec_status = Status::InternalError("not set");
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7211, 3, 1, &cache, &second, &dec2, &dec_status).ok());
+    EXPECT_TRUE(dec_status.ok()) << dec_status;
+    EXPECT_TRUE(second.from_cache);
+    EXPECT_EQ(dec.serialize(), dec2.serialize());
+
+    // without asking for it: nothing changes
+    LogicalDigestResult plain;
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7211, 3, 1, &cache, &plain).ok());
+    EXPECT_EQ(direct.root, plain.root);
+
+    // the cache holds another root for the key: the decomposed digest is dropped, the cached value wins
+    RestoreDigestCache poisoned(/*capacity=*/16);
+    RestoreDigestCache::Key key;
+    key.tablet_id = 7211;
+    key.version = 3;
+    key.algo_version = RestoreDigest::kAlgoVersion;
+    key.schema_sig = direct.schema_sig;
+    LogicalDigestResult bogus;
+    bogus.schema_sig = direct.schema_sig;
+    bogus.root = std::string(64, 'f');
+    bogus.rows = 5;
+    poisoned.insert(key, bogus);
+    LogicalDigestResult got;
+    RestoreDigestDecomposed dec3;
+    dec_status = Status::OK();
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7211, 3, 1, &poisoned, &got, &dec3, &dec_status).ok());
+    EXPECT_FALSE(dec_status.ok());
+    EXPECT_TRUE(dec3.rowsets.empty());
+    EXPECT_EQ(bogus.root, got.root);
+
+    // merge on read: the digest is computed as before, the decomposed digest says why it is absent
+    auto mor = create_tablet(7212, /*mow=*/false, /*unique=*/true);
+    ASSERT_NE(nullptr, mor);
+    write(mor, mor->tablet_schema(), 2, {{{1, 10}, {2, 20}}}, false, true);
+    write(mor, mor->tablet_schema(), 3, {{{2, 21}}}, false, true);
+    LogicalDigestResult mor_result;
+    RestoreDigestDecomposed mor_dec;
+    dec_status = Status::OK();
+    ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7212, 3, 1, nullptr, &mor_result, &mor_dec, &dec_status).ok());
+    EXPECT_TRUE(dec_status.is<ErrorCode::NOT_IMPLEMENTED_ERROR>()) << dec_status;
+    EXPECT_TRUE(mor_dec.rowsets.empty());
+    EXPECT_EQ(tablet_digest(7212, 3).root, mor_result.root);
+    EXPECT_EQ(2U, mor_result.rows);
 }
 
 } // namespace doris

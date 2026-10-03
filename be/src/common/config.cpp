@@ -290,6 +290,12 @@ DEFINE_Int32(restore_digest_task_concurrency, "2");
 DEFINE_mInt32(restore_digest_threads, "4");
 // max number of entries of the in-memory logical digest cache, 0 disables the cache
 DEFINE_mInt64(restore_digest_cache_capacity, "100000");
+// whether the snapshot task, besides the logical digest, also writes the per rowset decomposed digest
+// (the rdigest file) from which the digest at any rowset boundary version can be composed
+DEFINE_mBool(restore_digest_prefix_enabled, "true");
+// max number of extra scans (delete bitmap versions of a rowset for unique MoW, delete conditions for
+// duplicate) a decomposed digest may need; a tablet that needs more has no decomposed digest
+DEFINE_mInt32(restore_digest_prefix_max_scans, "4096");
 // download binlog meta timeout, default 30s
 DEFINE_mInt32(download_binlog_meta_timeout_ms, "30000");
 // the interval time(seconds) for agent report index policy to FE

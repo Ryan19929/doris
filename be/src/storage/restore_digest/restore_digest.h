@@ -22,6 +22,7 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -198,11 +199,103 @@ private:
 Status compute_restore_digest_schema_sig(const TabletSchema& schema, KeysType keys_type,
                                          bool enable_mow, std::string* schema_sig);
 
+using DigestBuckets = std::array<RestoreDigest::Bucket, RestoreDigest::kNumBuckets>;
+
+// The digest of a tablet at its backup version V_b, decomposed so that the digest at any rowset
+// boundary version V_l <= V_b can be composed without reading any data (phase 1 of the incremental
+// restore, see R2 design section 13).
+//
+// The visible rows at a version V are the rows of the rowsets with end <= V which are alive at V. A
+// row has a death version: the lowest version at which it stops being visible, because
+//   * (unique MoW) the delete bitmap marks it at that version, or
+//   * (duplicate) a DELETE condition of that version matches it (the condition removes the rows of the
+//     rowsets with end < version, the same rule the query path uses).
+// Delete sign rows are never visible. So, with
+//   rowset_buckets(R)  = buckets of the rows of R which are alive at R.end_version
+//   mark_buckets(k)    = buckets of the rows whose death version is k (> the end version of their
+//                        rowset), summed over all rowsets
+// the digest at a boundary V_l is
+//   compose(V_l) = sum(rowset_buckets(R), R.end <= V_l) - sum(mark_buckets(k), k <= V_l)
+// (every mark k of a row has k > R.end, so "the marked row's rowset ends <= V_l" holds whenever
+// k <= V_l). The sums are modulo 2^128, the counts are plain integers, both are exact, so the result
+// equals the digest computed directly at V_l, bucket by bucket.
+//
+// Supported: duplicate (also with DELETE conditions) and unique MoW without DELETE conditions. Unique
+// MoR (rows are merged across rowsets, not additive), unique MoW with DELETE conditions (the death
+// version would be the minimum of two independent sources), and tablets which need more than
+// config::restore_digest_prefix_max_scans extra scans are NotSupported.
+struct RestoreDigestRowsetPart {
+    std::string rowset_id; // on the source tablet, informational
+    int64_t start_version = 0;
+    int64_t end_version = 0;
+    DigestBuckets buckets {};
+};
+
+struct RestoreDigestMarkPart {
+    int64_t mark_version = 0;
+    DigestBuckets buckets {};
+};
+
+struct RestoreDigestDecomposed {
+    static constexpr uint32_t kFormatVersion = 1;
+    // file name next to the manifest of a local snapshot: <snapshot>/<tablet_id>/rdigest
+    static constexpr std::string_view kLocalFileName = "rdigest";
+
+    uint32_t algo_version = RestoreDigest::kAlgoVersion;
+    std::string schema_sig; // hex
+    bool mow = false;
+    int64_t tablet_id = 0;
+    // V_b, the version of the backup: the end version of the last rowset
+    int64_t base_version = 0;
+    // the digest at V_b, hex, and its row count; equals compose(base_version)
+    std::string root;
+    uint64_t rows = 0;
+    // sorted by end_version, the chain of the rowsets of (0, base_version]
+    std::vector<RestoreDigestRowsetPart> rowsets;
+    // sorted by mark_version, only the versions which have marked rows
+    std::vector<RestoreDigestMarkPart> marks;
+
+    // Binary content of the rdigest file. Sparse: only the buckets with rows are written.
+    std::string serialize() const;
+    // Parses a file, after checking that its SHA-256 is `expected_root` (RESTORE_MANIFEST_MISMATCH
+    // otherwise, also for a malformed file or a file of another tablet).
+    static Status parse(std::string_view content, std::string_view expected_root,
+                        int64_t expected_tablet_id, RestoreDigestDecomposed* out);
+    // Lower case hex SHA-256 of serialize(): the root of the file recorded in the backup job info.
+    std::string file_root() const;
+
+    // Whether `version` is the end version of one of the rowsets.
+    bool is_boundary(int64_t version) const;
+    // The digest at `version`, with the same buckets, rows and root as compute_restore_digest at
+    // `version`. NotSupported if `version` is not a rowset boundary (the other fields of the digest
+    // that describe the scan are left at their defaults).
+    Status compose(int64_t version, RestoreDigest* digest) const;
+};
+
+// Decomposed digest of the rowsets of a snapshot input (the layer which unit tests drive directly).
+// `input.version` is V_b and must be the end version of the last rowset. MoR and the other
+// unsupported cases return NotSupported with the reason.
+Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_id,
+                                RestoreDigestDecomposed* out);
+
+// Decomposed digest of tablet `tablet_id` at (0, version].
+Status compute_tablet_restore_digest_decomposed(StorageEngine& engine, int64_t tablet_id,
+                                                int64_t version, int threads,
+                                                RestoreDigestDecomposed* out);
+
 // The digest of tablet `tablet_id` at (0, version] for backup / restore: looks `cache` up first (by
 // the schema_sig of the tablet) and computes + caches on a miss. threads <= 0 means
 // config::restore_digest_threads. `cache` may be null (no caching).
+//
+// If `decomposed` is not null, the decomposed digest is produced as well and `*decomposed_status`
+// tells whether it is valid (when it is not, `decomposed` is left empty and the status says why: the
+// tablet is not supported, or a failure). When the decomposed digest is valid the whole digest is
+// composed from it, so the tablet is scanned only once; if the cache holds another root for the same
+// key, the decomposed digest is dropped as inconsistent and the cached value is returned.
 Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
                                  int threads, RestoreDigestCache* cache,
-                                 LogicalDigestResult* result);
+                                 LogicalDigestResult* result,
+                                 RestoreDigestDecomposed* decomposed = nullptr,
+                                 Status* decomposed_status = nullptr);
 
 } // namespace doris

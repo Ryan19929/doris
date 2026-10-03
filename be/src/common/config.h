@@ -346,6 +346,8 @@ DECLARE_mBool(restore_manifest_digest_check);
 DECLARE_Int32(restore_digest_task_concurrency);
 DECLARE_mInt32(restore_digest_threads);
 DECLARE_mInt64(restore_digest_cache_capacity);
+DECLARE_mBool(restore_digest_prefix_enabled);
+DECLARE_mInt32(restore_digest_prefix_max_scans);
 // download binlog meta timeout
 DECLARE_mInt32(download_binlog_meta_timeout_ms);
 // the interval time(seconds) for agent report index policy to FE
