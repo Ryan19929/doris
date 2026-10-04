@@ -132,7 +132,8 @@ suite("test_backup_restore_atomic_reuse", "backup_restore") {
             boolean ready = true
             for (String tbl : [dupTable, uniqTable]) {
                 def tablets = sql_return_maparray "SHOW TABLETS FROM ${db}.${tbl}"
-                if (tablets.any { (it.LocalDataSize as long) == 0 && (it.RowCount as long) > 0 }) {
+                // every tablet of the tables has rows, and its size is reported by the backend
+                if (tablets.any { (it.LocalDataSize as long) == 0 }) {
                     ready = false
                 }
             }
