@@ -224,6 +224,7 @@ suite("test_backup_restore_atomic_reuse", "backup_restore") {
     assertSame(dbA, dbB)
 
     setConfig("restore_reuse_min_partition_bytes", "1073741824")
+    setConfig("enable_restore_atomic_reuse", "false")
     for (String db : [dbA, dbB]) {
         sql "DROP DATABASE ${db} FORCE"
     }
