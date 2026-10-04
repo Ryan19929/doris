@@ -492,6 +492,12 @@ struct TSnapshotRequest {
     16: optional bool compute_logical_digest
     // restore only: make an empty snapshot dir, to download the increment of the incremental restore into
     17: optional bool restore_incremental
+    // restore only (atomic restore, partition level reuse): the data source of the snapshot is the local tablet
+    // ref_tablet_id (the tablet of the table being replaced) at `version`, instead of the tablet itself. Its files are
+    // hard linked into the snapshot dir of the tablet, or copied if the two tablets are not on the same disk. With
+    // restore_incremental the snapshot is loaded into the tablet at once (as the move of the restore does), and an
+    // empty snapshot dir is made for the increment to be downloaded into.
+    18: optional bool restore_local_source
 }
 
 // Where to read the decomposed digest file (rdigest) of the tablet of a backup, for the incremental restore

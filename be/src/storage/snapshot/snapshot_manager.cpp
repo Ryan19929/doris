@@ -105,7 +105,8 @@ SnapshotManager::SnapshotManager(StorageEngine& engine) : _engine(engine) {
 SnapshotManager::~SnapshotManager() = default;
 
 Status SnapshotManager::make_snapshot(const TSnapshotRequest& request, string* snapshot_path,
-                                      bool* allow_incremental_clone) {
+                                      bool* allow_incremental_clone,
+                                      LocalSourceStats* local_source_stats) {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
     Status res = Status::OK();
     if (snapshot_path == nullptr) {
@@ -120,10 +121,40 @@ Status SnapshotManager::make_snapshot(const TSnapshotRequest& request, string* s
         return Status::Error<TABLE_NOT_FOUND>("failed to get tablet. tablet={}", request.tablet_id);
     }
 
+    const bool local_source = request.__isset.restore_local_source && request.restore_local_source;
+    if (local_source && (!request.__isset.ref_tablet_id || !request.__isset.version ||
+                         request.ref_tablet_id == request.tablet_id)) {
+        return Status::Error<INVALID_ARGUMENT>(
+                "a local source snapshot needs the tablet to read from and the version. tablet={}",
+                request.tablet_id);
+    }
+
     TabletSharedPtr ref_tablet = target_tablet;
     if (request.__isset.ref_tablet_id) {
         int64_t ref_tablet_id = request.ref_tablet_id;
         TabletSharedPtr base_tablet = _engine.tablet_manager()->get_tablet(ref_tablet_id);
+
+        if (local_source) {
+            // The data is what the table being replaced has: no fallback to the tablet itself, which is empty. If
+            // the two tablets are not on the same disk the files are copied.
+            if (base_tablet == nullptr) {
+                return Status::Error<TABLE_NOT_FOUND>(
+                        "failed to get the local source tablet. tablet={}, source tablet={}",
+                        request.tablet_id, ref_tablet_id);
+            }
+            ref_tablet = std::move(base_tablet);
+            res = _create_snapshot_files(ref_tablet, target_tablet, request, snapshot_path,
+                                         allow_incremental_clone, local_source_stats);
+            if (!res.ok()) {
+                LOG(WARNING) << "failed to make local source snapshot. res=" << res
+                             << " tablet=" << request.tablet_id << " source tablet=" << ref_tablet_id;
+                return res;
+            }
+            LOG(INFO) << "success to make local source snapshot. path=['" << *snapshot_path << "']"
+                      << " tablet=" << request.tablet_id << " source tablet=" << ref_tablet_id
+                      << " version=" << request.version;
+            return res;
+        }
 
         // Some tasks, like medium migration, cause the target tablet and base tablet to stay on
         // different disks. In this case, we fall through to the normal restore path.
@@ -136,7 +167,7 @@ Status SnapshotManager::make_snapshot(const TSnapshotRequest& request, string* s
     }
 
     res = _create_snapshot_files(ref_tablet, target_tablet, request, snapshot_path,
-                                 allow_incremental_clone);
+                                 allow_incremental_clone, nullptr);
 
     if (!res.ok()) {
         LOG(WARNING) << "failed to make snapshot. res=" << res << " tablet=" << request.tablet_id;
@@ -455,7 +486,8 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
                                                const TabletSharedPtr& target_tablet,
                                                const TSnapshotRequest& request,
                                                string* snapshot_path,
-                                               bool* allow_incremental_clone) {
+                                               bool* allow_incremental_clone,
+                                               LocalSourceStats* local_source_stats) {
     int32_t snapshot_version = request.preferred_snapshot_version;
     LOG(INFO) << "receive a make snapshot request"
               << ", request detail is " << apache::thrift::ThriftDebugString(request)
@@ -500,7 +532,13 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
     string snapshot_id;
     RETURN_IF_ERROR(io::global_local_filesystem()->canonicalize(snapshot_id_path, &snapshot_id));
 
-    if (request.__isset.restore_incremental && request.restore_incremental) {
+    const bool local_source = request.__isset.restore_local_source && request.restore_local_source;
+    // the files of the local source tablet are copied if it is not on the same disk
+    bool copy_files =
+            local_source && ref_tablet->data_dir()->path() != target_tablet->data_dir()->path();
+    DBUG_EXECUTE_IF("SnapshotManager.restore_local_source.force_copy", { copy_files = local_source; });
+    LocalSourceStats source_stats;
+    if (request.__isset.restore_incremental && request.restore_incremental && !local_source) {
         // the dir to download the increment of the incremental restore into: no rowset, no tablet meta
         *snapshot_path = snapshot_id;
         return Status::OK();
@@ -673,9 +711,19 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
         for (auto& rs : consistent_rowsets) {
             if (rs->is_local()) {
                 // local rowset
-                res = rs->link_files_to(schema_full_path, rs->rowset_id());
+                if (copy_files) {
+                    res = rs->copy_files_to(schema_full_path, rs->rowset_id());
+                } else {
+                    res = rs->link_files_to(schema_full_path, rs->rowset_id());
+                }
                 if (!res.ok()) {
                     break;
+                }
+                if (local_source) {
+                    (copy_files ? source_stats.copied_files : source_stats.linked_files) +=
+                            rs->num_segments();
+                    (copy_files ? source_stats.copied_bytes : source_stats.linked_bytes) +=
+                            rs->rowset_meta()->total_disk_size();
                 }
             }
             rs_metas.push_back(rs->rowset_meta());
@@ -863,6 +911,10 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
         }
     } else {
         *snapshot_path = snapshot_id;
+        if (local_source && local_source_stats != nullptr) {
+            source_stats.tablets = 1;
+            *local_source_stats = source_stats;
+        }
     }
 
     return res;

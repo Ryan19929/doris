@@ -1667,8 +1667,21 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     bool allow_incremental_clone = false; // not used
     std::vector<std::string> snapshot_files;
     std::string manifest_root;
-    Status status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
-                                                         &allow_incremental_clone);
+    const bool local_source =
+            snapshot_request.__isset.restore_local_source && snapshot_request.restore_local_source;
+    LocalSourceStats local_source_stats;
+    Status status;
+    if (local_source && snapshot_request.__isset.restore_incremental &&
+        snapshot_request.restore_incremental) {
+        SnapshotLoader loader(engine, ExecEnv::GetInstance(), 0, snapshot_request.tablet_id);
+        SCOPED_ATTACH_TASK(loader.resource_ctx());
+        status = loader.make_local_source_snapshot_and_load(snapshot_request, &snapshot_path,
+                                                            &local_source_stats);
+    } else {
+        status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
+                                                      &allow_incremental_clone,
+                                                      local_source ? &local_source_stats : nullptr);
+    }
     if (status.ok() && snapshot_request.__isset.list_files) {
         // list and save all snapshot files
         // snapshot_path like: data/snapshot/20180417205230.1.86400
@@ -1756,6 +1769,15 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     }
     if (logical_digest.has_value()) {
         finish_task_request.__set_logical_digest(*logical_digest);
+    }
+    if (status.ok() && local_source) {
+        TDownloadStats stats;
+        stats.__set_local_source_tablets(local_source_stats.tablets);
+        stats.__set_local_source_linked_files(local_source_stats.linked_files);
+        stats.__set_local_source_linked_bytes(local_source_stats.linked_bytes);
+        stats.__set_local_source_copied_files(local_source_stats.copied_files);
+        stats.__set_local_source_copied_bytes(local_source_stats.copied_bytes);
+        finish_task_request.__set_download_stats(stats);
     }
     finish_task_request.__set_task_status(status.to_thrift());
 

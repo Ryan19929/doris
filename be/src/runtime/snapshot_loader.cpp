@@ -65,6 +65,7 @@
 #include "storage/tablet/tablet.h"
 #include "storage/tablet/tablet_manager.h"
 #include "util/client_cache.h"
+#include "util/defer_op.h"
 #include "util/md5.h"
 #include "util/s3_uri.h"
 #include "util/s3_util.h"
@@ -2448,6 +2449,35 @@ Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr ta
     LOG(INFO) << "finished to reload header of tablet: " << tablet_id;
 
     return status;
+}
+
+Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotRequest& request,
+                                                           std::string* snapshot_path,
+                                                           LocalSourceStats* stats) {
+    auto tablet = _engine.tablet_manager()->get_tablet(request.tablet_id);
+    if (tablet == nullptr) {
+        return Status::Error<ErrorCode::TABLE_NOT_FOUND>("failed to get tablet. tablet={}",
+                                                         request.tablet_id);
+    }
+    TSnapshotRequest source_request = request;
+    source_request.__set_restore_incremental(false);
+    std::string source_path;
+    bool allow_incremental_clone = false; // not used
+    RETURN_IF_ERROR(_engine.snapshot_mgr()->make_snapshot(source_request, &source_path,
+                                                          &allow_incremental_clone, stats));
+    Defer release_source {[&]() {
+        Status st = _engine.snapshot_mgr()->release_snapshot(source_path);
+        if (!st.ok()) {
+            LOG(WARNING) << "failed to release the local source snapshot " << source_path << ": "
+                         << st;
+        }
+    }};
+    RETURN_IF_ERROR(move(fmt::format("{}/{}/{}", source_path, request.tablet_id, request.schema_hash),
+                         tablet, true));
+    TSnapshotRequest empty_request = request;
+    empty_request.__set_restore_local_source(false);
+    return _engine.snapshot_mgr()->make_snapshot(empty_request, snapshot_path,
+                                                 &allow_incremental_clone, nullptr);
 }
 
 Status SnapshotLoader::append_increment(const std::string& snapshot_path, TabletSharedPtr tablet,

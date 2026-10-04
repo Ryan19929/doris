@@ -23,6 +23,7 @@
 #include <gen_cpp/Types_types.h>
 #include <gen_cpp/olap_file.pb.h>
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <xxh3.h>
 
@@ -30,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -3658,6 +3660,320 @@ TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
     ASSERT_TRUE(st.ok()) << st;
     whole_restore(src, whole, 6);
     EXPECT_TRUE(digests_equal(tablet_digest(7433, 6), tablet_digest(7432, 6)));
+}
+
+
+// The atomic restore keeps the data of the table being replaced: the snapshot of a tablet made from the local source
+// tablet (TSnapshotRequest.restore_local_source).
+class RestoreLocalSourceTest : public RestoreIncrementalAppendTest {
+protected:
+    size_t snapshot_dirs(const TabletSharedPtr& tablet) {
+        std::string dir = tablet->data_dir()->path() + "/snapshot";
+        if (!std::filesystem::exists(dir)) {
+            return 0;
+        }
+        return std::distance(std::filesystem::directory_iterator(dir),
+                             std::filesystem::directory_iterator());
+    }
+
+    TSnapshotRequest local_source_request(const TabletSharedPtr& src, const TabletSharedPtr& target,
+                                          int64_t version) {
+        TSnapshotRequest req;
+        req.__set_tablet_id(target->tablet_id());
+        req.__set_schema_hash(target->schema_hash());
+        req.__set_ref_tablet_id(src->tablet_id());
+        req.__set_version(version);
+        req.__set_restore_local_source(true);
+        return req;
+    }
+
+    // keep the data of src at `version` in target, as the snapshot and the move of the restore do
+    LocalSourceStats keep(const TabletSharedPtr& src, const TabletSharedPtr& target, int64_t version) {
+        TSnapshotRequest req = local_source_request(src, target, version);
+        std::string path;
+        bool allow = false;
+        LocalSourceStats stats;
+        Status st = _engine->snapshot_mgr()->make_snapshot(req, &path, &allow, &stats);
+        EXPECT_TRUE(st.ok()) << st;
+        std::string dir = fmt::format("{}/{}/{}", path, target->tablet_id(), target->schema_hash());
+        SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+        st = loader.move(dir, target, true);
+        EXPECT_TRUE(st.ok()) << st;
+        return stats;
+    }
+
+    void force_copy(bool copy) {
+        config::enable_debug_points = true;
+        DebugPoints::instance()->clear();
+        if (copy) {
+            DebugPoints::instance()->add("SnapshotManager.restore_local_source.force_copy");
+        }
+    }
+
+    int64_t hard_links(const TabletSharedPtr& tablet) {
+        std::vector<io::FileInfo> files;
+        bool exists = false;
+        EXPECT_TRUE(io::global_local_filesystem()->list(tablet->tablet_path(), true, &files, &exists).ok());
+        int64_t linked = 0;
+        for (const auto& f : files) {
+            struct stat st;
+            std::string path = tablet->tablet_path() + "/" + f.file_name;
+            if (f.file_name.ends_with(".dat") && stat(path.c_str(), &st) == 0 && st.st_nlink > 1) {
+                ++linked;
+            }
+        }
+        return linked;
+    }
+
+    void run_keep(bool mow, int64_t base_id, bool copy) {
+        _next_id = 970000 + base_id;
+        force_copy(copy);
+        Defer defer([]() {
+            DebugPoints::instance()->clear();
+            config::enable_debug_points = false;
+        });
+        auto src = create_tablet(base_id, mow);
+        auto target = create_tablet(base_id + 1, mow);
+        ASSERT_NE(nullptr, src);
+        ASSERT_NE(nullptr, target);
+        build_source(src, mow);
+        auto files_before = tablet_files(src);
+        RestoreDigest src_digest = tablet_digest(src->tablet_id(), 6);
+
+        LocalSourceStats stats = keep(src, target, 6);
+        EXPECT_EQ(1, stats.tablets);
+        // the files are linked or copied, one of the two
+        if (copy) {
+            EXPECT_EQ(0, stats.linked_files);
+            EXPECT_EQ(0, stats.linked_bytes);
+            EXPECT_GT(stats.copied_files, 0);
+            EXPECT_GT(stats.copied_bytes, 0);
+        } else {
+            EXPECT_EQ(0, stats.copied_files);
+            EXPECT_EQ(0, stats.copied_bytes);
+            EXPECT_GT(stats.linked_files, 0);
+            EXPECT_GT(stats.linked_bytes, 0);
+        }
+        auto moved = _engine->tablet_manager()->get_tablet(target->tablet_id());
+        ASSERT_NE(nullptr, moved);
+        EXPECT_EQ(6, moved->max_version_unlocked());
+        EXPECT_TRUE(digests_equal(src_digest, tablet_digest(target->tablet_id(), 6)));
+        // the source tablet is not changed in any way
+        EXPECT_EQ(files_before, tablet_files(src));
+        EXPECT_EQ(6, src->max_version_unlocked());
+        EXPECT_TRUE(digests_equal(src_digest, tablet_digest(src->tablet_id(), 6)));
+        // linked: the segment files of the source are shared with the moved tablet
+        if (!copy) {
+            EXPECT_GT(hard_links(moved), 0);
+        }
+    }
+};
+
+TEST_F(RestoreLocalSourceTest, DuplicateKeepEqualsSourceAndLinks) {
+    run_keep(false, 7501, false);
+}
+
+TEST_F(RestoreLocalSourceTest, MergeOnWriteKeepEqualsSourceAndLinks) {
+    run_keep(true, 7511, false);
+}
+
+// the source tablet is on another disk: the files are copied
+TEST_F(RestoreLocalSourceTest, DuplicateKeepCopiesOnAnotherDisk) {
+    run_keep(false, 7521, true);
+}
+
+TEST_F(RestoreLocalSourceTest, MergeOnWriteKeepCopiesOnAnotherDisk) {
+    run_keep(true, 7531, true);
+}
+
+// the version is a boundary inside the source tablet: the data of the source at that version, not the latest
+TEST_F(RestoreLocalSourceTest, KeepsTheDataAtTheVersionNotTheLatest) {
+    _next_id = 980000;
+    force_copy(false);
+    Defer defer([]() {
+        DebugPoints::instance()->clear();
+        config::enable_debug_points = false;
+    });
+    auto src = create_tablet(7541, false);
+    auto target = create_tablet(7542, false);
+    build_source(src, false);
+    RestoreDigest at3 = tablet_digest(src->tablet_id(), 3);
+    RestoreDigest at6 = tablet_digest(src->tablet_id(), 6);
+    EXPECT_FALSE(digests_equal(at3, at6));
+    keep(src, target, 3);
+    auto moved = _engine->tablet_manager()->get_tablet(target->tablet_id());
+    EXPECT_EQ(3, moved->max_version_unlocked());
+    EXPECT_TRUE(digests_equal(at3, tablet_digest(target->tablet_id(), 3)));
+    EXPECT_EQ(6, src->max_version_unlocked());
+}
+
+// no source tablet, a version the source does not have, a missing version: the task fails and no snapshot is left
+TEST_F(RestoreLocalSourceTest, FailureLeavesNoSnapshot) {
+    _next_id = 990000;
+    auto src = create_tablet(7551, false);
+    auto target = create_tablet(7552, false);
+    build_source(src, false);
+    size_t dirs = snapshot_dirs(target);
+    std::string path;
+    bool allow = false;
+    // a version after the last one of the source
+    TSnapshotRequest req = local_source_request(src, target, 9);
+    EXPECT_FALSE(_engine->snapshot_mgr()->make_snapshot(req, &path, &allow).ok());
+    EXPECT_EQ(dirs, snapshot_dirs(target));
+    // the source tablet does not exist (moved to another backend)
+    TSnapshotRequest missing = local_source_request(src, target, 6);
+    missing.__set_ref_tablet_id(7559);
+    EXPECT_FALSE(_engine->snapshot_mgr()->make_snapshot(missing, &path, &allow).ok());
+    EXPECT_EQ(dirs, snapshot_dirs(target));
+    // no version
+    TSnapshotRequest no_version = local_source_request(src, target, 6);
+    no_version.__isset.version = false;
+    EXPECT_FALSE(_engine->snapshot_mgr()->make_snapshot(no_version, &path, &allow).ok());
+    // the tablet itself as the source
+    TSnapshotRequest self = local_source_request(src, target, 6);
+    self.__set_ref_tablet_id(target->tablet_id());
+    EXPECT_FALSE(_engine->snapshot_mgr()->make_snapshot(self, &path, &allow).ok());
+    EXPECT_EQ(dirs, snapshot_dirs(target));
+    EXPECT_EQ(6, src->max_version_unlocked());
+}
+
+// The snapshot task of the atomic restore of a partition behind the backup: the local source at the base version
+// is loaded into the tablet, the snapshot dir is an empty one for the increment. The increment of the backup at
+// (base, end] is downloaded into it, and appended by the move.
+class RestoreLocalSourceIncrementalTest : public RestoreLocalSourceTest {
+protected:
+    // the increment of backup at (base, end], put into the (empty) dir of the target
+    void put_increment(const TabletSharedPtr& backup, const TabletSharedPtr& target,
+                       const std::string& dir, int64_t base, int64_t end) {
+        TSnapshotRequest req;
+        req.__set_tablet_id(backup->tablet_id());
+        req.__set_schema_hash(backup->schema_hash());
+        req.__set_version(end);
+        std::string src_path;
+        bool allow = false;
+        ASSERT_TRUE(_engine->snapshot_mgr()->make_snapshot(req, &src_path, &allow).ok());
+        std::string src_dir =
+                fmt::format("{}/{}/{}", src_path, backup->tablet_id(), backup->schema_hash());
+        TabletMetaPB remote;
+        ASSERT_TRUE(TabletMeta::load_from_file(fmt::format("{}/{}.hdr", src_dir, backup->tablet_id()), &remote)
+                            .ok());
+        TabletMetaPB inc;
+        std::vector<std::string> ids;
+        ASSERT_TRUE(select_incremental_rowsets(remote, base, end, &inc, &ids).ok());
+        std::vector<io::FileInfo> files;
+        bool exists = false;
+        ASSERT_TRUE(io::global_local_filesystem()->list(src_dir, true, &files, &exists).ok());
+        for (const auto& f : files) {
+            for (const auto& id : ids) {
+                if (is_rowset_file(f.file_name, id)) {
+                    ASSERT_TRUE(io::global_local_filesystem()
+                                        ->link_file(src_dir + "/" + f.file_name, dir + "/" + f.file_name)
+                                        .ok());
+                }
+            }
+        }
+        ASSERT_TRUE(TabletMeta::save(fmt::format("{}/{}.hdr", dir, target->tablet_id()), inc).ok());
+    }
+
+    void run_incremental(bool mow, int64_t base_id, bool copy) {
+        _next_id = 1010000 + base_id;
+        force_copy(copy);
+        Defer defer([]() {
+            DebugPoints::instance()->clear();
+            config::enable_debug_points = false;
+        });
+        // backup: the data at version 6; origin: the tablet being replaced, equal to it at 3
+        auto backup = create_tablet(base_id, mow);
+        auto origin = create_tablet(base_id + 1, mow);
+        auto target = create_tablet(base_id + 2, mow);
+        auto whole = create_tablet(base_id + 3, mow);
+        ASSERT_NE(nullptr, whole);
+        build_source(backup, mow);
+        build_local(origin, mow);
+        EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), 3), tablet_digest(origin->tablet_id(), 3)));
+        auto origin_files = tablet_files(origin);
+        size_t dirs = snapshot_dirs(target);
+
+        TSnapshotRequest req = local_source_request(origin, target, 3);
+        req.__set_restore_incremental(true);
+        std::string dir_path;
+        LocalSourceStats stats;
+        SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+        Status st = loader.make_local_source_snapshot_and_load(req, &dir_path, &stats);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(1, stats.tablets);
+        EXPECT_GT(stats.linked_files + stats.copied_files, 0);
+        // the local source snapshot is released, only the empty dir of the increment is left
+        EXPECT_EQ(dirs + 1, snapshot_dirs(target));
+        std::string dir = fmt::format("{}/{}/{}", dir_path, target->tablet_id(), target->schema_hash());
+        std::vector<io::FileInfo> files;
+        bool exists = false;
+        ASSERT_TRUE(io::global_local_filesystem()->list(dir, true, &files, &exists).ok());
+        EXPECT_TRUE(files.empty());
+        // the tablet is the origin at the base version, as the incremental restore of a local tablet finds it
+        auto loaded = _engine->tablet_manager()->get_tablet(target->tablet_id());
+        ASSERT_NE(nullptr, loaded);
+        EXPECT_EQ(3, loaded->max_version_unlocked());
+        EXPECT_TRUE(digests_equal(tablet_digest(origin->tablet_id(), 3), tablet_digest(target->tablet_id(), 3)));
+
+        put_increment(backup, target, dir, 3, 6);
+        TRestoreIncrementalRange range;
+        range.base_version = 3;
+        range.end_version = 6;
+        st = loader.append_increment(dir, loaded, range);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_EQ(6, loaded->max_version_unlocked());
+        whole_restore(backup, whole, 6);
+        // the same as the backup and as the whole download, at the end and at every version of the increment
+        EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), 6), tablet_digest(target->tablet_id(), 6)));
+        EXPECT_TRUE(digests_equal(tablet_digest(whole->tablet_id(), 6), tablet_digest(target->tablet_id(), 6)));
+        for (int64_t v = 3; v <= 6; ++v) {
+            EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), v), tablet_digest(target->tablet_id(), v)))
+                    << v;
+        }
+        // the origin tablet is not changed
+        EXPECT_EQ(origin_files, tablet_files(origin));
+        EXPECT_EQ(3, origin->max_version_unlocked());
+    }
+};
+
+TEST_F(RestoreLocalSourceIncrementalTest, DuplicateLocalBasePlusIncrementEqualsBackup) {
+    run_incremental(false, 7601, false);
+}
+
+TEST_F(RestoreLocalSourceIncrementalTest, MergeOnWriteLocalBasePlusIncrementEqualsBackup) {
+    run_incremental(true, 7611, false);
+}
+
+TEST_F(RestoreLocalSourceIncrementalTest, DuplicateLocalBaseCopiedOnAnotherDisk) {
+    run_incremental(false, 7621, true);
+}
+
+TEST_F(RestoreLocalSourceIncrementalTest, MergeOnWriteLocalBaseCopiedOnAnotherDisk) {
+    run_incremental(true, 7631, true);
+}
+
+// the local source can not be read: the task fails and no snapshot is left
+TEST_F(RestoreLocalSourceIncrementalTest, FailureLeavesNoSnapshot) {
+    _next_id = 1040000;
+    auto origin = create_tablet(7641, false);
+    auto target = create_tablet(7642, false);
+    build_local(origin, false);
+    size_t dirs = snapshot_dirs(target);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    std::string path;
+    LocalSourceStats stats;
+    // the origin has no version 5
+    TSnapshotRequest req = local_source_request(origin, target, 5);
+    req.__set_restore_incremental(true);
+    EXPECT_FALSE(loader.make_local_source_snapshot_and_load(req, &path, &stats).ok());
+    EXPECT_EQ(dirs, snapshot_dirs(target));
+    // the origin is not on this backend
+    TSnapshotRequest missing = local_source_request(origin, target, 3);
+    missing.__set_ref_tablet_id(7649);
+    missing.__set_restore_incremental(true);
+    EXPECT_FALSE(loader.make_local_source_snapshot_and_load(missing, &path, &stats).ok());
+    EXPECT_EQ(dirs, snapshot_dirs(target));
 }
 
 } // namespace doris

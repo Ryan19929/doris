@@ -41,6 +41,7 @@ class RemoteFileSystem;
 
 class DataDir;
 class TRemoteTabletSnapshot;
+struct LocalSourceStats;
 class StorageEngine;
 
 struct FileStat {
@@ -293,6 +294,16 @@ public:
                                 std::vector<int64_t>* downloaded_tablet_ids);
 
     Status move(const std::string& snapshot_path, TabletSharedPtr tablet, bool overwrite);
+
+    // Atomic restore with partition level reuse, a tablet whose increment is to be downloaded: the tablet being
+    // replaced (request.ref_tablet_id) is the source of the data up to request.version, the version the increment
+    // starts from. Make the snapshot of it (see TSnapshotRequest.restore_local_source), load it into the tablet of the
+    // restore at once as the move does, release it, and make an empty snapshot dir (snapshot_path) for the increment
+    // to be downloaded into. The tablet then looks like the local tablet of the incremental restore. On failure
+    // no snapshot is left, the tablet may have been loaded.
+    Status make_local_source_snapshot_and_load(const TSnapshotRequest& request,
+                                               std::string* snapshot_path,
+                                               LocalSourceStats* stats);
 
     int64_t get_http_download_files_num() const { return _http_download_files_num; }
 
