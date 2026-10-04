@@ -44,6 +44,9 @@ public class SnapshotTask extends AgentTask {
     private boolean computeLogicalDigest = false;
     // Restore only: the backend makes an empty snapshot dir, for the increment of the incremental restore.
     private boolean restoreIncremental = false;
+    // Restore only (atomic restore): the data of the snapshot is the local tablet refTabletId at the version, see
+    // TSnapshotRequest.restore_local_source.
+    private boolean restoreLocalSource = false;
 
     public SnapshotTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId, long tableId,
             long partitionId, long indexId, long tabletId, long version, int schemaHash, long timeoutMs,
@@ -129,6 +132,14 @@ public class SnapshotTask extends AgentTask {
         return restoreIncremental;
     }
 
+    public void setRestoreLocalSource(boolean restoreLocalSource) {
+        this.restoreLocalSource = restoreLocalSource;
+    }
+
+    public boolean isRestoreLocalSource() {
+        return restoreLocalSource;
+    }
+
     public void setRefTabletId(long refTabletId) {
         assert refTabletId > 0;
         this.refTabletId = refTabletId;
@@ -154,6 +165,9 @@ public class SnapshotTask extends AgentTask {
         }
         if (restoreIncremental) {
             request.setRestoreIncremental(true);
+        }
+        if (restoreLocalSource) {
+            request.setRestoreLocalSource(true);
         }
         return request;
     }

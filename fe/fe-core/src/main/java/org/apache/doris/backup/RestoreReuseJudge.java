@@ -34,6 +34,7 @@ import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.RestoreSource;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.common.Config;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
@@ -103,6 +104,10 @@ public final class RestoreReuseJudge {
     /** What a condition needs to know about a partition to restore. */
     public static class Input {
         public boolean atomicRestore;
+        // Atomic restore: why the data of the partition can not be made from the local tablets of the table being
+        // replaced (the schema is changed, the staging tablets are not bound to the local ones, see
+        // RestoreJob#checkAtomicBinding), null if it can.
+        public String atomicReject;
         public boolean allowLoad;
         public boolean cloudMode;
         public long minPartitionBytes;
@@ -297,10 +302,24 @@ public final class RestoreReuseJudge {
         return null;
     }
 
-    // 1. non-atomic restore into an existing table that is forbidden to write.
+    // 1. non-atomic restore into an existing table that is forbidden to write, or an atomic restore whose staging
+    // tablets are bound to the local ones, to a table without schema change.
     static String checkMode(Input in) {
         if (in.atomicRestore) {
-            return "ATOMIC_RESTORE";
+            if (!Config.enable_restore_atomic_reuse) {
+                return "ATOMIC_RESTORE";
+            }
+            if (in.allowLoad) {
+                return "ALLOW_LOAD";
+            }
+            if (in.atomicReject != null) {
+                return in.atomicReject;
+            }
+            // the table being replaced is not forbidden to write, the version is checked before it is replaced
+            if (in.localTable.getState() != OlapTableState.NORMAL) {
+                return "TABLE_STATE_" + in.localTable.getState().name();
+            }
+            return null;
         }
         if (in.allowLoad) {
             // the version may change after the judgement

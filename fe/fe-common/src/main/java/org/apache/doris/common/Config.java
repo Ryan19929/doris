@@ -2886,6 +2886,16 @@ public class Config extends ConfigBase {
             + "being downloaded as a whole. Disabled by default, the restore behaves as before if disabled.")
     public static boolean enable_restore_incremental_append = false;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether partition level reuse (and the incremental "
+            + "append, if enabled) also works for an atomic restore (needs enable_restore_partition_reuse too): the "
+            + "partitions of the table being replaced that are proved logically equal to the backup are made into "
+            + "the staging table by a local snapshot (hard links, or a copy on another disk) of the tablets of the "
+            + "table being replaced instead of a download. Only for a table whose schema is not changed and whose "
+            + "staging replicas are bound to the replicas of the table being replaced. If the version of such a "
+            + "partition changed before the tables are replaced, the restore fails (the table being replaced is "
+            + "not touched). Disabled by default, the atomic restore behaves as before if disabled.")
+    public static boolean enable_restore_atomic_reuse = false;
+
     @ConfField(mutable = true, description = "The time after which a BE is considered unavailable if no heartbeat is "
             + "received.")
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

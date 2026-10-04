@@ -61,6 +61,19 @@ public class RestoreDownloadStats {
     private long incrementalFiles;
     @SerializedName("ib")
     private long incrementalBytes;
+    // Atomic restore, the tablets made from the local tablets of the table being replaced by a snapshot task
+    // (kept partitions and the local base of incremental partitions), and the files and bytes hard linked / copied
+    // (another disk) from them. Reported by the snapshot tasks, not in the counts of the download.
+    @SerializedName("lst")
+    private long localSourceTablets;
+    @SerializedName("llf")
+    private long localSourceLinkedFiles;
+    @SerializedName("llb")
+    private long localSourceLinkedBytes;
+    @SerializedName("lcf")
+    private long localSourceCopiedFiles;
+    @SerializedName("lcb")
+    private long localSourceCopiedBytes;
     @SerializedName("um")
     private long unmatchedRowsets;
     @SerializedName("ums")
@@ -99,6 +112,36 @@ public class RestoreDownloadStats {
         unmatchedSourceNotInSnapshot += stats.getUnmatchedSourceNotInSnapshot();
         unmatchedVersionMismatch += stats.getUnmatchedVersionMismatch();
         reportedReplicas += replicas;
+    }
+
+    // Add the stats reported by a snapshot task made from a local tablet (restore_local_source).
+    public void addLocalSource(TDownloadStats stats) {
+        localSourceTablets += stats.getLocalSourceTablets();
+        localSourceLinkedFiles += stats.getLocalSourceLinkedFiles();
+        localSourceLinkedBytes += stats.getLocalSourceLinkedBytes();
+        localSourceCopiedFiles += stats.getLocalSourceCopiedFiles();
+        localSourceCopiedBytes += stats.getLocalSourceCopiedBytes();
+    }
+
+    // The counts of the local snapshots are made before the download starts, which resets the stats.
+    public void carryLocalSource(RestoreDownloadStats other) {
+        localSourceTablets += other.localSourceTablets;
+        localSourceLinkedFiles += other.localSourceLinkedFiles;
+        localSourceLinkedBytes += other.localSourceLinkedBytes;
+        localSourceCopiedFiles += other.localSourceCopiedFiles;
+        localSourceCopiedBytes += other.localSourceCopiedBytes;
+    }
+
+    public long getLocalSourceTablets() {
+        return localSourceTablets;
+    }
+
+    public long getLocalSourceLinkedBytes() {
+        return localSourceLinkedBytes;
+    }
+
+    public long getLocalSourceCopiedBytes() {
+        return localSourceCopiedBytes;
     }
 
     public boolean isFixed() {
@@ -161,6 +204,14 @@ public class RestoreDownloadStats {
      *         downloaded and not in the other counts, but is data that needed no download.
      */
     public String toJson(long currentTotalReplicas, long keptBytes) {
+        return toJson(currentTotalReplicas, keptBytes, 0);
+    }
+
+    /**
+     * @param keptAtomicBytes the part of keptBytes kept by an atomic restore (the local snapshots of the table being
+     *         replaced), it is also in keptBytes
+     */
+    public String toJson(long currentTotalReplicas, long keptBytes, long keptAtomicBytes) {
         long total = isFixed() ? totalReplicas : currentTotalReplicas;
         Map<String, Object> json = new LinkedHashMap<>();
         json.put("linked_bytes", linkedBytes);
@@ -170,6 +221,17 @@ public class RestoreDownloadStats {
         if (Config.enable_restore_incremental_append || incrementalTablets > 0) {
             json.put("incremental_tablets", incrementalTablets);
             json.put("incremental_bytes", incrementalBytes);
+        }
+        if (Config.enable_restore_atomic_reuse || localSourceTablets > 0 || keptAtomicBytes > 0) {
+            // atomic restore: what the table being replaced kept, by the local snapshots, not downloaded
+            json.put("kept_atomic_bytes", keptAtomicBytes);
+            Map<String, Object> atomic = new LinkedHashMap<>();
+            atomic.put("local_tablets", localSourceTablets);
+            atomic.put("linked_bytes", localSourceLinkedBytes);
+            atomic.put("linked_files", localSourceLinkedFiles);
+            atomic.put("copied_bytes", localSourceCopiedBytes);
+            atomic.put("copied_files", localSourceCopiedFiles);
+            json.put("atomic_local", atomic);
         }
         json.put("reuse_ratio", getReuseRatio(keptBytes));
         json.put("linked_files", linkedFiles);

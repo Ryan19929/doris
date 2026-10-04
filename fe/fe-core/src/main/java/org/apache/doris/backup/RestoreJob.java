@@ -395,6 +395,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         taskProgress.remove(task.getSignature());
         Long removedTabletId = unfinishedSignatureToId.remove(task.getSignature());
         if (removedTabletId != null) {
+            recordLocalSourceStats(request);
             taskErrMsg.remove(task.getSignature());
             Preconditions.checkState(task.getTabletId() == removedTabletId, removedTabletId);
             if (LOG.isDebugEnabled()) {
@@ -467,6 +468,23 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         return true;
     }
 
+    // Add the stats of a snapshot made from the local tablet of the table being replaced (atomic restore). It never
+    // fails the job.
+    @VisibleForTesting
+    void recordLocalSourceStats(TFinishTaskRequest request) {
+        try {
+            if (!request.isSetDownloadStats() || !request.getDownloadStats().isSetLocalSourceTablets()) {
+                return;
+            }
+            if (downloadStats == null) {
+                downloadStats = new RestoreDownloadStats();
+            }
+            downloadStats.addLocalSource(request.getDownloadStats());
+        } catch (Exception e) {
+            LOG.warn("failed to record the local source stats, ignore it. {}", this, e);
+        }
+    }
+
     // Add the download stats reported by the backend. An old backend does not report it, its replicas are counted as
     // not reported. It never fails the job.
     @VisibleForTesting
@@ -489,14 +507,19 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     private void resetDownloadStats() {
+        RestoreDownloadStats before = downloadStats;
         downloadStats = new RestoreDownloadStats();
+        if (before != null) {
+            // what the snapshot tasks made from the local tablets, which is before the download
+            downloadStats.carryLocalSource(before);
+        }
     }
 
     // Fix the replicas to download in the stats, when the download finishes or the job is cancelled.
     @VisibleForTesting
     void fixDownloadStats() {
         if (downloadStats != null && !downloadStats.isFixed()) {
-            downloadStats.fix(snapshotInfos.size());
+            downloadStats.fix(countSnapshotsToDownload());
             LOG.info("download stats: {}. {}", downloadStats, this);
         }
     }
@@ -540,7 +563,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         if (jobInfo == null || !jobInfo.hasManifest()) {
             return null;
         }
-        long total = Math.max(snapshotInfos.size(), manifestVerifiedReplicas.size());
+        long total = Math.max(countSnapshotsToDownload(), manifestVerifiedReplicas.size());
         long verified = manifestVerifiedReplicas.size();
         boolean digestChecked = verified > 0 && manifestDigestCheckedReplicas.size() == verified;
         return new RestoreManifestCheck(jobInfo.manifestVersion, jobInfo.digestAlgorithm, verified,
@@ -895,6 +918,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         // the new tablets -> { local tablet, schema hash, storage medium }, used in atomic restore.
         Map<Long, TabletRef> tabletBases = new HashMap<>();
+        // the staging tables of atomic restore whose tablets are bound to the tablets of the table being replaced,
+        // by the name of the table in the backup
+        Map<String, OlapTable> atomicStaging = new HashMap<>();
 
         // Check and prepare meta objects.
 
@@ -1117,6 +1143,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         if (!status.ok()) {
                             return;
                         }
+                        atomicStaging.put(tableName, remoteOlapTbl);
                     }
                     if (LOG.isDebugEnabled()) {
                         LOG.debug("put remote table {} to restoredTbls", remoteOlapTbl.getName());
@@ -1254,7 +1281,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // written before any tablet data is moved, and the lineage is written again in allTabletCommitted.
         // The candidates of partition level reuse keep their lineage until they are decided in VERIFYING, nothing
         // local is changed before that.
-        Set<Pair<Long, Long>> candidateKeys = selectReuseCandidates(db);
+        Set<Pair<Long, Long>> candidateKeys = selectReuseCandidates(db, atomicStaging, tabletBases);
         invalidateRestoreLineageOfOverwrittenPartitions(db, candidateKeys);
 
         // check and restore resources
@@ -1543,6 +1570,18 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     boolean isRestoreTask = true;
                     // We don't care the visible version in restore job, the end version is used.
                     long visibleVersion = -1L;
+                    // Atomic restore, a partition that keeps the data of the table being replaced, or its base: the
+                    // snapshot is made from the local tablet at this version (the one of the proof).
+                    RestoreReuseResult.Decision atomicDecision = getAtomicLocalDecision(tbl.getId(), part.getId());
+                    if (atomicDecision != null) {
+                        if (!entry.getValue().hasRefTabletId()) {
+                            status = new Status(ErrCode.COMMON_ERROR, "the tablet " + tablet.getId()
+                                    + " of the partition " + atomicDecision.tableName + "."
+                                    + atomicDecision.partitionName + " is not bound to a local tablet");
+                            return;
+                        }
+                        visibleVersion = atomicDecision.version;
+                    }
                     long beId = replica.getBackendIdWithoutException();
                     SnapshotTask task = new SnapshotTask(null, beId,
                             signature, jobId, db.getId(),
@@ -1550,6 +1589,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             tbl.getSchemaHashByIndexId(index.getId()), timeoutMs, isRestoreTask);
                     if (entry.getValue().hasRefTabletId()) {
                         task.setRefTabletId(entry.getValue().getRefTabletId());
+                    }
+                    if (atomicDecision != null) {
+                        task.setRestoreLocalSource(true);
                     }
                     if (isIncrementalPartition(tbl.getId(), part.getId())) {
                         // an empty dir, only the increment is downloaded into it
@@ -2068,6 +2110,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // We classify the snapshot info by backend
             ArrayListMultimap<Long, SnapshotInfo> beToSnapshots = ArrayListMultimap.create();
             for (SnapshotInfo info : infos) {
+                if (isKeptPartition(info.getTblId(), info.getPartitionId())) {
+                    // made from the local tablets by the snapshot task
+                    continue;
+                }
                 beToSnapshots.put(info.getBeId(), info);
             }
 
@@ -2201,6 +2247,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // We classify the snapshot info by backend
             ArrayListMultimap<Long, SnapshotInfo> beToSnapshots = ArrayListMultimap.create();
             for (SnapshotInfo info : infos) {
+                if (isKeptPartition(info.getTblId(), info.getPartitionId())) {
+                    // made from the local tablets by the snapshot task
+                    continue;
+                }
                 beToSnapshots.put(info.getBeId(), info);
             }
 
@@ -2323,6 +2373,37 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     private boolean isIncrementalPartition(long tblId, long partId) {
         return getIncrementalDecision(tblId, partId) != null;
+    }
+
+    /** The partition (of the staging table) keeps the data of the table being replaced: nothing to download. */
+    private boolean isKeptPartition(long tblId, long partId) {
+        return reuseResult != null && reuseResult.getKept(tblId, partId) != null;
+    }
+
+    /**
+     * Atomic restore: the decision of the staging partition if its data is made from the local tablets of the table
+     * being replaced (kept, or the base of an incremental partition), otherwise null.
+     */
+    private RestoreReuseResult.Decision getAtomicLocalDecision(long tblId, long partId) {
+        if (reuseResult == null) {
+            return null;
+        }
+        RestoreReuseResult.Decision decision = reuseResult.getKept(tblId, partId);
+        if (decision == null) {
+            decision = reuseResult.getIncremental(tblId, partId);
+        }
+        return decision != null && decision.atomic ? decision : null;
+    }
+
+    /** The snapshots the download works on: those of the partitions that keep their data are not downloaded. */
+    private long countSnapshotsToDownload() {
+        long count = 0;
+        for (SnapshotInfo info : snapshotInfos.values()) {
+            if (!isKeptPartition(info.getTblId(), info.getPartitionId())) {
+                count++;
+            }
+        }
+        return count;
     }
 
     protected DownloadTask createDownloadTask(long beId, long signature, long jobId, long dbId,
@@ -2712,11 +2793,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             RestoreManifestCheck check = getManifestCheck();
             info.add(check == null ? FeConstants.null_string : check.toString());
             long keptBytes = reuseResult == null ? 0 : reuseResult.getKeptBytesAllReplicas();
+            long keptAtomicBytes = reuseResult == null ? 0 : reuseResult.getKeptAtomicBytesAllReplicas();
             if (downloadStats != null) {
-                info.add(downloadStats.toJson(snapshotInfos.size(), keptBytes));
+                info.add(downloadStats.toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes));
             } else if (keptBytes > 0) {
                 // everything was kept, nothing was downloaded
-                info.add(new RestoreDownloadStats().toJson(snapshotInfos.size(), keptBytes));
+                info.add(new RestoreDownloadStats().toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes));
             } else {
                 info.add(FeConstants.null_string);
             }
@@ -2763,10 +2845,22 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     Set<Pair<Long, Long>> selectReuseCandidates(Database db) {
+        return selectReuseCandidates(db, Collections.emptyMap(), Collections.emptyMap());
+    }
+
+    /**
+     * @param atomicStaging atomic restore: the staging tables bound to the table being replaced, by the name of the
+     *         table in the backup. The candidates are the partitions of the table being replaced then.
+     * @param tabletBases atomic restore: the staging tablet to the tablet of the table being replaced
+     */
+    @VisibleForTesting
+    Set<Pair<Long, Long>> selectReuseCandidates(Database db, Map<String, OlapTable> atomicStaging,
+            Map<Long, TabletRef> tabletBases) {
         reuseCandidates.clear();
         reuseResult = null;
         Set<Pair<Long, Long>> keys = Sets.newHashSet();
-        if (!Config.enable_restore_partition_reuse || Config.isCloudMode() || isAtomicRestore
+        if (!Config.enable_restore_partition_reuse || Config.isCloudMode()
+                || (isAtomicRestore && !Config.enable_restore_atomic_reuse)
                 || !(jobInfo.content == null || jobInfo.content == BackupCommand.BackupContent.ALL)) {
             return keys;
         }
@@ -2787,16 +2881,31 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 }
                 OlapTable localOlapTbl = (OlapTable) localTbl;
                 CheckLevel level = RestoreReuseJudge.levelOfTable(jobLevel, localOlapTbl.getKeysType());
+                OlapTable stagingTbl = isAtomicRestore ? atomicStaging.get(tblEntry.getKey()) : null;
                 localOlapTbl.readLock();
                 try {
                     for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
                         Partition localPart = localOlapTbl.getPartition(partEntry.getKey(), false);
-                        if (localPart == null || !restoredVersionInfo.contains(localOlapTbl.getId(),
-                                localPart.getId())) {
+                        if (localPart == null) {
+                            continue;
+                        }
+                        // Atomic restore: the staging partition of the same name is the one to restore, and its
+                        // tablets must be bound to the local ones. Otherwise the partition of the restored
+                        // partitions (the A1 branch).
+                        Partition stagingPart = null;
+                        String atomicReject = null;
+                        if (isAtomicRestore) {
+                            atomicReject = stagingTbl == null ? "ATOMIC_NOT_BOUND_TABLE"
+                                    : checkAtomicBinding(localOlapTbl, localPart, stagingTbl, tabletBases);
+                            if (stagingTbl != null) {
+                                stagingPart = stagingTbl.getPartition(partEntry.getKey(), false);
+                            }
+                        } else if (!restoredVersionInfo.contains(localOlapTbl.getId(), localPart.getId())) {
                             continue;
                         }
                         RestoreReuseJudge.Input in = buildReuseInput(tblEntry.getKey(), tblInfo,
                                 partEntry.getKey(), partEntry.getValue(), localOlapTbl, localPart, level);
+                        in.atomicReject = atomicReject;
                         String reject = RestoreReuseJudge.firstReject(in);
                         boolean incremental = false;
                         if (reject != null) {
@@ -2823,6 +2932,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         candidate.partitionName = partEntry.getKey();
                         candidate.incrementalCandidate = incremental;
                         candidate.backupTableId = tblInfo.id;
+                        if (isAtomicRestore) {
+                            candidate.atomic = true;
+                            candidate.stagingTableId = stagingTbl.getId();
+                            candidate.stagingPartitionId = stagingPart.getId();
+                        }
                         candidate.version = in.backupPartition.version;
                         // the version the digests are computed at: the local one for the incremental append
                         candidate.digestVersion = incremental ? localPart.getVisibleVersion()
@@ -2855,6 +2969,57 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             keys.clear();
         }
         return keys;
+    }
+
+    /**
+     * Atomic restore: whether the staging partition of the same name is bound to the local partition, tablet by tablet
+     * and replica by replica, as bindLocalAndRemoteOlapTableReplicas does: the staging tablet has its local tablet
+     * as the base tablet, and each of its replicas is on the backend of the local replica at the same position.
+     * The data of the partition can be made from the local tablets only then. The caller holds the read lock of the
+     * local table.
+     *
+     * @return null if bound, otherwise the reason
+     */
+    @VisibleForTesting
+    static String checkAtomicBinding(OlapTable localTbl, Partition localPart, OlapTable stagingTbl,
+            Map<Long, TabletRef> tabletBases) {
+        Partition stagingPart = stagingTbl.getPartition(localPart.getName(), false);
+        if (stagingPart == null) {
+            return "ATOMIC_NOT_BOUND_PARTITION";
+        }
+        for (MaterializedIndex localIdx : localPart.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            MaterializedIndex stagingIdx;
+            if (localIdx.getId() == localTbl.getBaseIndexId()) {
+                // the base index is named by the table, which is renamed to the temp name
+                stagingIdx = stagingPart.getBaseIndex();
+            } else {
+                Long stagingIdxId = stagingTbl.getIndexIdByName(localTbl.getIndexNameById(localIdx.getId()));
+                stagingIdx = stagingIdxId == null ? null : stagingPart.getIndex(stagingIdxId);
+            }
+            if (stagingIdx == null || stagingIdx.getTablets().size() != localIdx.getTablets().size()) {
+                return "ATOMIC_NOT_BOUND_INDEX";
+            }
+            for (int i = 0; i < localIdx.getTablets().size(); i++) {
+                Tablet localTablet = localIdx.getTablets().get(i);
+                Tablet stagingTablet = stagingIdx.getTablets().get(i);
+                TabletRef ref = tabletBases.get(stagingTablet.getId());
+                if (ref == null || ref.tabletId != localTablet.getId()) {
+                    return "ATOMIC_NOT_BOUND_TABLET";
+                }
+                List<Replica> localReplicas = localTablet.getReplicas();
+                List<Replica> stagingReplicas = stagingTablet.getReplicas();
+                if (localReplicas.isEmpty() || localReplicas.size() != stagingReplicas.size()) {
+                    return "ATOMIC_NOT_BOUND_REPLICA";
+                }
+                for (int j = 0; j < localReplicas.size(); j++) {
+                    if (localReplicas.get(j).getBackendIdWithoutException()
+                            != stagingReplicas.get(j).getBackendIdWithoutException()) {
+                        return "ATOMIC_NOT_BOUND_REPLICA";
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -3188,10 +3353,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
             result.addDecision(candidate.toDecision());
             LOG.info("restore reuse: partition {}, job: {}", candidate.toDecision(), jobId);
-            if (candidate.kept) {
+            if (candidate.kept && !candidate.atomic) {
                 kept.add(Pair.of(candidate.tableId, candidate.partitionId));
                 restoredVersionInfo.remove(candidate.tableId, candidate.partitionId);
             }
+            // An atomic restore keeps the file mapping of a kept partition: its snapshot task makes the local snapshot
+            // of the staging tablets, only the download is skipped.
         }
         fileMapping.removePartitions(kept);
         reuseResult = result;
@@ -3358,6 +3525,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         boolean incrementalCandidate = false;
         long digestVersion;
         long backupTableId;
+        // atomic restore: the staging table and partition the data goes to
+        boolean atomic = false;
+        long stagingTableId;
+        long stagingPartitionId;
         // the outcome: restored incrementally
         boolean incremental = false;
         // in the sample of the check level sample
@@ -3398,6 +3569,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             decision.kept = kept;
             decision.incremental = incremental;
             decision.reason = reason;
+            decision.atomic = atomic;
+            decision.stagingTableId = stagingTableId;
+            decision.stagingPartitionId = stagingPartitionId;
             return decision;
         }
     }
@@ -3630,7 +3804,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     for (Long taskId : unfinishedSignatureToId.keySet()) {
                         AgentTaskQueue.removeTaskOfType(TTaskType.MOVE, taskId);
                     }
-                    if (reuseResult != null && reuseResult.getIncrementalPartitions() > 0) {
+                    if (reuseResult != null && reuseResult.getIncrementalPartitions()
+                            > reuseResult.getIncrementalAtomicPartitions()) {
                         // The append of a tablet is all or nothing, but the tablets of a partition are not. Say so,
                         // restoring again downloads the partition as a whole, since its replicas differ.
                         LOG.warn("restore job {} is cancelled while appending the increments, the tablets of the "
@@ -3778,6 +3953,47 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
     }
 
+    // The decisions of the partitions of the origin table that keep its data (or its base), atomic restore.
+    private List<RestoreReuseResult.Decision> getAtomicLocalDecisions(long originTableId) {
+        List<RestoreReuseResult.Decision> result = Lists.newArrayList();
+        if (reuseResult != null) {
+            for (RestoreReuseResult.Decision decision : reuseResult.getDecisions()) {
+                if (decision.atomic && (decision.kept || decision.incremental) && decision.tableId == originTableId) {
+                    result.add(decision);
+                }
+            }
+        }
+        return result;
+    }
+
+    private boolean hasAtomicLocalDecision(long originTableId) {
+        return !getAtomicLocalDecisions(originTableId).isEmpty();
+    }
+
+    /**
+     * Fail if a partition of the origin table that the staging table is made from has been written since it was proved
+     * equal to the backup (its version changed, or a load is committed and not published yet). The caller holds the
+     * write lock of the origin table.
+     */
+    @VisibleForTesting
+    Status checkAtomicLocalVersions(OlapTable originTbl) {
+        for (RestoreReuseResult.Decision decision : getAtomicLocalDecisions(originTbl.getId())) {
+            Partition part = originTbl.getPartition(decision.partitionId);
+            if (part == null) {
+                return new Status(ErrCode.NOT_FOUND, "the partition " + decision.tableName + "."
+                        + decision.partitionName + " that the restored data is made from has been dropped");
+            }
+            if (part.getVisibleVersion() != decision.version || part.getNextVersion() != decision.version + 1) {
+                return new Status(ErrCode.COMMON_ERROR, "the visible version of the partition "
+                        + decision.tableName + "." + decision.partitionName + " that the restored data is made from"
+                        + " changed from " + decision.version + " to " + part.getVisibleVersion() + " (next version "
+                        + part.getNextVersion() + ") during the restore, the local data is not what was verified any"
+                        + " more. The table is not replaced, restore again");
+            }
+        }
+        return Status.OK;
+    }
+
     private Status atomicReplaceOlapTables(Database db, boolean isReplay) {
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
             String originName = jobInfo.getAliasByOriginNameIfSet(tableName);
@@ -3820,6 +4036,20 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     originOlapTbl = (OlapTable) originTbl; // save the origin olap table, then drop it.
                 }
 
+                // The partitions made from the local tablets of the origin table must be at the version they were
+                // proved at, until the table is replaced: no write is allowed to be in between (the check and the
+                // replace are under the same lock of the origin table). The origin table is not touched if not.
+                boolean originLocked = false;
+                if (!isReplay && originOlapTbl != null && hasAtomicLocalDecision(originOlapTbl.getId())) {
+                    originOlapTbl.writeLock();
+                    originLocked = true;
+                    Status st = checkAtomicLocalVersions(originOlapTbl);
+                    if (!st.ok()) {
+                        originOlapTbl.writeUnlock();
+                        return st;
+                    }
+                }
+
                 // replace the table.
                 OlapTable newOlapTbl = (OlapTable) newTbl;
                 newOlapTbl.writeLock();
@@ -3840,6 +4070,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 } catch (DdlException e) {
                     LOG.warn("restore with replace table {} name from {} to {}, isAtomicRestore: {}",
                             newOlapTbl.getId(), aliasName, originName, isAtomicRestore, e);
+                    if (originLocked) {
+                        originOlapTbl.writeUnlock();
+                    }
                     return new Status(ErrCode.COMMON_ERROR, "replace table from " + aliasName + " to " + originName
                             + " failed, reason=" + e.getMessage());
                 } finally {
@@ -3856,6 +4089,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     } finally {
                         originOlapTbl.writeUnlock();
                     }
+                }
+                if (originLocked) {
+                    originOlapTbl.writeUnlock();
                 }
             } finally {
                 db.writeUnlock();

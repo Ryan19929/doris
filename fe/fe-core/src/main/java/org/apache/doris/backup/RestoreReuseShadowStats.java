@@ -190,7 +190,7 @@ public class RestoreReuseShadowStats {
      * Whether the local partition is in a case not covered by the first version of partition level reuse.
      */
     public static Unsupported checkUnsupported(boolean isAtomicRestore, OlapTable localTbl, Partition localPart) {
-        if (isAtomicRestore) {
+        if (isAtomicRestore && !Config.enable_restore_atomic_reuse) {
             return Unsupported.ATOMIC_RESTORE;
         }
         if (localTbl.getKeysType() == KeysType.AGG_KEYS) {
@@ -392,6 +392,13 @@ public class RestoreReuseShadowStats {
         json.addProperty("download_sample_failed", actual.countReasons(RestoreReuseResult.DOWNLOAD_SAMPLE_FAILED));
         json.addProperty("download_other", actual.countReasons(RestoreReuseResult.DOWNLOAD_CHANGED,
                 RestoreReuseResult.DOWNLOAD_VERIFY_ERROR));
+        if (Config.enable_restore_atomic_reuse || actual.getKeptAtomicPartitions() > 0
+                || actual.getIncrementalAtomicPartitions() > 0) {
+            // the partitions of an atomic restore made from the local snapshot of the table being replaced
+            json.addProperty("kept_atomic", actual.getKeptAtomicPartitions());
+            json.addProperty("incremental_atomic", actual.getIncrementalAtomicPartitions());
+            json.addProperty("kept_atomic_bytes_all_replicas", actual.getKeptAtomicBytesAllReplicas());
+        }
         if (Config.enable_restore_incremental_append || actual.getIncrementalPartitions() > 0) {
             // the partitions that download only the rowsets after the local version, and the local data they keep
             json.addProperty("incremental_partitions", actual.getIncrementalPartitions());

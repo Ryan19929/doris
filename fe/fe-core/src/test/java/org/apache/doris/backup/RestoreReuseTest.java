@@ -40,12 +40,15 @@ import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.RestoreSource;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
+import org.apache.doris.common.Pair;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.persist.EditLog;
+import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.task.AgentBatchTask;
@@ -53,13 +56,16 @@ import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskExecutor;
 import org.apache.doris.task.DirMoveTask;
 import org.apache.doris.task.DownloadTask;
+import org.apache.doris.task.ReleaseSnapshotTask;
 import org.apache.doris.task.RestoreDigestTask;
 import org.apache.doris.task.SnapshotTask;
+import org.apache.doris.thrift.TDownloadStats;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TLogicalDigest;
 import org.apache.doris.thrift.TRemoteTabletSnapshot;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
+import org.apache.doris.thrift.TStorageMedium;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -108,6 +114,7 @@ public class RestoreReuseTest {
 
     private boolean origEnable;
     private boolean origIncremental;
+    private boolean origAtomic;
     private String origLevel;
     private double origRatio;
     private long origMinBytes;
@@ -118,6 +125,7 @@ public class RestoreReuseTest {
     public void setUp() throws Exception {
         origEnable = Config.enable_restore_partition_reuse;
         origIncremental = Config.enable_restore_incremental_append;
+        origAtomic = Config.enable_restore_atomic_reuse;
         origLevel = Config.restore_reuse_default_check_level;
         origRatio = Config.restore_reuse_sample_ratio;
         origMinBytes = Config.restore_reuse_min_partition_bytes;
@@ -149,6 +157,16 @@ public class RestoreReuseTest {
         Mockito.when(systemInfo.getBackend(Mockito.anyLong())).thenReturn(backend);
         Mockito.when(systemInfo.checkExceedDiskCapacityLimit(Mockito.any(), Mockito.anyBoolean()))
                 .thenReturn(org.apache.doris.common.Status.OK);
+
+        // the new replicas of the staging table of an atomic restore, they are bound to the local ones
+        Mockito.when(systemInfo.selectBackendIdsForReplicaCreation(Mockito.any(), Mockito.any(), Mockito.any(),
+                Mockito.anyBoolean(), Mockito.anyBoolean())).thenAnswer(inv -> {
+                    Map<Tag, List<Long>> beIds = Maps.newHashMap();
+                    beIds.put(Tag.DEFAULT_BACKEND_TAG, Lists.newArrayList(CatalogMocker.BACKEND1_ID,
+                            CatalogMocker.BACKEND2_ID, CatalogMocker.BACKEND3_ID));
+                    return Pair.of(beIds, TStorageMedium.HDD);
+                });
+        mockedEnvStatic.when(Env::getCurrentInvertedIndex).thenReturn(Mockito.mock(TabletInvertedIndex.class));
 
         mockedExecutor = Mockito.mockStatic(AgentTaskExecutor.class);
         mockedExecutor.when(() -> AgentTaskExecutor.submit(Mockito.any(AgentBatchTask.class)))
@@ -183,6 +201,7 @@ public class RestoreReuseTest {
     public void tearDown() {
         Config.enable_restore_partition_reuse = origEnable;
         Config.enable_restore_incremental_append = origIncremental;
+        Config.enable_restore_atomic_reuse = origAtomic;
         Config.restore_reuse_default_check_level = origLevel;
         Config.restore_reuse_sample_ratio = origRatio;
         Config.restore_reuse_min_partition_bytes = origMinBytes;
@@ -2005,5 +2024,607 @@ public class RestoreReuseTest {
         Assertions.assertTrue(json.contains("\"incremental_bytes\":400"), json);
         // off: unchanged output for the jobs without an increment
         Assertions.assertFalse(new RestoreDownloadStats().toJson(0, 0).contains("incremental"));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // atomic restore: the partitions of the table being replaced are the source of the data
+    // ---------------------------------------------------------------------------------------------
+
+    // The backup kept on local: where the snapshot of every tablet is, for the download.
+    private BackupJobInfo localBackupJobInfo() {
+        BackupJobInfo info = selfBackupJobInfo();
+        info.extraInfo = new BackupJobInfo.ExtraInfo();
+        info.extraInfo.token = "token";
+        BackupJobInfo.ExtraInfo.NetworkAddrss addr = new BackupJobInfo.ExtraInfo.NetworkAddrss();
+        addr.ip = "127.0.0.1";
+        addr.port = 8040;
+        info.extraInfo.beNetworkMap.put(1L, addr);
+        for (BackupPartitionInfo partInfo : info.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME).partitions.values()) {
+            for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                for (BackupTabletInfo tablet : idxInfo.sortedTabletInfoList) {
+                    info.tabletBeMap.put(tablet.id, 1L);
+                    info.tabletSnapshotPathMap.put(tablet.id, "/snapshot/ss");
+                }
+            }
+        }
+        return info;
+    }
+
+    // the backup meta of test_tbl2 with the partitions at the version
+    private BackupMeta backupMetaAt(long version) {
+        OlapTable remoteTbl = tbl2.selectiveCopy(null, IndexExtState.VISIBLE, true);
+        for (Partition part : remoteTbl.getPartitions()) {
+            part.updateVersionForRestore(version);
+        }
+        return new BackupMeta(Lists.newArrayList(remoteTbl), Lists.<Resource>newArrayList());
+    }
+
+    private RestoreJob newAtomicJob(BackupJobInfo info, String level) {
+        long version = info.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME).partitions.values().iterator().next()
+                .version;
+        RestoreJob job = new RestoreJob("restore_label", "2024-01-01 00:00:00", db.getId(), db.getFullName(), info,
+                false, new ReplicaAllocation((short) 3), 100000, -1, false, false, false, false, false, false,
+                true /* atomic */, false, env, Repository.KEEP_ON_LOCAL_REPO_ID, backupMetaAt(version));
+        job.setReuseCheckLevel(level);
+        return job;
+    }
+
+    private RestoreJob prepareAtomicJob(BackupJobInfo info, String level) {
+        Config.enable_restore_atomic_reuse = true;
+        RestoreJob job = newAtomicJob(info, level);
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+        Assertions.assertEquals(RestoreJobState.CREATING, job.getState());
+        return job;
+    }
+
+    // the staging table of an atomic restore, registered under the temp name
+    private OlapTable staging(RestoreJob job) {
+        List<org.apache.doris.catalog.Table> restored = Deencapsulation.getField(job, "restoredTbls");
+        Assertions.assertEquals(1, restored.size());
+        return (OlapTable) restored.get(0);
+    }
+
+    private static List<SnapshotTask> snapshotTasks(List<AgentTask> tasks) {
+        return tasks.stream().filter(t -> t instanceof SnapshotTask).map(t -> (SnapshotTask) t)
+                .collect(Collectors.toList());
+    }
+
+    private static List<Long> tabletIds(Partition part) {
+        List<Long> ids = Lists.newArrayList();
+        for (MaterializedIndex index : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            for (Tablet tablet : index.getTablets()) {
+                ids.add(tablet.getId());
+            }
+        }
+        return ids;
+    }
+
+    // Finish the snapshot tasks, each reporting what it made from the local tablet.
+    private void finishSnapshots(RestoreJob job, List<SnapshotTask> tasks, long linkedBytes, long copiedBytes) {
+        for (SnapshotTask task : tasks) {
+            TFinishTaskRequest report = new TFinishTaskRequest();
+            report.setTaskStatus(new TStatus(TStatusCode.OK));
+            report.setSnapshotPath("/path/snapshot/" + task.getTabletId());
+            if (task.isRestoreLocalSource()) {
+                TDownloadStats stats = new TDownloadStats();
+                stats.setLocalSourceTablets(1);
+                stats.setLocalSourceLinkedFiles(linkedBytes > 0 ? 2 : 0);
+                stats.setLocalSourceLinkedBytes(linkedBytes);
+                stats.setLocalSourceCopiedFiles(copiedBytes > 0 ? 3 : 0);
+                stats.setLocalSourceCopiedBytes(copiedBytes);
+                report.setDownloadStats(stats);
+            }
+            Assertions.assertTrue(job.finishTabletSnapshotTask(task, report));
+        }
+    }
+
+    @Test
+    public void testAtomicRestoreIsNotReusedByDefault() {
+        Config.enable_restore_atomic_reuse = false;
+        RestoreJob job = newAtomicJob(selfBackupJobInfo(), "full");
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        // no candidate, no digest task: straight to the snapshots, which are as before
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertNull(job.getReuseResult());
+        Assertions.assertTrue(digestTasks(submitted).isEmpty());
+        List<SnapshotTask> snapshots = snapshotTasks(submitted);
+        Assertions.assertFalse(snapshots.isEmpty());
+        for (SnapshotTask task : snapshots) {
+            Assertions.assertFalse(task.isRestoreLocalSource());
+            Assertions.assertFalse(task.isRestoreIncremental());
+            Assertions.assertFalse(task.toThrift().isSetVersion());
+            // the base tablet is still used by the download, as before
+            Assertions.assertTrue(task.toThrift().isSetRefTabletId());
+        }
+        // with the switch off the judge still says why
+        RestoreReuseJudge.Input in = input(CheckLevel.FULL);
+        in.atomicRestore = true;
+        Assertions.assertEquals("ATOMIC_RESTORE", RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.ATOMIC_RESTORE,
+                RestoreReuseShadowStats.checkUnsupported(true, tbl2, p1()));
+        Assertions.assertFalse(job.getFullInfo().toString().contains("kept_atomic"));
+    }
+
+    @Test
+    public void testAtomicCandidatesAreThePartitionsOfTheTableBeingReplaced() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        OlapTable stagingTbl = staging(job);
+        Assertions.assertNotEquals(tbl2.getId(), stagingTbl.getId());
+        // the table being replaced is not touched: not in the RESTORE state, no lineage change
+        Assertions.assertEquals(OlapTableState.NORMAL, tbl2.getState());
+        Assertions.assertNotNull(p1().getRestoreLineage());
+        Assertions.assertNotNull(p2().getRestoreLineage());
+        // nothing is registered as an overwritten partition
+        Assertions.assertTrue(versionInfo(job).isEmpty());
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertNotNull(result);
+        Assertions.assertTrue(result.getRejected().isEmpty(), result.getRejected().toString());
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        // one digest task for each replica of the table being replaced, at the version of the backup
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        for (RestoreDigestTask task : tasks) {
+            Assertions.assertEquals(tbl2.getId(), task.getTableId());
+            Assertions.assertEquals(V1, task.getVersion());
+            Assertions.assertTrue(tabletIds(p1()).contains(task.getTabletId())
+                    || tabletIds(p2()).contains(task.getTabletId()));
+        }
+        Assertions.assertTrue(submitted.stream().noneMatch(t -> t instanceof SnapshotTask));
+    }
+
+    @Test
+    public void testAtomicKeepFlowToCommit() throws Exception {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        OlapTable stagingTbl = staging(job);
+        Partition stagingP1 = stagingTbl.getPartition(p1().getName());
+        Partition stagingP2 = stagingTbl.getPartition(p2().getName());
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getKeptPartitions());
+        Assertions.assertEquals(2, result.getKeptAtomicPartitions());
+        Assertions.assertEquals(0, result.getIncrementalPartitions());
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertTrue(decision.kept);
+            Assertions.assertTrue(decision.atomic);
+            // the decision is about the table being replaced, the tasks work on the staging table
+            Assertions.assertEquals(tbl2.getId(), decision.tableId);
+            Assertions.assertEquals(stagingTbl.getId(), decision.stagingTableId);
+            Partition local = tbl2.getPartition(decision.partitionId);
+            Assertions.assertEquals(stagingTbl.getPartition(local.getName()).getId(), decision.stagingPartitionId);
+            Assertions.assertEquals(V1, decision.version);
+            Assertions.assertEquals(RestoreReuseResult.KEPT_DIGEST_VERIFIED, decision.reason);
+        }
+        Assertions.assertNotNull(result.getKept(stagingTbl.getId(), stagingP1.getId()));
+        Assertions.assertNull(result.getKept(tbl2.getId(), p1().getId()));
+        // the lineage of the table being replaced is not invalidated (the table is dropped when replaced)
+        Assertions.assertNotNull(p1().getRestoreLineage());
+
+        // the snapshot tasks of the staging tablets are made from the local tablets at the version of the backup
+        List<SnapshotTask> snapshots = snapshotTasks(submitted);
+        Assertions.assertEquals(replicasOf(stagingP1) + replicasOf(stagingP2), snapshots.size());
+        List<Long> localTablets = Lists.newArrayList(tabletIds(p1()));
+        localTablets.addAll(tabletIds(p2()));
+        for (SnapshotTask task : snapshots) {
+            Assertions.assertTrue(task.isRestoreLocalSource());
+            Assertions.assertFalse(task.isRestoreIncremental());
+            Assertions.assertEquals(V1, task.getVersion());
+            Assertions.assertEquals(stagingTbl.getId(), task.getTableId());
+            org.apache.doris.thrift.TSnapshotRequest request = task.toThrift();
+            Assertions.assertTrue(request.isRestoreLocalSource());
+            Assertions.assertEquals(V1, request.getVersion());
+            Assertions.assertTrue(localTablets.contains(request.getRefTabletId()));
+            Assertions.assertNotEquals(task.getTabletId(), request.getRefTabletId());
+        }
+        finishSnapshots(job, snapshots, 1000, 0);
+
+        // nothing is downloaded
+        Deencapsulation.invoke(job, "waitingAllSnapshotsFinished");
+        Assertions.assertEquals(RestoreJobState.DOWNLOAD, job.getState());
+        submitted.clear();
+        Deencapsulation.invoke(job, "downloadSnapshots");
+        Assertions.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+        Assertions.assertTrue(submitted.stream().noneMatch(t -> t instanceof DownloadTask), submitted.toString());
+        Deencapsulation.invoke(job, "waitingAllDownloadFinished");
+        Assertions.assertEquals(RestoreJobState.COMMIT, job.getState());
+
+        // the move of every staging tablet loads its snapshot as it is
+        submitted.clear();
+        job.commit();
+        List<DirMoveTask> moves = submitted.stream().filter(t -> t instanceof DirMoveTask)
+                .map(t -> (DirMoveTask) t).collect(Collectors.toList());
+        Assertions.assertEquals(replicasOf(stagingP1) + replicasOf(stagingP2), moves.size());
+        for (DirMoveTask move : moves) {
+            Assertions.assertNull(move.getIncrementalRange());
+        }
+
+        // observable: the partitions kept, and the local bytes by the snapshots
+        String download = job.getFullInfo().stream().filter(x -> x.contains("atomic_local")).findFirst().orElse("");
+        long snapshotsMade = snapshots.size();
+        Assertions.assertTrue(download.contains("\"local_tablets\":" + snapshotsMade), download);
+        Assertions.assertTrue(download.contains("\"linked_bytes\":" + 1000 * snapshotsMade), download);
+        Assertions.assertTrue(download.contains("\"copied_bytes\":0"), download);
+        Assertions.assertTrue(download.contains("\"kept_atomic_bytes\":" + result.getKeptAtomicBytesAllReplicas()),
+                download);
+        Assertions.assertTrue(result.getKeptAtomicBytesAllReplicas() > 0);
+        // the tablets are not counted as downloaded: every replica to download is reported
+        Assertions.assertTrue(download.contains("\"not_reported\":0"), download);
+        String estimate = job.getFullInfo().stream().filter(x -> x.contains("kept_atomic\"")).findFirst().orElse("");
+        Assertions.assertTrue(estimate.contains("\"kept_atomic\":2"), estimate);
+        Assertions.assertTrue(estimate.contains("\"incremental_atomic\":0"), estimate);
+        Assertions.assertTrue(estimate.contains("\"kept_partitions\":2"), estimate);
+
+        // persisted: the decisions with the staging ids, and the counts of the local snapshots
+        RestoreJob replayed = writeAndRead(job);
+        RestoreReuseResult.Decision kept = replayed.getReuseResult().getKept(stagingTbl.getId(), stagingP1.getId());
+        Assertions.assertNotNull(kept);
+        Assertions.assertTrue(kept.atomic);
+        Assertions.assertEquals(tbl2.getId(), kept.tableId);
+        Assertions.assertEquals(p1().getId(), kept.partitionId);
+        Assertions.assertEquals(result.getKeptAtomicBytesAllReplicas(),
+                replayed.getReuseResult().getKeptAtomicBytesAllReplicas());
+        Assertions.assertEquals(snapshotsMade, replayed.getDownloadStats().getLocalSourceTablets());
+        Assertions.assertEquals(1000 * snapshotsMade, replayed.getDownloadStats().getLocalSourceLinkedBytes());
+
+        // the commit replaces the table, which is the staging one at the version of the backup
+        for (DirMoveTask move : moves) {
+            TFinishTaskRequest report = new TFinishTaskRequest();
+            report.setTaskStatus(new TStatus(TStatusCode.OK));
+            Assertions.assertTrue(job.finishDirMoveTask(move, report));
+        }
+        Status st = job.allTabletCommitted(false);
+        Assertions.assertTrue(st.ok(), st.toString());
+        OlapTable replaced = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL2_NAME);
+        Assertions.assertEquals(stagingTbl.getId(), replaced.getId());
+        Assertions.assertEquals(OlapTableState.NORMAL, replaced.getState());
+        for (Partition part : replaced.getPartitions()) {
+            Assertions.assertEquals(V1, part.getVisibleVersion());
+            Assertions.assertEquals(V1, part.getRestoreLineage().getSrcVersion());
+            for (Replica replica : part.getBaseIndex().getTablets().get(0).getReplicas()) {
+                Assertions.assertEquals(V1, replica.getVersion());
+            }
+        }
+        Assertions.assertEquals(RestoreJobState.FINISHED, job.getState());
+    }
+
+    @Test
+    public void testAtomicDigestMismatchDownloadsThePartition() {
+        RestoreJob job = prepareAtomicJob(localBackupJobInfo(), "full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Map<Long, TFinishTaskRequest> faulty = Maps.newHashMap();
+        // one replica of p2 differs
+        for (RestoreDigestTask task : tasks) {
+            if (task.getPartitionId() == p2().getId()) {
+                faulty.put(task.getSignature(), okReport("ff99", SIG, 1));
+                break;
+            }
+        }
+        reportAll(job, tasks, faulty);
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(1, result.getKeptPartitions());
+        Assertions.assertEquals(1, result.getDownloadedPartitions());
+        OlapTable stagingTbl = staging(job);
+        Assertions.assertNotNull(result.getKept(stagingTbl.getId(), stagingTbl.getPartition(p1().getName()).getId()));
+        Assertions.assertNull(result.getKept(stagingTbl.getId(), stagingTbl.getPartition(p2().getName()).getId()));
+        // p2 is a plain restore of the staging partition, as it is without partition level reuse
+        for (SnapshotTask task : snapshotTasks(submitted)) {
+            boolean ofP1 = task.getPartitionId() == stagingTbl.getPartition(p1().getName()).getId();
+            Assertions.assertEquals(ofP1, task.isRestoreLocalSource());
+            Assertions.assertEquals(ofP1, task.getVersion() == V1);
+            Assertions.assertTrue(task.toThrift().isSetRefTabletId());
+        }
+        finishSnapshots(job, snapshotTasks(submitted), 0, 500);
+        Deencapsulation.invoke(job, "waitingAllSnapshotsFinished");
+        submitted.clear();
+        Deencapsulation.invoke(job, "downloadSnapshots");
+        // only p2 is downloaded
+        List<DownloadTask> downloads = submitted.stream().filter(t -> t instanceof DownloadTask)
+                .map(t -> (DownloadTask) t).collect(Collectors.toList());
+        Assertions.assertFalse(downloads.isEmpty());
+        int remotes = 0;
+        for (DownloadTask download : downloads) {
+            for (TRemoteTabletSnapshot remote : download.getRemoteTabletSnapshots()) {
+                Assertions.assertTrue(tabletIds(stagingTbl.getPartition(p2().getName()))
+                        .contains(remote.getLocalTabletId()));
+                remotes++;
+            }
+        }
+        Assertions.assertEquals(replicasOf(stagingTbl.getPartition(p2().getName())), remotes);
+        // the copied bytes are counted apart
+        String download = job.getFullInfo().stream().filter(x -> x.contains("atomic_local")).findFirst().orElse("");
+        Assertions.assertTrue(download.contains("\"linked_bytes\":0"), download);
+        Assertions.assertTrue(download.contains("\"copied_bytes\":" + 500 * replicasOf(p1())), download);
+    }
+
+    @Test
+    public void testAtomicNotBoundIsDownloaded() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        OlapTable stagingTbl = staging(job);
+        // the binding of the tablets as the job made it
+        Map<Long, RestoreJob.TabletRef> bases = Maps.newHashMap();
+        for (Partition part : stagingTbl.getPartitions()) {
+            Partition local = tbl2.getPartition(part.getName());
+            for (MaterializedIndex stagingIdx : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                MaterializedIndex localIdx = stagingIdx.getId() == stagingTbl.getBaseIndexId() ? local.getBaseIndex()
+                        : local.getIndex(tbl2.getIndexIdByName(stagingTbl.getIndexNameById(stagingIdx.getId())));
+                for (int i = 0; i < stagingIdx.getTablets().size(); i++) {
+                    bases.put(stagingIdx.getTablets().get(i).getId(), new RestoreJob.TabletRef(
+                            localIdx.getTablets().get(i).getId(), 1));
+                }
+            }
+        }
+        Assertions.assertNull(RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+        Assertions.assertNull(RestoreJob.checkAtomicBinding(tbl2, p2(), stagingTbl, bases));
+
+        // a staging tablet without a base tablet
+        Tablet stagingTablet = stagingTbl.getPartition(p1().getName()).getBaseIndex().getTablets().get(0);
+        RestoreJob.TabletRef ref = bases.remove(stagingTablet.getId());
+        Assertions.assertEquals("ATOMIC_NOT_BOUND_TABLET", RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+        Assertions.assertNull(RestoreJob.checkAtomicBinding(tbl2, p2(), stagingTbl, bases));
+        // a base tablet that is another one
+        bases.put(stagingTablet.getId(), new RestoreJob.TabletRef(ref.tabletId + 1, 1));
+        Assertions.assertEquals("ATOMIC_NOT_BOUND_TABLET", RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+        bases.put(stagingTablet.getId(), ref);
+        Assertions.assertNull(RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+
+        // the replicas are not on the same backends
+        Replica stagingReplica = stagingTablet.getReplicas().get(0);
+        long backend = stagingReplica.getBackendIdWithoutException();
+        stagingReplica.setBackendId(backend + 100);
+        Assertions.assertEquals("ATOMIC_NOT_BOUND_REPLICA", RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+        // the order matters: the replica of the same position
+        stagingReplica.setBackendId(stagingTablet.getReplicas().get(1).getBackendIdWithoutException());
+        Assertions.assertEquals("ATOMIC_NOT_BOUND_REPLICA", RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+        stagingReplica.setBackendId(backend);
+        Assertions.assertNull(RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+        // a different number of replicas
+        Replica removed = stagingTablet.getReplicas().get(2);
+        stagingTablet.deleteReplica(removed);
+        Assertions.assertEquals("ATOMIC_NOT_BOUND_REPLICA", RestoreJob.checkAtomicBinding(tbl2, p1(), stagingTbl, bases));
+        stagingTablet.addReplica(removed, true);
+
+        // no staging partition of the name
+        String p2Name = p2().getName();
+        p2().setName("p2_renamed");
+        Assertions.assertEquals("ATOMIC_NOT_BOUND_PARTITION", RestoreJob.checkAtomicBinding(tbl2, p2(), stagingTbl, bases));
+        p2().setName(p2Name);
+
+        // the job: a table that is not bound (schema changed) is not a candidate, the judge says why
+        job.selectReuseCandidates(db, Maps.newHashMap(), bases);
+        Assertions.assertEquals(2L, (long) job.getReuseResult().getRejected().get("ATOMIC_NOT_BOUND_TABLE"));
+        Assertions.assertTrue(job.getReuseResult().getDecisions().isEmpty());
+        Map<String, OlapTable> bound = Maps.newHashMap();
+        bound.put(CatalogMocker.TEST_TBL2_NAME, stagingTbl);
+        bases.remove(stagingTablet.getId());
+        job.selectReuseCandidates(db, bound, bases);
+        Assertions.assertEquals(1L, (long) job.getReuseResult().getRejected().get("ATOMIC_NOT_BOUND_TABLET"));
+    }
+
+    @Test
+    public void testAtomicConditions() {
+        Config.enable_restore_atomic_reuse = true;
+        RestoreReuseJudge.Input in = input(CheckLevel.FULL);
+        tbl2.setState(OlapTableState.NORMAL);
+        in.atomicRestore = true;
+        // the table being replaced is not forbidden to write
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        in.allowLoad = true;
+        Assertions.assertEquals("ALLOW_LOAD", RestoreReuseJudge.firstReject(in));
+        in.allowLoad = false;
+        in.atomicReject = "ATOMIC_NOT_BOUND_REPLICA";
+        Assertions.assertEquals("ATOMIC_NOT_BOUND_REPLICA", RestoreReuseJudge.firstReject(in));
+        in.atomicReject = null;
+        tbl2.setState(OlapTableState.SCHEMA_CHANGE);
+        Assertions.assertEquals("TABLE_STATE_SCHEMA_CHANGE", RestoreReuseJudge.firstReject(in));
+        tbl2.setState(OlapTableState.NORMAL);
+        // the other conditions are the same
+        p1().setRestoreLineage(null);
+        Assertions.assertEquals("L0_NO_LINEAGE", RestoreReuseJudge.firstReject(in));
+        p1().setRestoreLineage(lineage(in.jobInfo, p1()));
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.NONE,
+                RestoreReuseShadowStats.checkUnsupported(true, tbl2, p1()));
+        Deencapsulation.setField(tbl2, "keysType", KeysType.AGG_KEYS);
+        Assertions.assertEquals("AGGREGATE_TABLE", RestoreReuseJudge.firstReject(in));
+    }
+
+    @Test
+    public void testAtomicIncrementalFlow() throws Exception {
+        Config.enable_restore_incremental_append = true;
+        RestoreJob job = prepareAtomicJob(incrementalJobInfo(), "full");
+        OlapTable stagingTbl = staging(job);
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        for (RestoreDigestTask task : tasks) {
+            // at the local version, of the table being replaced, with the decomposed digest of the backup
+            Assertions.assertEquals(tbl2.getId(), task.getTableId());
+            Assertions.assertEquals(V1, task.getVersion());
+            Assertions.assertEquals(V2, task.getPrefixSource().getEndVersion());
+        }
+        reportPrefix(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getIncrementalPartitions());
+        Assertions.assertEquals(2, result.getIncrementalAtomicPartitions());
+        Assertions.assertEquals(0, result.getKeptPartitions());
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertTrue(decision.incremental);
+            Assertions.assertTrue(decision.atomic);
+            Assertions.assertEquals(V1, decision.version);
+            Assertions.assertEquals(V2, decision.targetVersion);
+            Assertions.assertEquals(stagingTbl.getId(), decision.stagingTableId);
+        }
+        Partition stagingP1 = stagingTbl.getPartition(p1().getName());
+        Assertions.assertNotNull(result.getIncremental(stagingTbl.getId(), stagingP1.getId()));
+        Assertions.assertNull(result.getIncremental(tbl2.getId(), p1().getId()));
+
+        // the snapshot loads the local data up to the local version, and leaves an empty dir for the increment
+        List<SnapshotTask> snapshots = snapshotTasks(submitted);
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), snapshots.size());
+        for (SnapshotTask task : snapshots) {
+            Assertions.assertTrue(task.isRestoreLocalSource());
+            Assertions.assertTrue(task.isRestoreIncremental());
+            Assertions.assertEquals(V1, task.getVersion());
+            Assertions.assertTrue(task.toThrift().isSetRefTabletId());
+        }
+        finishSnapshots(job, snapshots, 700, 0);
+        Deencapsulation.invoke(job, "waitingAllSnapshotsFinished");
+
+        // the download is the increment, of the staging tablets
+        submitted.clear();
+        Deencapsulation.invoke(job, "downloadSnapshots");
+        int remotes = 0;
+        for (AgentTask task : submitted) {
+            if (task instanceof DownloadTask) {
+                for (TRemoteTabletSnapshot remote : ((DownloadTask) task).getRemoteTabletSnapshots()) {
+                    Assertions.assertEquals(V1, remote.getIncremental().getBaseVersion());
+                    Assertions.assertEquals(V2, remote.getIncremental().getEndVersion());
+                    remotes++;
+                }
+            }
+        }
+        Assertions.assertEquals(snapshots.size(), remotes);
+        // the download resets its stats, not what the local snapshots made
+        Assertions.assertEquals(snapshots.size(), job.getDownloadStats().getLocalSourceTablets());
+        Deencapsulation.setField(job, "state", RestoreJobState.COMMIT);
+        submitted.clear();
+        job.commit();
+        List<DirMoveTask> moves = submitted.stream().filter(t -> t instanceof DirMoveTask)
+                .map(t -> (DirMoveTask) t).collect(Collectors.toList());
+        Assertions.assertEquals(snapshots.size(), moves.size());
+        for (DirMoveTask move : moves) {
+            Assertions.assertEquals(V1, move.getIncrementalRange().getBaseVersion());
+            Assertions.assertEquals(V2, move.getIncrementalRange().getEndVersion());
+        }
+        String estimate = job.getFullInfo().stream().filter(x -> x.contains("kept_atomic\"")).findFirst().orElse("");
+        Assertions.assertTrue(estimate.contains("\"incremental_atomic\":2"), estimate);
+        Assertions.assertTrue(estimate.contains("\"kept_atomic\":0"), estimate);
+        Assertions.assertTrue(estimate.contains("\"incremental_partitions\":2"), estimate);
+        RestoreJob replayed = writeAndRead(job);
+        Assertions.assertEquals(2, replayed.getReuseResult().getIncrementalAtomicPartitions());
+        // the versions of the table being replaced are checked, with the version of the proof
+        Status st = job.allTabletCommitted(false);
+        Assertions.assertTrue(st.ok(), st.toString());
+        OlapTable replaced = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL2_NAME);
+        Assertions.assertEquals(stagingTbl.getId(), replaced.getId());
+        for (Partition part : replaced.getPartitions()) {
+            Assertions.assertEquals(V2, part.getVisibleVersion());
+            Assertions.assertEquals(V2, part.getRestoreLineage().getSrcVersion());
+        }
+    }
+
+    @Test
+    public void testAtomicWriteBeforeReplaceFailsAndTheTableIsNotReplaced() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        OlapTable stagingTbl = staging(job);
+        Assertions.assertEquals(2, job.getReuseResult().getKeptAtomicPartitions());
+
+        // the check under the lock of the table being replaced
+        Assertions.assertTrue(job.checkAtomicLocalVersions(tbl2).ok());
+        // a write: the version moved
+        p1().updateVersionForRestore(V1 + 1);
+        Status st = job.checkAtomicLocalVersions(tbl2);
+        Assertions.assertFalse(st.ok());
+        Assertions.assertTrue(st.getErrMsg().contains("changed from " + V1 + " to " + (V1 + 1)), st.getErrMsg());
+        p1().updateVersionForRestore(V1);
+        // a load committed and not published yet
+        p2().setNextVersion(V1 + 2);
+        st = job.checkAtomicLocalVersions(tbl2);
+        Assertions.assertFalse(st.ok());
+        Assertions.assertTrue(st.getErrMsg().contains(p2().getName()), st.getErrMsg());
+        p2().setNextVersion(V1 + 1);
+        Assertions.assertTrue(job.checkAtomicLocalVersions(tbl2).ok());
+
+        // the commit: fails before any tablet is moved and before the tables are replaced
+        p1().updateVersionForRestore(V1 + 1);
+        submitted.clear();
+        Deencapsulation.setField(job, "state", RestoreJobState.COMMIT);
+        job.commit();
+        Assertions.assertFalse(job.getStatus().ok());
+        Assertions.assertTrue(submitted.stream().noneMatch(t -> t instanceof DirMoveTask));
+        st = job.allTabletCommitted(false);
+        Assertions.assertFalse(st.ok());
+        // the table being replaced is still the table of the name
+        Assertions.assertEquals(tbl2.getId(), db.getTableNullable(CatalogMocker.TEST_TBL2_NAME).getId());
+        Assertions.assertNotNull(db.getTableNullable(RestoreJob.tableAliasWithAtomicRestore(
+                CatalogMocker.TEST_TBL2_NAME)));
+        Assertions.assertEquals(stagingTbl.getId(), db.getTableNullable(RestoreJob.tableAliasWithAtomicRestore(
+                CatalogMocker.TEST_TBL2_NAME)).getId());
+    }
+
+    @Test
+    public void testAtomicCancelReleasesTheLocalSnapshotsAndKeepsTheTable() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        List<SnapshotTask> snapshots = snapshotTasks(submitted);
+        finishSnapshots(job, snapshots, 1000, 0);
+        Deencapsulation.invoke(job, "waitingAllSnapshotsFinished");
+        submitted.clear();
+        job.cancel();
+        Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+        // every snapshot, the ones made from the local tablets too, is released
+        List<ReleaseSnapshotTask> releases = submitted.stream().filter(t -> t instanceof ReleaseSnapshotTask)
+                .map(t -> (ReleaseSnapshotTask) t).collect(Collectors.toList());
+        Assertions.assertEquals(snapshots.size(), releases.size());
+        // the table being replaced is as before, the staging table is gone
+        Assertions.assertEquals(V1, p1().getVisibleVersion());
+        Assertions.assertNotNull(p1().getRestoreLineage());
+        Assertions.assertEquals(OlapTableState.NORMAL, tbl2.getState());
+        Assertions.assertFalse(tbl2.isInAtomicRestore());
+        Assertions.assertNull(db.getTableNullable(RestoreJob.tableAliasWithAtomicRestore(
+                CatalogMocker.TEST_TBL2_NAME)));
+    }
+
+    @Test
+    public void testAtomicCancelWhileVerifyingChangesNothing() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(job);
+        newDigestTasks();
+        job.cancel();
+        Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertEquals(V1, p1().getVisibleVersion());
+        Assertions.assertNotNull(p1().getRestoreLineage());
+        Assertions.assertEquals(OlapTableState.NORMAL, tbl2.getState());
+        Assertions.assertNull(db.getTableNullable(RestoreJob.tableAliasWithAtomicRestore(
+                CatalogMocker.TEST_TBL2_NAME)));
+    }
+
+    @Test
+    public void testLocalSourceStatsAreSummedAndJson() {
+        RestoreDownloadStats stats = new RestoreDownloadStats();
+        TDownloadStats a = new TDownloadStats();
+        a.setLocalSourceTablets(2);
+        a.setLocalSourceLinkedFiles(5);
+        a.setLocalSourceLinkedBytes(500);
+        a.setLocalSourceCopiedFiles(1);
+        a.setLocalSourceCopiedBytes(70);
+        stats.addLocalSource(a);
+        stats.addLocalSource(a);
+        Assertions.assertEquals(4, stats.getLocalSourceTablets());
+        Assertions.assertEquals(1000, stats.getLocalSourceLinkedBytes());
+        Assertions.assertEquals(140, stats.getLocalSourceCopiedBytes());
+        RestoreDownloadStats next = new RestoreDownloadStats();
+        next.carryLocalSource(stats);
+        String json = next.toJson(0, 5000, 5000);
+        Assertions.assertTrue(json.contains("\"kept_atomic_bytes\":5000"), json);
+        Assertions.assertTrue(json.contains("\"copied_bytes\":140"), json);
+        Assertions.assertTrue(json.contains("\"local_tablets\":4"), json);
+        // untouched without an atomic restore
+        Config.enable_restore_atomic_reuse = false;
+        Assertions.assertFalse(new RestoreDownloadStats().toJson(0, 0).contains("atomic"));
     }
 }

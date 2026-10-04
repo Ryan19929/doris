@@ -103,10 +103,30 @@ public class RestoreReuseResult {
         public long targetVersion;
         @SerializedName("r")
         public String reason;
+        // Atomic restore: tableId and partitionId are those of the table being replaced (the local data, its version
+        // is checked before the tables are replaced), the data goes to the partition stagingPartitionId of the staging
+        // table stagingTableId, which is what the snapshot, download and move tasks are about.
+        @SerializedName("at")
+        public boolean atomic;
+        @SerializedName("stid")
+        public long stagingTableId;
+        @SerializedName("spid")
+        public long stagingPartitionId;
+
+        /** The table the tasks of the restore work on: the staging table in an atomic restore. */
+        public long restoredTableId() {
+            return atomic ? stagingTableId : tableId;
+        }
+
+        /** The partition the tasks of the restore work on. */
+        public long restoredPartitionId() {
+            return atomic ? stagingPartitionId : partitionId;
+        }
 
         @Override
         public String toString() {
-            return tableName + "." + partitionName + "(" + tableId + "," + partitionId + ", v" + version
+            return tableName + "." + partitionName + "(" + tableId + "," + partitionId
+                    + (atomic ? ", staging " + stagingTableId + "," + stagingPartitionId : "") + ", v" + version
                     + (incremental ? "->v" + targetVersion : "") + ", " + level + ", L0 " + l0Path + "): "
                     + (kept ? "KEEP " : incremental ? "INCREMENTAL " : "DOWNLOAD ") + reason;
         }
@@ -147,14 +167,45 @@ public class RestoreReuseResult {
         return false;
     }
 
-    /** The decision of the partition if it is restored incrementally, otherwise null. */
+    /**
+     * The decision of the restored partition if it is restored incrementally, otherwise null.
+     *
+     * @param tableId the table the tasks work on (the staging table in an atomic restore)
+     */
     public Decision getIncremental(long tableId, long partitionId) {
         for (Decision decision : decisions) {
-            if (decision.incremental && decision.tableId == tableId && decision.partitionId == partitionId) {
+            if (decision.incremental && decision.restoredTableId() == tableId
+                    && decision.restoredPartitionId() == partitionId) {
                 return decision;
             }
         }
         return null;
+    }
+
+    /** The decision of the restored partition if it keeps its local data, otherwise null. */
+    public Decision getKept(long tableId, long partitionId) {
+        for (Decision decision : decisions) {
+            if (decision.kept && decision.restoredTableId() == tableId
+                    && decision.restoredPartitionId() == partitionId) {
+                return decision;
+            }
+        }
+        return null;
+    }
+
+    /** The partitions of an atomic restore that keep the data of the table being replaced. */
+    public long getKeptAtomicPartitions() {
+        return decisions.stream().filter(d -> d.kept && d.atomic).count();
+    }
+
+    /** The partitions of an atomic restore restored by the local base and the increment. */
+    public long getIncrementalAtomicPartitions() {
+        return decisions.stream().filter(d -> d.incremental && d.atomic).count();
+    }
+
+    /** The local data size of all replicas of the partitions kept by an atomic restore. */
+    public long getKeptAtomicBytesAllReplicas() {
+        return decisions.stream().filter(d -> d.kept && d.atomic).mapToLong(d -> d.bytesAllReplicas).sum();
     }
 
     public List<Decision> getIncrementalDecisions() {
