@@ -37,8 +37,8 @@
 #include <memory>
 #include <optional>
 #include <random>
-#include <shared_mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -53,11 +53,10 @@
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
 #include "runtime/snapshot_loader.h"
-#include "storage/snapshot/snapshot_manager.h"
-#include "util/debug_points.h"
 #include "storage/data_dir.h"
 #include "storage/delete/delete_handler.h"
 #include "storage/merger.h"
+#include "storage/mow/mow_transform_test_base.h"
 #include "storage/olap_common.h"
 #include "storage/options.h"
 #include "storage/rowid_conversion.h"
@@ -66,7 +65,7 @@
 #include "storage/rowset/rowset_reader.h"
 #include "storage/rowset/rowset_writer.h"
 #include "storage/rowset/rowset_writer_context.h"
-#include "storage/mow/mow_transform_test_base.h"
+#include "storage/snapshot/snapshot_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet/tablet.h"
 #include "storage/tablet/tablet_manager.h"
@@ -74,6 +73,7 @@
 #include "storage/tablet/tablet_schema.h"
 #include "storage/utils.h"
 #include "testutil/creators.h"
+#include "util/debug_points.h"
 #include "util/defer_op.h"
 #include "util/jsonb_parser_simd.h"
 #include "util/jsonb_writer.h"
@@ -3662,7 +3662,6 @@ TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
     EXPECT_TRUE(digests_equal(tablet_digest(7433, 6), tablet_digest(7432, 6)));
 }
 
-
 // The atomic restore keeps the data of the table being replaced: the snapshot of a tablet made from the local source
 // tablet (TSnapshotRequest.restore_local_source).
 class RestoreLocalSourceTest : public RestoreIncrementalAppendTest {
@@ -3688,7 +3687,8 @@ protected:
     }
 
     // keep the data of src at `version` in target, as the snapshot and the move of the restore do
-    LocalSourceStats keep(const TabletSharedPtr& src, const TabletSharedPtr& target, int64_t version) {
+    LocalSourceStats keep(const TabletSharedPtr& src, const TabletSharedPtr& target,
+                          int64_t version) {
         TSnapshotRequest req = local_source_request(src, target, version);
         std::string path;
         bool allow = false;
@@ -3713,7 +3713,9 @@ protected:
     int64_t hard_links(const TabletSharedPtr& tablet) {
         std::vector<io::FileInfo> files;
         bool exists = false;
-        EXPECT_TRUE(io::global_local_filesystem()->list(tablet->tablet_path(), true, &files, &exists).ok());
+        EXPECT_TRUE(io::global_local_filesystem()
+                            ->list(tablet->tablet_path(), true, &files, &exists)
+                            .ok());
         int64_t linked = 0;
         for (const auto& f : files) {
             struct stat st;
@@ -3855,7 +3857,8 @@ protected:
         std::string src_dir =
                 fmt::format("{}/{}/{}", src_path, backup->tablet_id(), backup->schema_hash());
         TabletMetaPB remote;
-        ASSERT_TRUE(TabletMeta::load_from_file(fmt::format("{}/{}.hdr", src_dir, backup->tablet_id()), &remote)
+        ASSERT_TRUE(TabletMeta::load_from_file(
+                            fmt::format("{}/{}.hdr", src_dir, backup->tablet_id()), &remote)
                             .ok());
         TabletMetaPB inc;
         std::vector<std::string> ids;
@@ -3867,7 +3870,8 @@ protected:
             for (const auto& id : ids) {
                 if (is_rowset_file(f.file_name, id)) {
                     ASSERT_TRUE(io::global_local_filesystem()
-                                        ->link_file(src_dir + "/" + f.file_name, dir + "/" + f.file_name)
+                                        ->link_file(src_dir + "/" + f.file_name,
+                                                    dir + "/" + f.file_name)
                                         .ok());
                 }
             }
@@ -3890,7 +3894,8 @@ protected:
         ASSERT_NE(nullptr, whole);
         build_source(backup, mow);
         build_local(origin, mow);
-        EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), 3), tablet_digest(origin->tablet_id(), 3)));
+        EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), 3),
+                                  tablet_digest(origin->tablet_id(), 3)));
         auto origin_files = tablet_files(origin);
         size_t dirs = snapshot_dirs(target);
 
@@ -3905,7 +3910,8 @@ protected:
         EXPECT_GT(stats.linked_files + stats.copied_files, 0);
         // the local source snapshot is released, only the empty dir of the increment is left
         EXPECT_EQ(dirs + 1, snapshot_dirs(target));
-        std::string dir = fmt::format("{}/{}/{}", dir_path, target->tablet_id(), target->schema_hash());
+        std::string dir =
+                fmt::format("{}/{}/{}", dir_path, target->tablet_id(), target->schema_hash());
         std::vector<io::FileInfo> files;
         bool exists = false;
         ASSERT_TRUE(io::global_local_filesystem()->list(dir, true, &files, &exists).ok());
@@ -3914,7 +3920,8 @@ protected:
         auto loaded = _engine->tablet_manager()->get_tablet(target->tablet_id());
         ASSERT_NE(nullptr, loaded);
         EXPECT_EQ(3, loaded->max_version_unlocked());
-        EXPECT_TRUE(digests_equal(tablet_digest(origin->tablet_id(), 3), tablet_digest(target->tablet_id(), 3)));
+        EXPECT_TRUE(digests_equal(tablet_digest(origin->tablet_id(), 3),
+                                  tablet_digest(target->tablet_id(), 3)));
 
         put_increment(backup, target, dir, 3, 6);
         TRestoreIncrementalRange range;
@@ -3925,10 +3932,13 @@ protected:
         EXPECT_EQ(6, loaded->max_version_unlocked());
         whole_restore(backup, whole, 6);
         // the same as the backup and as the whole download, at the end and at every version of the increment
-        EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), 6), tablet_digest(target->tablet_id(), 6)));
-        EXPECT_TRUE(digests_equal(tablet_digest(whole->tablet_id(), 6), tablet_digest(target->tablet_id(), 6)));
+        EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), 6),
+                                  tablet_digest(target->tablet_id(), 6)));
+        EXPECT_TRUE(digests_equal(tablet_digest(whole->tablet_id(), 6),
+                                  tablet_digest(target->tablet_id(), 6)));
         for (int64_t v = 3; v <= 6; ++v) {
-            EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), v), tablet_digest(target->tablet_id(), v)))
+            EXPECT_TRUE(digests_equal(tablet_digest(backup->tablet_id(), v),
+                                      tablet_digest(target->tablet_id(), v)))
                     << v;
         }
         // the origin tablet is not changed

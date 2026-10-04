@@ -147,7 +147,8 @@ Status SnapshotManager::make_snapshot(const TSnapshotRequest& request, string* s
                                          allow_incremental_clone, local_source_stats);
             if (!res.ok()) {
                 LOG(WARNING) << "failed to make local source snapshot. res=" << res
-                             << " tablet=" << request.tablet_id << " source tablet=" << ref_tablet_id;
+                             << " tablet=" << request.tablet_id
+                             << " source tablet=" << ref_tablet_id;
                 return res;
             }
             LOG(INFO) << "success to make local source snapshot. path=['" << *snapshot_path << "']"
@@ -485,8 +486,7 @@ Status SnapshotManager::_link_index_and_data_files(
 Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet,
                                                const TabletSharedPtr& target_tablet,
                                                const TSnapshotRequest& request,
-                                               string* snapshot_path,
-                                               bool* allow_incremental_clone,
+                                               string* snapshot_path, bool* allow_incremental_clone,
                                                LocalSourceStats* local_source_stats) {
     int32_t snapshot_version = request.preferred_snapshot_version;
     LOG(INFO) << "receive a make snapshot request"
@@ -536,7 +536,8 @@ Status SnapshotManager::_create_snapshot_files(const TabletSharedPtr& ref_tablet
     // the files of the local source tablet are copied if it is not on the same disk
     bool copy_files =
             local_source && ref_tablet->data_dir()->path() != target_tablet->data_dir()->path();
-    DBUG_EXECUTE_IF("SnapshotManager.restore_local_source.force_copy", { copy_files = local_source; });
+    DBUG_EXECUTE_IF("SnapshotManager.restore_local_source.force_copy",
+                    { copy_files = local_source; });
     LocalSourceStats source_stats;
     if (request.__isset.restore_incremental && request.restore_incremental && !local_source) {
         // the dir to download the increment of the incremental restore into: no rowset, no tablet meta

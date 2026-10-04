@@ -302,8 +302,7 @@ public:
     // to be downloaded into. The tablet then looks like the local tablet of the incremental restore. On failure
     // no snapshot is left, the tablet may have been loaded.
     Status make_local_source_snapshot_and_load(const TSnapshotRequest& request,
-                                               std::string* snapshot_path,
-                                               LocalSourceStats* stats);
+                                               std::string* snapshot_path, LocalSourceStats* stats);
 
     int64_t get_http_download_files_num() const { return _http_download_files_num; }
 

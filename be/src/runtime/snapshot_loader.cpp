@@ -2472,8 +2472,9 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
                          << st;
         }
     }};
-    RETURN_IF_ERROR(move(fmt::format("{}/{}/{}", source_path, request.tablet_id, request.schema_hash),
-                         tablet, true));
+    RETURN_IF_ERROR(
+            move(fmt::format("{}/{}/{}", source_path, request.tablet_id, request.schema_hash),
+                 tablet, true));
     TSnapshotRequest empty_request = request;
     empty_request.__set_restore_local_source(false);
     return _engine.snapshot_mgr()->make_snapshot(empty_request, snapshot_path,
