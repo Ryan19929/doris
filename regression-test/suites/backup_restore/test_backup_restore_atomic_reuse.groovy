@@ -22,6 +22,8 @@ import groovy.json.JsonSlurper
 // the partition that is behind the backup downloads only the increment. The table is replaced in the end: the data,
 // the versions equal the source, and the tablets are the new ones. With the switch off the atomic restore downloads
 // everything as before.
+// Auto compaction is off: a compaction of A could merge the rowsets across the version of B, and the partition would
+// be downloaded whole, which is correct but not what this test is about.
 suite("test_backup_restore_atomic_reuse", "backup_restore") {
     String suiteName = "test_backup_restore_atomic_reuse"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
@@ -63,7 +65,7 @@ suite("test_backup_restore_atomic_reuse", "backup_restore") {
                 PARTITION p3 VALUES LESS THAN ("3000")
             )
             DISTRIBUTED BY HASH(`id`) BUCKETS 2
-            PROPERTIES ("replication_num" = "1"${props})
+            PROPERTIES ("replication_num" = "1", "disable_auto_compaction" = "true"${props})
             """
         for (int b = 0; b < 3; ++b) {
             List<String> values = []

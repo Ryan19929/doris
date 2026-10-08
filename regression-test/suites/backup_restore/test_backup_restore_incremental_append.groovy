@@ -22,6 +22,8 @@ import groovy.json.JsonSlurper
 // behind only the rowsets after its version are downloaded and appended to the local tablets. The data of B equals
 // the data of A row by row, the downloaded bytes are far less than a whole download, and with the switch off the
 // partition is downloaded as a whole.
+// Auto compaction is off: a compaction of A could merge the rowsets across the version of B, and the partition would
+// be downloaded whole, which is correct but not what this test is about.
 suite("test_backup_restore_incremental_append", "backup_restore") {
     String suiteName = "test_backup_restore_incremental_append"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
@@ -62,7 +64,7 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
                 PARTITION p3 VALUES LESS THAN ("3000")
             )
             DISTRIBUTED BY HASH(`id`) BUCKETS 2
-            PROPERTIES ("replication_num" = "1"${props})
+            PROPERTIES ("replication_num" = "1", "disable_auto_compaction" = "true"${props})
             """
         for (int b = 0; b < 3; ++b) {
             List<String> values = []
