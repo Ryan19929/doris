@@ -162,7 +162,7 @@ std::string sha256_of(std::string_view data) {
 std::string RestoreDigestDecomposed::serialize() const {
     Writer w;
     w.bytes(kMagic, sizeof(kMagic));
-    w.u32(kFormatVersion);
+    w.u32(mor ? kFormatVersionMor : kFormatVersion);
     w.u32(algo_version);
     w.u8(mow ? 1 : 0);
     w.i64(tablet_id);
@@ -181,6 +181,14 @@ std::string RestoreDigestDecomposed::serialize() const {
     for (const auto& mark : marks) {
         w.i64(mark.mark_version);
         w.buckets(mark.buckets);
+    }
+    if (mor) {
+        // format version 2: the whole digests
+        w.u32(static_cast<uint32_t>(wholes.size()));
+        for (const auto& whole : wholes) {
+            w.i64(whole.version);
+            w.buckets(whole.buckets);
+        }
     }
     return w.take();
 }
@@ -216,7 +224,7 @@ Status RestoreDigestDecomposed::parse(std::string_view content, std::string_view
     RestoreDigestDecomposed d;
     uint32_t format = 0;
     uint8_t mow = 0;
-    if (!r.u32(&format) || format != kFormatVersion) {
+    if (!r.u32(&format) || (format != kFormatVersion && format != kFormatVersionMor)) {
         return invalid("unknown format version");
     }
     if (!r.u32(&d.algo_version) || !r.u8(&mow) || !r.i64(&d.tablet_id) || !r.i64(&d.base_version) ||
@@ -256,6 +264,33 @@ Status RestoreDigestDecomposed::parse(std::string_view content, std::string_view
         }
         d.marks.push_back(std::move(mark));
     }
+    if (format == kFormatVersionMor) {
+        d.mor = true;
+        if (d.mow || !d.marks.empty()) {
+            return invalid("a merge on read file has marks");
+        }
+        if (!r.u32(&n)) {
+            return invalid("truncated whole digests");
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            RestoreDigestWholePart whole;
+            if (!r.i64(&whole.version) || !r.buckets(&whole.buckets)) {
+                return invalid("bad whole digest");
+            }
+            if (!d.wholes.empty() && whole.version <= d.wholes.back().version) {
+                return invalid("whole digest versions are not ascending");
+            }
+            d.wholes.push_back(std::move(whole));
+        }
+        if (d.wholes.empty() || d.wholes.back().version != d.base_version) {
+            return invalid("the last whole digest is not at the base version");
+        }
+        for (const auto& whole : d.wholes) {
+            if (!d.is_rowset_end(whole.version)) {
+                return invalid("a whole digest is not at the end of a rowset");
+            }
+        }
+    }
     if (!r.at_end()) {
         return invalid("trailing bytes");
     }
@@ -266,11 +301,19 @@ Status RestoreDigestDecomposed::parse(std::string_view content, std::string_view
     return Status::OK();
 }
 
-bool RestoreDigestDecomposed::is_boundary(int64_t version) const {
+bool RestoreDigestDecomposed::is_rowset_end(int64_t version) const {
     auto it = std::lower_bound(
             rowsets.begin(), rowsets.end(), version,
             [](const RestoreDigestRowsetPart& rs, int64_t v) { return rs.end_version < v; });
     return it != rowsets.end() && it->end_version == version;
+}
+
+bool RestoreDigestDecomposed::is_boundary(int64_t version) const {
+    if (mor) {
+        return std::any_of(wholes.begin(), wholes.end(),
+                           [version](const RestoreDigestWholePart& w) { return w.version == version; });
+    }
+    return is_rowset_end(version);
 }
 
 Status RestoreDigestDecomposed::compose(int64_t version, RestoreDigest* digest) const {
@@ -282,23 +325,38 @@ Status RestoreDigestDecomposed::compose(int64_t version, RestoreDigest* digest) 
     }
     RestoreDigest total;
     total.schema_sig = schema_sig;
-    for (const auto& rs : rowsets) {
-        if (rs.end_version > version) {
-            break;
+    if (mor) {
+        // the whole digest of that version
+        for (const auto& whole : wholes) {
+            if (whole.version == version) {
+                total.buckets = whole.buckets;
+            }
         }
-        total.rowset_count++;
-        for (size_t i = 0; i < RestoreDigest::kNumBuckets; ++i) {
-            total.buckets[i].sum += rs.buckets[i].sum;
-            total.buckets[i].count += rs.buckets[i].count;
+        for (const auto& rs : rowsets) {
+            if (rs.end_version > version) {
+                break;
+            }
+            total.rowset_count++;
         }
-    }
-    for (const auto& mark : marks) {
-        if (mark.mark_version > version) {
-            break;
+    } else {
+        for (const auto& rs : rowsets) {
+            if (rs.end_version > version) {
+                break;
+            }
+            total.rowset_count++;
+            for (size_t i = 0; i < RestoreDigest::kNumBuckets; ++i) {
+                total.buckets[i].sum += rs.buckets[i].sum;
+                total.buckets[i].count += rs.buckets[i].count;
+            }
         }
-        for (size_t i = 0; i < RestoreDigest::kNumBuckets; ++i) {
-            total.buckets[i].sum -= mark.buckets[i].sum;
-            total.buckets[i].count -= mark.buckets[i].count;
+        for (const auto& mark : marks) {
+            if (mark.mark_version > version) {
+                break;
+            }
+            for (size_t i = 0; i < RestoreDigest::kNumBuckets; ++i) {
+                total.buckets[i].sum -= mark.buckets[i].sum;
+                total.buckets[i].count -= mark.buckets[i].count;
+            }
         }
     }
     for (const auto& b : total.buckets) {

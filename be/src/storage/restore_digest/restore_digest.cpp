@@ -899,6 +899,85 @@ int64_t next_scratch_bitmap_tablet_id() {
 
 } // namespace
 
+namespace {
+
+// Unique MoR: a whole digest at the base version and at the most recent rowset boundaries below it.
+// The rowsets of every version are merged by key, nothing of one is reused for another.
+Status decompose_mor(const RestoreDigestInput& input, int64_t tablet_id, const std::string& schema_sig,
+                     int threads, RestoreDigestDecomposed* out) {
+    using namespace restore_digest_detail;
+    if (input.tablet == nullptr) {
+        return Status::InvalidArgument("restore digest: unique MoR needs the tablet");
+    }
+    const int64_t boundaries = config::restore_digest_mor_prefix_boundaries;
+    if (boundaries <= 0) {
+        return Status::NotSupported(
+                "restore digest: the decomposed digest of unique merge on read is disabled "
+                "(restore_digest_mor_prefix_boundaries = 0)");
+    }
+    // prefixes[0] is the whole chain, then the shorter ones, the most recent first
+    std::vector<size_t> prefixes {input.rowsets.size()};
+    for (size_t n = input.rowsets.size(); n > 1 && static_cast<int64_t>(prefixes.size()) <= boundaries;
+         --n) {
+        prefixes.push_back(n - 1);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<RestoreDigest> digests(prefixes.size());
+    std::vector<DigestScanTask> tasks(prefixes.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        tasks[i].rowset_idx = i;
+    }
+    RestoreDigest unused;
+    RETURN_IF_ERROR(run_tasks(
+            tasks, std::min<int>(threads, static_cast<int>(tasks.size())),
+            [&](const DigestScanTask& task, RestoreDigest*) {
+                RestoreDigestInput sub = input;
+                sub.rowsets.assign(input.rowsets.begin(),
+                                   input.rowsets.begin() + static_cast<long>(prefixes[task.rowset_idx]));
+                sub.version = sub.rowsets.back()->end_version();
+                sub.threads = 1;
+                return compute_restore_digest(sub, &digests[task.rowset_idx]);
+            },
+            &unused));
+
+    RestoreDigestDecomposed result;
+    result.algo_version = RestoreDigest::kAlgoVersion;
+    result.schema_sig = schema_sig;
+    result.mow = false;
+    result.mor = true;
+    result.tablet_id = tablet_id;
+    result.base_version = input.version;
+    for (const RowsetSharedPtr& rowset : input.rowsets) {
+        RestoreDigestRowsetPart part;
+        part.rowset_id = rowset->rowset_id().to_string();
+        part.start_version = rowset->start_version();
+        part.end_version = rowset->end_version();
+        result.rowsets.push_back(std::move(part));
+    }
+    for (size_t i = prefixes.size(); i-- > 0;) {
+        RestoreDigestWholePart whole;
+        whole.version = input.rowsets[prefixes[i] - 1]->end_version();
+        whole.buckets = digests[i].buckets;
+        result.wholes.push_back(std::move(whole));
+    }
+    result.root = digests[0].root;
+    result.rows = digests[0].rows;
+    int64_t scanned = 0;
+    for (const auto& d : digests) {
+        scanned += static_cast<int64_t>(d.rows_scanned);
+    }
+    LOG(INFO) << "decomposed digest of the MoR tablet " << tablet_id << " at version " << input.version
+              << ": " << prefixes.size() << " whole digests, " << scanned << " rows scanned in total, "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+              << " ms, the base version alone took " << digests[0].elapsed_ms << " ms";
+    *out = std::move(result);
+    return Status::OK();
+}
+
+} // namespace
+
 Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_id,
                                 RestoreDigestDecomposed* out) {
     using namespace restore_digest_detail;
@@ -907,10 +986,7 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
     }
     ColumnPlan plan;
     RETURN_IF_ERROR(build_plan(*input.schema, input.keys_type, input.enable_mow, &plan));
-    if (input.keys_type == UNIQUE_KEYS && !input.enable_mow) {
-        return Status::NotSupported(
-                "restore digest: the decomposed digest does not support unique merge on read");
-    }
+    const bool is_mor = input.keys_type == UNIQUE_KEYS && !input.enable_mow;
     if (input.enable_mow && input.delete_bitmap == nullptr) {
         return Status::InvalidArgument("restore digest: MoW needs a delete bitmap snapshot");
     }
@@ -934,13 +1010,10 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
             delete_metas.push_back(rowset->rowset_meta());
         }
     }
-    if (input.enable_mow && !delete_metas.empty()) {
-        return Status::NotSupported(
-                "restore digest: the decomposed digest does not support unique merge on write with "
-                "delete conditions ({} found)",
-                delete_metas.size());
-    }
     const int threads = std::max(1, input.threads);
+    if (is_mor) {
+        return decompose_mor(input, tablet_id, plan.schema_sig, threads, out);
+    }
     const int64_t max_scans = std::max<int64_t>(0, config::restore_digest_prefix_max_scans);
 
     // 1. Plan the scans.
@@ -950,6 +1023,9 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
         // (version, group) of the later scans, ascending: the delete conditions (duplicate), or the
         // death versions of rows (MoW)
         std::vector<std::pair<int64_t, size_t>> later;
+        // MoW with DELETE conditions above the rowset: (version of the condition, group) of the level
+        // scans, the rows alive after the condition. `later` then holds the bitmap deaths only.
+        std::vector<std::pair<int64_t, size_t>> levels;
     };
     std::vector<RowsetPlan> plans(input.rowsets.size());
     std::vector<PrefixScanJob> jobs;
@@ -1013,6 +1089,34 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
             continue;
         }
 
+        // Unique MoW. The DELETE conditions above the rowset kill rows at their own versions: the rows
+        // alive after each condition are read with a level scan, the rows killed by the bitmap
+        // before a condition are the ones the bitmap scans below read.
+        std::vector<int64_t> preds;
+        for (const auto& meta : delete_metas) {
+            if (meta->version().first > end) {
+                preds.push_back(meta->version().first);
+            }
+        }
+        std::sort(preds.begin(), preds.end());
+        for (const int64_t d : preds) {
+            if (++extra_scans > max_scans) {
+                return Status::NotSupported(
+                        "restore digest: the decomposed digest needs more than {} extra scans for "
+                        "the delete conditions",
+                        max_scans);
+            }
+            const size_t group = groups++;
+            plan_i.levels.emplace_back(d, group);
+            for (const auto& run : segment_runs(num_segments, threads)) {
+                ScanView view;
+                view.version = d;
+                view.delete_bitmap = input.delete_bitmap;
+                view.delete_metas = delete_metas;
+                add_job(i, std::move(view), run, group);
+            }
+        }
+
         // Unique MoW: the rows of every segment by the first version above the end version at
         // which the delete bitmap marks them.
         std::map<int64_t, std::map<uint32_t, roaring::Roaring>> by_version;
@@ -1049,6 +1153,10 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
         std::vector<uint32_t> segment_rows;
         rowset->rowset_meta()->get_num_segment_rows(&segment_rows);
         for (const auto& [k, per_segment] : by_version) {
+            // the rows killed by the bitmap at the version of a condition die there anyway
+            if (std::binary_search(preds.begin(), preds.end(), k)) {
+                continue;
+            }
             if (++extra_scans > max_scans) {
                 return Status::NotSupported(
                         "restore digest: the decomposed digest needs more than {} extra scans for "
@@ -1074,7 +1182,11 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
             const size_t group = groups++;
             plan_i.later.emplace_back(k, group);
             ScanView view;
-            view.version = std::max<int64_t>(1, input.version);
+            // the rows which die at k, and are not hit by a condition up to k
+            view.version = preds.empty() ? std::max<int64_t>(1, input.version) : k;
+            if (!preds.empty()) {
+                view.delete_metas = delete_metas;
+            }
             view.delete_bitmap = std::move(bitmap);
             add_job(i, std::move(view),
                     lo == 0 && hi + 1 == num_segments ? std::pair<int64_t, int64_t> {0, 0}
@@ -1127,6 +1239,21 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
             if (input.enable_mow) {
                 for (const auto& [k, group] : plan_i.later) {
                     add_buckets(&marks[k], group_buckets[group]);
+                }
+                // The rows alive just before a condition d are the rows alive after the previous
+                // one, less the rows the bitmap kills in between (not hit by a condition, so they
+                // are the rows of the bitmap scans). Those that d kills die at d.
+                size_t next_later = 0;
+                DigestBuckets running = part.buckets;
+                for (const auto& [d, group] : plan_i.levels) {
+                    while (next_later < plan_i.later.size() && plan_i.later[next_later].first < d) {
+                        sub_buckets(&running, group_buckets[plan_i.later[next_later].second]);
+                        ++next_later;
+                    }
+                    DigestBuckets removed = running;
+                    sub_buckets(&removed, group_buckets[group]);
+                    add_buckets(&marks[d], removed);
+                    running = group_buckets[group];
                 }
             } else {
                 const DigestBuckets* previous = &part.buckets;

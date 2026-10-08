@@ -296,6 +296,11 @@ DEFINE_mBool(restore_digest_prefix_enabled, "true");
 // max number of extra scans (delete bitmap versions of a rowset for unique MoW, delete conditions for
 // duplicate) a decomposed digest may need; a tablet that needs more has no decomposed digest
 DEFINE_mInt32(restore_digest_prefix_max_scans, "4096");
+// unique merge on read: the number of most recent rowset boundary versions (below the backup version) on
+// which a snapshot task computes a whole digest, so that a restore can append an increment on top of
+// the local data when it stands at one of them; every one is a full merge scan of the tablet. 0 disables
+// the decomposed digest of merge on read tablets.
+DEFINE_mInt32(restore_digest_mor_prefix_boundaries, "3");
 // download binlog meta timeout, default 30s
 DEFINE_mInt32(download_binlog_meta_timeout_ms, "30000");
 // the interval time(seconds) for agent report index policy to FE

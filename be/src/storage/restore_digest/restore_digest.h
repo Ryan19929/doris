@@ -220,10 +220,19 @@ using DigestBuckets = std::array<RestoreDigest::Bucket, RestoreDigest::kNumBucke
 // k <= V_l). The sums are modulo 2^128, the counts are plain integers, both are exact, so the result
 // equals the digest computed directly at V_l, bucket by bucket.
 //
-// Supported: duplicate (also with DELETE conditions) and unique MoW without DELETE conditions. Unique
-// MoR (rows are merged across rowsets, not additive), unique MoW with DELETE conditions (the death
-// version would be the minimum of two independent sources), and tablets which need more than
-// config::restore_digest_prefix_max_scans extra scans are NotSupported.
+// Unique MoW with DELETE conditions: the death version of a row is the lower of the version at which
+// the delete bitmap marks it and the version of the first DELETE condition which matches it and is
+// above the end version of its rowset (R2 design section 15). The rows which die at a bitmap version
+// are read through a bitmap of their own, the rows which die at a DELETE condition are the difference
+// of two levels of the rowset, so the composition formula stays the same.
+//
+// Unique MoR: the visible rows are decided by merging the rowsets by key, which is not additive. A
+// file of a MoR tablet carries, besides the rowset chain (without buckets), the whole digest at the
+// `restore_digest_mor_prefix_boundaries` most recent rowset boundaries below the base version and at
+// the base version (format version 2). Only those versions are boundaries of such a file.
+//
+// Not supported: tablets which need more than config::restore_digest_prefix_max_scans extra scans, and
+// MoR with the number of boundaries set to 0.
 struct RestoreDigestRowsetPart {
     std::string rowset_id; // on the source tablet, informational
     int64_t start_version = 0;
@@ -236,8 +245,17 @@ struct RestoreDigestMarkPart {
     DigestBuckets buckets {};
 };
 
+// Unique MoR: the whole digest at one version (format version 2 files).
+struct RestoreDigestWholePart {
+    int64_t version = 0;
+    DigestBuckets buckets {};
+};
+
 struct RestoreDigestDecomposed {
+    // Files of the models which compose by rowset (duplicate, MoW) keep format version 1, byte for byte as
+    // before. A MoR file is format version 2: version 1 plus a trailing section with the whole digests.
     static constexpr uint32_t kFormatVersion = 1;
+    static constexpr uint32_t kFormatVersionMor = 2;
     // file name next to the manifest of a local snapshot: <snapshot>/<tablet_id>/rdigest
     static constexpr std::string_view kLocalFileName = "rdigest";
 
@@ -254,6 +272,10 @@ struct RestoreDigestDecomposed {
     std::vector<RestoreDigestRowsetPart> rowsets;
     // sorted by mark_version, only the versions which have marked rows
     std::vector<RestoreDigestMarkPart> marks;
+    // unique MoR only: the rowsets above carry no buckets, the digests are these whole ones, sorted by
+    // version, the last one is at base_version
+    bool mor = false;
+    std::vector<RestoreDigestWholePart> wholes;
 
     // Binary content of the rdigest file. Sparse: only the buckets with rows are written.
     std::string serialize() const;
@@ -264,8 +286,11 @@ struct RestoreDigestDecomposed {
     // Lower case hex SHA-256 of serialize(): the root of the file recorded in the backup job info.
     std::string file_root() const;
 
-    // Whether `version` is the end version of one of the rowsets.
+    // Whether `version` is the end version of one of the rowsets (MoR: one of the versions with a whole
+    // digest).
     bool is_boundary(int64_t version) const;
+    // Whether `version` is the end version of one of the rowsets.
+    bool is_rowset_end(int64_t version) const;
     // The digest at `version`, with the same buckets, rows and root as compute_restore_digest at
     // `version`. NotSupported if `version` is not a rowset boundary (the other fields of the digest
     // that describe the scan are left at their defaults).
