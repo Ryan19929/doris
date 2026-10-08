@@ -198,6 +198,9 @@ suite("test_backup_restore_atomic_reuse", "backup_restore") {
     assertTrue((stats.incremental_bytes as long) > 0)
     assertEquals(stats.incremental_bytes as long, stats.downloaded_bytes as long)
     assertTrue((stats.downloaded_bytes as long) * 5 < baselineBytes)
+    // the local data of the incremental partitions counts in the reuse ratio
+    assertTrue((stats.incremental_local_bytes as long) > 0)
+    assertTrue((stats.reuse_ratio as double) > 0)
     // the local base of the incremental partitions is a local snapshot too
     assertEquals(2 * numPartitions * 2, stats.atomic_local.local_tablets as int)
     assertSame(dbA, dbB)

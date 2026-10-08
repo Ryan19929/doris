@@ -2794,11 +2794,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             info.add(check == null ? FeConstants.null_string : check.toString());
             long keptBytes = reuseResult == null ? 0 : reuseResult.getKeptBytesAllReplicas();
             long keptAtomicBytes = reuseResult == null ? 0 : reuseResult.getKeptAtomicBytesAllReplicas();
+            long incrementalLocalBytes = reuseResult == null ? 0 : reuseResult.getIncrementalLocalBytesAllReplicas();
             if (downloadStats != null) {
-                info.add(downloadStats.toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes));
-            } else if (keptBytes > 0) {
+                info.add(downloadStats.toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes,
+                        incrementalLocalBytes));
+            } else if (keptBytes > 0 || incrementalLocalBytes > 0) {
                 // everything was kept, nothing was downloaded
-                info.add(new RestoreDownloadStats().toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes));
+                info.add(new RestoreDownloadStats().toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes,
+                        incrementalLocalBytes));
             } else {
                 info.add(FeConstants.null_string);
             }

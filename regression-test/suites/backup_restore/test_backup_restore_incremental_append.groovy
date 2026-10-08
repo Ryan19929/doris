@@ -123,6 +123,25 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
         }
     }
 
+    // the data size of the replicas is known by the report of the backends, incremental_local_bytes and kept_bytes
+    // count it
+    def waitDataSize = { String db ->
+        for (int i = 0; i < 30; ++i) {
+            boolean ready = true
+            for (String tbl : [dupTable, uniqTable]) {
+                def tablets = sql_return_maparray "SHOW TABLETS FROM ${db}.${tbl}"
+                if (tablets.sum { it.RowCount as long } != numPartitions * 3 * 200
+                        || tablets.any { (it.LocalDataSize as long) == 0 && (it.RowCount as long) > 0 }) {
+                    ready = false
+                }
+            }
+            if (ready) {
+                return
+            }
+            sleep(5000)
+        }
+    }
+
     // 1. A -> B: B does not have the tables, everything is downloaded.
     String tsA1 = backupAndWait(dbA, "${suiteName}_1")
     def stats = restoreAndWait(dbB, "${suiteName}_1", tsA1)
@@ -136,6 +155,7 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
     sql "DELETE FROM ${dbA}.${uniqTable} WHERE id = 7"
     sql "sync"
     String tsA2 = backupAndWait(dbA, "${suiteName}_2")
+    waitDataSize(dbB)
     stats = restoreAndWait(dbB, "${suiteName}_2", tsA2)
     // p2 and p3 are kept, p1 downloads the increment only
     assertEquals(2 * (numPartitions - 1), lastEstimate.kept_partitions as int)
@@ -146,6 +166,19 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
     assertEquals(stats.incremental_bytes as long, stats.downloaded_bytes as long)
     assertTrue((stats.downloaded_bytes as long) * 5 < baselineBytes)
     assertSame(dbA, dbB)
+    // the local data of p1 (0, V_l] that is kept and only appended to counts in the reuse ratio, which is about
+    // (kept + local) / (kept + local + increment) now
+    long incLocal = stats.incremental_local_bytes as long
+    assertTrue(incLocal > 0)
+    assertEquals(lastEstimate.incremental_local_bytes_all_replicas as long, incLocal)
+    long reused = (stats.linked_bytes as long) + (stats.skipped_bytes as long) + (stats.kept_bytes as long) + incLocal
+    double expectRatio = (double) reused / (reused + (stats.downloaded_bytes as long))
+    assertTrue((stats.reuse_ratio as double) > 0)
+    assertEquals(expectRatio, stats.reuse_ratio as double, 0.002)
+    // and the partition itself: the local data against the local data and the increment
+    double incRatio = (double) incLocal / (incLocal + (stats.incremental_bytes as long))
+    assertTrue(incRatio > 0.5)
+    assertTrue((stats.reuse_ratio as double) >= incRatio - 0.001)
     // the rows of the increment are there
     assertEquals(0, (sql "SELECT COUNT(*) FROM ${dbB}.${uniqTable} WHERE id = 7")[0][0])
     assertEquals("updated in p1", (sql "SELECT value FROM ${dbB}.${uniqTable} WHERE id = 5")[0][0])

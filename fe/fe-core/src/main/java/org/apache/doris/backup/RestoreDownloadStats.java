@@ -187,11 +187,22 @@ public class RestoreDownloadStats {
      * @param keptBytes the local data size of the partitions kept by partition level reuse, by replica
      */
     public double getReuseRatio(long keptBytes) {
-        long total = linkedBytes + skippedBytes + keptBytes + downloadedBytes;
+        return getReuseRatio(keptBytes, 0);
+    }
+
+    /**
+     * (linked + skipped + kept + incrementalLocal) / (linked + skipped + kept + incrementalLocal + downloaded) by
+     * bytes, 0 if there is no data at all.
+     *
+     * @param incrementalLocalBytes the local data size (0, V_l] that the incremental partitions keep, by replica
+     */
+    public double getReuseRatio(long keptBytes, long incrementalLocalBytes) {
+        long reused = linkedBytes + skippedBytes + keptBytes + incrementalLocalBytes;
+        long total = reused + downloadedBytes;
         if (total <= 0) {
             return 0.0;
         }
-        return Math.round((double) (linkedBytes + skippedBytes + keptBytes) / total * 1000) / 1000.0;
+        return Math.round((double) reused / total * 1000) / 1000.0;
     }
 
     public String toJson(long currentTotalReplicas) {
@@ -212,15 +223,25 @@ public class RestoreDownloadStats {
      *         replaced), it is also in keptBytes
      */
     public String toJson(long currentTotalReplicas, long keptBytes, long keptAtomicBytes) {
+        return toJson(currentTotalReplicas, keptBytes, keptAtomicBytes, 0);
+    }
+
+    /**
+     * @param incrementalLocalBytes the local data size (0, V_l] that the incremental partitions (of an atomic restore
+     *         too) keep and only append the increment to, by replica. Not in keptBytes, counts in the reuse ratio.
+     */
+    public String toJson(long currentTotalReplicas, long keptBytes, long keptAtomicBytes,
+            long incrementalLocalBytes) {
         long total = isFixed() ? totalReplicas : currentTotalReplicas;
         Map<String, Object> json = new LinkedHashMap<>();
         json.put("linked_bytes", linkedBytes);
         json.put("skipped_bytes", skippedBytes);
         json.put("kept_bytes", keptBytes);
         json.put("downloaded_bytes", downloadedBytes);
-        if (Config.enable_restore_incremental_append || incrementalTablets > 0) {
+        if (Config.enable_restore_incremental_append || incrementalTablets > 0 || incrementalLocalBytes > 0) {
             json.put("incremental_tablets", incrementalTablets);
             json.put("incremental_bytes", incrementalBytes);
+            json.put("incremental_local_bytes", incrementalLocalBytes);
         }
         if (Config.enable_restore_atomic_reuse || localSourceTablets > 0 || keptAtomicBytes > 0) {
             // atomic restore: what the table being replaced kept, by the local snapshots, not downloaded
@@ -233,7 +254,7 @@ public class RestoreDownloadStats {
             atomic.put("copied_files", localSourceCopiedFiles);
             json.put("atomic_local", atomic);
         }
-        json.put("reuse_ratio", getReuseRatio(keptBytes));
+        json.put("reuse_ratio", getReuseRatio(keptBytes, incrementalLocalBytes));
         json.put("linked_files", linkedFiles);
         json.put("skipped_files", skippedFiles);
         json.put("downloaded_files", downloadedFiles);

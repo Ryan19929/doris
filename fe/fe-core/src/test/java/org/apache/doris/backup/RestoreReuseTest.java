@@ -970,6 +970,46 @@ public class RestoreReuseTest {
         Assertions.assertEquals(0.4, json.get("reuse_ratio").getAsDouble(), 0.0001);
     }
 
+    // The incremental partitions keep their local data (0, V_l]: DownloadStats counts it in incremental_local_bytes
+    // and the reuse ratio, by replica.
+    private void assertIncrementalLocalBytes(RestoreJob job, RestoreReuseResult result) {
+        long local = RestoreReuseShadowStats.getAllReplicasLocalDataSize(p1())
+                + RestoreReuseShadowStats.getAllReplicasLocalDataSize(p2());
+        Assertions.assertTrue(local > 0);
+        Assertions.assertEquals(local, result.getIncrementalLocalBytesAllReplicas());
+        Assertions.assertEquals(0, result.getKeptBytesAllReplicas());
+        List<String> info = job.getInfo(false);
+        com.google.gson.JsonObject json = com.google.gson.JsonParser.parseString(info.get(info.size() - 1))
+                .getAsJsonObject();
+        Assertions.assertEquals(local, json.get("incremental_local_bytes").getAsLong());
+        Assertions.assertEquals(0, json.get("kept_bytes").getAsLong());
+        // nothing is downloaded yet: the whole of the data is the local one
+        Assertions.assertEquals(1.0, json.get("reuse_ratio").getAsDouble(), 0.0001);
+    }
+
+    @Test
+    public void testDownloadStatsReuseRatioWithIncrementalLocalBytes() {
+        RestoreDownloadStats stats = new RestoreDownloadStats();
+        org.apache.doris.thrift.TDownloadStats reported = new org.apache.doris.thrift.TDownloadStats();
+        reported.setLinkedBytes(100);
+        reported.setSkippedBytes(100);
+        reported.setDownloadedBytes(300);
+        stats.add(reported, 3);
+        // (100 + 100 + 500 + 400) / (100 + 100 + 500 + 400 + 300)
+        Assertions.assertEquals(0.786, stats.getReuseRatio(500, 400), 0.0001);
+        Assertions.assertEquals(0.7, stats.getReuseRatio(500), 0.0001);
+        com.google.gson.JsonObject json = com.google.gson.JsonParser.parseString(stats.toJson(3, 500, 0, 400))
+                .getAsJsonObject();
+        Assertions.assertEquals(500, json.get("kept_bytes").getAsLong());
+        Assertions.assertEquals(400, json.get("incremental_local_bytes").getAsLong());
+        Assertions.assertEquals(0.786, json.get("reuse_ratio").getAsDouble(), 0.0001);
+        // only incremental local data and the increment: 400 / (400 + 300)
+        stats = new RestoreDownloadStats();
+        stats.add(new org.apache.doris.thrift.TDownloadStats().setDownloadedBytes(300), 3);
+        json = com.google.gson.JsonParser.parseString(stats.toJson(3, 0, 0, 400)).getAsJsonObject();
+        Assertions.assertEquals(0.571, json.get("reuse_ratio").getAsDouble(), 0.0001);
+    }
+
     @Test
     public void testReplicaMustBeHealthyAtTheBackupVersion() {
         Replica replica = p1().getBaseIndex().getTablets().get(0).getReplicas().get(0);
@@ -1830,6 +1870,7 @@ public class RestoreReuseTest {
             Assertions.assertEquals(V2, decision.targetVersion);
             Assertions.assertEquals(RestoreReuseResult.INCREMENTAL_VERIFIED, decision.reason);
         }
+        assertIncrementalLocalBytes(job, result);
         // the partitions are still restored: version info, file mapping, and the lineage is invalidated
         Assertions.assertEquals(2, versionInfo(job).size());
         Assertions.assertEquals(V2, versionInfo(job).get(tbl2.getId(), p1().getId()));
@@ -2463,6 +2504,7 @@ public class RestoreReuseTest {
             Assertions.assertEquals(V2, decision.targetVersion);
             Assertions.assertEquals(stagingTbl.getId(), decision.stagingTableId);
         }
+        assertIncrementalLocalBytes(job, result);
         Partition stagingP1 = stagingTbl.getPartition(p1().getName());
         Assertions.assertNotNull(result.getIncremental(stagingTbl.getId(), stagingP1.getId()));
         Assertions.assertNull(result.getIncremental(tbl2.getId(), p1().getId()));
