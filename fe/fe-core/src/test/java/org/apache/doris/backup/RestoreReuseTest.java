@@ -1747,12 +1747,26 @@ public class RestoreReuseTest {
         in.srcCommitSeq = COMMIT_SEQ - 1;
         Assertions.assertEquals("L0_COMMIT_SEQ_MISMATCH", RestoreReuseJudge.firstRejectIncremental(in));
 
-        // the model: duplicate and merge-on-write only
+        // the model: duplicate and unique (merge-on-read and merge-on-write) are candidates, aggregate is not
         in = incrementalInput(CheckLevel.FULL);
         Deencapsulation.setField(tbl2, "keysType", KeysType.AGG_KEYS);
         Assertions.assertEquals("AGGREGATE_TABLE", RestoreReuseJudge.firstRejectIncremental(in));
         Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
-        Assertions.assertEquals("INCREMENTAL_MODEL_UNIQUE_KEYS", RestoreReuseJudge.firstRejectIncremental(in));
+        tbl2.setEnableUniqueKeyMergeOnWrite(false);
+        Assertions.assertFalse(tbl2.getEnableUniqueKeyMergeOnWrite());
+        Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(in));
+        Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(in));
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(in));
+        Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(in));
+        // the other conditions still apply to them
+        in.incrementalEnabled = false;
+        Assertions.assertEquals("INCREMENTAL_DISABLED", RestoreReuseJudge.firstRejectIncremental(in));
+        in.incrementalEnabled = true;
+        tbl2.setEnableUniqueKeyMergeOnWrite(false);
+        in.jobInfo.manifestVersion = null;
+        Assertions.assertEquals("NO_MANIFEST", RestoreReuseJudge.firstRejectIncremental(in));
+        in = incrementalInput(CheckLevel.FULL);
         Deencapsulation.setField(tbl2, "keysType", KeysType.DUP_KEYS);
 
         // the backup must have the manifest and the decomposed digest of every tablet
@@ -1969,6 +1983,44 @@ public class RestoreReuseTest {
             if (task instanceof SnapshotTask) {
                 Assertions.assertEquals(task.getPartitionId() == p1().getId(),
                         ((SnapshotTask) task).isRestoreIncremental());
+            }
+        }
+    }
+
+    // Merge-on-read and merge-on-write tables are candidates of the incremental append. For merge-on-read the
+    // backup holds whole digests at its most recent boundaries only: a local version outside them is reported as
+    // NOT_BOUNDARY by the BE, and that partition is downloaded whole.
+    @Test
+    public void testMergeOnReadTableIsAnIncrementalCandidate() {
+        assertUniqueTableIsACandidate(false);
+    }
+
+    @Test
+    public void testMergeOnWriteTableIsAnIncrementalCandidate() {
+        assertUniqueTableIsACandidate(true);
+    }
+
+    private void assertUniqueTableIsACandidate(boolean mow) {
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(mow);
+        RestoreJob job = prepareIncrementalJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(2, tasks.stream().map(RestoreDigestTask::getPartitionId).distinct().count());
+        Map<Long, String> verdicts = Maps.newHashMap();
+        verdicts.put(p2().getId(), "NOT_BOUNDARY");
+        reportPrefix(job, tasks, verdicts);
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        String what = mow ? "mow" : "mor";
+        Assertions.assertEquals(1, result.getIncrementalPartitions(), what);
+        Assertions.assertNotNull(result.getIncremental(tbl2.getId(), p1().getId()), what);
+        Assertions.assertNull(result.getIncremental(tbl2.getId(), p2().getId()), what);
+        Assertions.assertEquals(1, result.getDownloadedPartitions(), what);
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            if (decision.partitionId == p2().getId()) {
+                Assertions.assertFalse(decision.incremental, what);
+                Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_NOT_BOUNDARY, decision.reason, what);
             }
         }
     }

@@ -463,11 +463,14 @@ public final class RestoreReuseJudge {
         return null;
     }
 
-    // Duplicate and unique merge-on-write: the models whose digest can be composed by rowset.
+    // Duplicate and unique (merge-on-write and merge-on-read): a duplicate or merge-on-write digest is composed by
+    // rowset, a merge-on-read one is carried by the whole digests the backup keeps at its most recent rowset
+    // boundaries (restore_digest_mor_prefix_boundaries), so a local version outside them is no boundary and the
+    // partition is downloaded whole (the BE reports NOT_BOUNDARY). Whether the backup has a decomposed digest at all
+    // is checkDigestPresent / checkIncrementalSources.
     static String checkIncrementalModel(Input in) {
         KeysType keysType = in.localTable.getKeysType();
-        if (keysType == KeysType.DUP_KEYS
-                || (keysType == KeysType.UNIQUE_KEYS && in.localTable.getEnableUniqueKeyMergeOnWrite())) {
+        if (keysType == KeysType.DUP_KEYS || keysType == KeysType.UNIQUE_KEYS) {
             // A table with binlog is fine: a restore never carries the binlog of the snapshot, the whole download
             // does not either.
             return null;
