@@ -244,7 +244,7 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
     runCase(false)
     runCase(true)
 
-    setConfig("restore_reuse_min_partition_bytes", "1073741824")
+    setConfig("restore_reuse_min_partition_bytes", "0")
     setConfig("enable_restore_atomic_reuse", "false")
     sql "DROP REPOSITORY `${repoName}`"
 }

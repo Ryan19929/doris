@@ -179,7 +179,7 @@ suite("test_backup_restore_partition_reuse_reverse", "backup_restore") {
     assertEquals(2 * (numPartitions - 1), (lastEstimate.kept_a as int) + (lastEstimate.kept_b as int))
     assertSame(dbA, dbB)
 
-    setConfig("restore_reuse_min_partition_bytes", "1073741824")
+    setConfig("restore_reuse_min_partition_bytes", "0")
     for (String db : [dbA, dbB]) {
         sql "DROP DATABASE ${db} FORCE"
     }

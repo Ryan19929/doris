@@ -197,7 +197,7 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
     assertTrue((stats.downloaded_bytes as long) > 0)
     assertSame(dbA, dbB)
 
-    setConfig("restore_reuse_min_partition_bytes", "1073741824")
+    setConfig("restore_reuse_min_partition_bytes", "0")
     for (String db : [dbA, dbB]) {
         sql "DROP DATABASE ${db} FORCE"
     }

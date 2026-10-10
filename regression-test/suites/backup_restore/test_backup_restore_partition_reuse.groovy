@@ -277,7 +277,7 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
         exception "reuse_check_level"
     }
 
-    setConfig("restore_reuse_min_partition_bytes", "1073741824")
+    setConfig("restore_reuse_min_partition_bytes", "0")
     for (String db : [srcDbName, dbName, fullDbName]) {
         sql "DROP DATABASE ${db} FORCE"
     }

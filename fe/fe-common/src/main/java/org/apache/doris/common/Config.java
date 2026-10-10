@@ -2872,8 +2872,9 @@ public class Config extends ConfigBase {
 
     @ConfField(mutable = true, masterOnly = true, description = "The minimum size (local data size of a single "
             + "replica, in bytes) of a partition to be considered for partition level reuse, smaller partitions are "
-            + "downloaded. 1 GB by default.")
-    public static long restore_reuse_min_partition_bytes = 1024L * 1024 * 1024;
+            + "downloaded. 0 by default, every partition is considered: the digest check of a small partition costs "
+            + "little, and the partitions of a table partitioned by day are often smaller than 1 GB.")
+    public static long restore_reuse_min_partition_bytes = 0;
 
     @ConfField(mutable = true, masterOnly = true, description = "The timeout (in seconds) of waiting for the digest "
             + "tasks of partition level reuse, the partitions timed out are downloaded.")
