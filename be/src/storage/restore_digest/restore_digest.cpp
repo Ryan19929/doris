@@ -1378,7 +1378,42 @@ int64_t RestoreDigestCache::capacity() const {
     return _capacity > 0 ? _capacity : config::restore_digest_cache_capacity;
 }
 
-bool RestoreDigestCache::lookup(const Key& key, LogicalDigestResult* out) {
+int64_t RestoreDigestCache::estimate_bytes(const RestoreDigestDecomposed& d) {
+    int64_t bytes = static_cast<int64_t>(sizeof(RestoreDigestDecomposed));
+    bytes += static_cast<int64_t>(d.schema_sig.capacity() + d.root.capacity());
+    bytes += static_cast<int64_t>(d.rowsets.capacity() * sizeof(RestoreDigestRowsetPart));
+    for (const auto& r : d.rowsets) {
+        bytes += static_cast<int64_t>(r.rowset_id.capacity());
+    }
+    bytes += static_cast<int64_t>(d.marks.capacity() * sizeof(RestoreDigestMarkPart));
+    bytes += static_cast<int64_t>(d.wholes.capacity() * sizeof(RestoreDigestWholePart));
+    return bytes;
+}
+
+void RestoreDigestCache::drop_decomposed(EntryList::iterator it) {
+    if (it->decomposed == nullptr) {
+        return;
+    }
+    _decomposed_bytes -= it->decomposed_bytes;
+    _decomposed_lru.erase(it->decomposed_pos);
+    it->decomposed.reset();
+    it->decomposed_bytes = 0;
+    it->guard = DecomposedGuard();
+}
+
+void RestoreDigestCache::erase_entry(EntryList::iterator it) {
+    drop_decomposed(it);
+    _map.erase(it->key);
+    _lru.erase(it);
+}
+
+void RestoreDigestCache::enforce_decomposed_limit(int64_t limit) {
+    while (_decomposed_bytes > limit && !_decomposed_lru.empty()) {
+        drop_decomposed(_decomposed_lru.back());
+    }
+}
+
+bool RestoreDigestCache::lookup(const Key& key, LogicalDigestResult* out, Hit* hit) {
     std::lock_guard lock(_mtx);
     auto it = _map.find(key);
     if (it == _map.end()) {
@@ -1386,26 +1421,69 @@ bool RestoreDigestCache::lookup(const Key& key, LogicalDigestResult* out) {
         return false;
     }
     _lru.splice(_lru.begin(), _lru, it->second);
-    *out = it->second->second;
+    Entry& entry = *it->second;
+    *out = entry.value;
     out->from_cache = true;
+    if (hit != nullptr) {
+        hit->decomposed = entry.decomposed;
+        hit->guard = entry.guard;
+        if (entry.decomposed != nullptr) {
+            _decomposed_lru.splice(_decomposed_lru.begin(), _decomposed_lru, entry.decomposed_pos);
+        }
+    }
     ++_hits;
     return true;
 }
 
 void RestoreDigestCache::insert(const Key& key, const LogicalDigestResult& value) {
+    insert(key, value, nullptr, DecomposedGuard());
+}
+
+void RestoreDigestCache::insert(const Key& key, const LogicalDigestResult& value,
+                                std::shared_ptr<const RestoreDigestDecomposed> decomposed,
+                                const DecomposedGuard& guard) {
     const int64_t cap = capacity();
+    const int64_t limit = std::max<int64_t>(0, config::restore_digest_cache_decomposed_mb) << 20;
+    const int64_t bytes = decomposed != nullptr ? estimate_bytes(*decomposed) : 0;
     std::lock_guard lock(_mtx);
     auto it = _map.find(key);
     if (it != _map.end()) {
-        it->second->second = value;
+        // keep the existing decomposed digest only when none is given and the root did not change
+        if (decomposed != nullptr || it->second->value.root != value.root) {
+            drop_decomposed(it->second);
+        }
+        it->second->value = value;
         _lru.splice(_lru.begin(), _lru, it->second);
     } else if (cap > 0) {
-        _lru.emplace_front(key, value);
+        _lru.emplace_front();
+        _lru.front().key = key;
+        _lru.front().value = value;
         _map[key] = _lru.begin();
+        it = _map.find(key);
+    } else {
+        return;
+    }
+    // a digest larger than the limit is not kept, and no other digest is dropped for it
+    if (decomposed != nullptr && limit > 0 && bytes <= limit) {
+        Entry& entry = *it->second;
+        entry.decomposed = std::move(decomposed);
+        entry.guard = guard;
+        entry.decomposed_bytes = bytes;
+        _decomposed_lru.push_front(it->second);
+        entry.decomposed_pos = _decomposed_lru.begin();
+        _decomposed_bytes += bytes;
     }
     while (!_lru.empty() && static_cast<int64_t>(_lru.size()) > std::max<int64_t>(cap, 0)) {
-        _map.erase(_lru.back().first);
-        _lru.pop_back();
+        erase_entry(std::prev(_lru.end()));
+    }
+    enforce_decomposed_limit(limit);
+}
+
+void RestoreDigestCache::erase(const Key& key) {
+    std::lock_guard lock(_mtx);
+    auto it = _map.find(key);
+    if (it != _map.end()) {
+        erase_entry(it->second);
     }
 }
 
@@ -1414,8 +1492,20 @@ size_t RestoreDigestCache::size() const {
     return _lru.size();
 }
 
+size_t RestoreDigestCache::decomposed_count() const {
+    std::lock_guard lock(_mtx);
+    return _decomposed_lru.size();
+}
+
+int64_t RestoreDigestCache::decomposed_bytes() const {
+    std::lock_guard lock(_mtx);
+    return _decomposed_bytes;
+}
+
 void RestoreDigestCache::clear() {
     std::lock_guard lock(_mtx);
+    _decomposed_lru.clear();
+    _decomposed_bytes = 0;
     _lru.clear();
     _map.clear();
 }
@@ -1431,12 +1521,54 @@ Status compute_tablet_restore_digest_decomposed(StorageEngine& engine, int64_t t
     return decompose_restore_digest(input, tablet_id, out);
 }
 
+namespace {
+std::atomic<uint64_t> g_scan_count {0};
+
+void fill_result(const RestoreDigest& digest, LogicalDigestResult* result) {
+    result->algo_version = RestoreDigest::kAlgoVersion;
+    result->schema_sig = digest.schema_sig;
+    result->root = digest.root;
+    result->rows = digest.rows;
+    result->from_cache = false;
+}
+
+// Whether the decomposed digest of a cache hit still describes the rowsets which were just
+// captured (the same ids and versions, in the same order).
+bool decomposed_matches_input(const RestoreDigestDecomposed& d, const RestoreDigestInput& input,
+                              const RestoreDigestCache::DecomposedGuard& cached,
+                              const RestoreDigestCache::DecomposedGuard& now) {
+    if (!(cached == now) || d.rowsets.size() != input.rowsets.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < d.rowsets.size(); ++i) {
+        const RowsetSharedPtr& rs = input.rowsets[i];
+        if (d.rowsets[i].start_version != rs->start_version() ||
+            d.rowsets[i].end_version != rs->end_version() ||
+            d.rowsets[i].rowset_id != rs->rowset_id().to_string()) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
+uint64_t restore_digest_scan_count() {
+    return g_scan_count.load();
+}
+
 Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
                                  int threads, RestoreDigestCache* cache,
-                                 LogicalDigestResult* result, RestoreDigestDecomposed* decomposed,
-                                 Status* decomposed_status) {
+                                 LogicalDigestResult* result,
+                                 std::shared_ptr<const RestoreDigestDecomposed>* decomposed,
+                                 Status* decomposed_status, bool* decomposed_from_cache) {
     if (threads <= 0) {
         threads = std::max(1, config::restore_digest_threads);
+    }
+    if (decomposed != nullptr) {
+        decomposed->reset();
+    }
+    if (decomposed_from_cache != nullptr) {
+        *decomposed_from_cache = false;
     }
     RestoreDigestInput input;
     RETURN_IF_ERROR(prepare_tablet_input(engine, tablet_id, version, threads, &input));
@@ -1447,13 +1579,51 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
     // NotSupported schemas are reported here, before anything is scanned or cached.
     RETURN_IF_ERROR(compute_restore_digest_schema_sig(*input.schema, input.keys_type,
                                                       input.enable_mow, &key.schema_sig));
-    bool cached = cache != nullptr && cache->lookup(key, result);
+    RestoreDigestCache::DecomposedGuard guard;
+    if (input.keys_type == UNIQUE_KEYS && !input.enable_mow) {
+        guard.mor_boundaries = config::restore_digest_mor_prefix_boundaries;
+    }
+    if (input.enable_mow && input.delete_bitmap != nullptr) {
+        guard.bitmap_keys = static_cast<int64_t>(input.delete_bitmap->delete_bitmap.size());
+    }
+    RestoreDigestCache::Hit hit;
+    bool cached = cache != nullptr &&
+                  cache->lookup(key, result, decomposed != nullptr ? &hit : nullptr);
     if (decomposed != nullptr) {
+        if (cached && hit.decomposed != nullptr &&
+            decomposed_matches_input(*hit.decomposed, input, hit.guard, guard)) {
+            // No I/O: the parts compose to the whole digest, which must be the cached one.
+            RestoreDigest composed;
+            Status st = hit.decomposed->compose(version, &composed);
+            if (st.ok() && composed.root == result->root) {
+                cache->note_decomposed(true);
+                *decomposed = std::move(hit.decomposed);
+                if (decomposed_status != nullptr) {
+                    *decomposed_status = Status::OK();
+                }
+                if (decomposed_from_cache != nullptr) {
+                    *decomposed_from_cache = true;
+                }
+                return Status::OK();
+            }
+            LOG(WARNING) << "restore digest: the cached decomposed digest of tablet " << tablet_id
+                         << " at version " << version << " composes to root "
+                         << (st.ok() ? composed.root : st.to_string())
+                         << " but the cached digest is " << result->root
+                         << ", dropping both and scanning again";
+            cache->erase(key);
+            cached = false;
+        }
+        if (cache != nullptr) {
+            cache->note_decomposed(false);
+        }
         // One pass over the tablet gives the parts, and the whole digest is composed from them.
-        Status st = decompose_restore_digest(input, tablet_id, decomposed);
+        ++g_scan_count;
+        auto fresh = std::make_shared<RestoreDigestDecomposed>();
+        Status st = decompose_restore_digest(input, tablet_id, fresh.get());
         RestoreDigest composed;
         if (st.ok()) {
-            st = decomposed->compose(version, &composed);
+            st = fresh->compose(version, &composed);
         }
         if (st.ok() && cached && composed.root != result->root) {
             st = Status::InternalError(
@@ -1461,34 +1631,30 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
                     "root {} but the cached digest is {}",
                     tablet_id, version, composed.root, result->root);
         }
-        if (!st.ok()) {
-            *decomposed = RestoreDigestDecomposed();
-        }
         if (decomposed_status != nullptr) {
             *decomposed_status = st;
         }
-        if (st.ok() && !cached) {
-            result->algo_version = RestoreDigest::kAlgoVersion;
-            result->schema_sig = composed.schema_sig;
-            result->root = composed.root;
-            result->rows = composed.rows;
-            result->from_cache = false;
-            if (cache != nullptr) {
-                cache->insert(key, *result);
+        if (st.ok()) {
+            if (!cached) {
+                fill_result(composed, result);
             }
+            if (cache != nullptr) {
+                // for a cached whole digest this attaches the decomposed digest to its entry
+                cache->insert(key, *result, fresh, guard);
+            }
+            *decomposed = std::move(fresh);
             return Status::OK();
         }
+        // The decomposed digest failed (not supported, over the scan limit, ...): only the whole
+        // digest is cached, from the cache if it is there.
     }
     if (cached) {
         return Status::OK();
     }
+    ++g_scan_count;
     RestoreDigest digest;
     RETURN_IF_ERROR(compute_restore_digest(input, &digest));
-    result->algo_version = RestoreDigest::kAlgoVersion;
-    result->schema_sig = digest.schema_sig;
-    result->root = digest.root;
-    result->rows = digest.rows;
-    result->from_cache = false;
+    fill_result(digest, result);
     if (cache != nullptr) {
         cache->insert(key, *result);
     }

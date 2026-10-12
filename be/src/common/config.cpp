@@ -290,6 +290,11 @@ DEFINE_Int32(restore_digest_task_concurrency, "2");
 DEFINE_mInt32(restore_digest_threads, "4");
 // max number of entries of the in-memory logical digest cache, 0 disables the cache
 DEFINE_mInt64(restore_digest_cache_capacity, "100000");
+// max memory (MB) of the decomposed digests (the per rowset parts) kept in the logical digest cache, so
+// that a repeated backup of the same version does not scan the tablet again; when exceeded the decomposed
+// digest of the least recently used entries is dropped (their whole digest stays). 0 does not cache
+// them. A digest larger than the limit is not cached.
+DEFINE_mInt64(restore_digest_cache_decomposed_mb, "256");
 // whether the snapshot task, besides the logical digest, also writes the per rowset decomposed digest
 // (the rdigest file) from which the digest at any rowset boundary version can be composed
 DEFINE_mBool(restore_digest_prefix_enabled, "true");

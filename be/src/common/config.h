@@ -346,6 +346,7 @@ DECLARE_mBool(restore_manifest_digest_check);
 DECLARE_Int32(restore_digest_task_concurrency);
 DECLARE_mInt32(restore_digest_threads);
 DECLARE_mInt64(restore_digest_cache_capacity);
+DECLARE_mInt64(restore_digest_cache_decomposed_mb);
 DECLARE_mBool(restore_digest_prefix_enabled);
 DECLARE_mInt32(restore_digest_prefix_max_scans);
 DECLARE_mInt32(restore_digest_mor_prefix_boundaries);

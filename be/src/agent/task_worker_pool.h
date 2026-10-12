@@ -151,7 +151,9 @@ void check_consistency_callback(StorageEngine& engine, const TAgentTaskRequest& 
 // the same pass over the tablet; prefix->produced tells whether it is valid, reason says why not.
 struct PrefixDigestOutput {
     bool produced = false;
-    RestoreDigestDecomposed digest;
+    // shared with the digest cache, immutable
+    std::shared_ptr<const RestoreDigestDecomposed> digest;
+    bool from_cache = false;
     std::string reason;
 };
 TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,

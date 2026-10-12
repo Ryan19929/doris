@@ -18,8 +18,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -151,8 +153,18 @@ struct LogicalDigestResult {
     bool from_cache = false;
 };
 
+struct RestoreDigestDecomposed;
+
 // In-memory LRU cache of tablet digests. A digest of a tablet at a version never changes, so the key
 // is (tablet_id, version, algo_version, schema_sig). The cache is lost when the BE restarts.
+//
+// An entry may also hold the decomposed digest (the per rowset parts, which is what the source of a
+// backup needs besides the whole digest), shared and immutable. The decomposed digest describes the
+// rowsets which the tablet had at the time, and a compaction can change those without changing the
+// whole digest, so it carries a guard: the caller compares it with the current state before using it.
+// The decomposed digests are limited in bytes (config::restore_digest_cache_decomposed_mb, checked at
+// every insert) by a second LRU: when over the limit only the decomposed digest of the least recently
+// used entries is dropped, their whole digests stay.
 class RestoreDigestCache {
 public:
     struct Key {
@@ -166,32 +178,88 @@ public:
         }
     };
 
+    // What the decomposed digest depends on besides the key and its rowset list.
+    struct DecomposedGuard {
+        // unique MoR: config::restore_digest_mor_prefix_boundaries when it was computed, else -1
+        int64_t mor_boundaries = -1;
+        // MoW: number of keys of the delete bitmap snapshot at the version, else -1
+        int64_t bitmap_keys = -1;
+        bool operator==(const DecomposedGuard& o) const {
+            return mor_boundaries == o.mor_boundaries && bitmap_keys == o.bitmap_keys;
+        }
+    };
+
+    struct Hit {
+        // null if the entry has no decomposed digest
+        std::shared_ptr<const RestoreDigestDecomposed> decomposed;
+        DecomposedGuard guard;
+    };
+
     // capacity <= 0 means "use config::restore_digest_cache_capacity (checked at every insert)".
     explicit RestoreDigestCache(int64_t capacity = 0) : _capacity(capacity) {}
 
     static RestoreDigestCache* instance();
 
-    bool lookup(const Key& key, LogicalDigestResult* out);
+    // `hit` may be null; when it is not, the decomposed digest of the entry (if any) is returned too and
+    // counts as recently used by the byte limited LRU.
+    bool lookup(const Key& key, LogicalDigestResult* out, Hit* hit = nullptr);
+    // Stores the whole digest. An existing decomposed digest stays if the root is the same, else it
+    // is dropped.
     void insert(const Key& key, const LogicalDigestResult& value);
+    // Stores the whole digest and its decomposed digest, which replaces any existing one. The
+    // decomposed digest is not kept (the whole digest is) if config::restore_digest_cache_decomposed_mb
+    // is 0 or the digest alone is larger than that.
+    void insert(const Key& key, const LogicalDigestResult& value,
+                std::shared_ptr<const RestoreDigestDecomposed> decomposed,
+                const DecomposedGuard& guard);
+    void erase(const Key& key);
     size_t size() const;
     uint64_t hits() const { return _hits; }
     uint64_t misses() const { return _misses; }
+    // Statistics of the decomposed digests: count and bytes held now, and how many times a caller
+    // that asked for one found it usable / not.
+    size_t decomposed_count() const;
+    int64_t decomposed_bytes() const;
+    uint64_t decomposed_hits() const { return _decomposed_hits; }
+    uint64_t decomposed_misses() const { return _decomposed_misses; }
+    void note_decomposed(bool hit) { ++(hit ? _decomposed_hits : _decomposed_misses); }
     void clear();
+
+    // Approximate memory of a decomposed digest.
+    static int64_t estimate_bytes(const RestoreDigestDecomposed& d);
 
 private:
     struct KeyHash {
         size_t operator()(const Key& k) const;
     };
-    using Entry = std::pair<Key, LogicalDigestResult>;
+    struct Entry;
+    using EntryList = std::list<Entry>;
+    using DecomposedList = std::list<EntryList::iterator>;
+    struct Entry {
+        Key key;
+        LogicalDigestResult value;
+        std::shared_ptr<const RestoreDigestDecomposed> decomposed;
+        DecomposedGuard guard;
+        int64_t decomposed_bytes = 0;
+        DecomposedList::iterator decomposed_pos; // valid iff decomposed != null
+    };
 
     int64_t capacity() const;
+    // all with _mtx held
+    void drop_decomposed(EntryList::iterator it);
+    void erase_entry(EntryList::iterator it);
+    void enforce_decomposed_limit(int64_t limit);
 
     int64_t _capacity;
     mutable std::mutex _mtx;
-    std::list<Entry> _lru; // front = most recently used
-    std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> _map;
-    uint64_t _hits = 0;
-    uint64_t _misses = 0;
+    EntryList _lru; // front = most recently used
+    std::unordered_map<Key, EntryList::iterator, KeyHash> _map;
+    DecomposedList _decomposed_lru; // the entries holding a decomposed digest, front = most recent
+    int64_t _decomposed_bytes = 0;
+    std::atomic<uint64_t> _hits {0};
+    std::atomic<uint64_t> _misses {0};
+    std::atomic<uint64_t> _decomposed_hits {0};
+    std::atomic<uint64_t> _decomposed_misses {0};
 };
 
 // Computes the schema_sig a digest of this schema would have. NotSupported if the digest does not
@@ -313,14 +381,23 @@ Status compute_tablet_restore_digest_decomposed(StorageEngine& engine, int64_t t
 // config::restore_digest_threads. `cache` may be null (no caching).
 //
 // If `decomposed` is not null, the decomposed digest is produced as well and `*decomposed_status`
-// tells whether it is valid (when it is not, `decomposed` is left empty and the status says why: the
-// tablet is not supported, or a failure). When the decomposed digest is valid the whole digest is
-// composed from it, so the tablet is scanned only once; if the cache holds another root for the same
-// key, the decomposed digest is dropped as inconsistent and the cached value is returned.
+// tells whether it is valid (when it is not, `*decomposed` is null and the status says why: the
+// tablet is not supported, or a failure). The decomposed digest comes from the cache when the entry
+// has one that still describes the rowsets captured now (same rowset ids and versions, same MoR
+// boundaries setting, same size of the MoW delete bitmap) and composes to the cached root; then
+// nothing is scanned (`*decomposed_from_cache` is true). Otherwise the tablet is scanned once, the
+// whole digest is composed from the parts, and both are cached (the decomposed digest only if it
+// is valid and fits config::restore_digest_cache_decomposed_mb). If the cache holds another root for
+// the same key, the decomposed digest is dropped as inconsistent and the cached value is returned.
+// If `decomposed` is null the decomposed part of the cache is neither read nor written.
 Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64_t version,
                                  int threads, RestoreDigestCache* cache,
                                  LogicalDigestResult* result,
-                                 RestoreDigestDecomposed* decomposed = nullptr,
-                                 Status* decomposed_status = nullptr);
+                                 std::shared_ptr<const RestoreDigestDecomposed>* decomposed = nullptr,
+                                 Status* decomposed_status = nullptr,
+                                 bool* decomposed_from_cache = nullptr);
+
+// Number of scans (decomposed or whole) get_tablet_logical_digest has started, for tests.
+uint64_t restore_digest_scan_count();
 
 } // namespace doris

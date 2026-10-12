@@ -1459,6 +1459,7 @@ TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t ta
     LogicalDigestResult result;
     Status st;
     Status prefix_status = Status::OK();
+    const auto start = std::chrono::steady_clock::now();
     {
         auto mem_tracker = MemTrackerLimiter::create_shared(
                 MemTrackerLimiter::Type::OTHER,
@@ -1467,10 +1468,11 @@ TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t ta
         st = get_tablet_logical_digest(engine, tablet_id, version, threads,
                                        RestoreDigestCache::instance(), &result,
                                        prefix != nullptr ? &prefix->digest : nullptr,
-                                       &prefix_status);
+                                       &prefix_status,
+                                       prefix != nullptr ? &prefix->from_cache : nullptr);
     }
     if (prefix != nullptr) {
-        prefix->produced = st.ok() && prefix_status.ok();
+        prefix->produced = st.ok() && prefix_status.ok() && prefix->digest != nullptr;
         if (!prefix->produced) {
             prefix->reason = st.ok() ? prefix_status.to_string() : st.to_string();
         }
@@ -1484,7 +1486,15 @@ TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t ta
         digest.__set_status_code("OK");
         LOG(INFO) << "logical digest done, tablet_id=" << tablet_id << ", version=" << version
                   << ", rows=" << result.rows << ", root=" << result.root
-                  << ", from_cache=" << result.from_cache;
+                  << ", from_cache=" << result.from_cache
+                  << ", decomposed_from_cache=" << (prefix != nullptr && prefix->from_cache)
+                  << ", cache_decomposed_entries="
+                  << RestoreDigestCache::instance()->decomposed_count()
+                  << ", cache_decomposed_bytes="
+                  << RestoreDigestCache::instance()->decomposed_bytes() << ", elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
     } else {
         digest.__set_status_code(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>() ? "NOT_SUPPORTED"
                                                                            : "ERROR");
@@ -1520,7 +1530,7 @@ void write_snapshot_prefix_digest(const std::string& snapshot_path, int64_t tabl
                 fmt::format("{}/{}/{}/{}.hdr", snapshot_path, tablet_id, schema_hash, tablet_id),
                 &in_snapshot);
         std::set<std::pair<int64_t, int64_t>> in_digest;
-        for (const auto& rs : prefix.digest.rowsets) {
+        for (const auto& rs : prefix.digest->rowsets) {
             in_digest.emplace(rs.start_version, rs.end_version);
         }
         if (!st.ok()) {
@@ -1528,7 +1538,7 @@ void write_snapshot_prefix_digest(const std::string& snapshot_path, int64_t tabl
         } else if (in_snapshot != in_digest) {
             reason = "the rowsets of the tablet changed after the snapshot was made";
         } else {
-            std::string content = prefix.digest.serialize();
+            std::string content = prefix.digest->serialize();
             std::string root;
             st = write_prefix_digest_file(
                     content,
@@ -1539,8 +1549,8 @@ void write_snapshot_prefix_digest(const std::string& snapshot_path, int64_t tabl
                 digest->__set_prefix_root(root);
                 digest->__set_prefix_bytes(static_cast<int64_t>(content.size()));
                 LOG(INFO) << "decomposed digest written, tablet_id=" << tablet_id
-                          << ", rowsets=" << prefix.digest.rowsets.size()
-                          << ", marks=" << prefix.digest.marks.size() << ", bytes=" << content.size()
+                          << ", rowsets=" << prefix.digest->rowsets.size()
+                          << ", marks=" << prefix.digest->marks.size() << ", bytes=" << content.size()
                           << ", root=" << root;
                 return;
             }
