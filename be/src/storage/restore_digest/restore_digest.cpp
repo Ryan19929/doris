@@ -1340,13 +1340,14 @@ Status prepare_tablet_input(StorageEngine& engine, int64_t tablet_id, int64_t ve
             return std::move(ret.error());
         }
         input->rowsets = std::move(ret->rowsets);
-        // the data identity, from the very rowsets which will be read
-        input->rowsets_sig = restore_digest_rowsets_sig(input->rowsets);
         if (input->enable_mow) {
             input->delete_bitmap = std::make_shared<DeleteBitmap>(
                     tablet->tablet_meta()->delete_bitmap().snapshot(version));
         }
     }
+    // the data identity, from the very rowsets which will be read (computed outside of the header
+    // lock: the rowsets are immutable)
+    input->rowsets_sig = restore_digest_rowsets_sig(input->rowsets);
     std::vector<RowsetMetaSharedPtr> metas;
     metas.reserve(input->rowsets.size());
     for (const auto& rs : input->rowsets) {
@@ -1396,6 +1397,7 @@ size_t RestoreDigestCache::KeyHash::operator()(const Key& k) const {
     mix(static_cast<uint64_t>(k.tablet_uid.hi));
     mix(static_cast<uint64_t>(k.tablet_uid.lo));
     mix(std::hash<std::string>()(k.rowsets_sig));
+    mix(static_cast<uint64_t>(k.bitmap_keys));
     return h;
 }
 
@@ -1433,6 +1435,14 @@ void RestoreDigestCache::drop_decomposed(EntryList::iterator it) {
 
 void RestoreDigestCache::erase_entry(EntryList::iterator it) {
     drop_decomposed(it);
+    auto idx = _by_tablet_version.find({it->key.tablet_id, it->key.version});
+    if (idx != _by_tablet_version.end()) {
+        auto& entries = idx->second;
+        entries.erase(std::remove(entries.begin(), entries.end(), it), entries.end());
+        if (entries.empty()) {
+            _by_tablet_version.erase(idx);
+        }
+    }
     _map.erase(it->key);
     _lru.erase(it);
 }
@@ -1485,10 +1495,26 @@ void RestoreDigestCache::insert(const Key& key, const LogicalDigestResult& value
         it->second->value = value;
         _lru.splice(_lru.begin(), _lru, it->second);
     } else if (cap > 0) {
+        // older generations of the same data can never hit again: drop them (and the bytes of their
+        // decomposed digests) before the new entry is added
+        auto idx = _by_tablet_version.find({key.tablet_id, key.version});
+        if (idx != _by_tablet_version.end()) {
+            std::vector<EntryList::iterator> stale;
+            for (const auto& e : idx->second) {
+                if (e->key.algo_version == key.algo_version &&
+                    e->key.schema_sig == key.schema_sig) {
+                    stale.push_back(e);
+                }
+            }
+            for (const auto& e : stale) {
+                erase_entry(e);
+            }
+        }
         _lru.emplace_front();
         _lru.front().key = key;
         _lru.front().value = value;
         _map[key] = _lru.begin();
+        _by_tablet_version[std::make_pair(key.tablet_id, key.version)].push_back(_lru.begin());
         it = _map.find(key);
     } else {
         return;
@@ -1538,6 +1564,7 @@ void RestoreDigestCache::clear() {
     _decomposed_bytes = 0;
     _lru.clear();
     _map.clear();
+    _by_tablet_version.clear();
 }
 
 Status compute_tablet_restore_digest_decomposed(StorageEngine& engine, int64_t tablet_id,
@@ -1591,15 +1618,6 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
     }
     RestoreDigestInput input;
     RETURN_IF_ERROR(prepare_tablet_input(engine, tablet_id, version, threads, &input));
-    RestoreDigestCache::Key key;
-    key.tablet_id = tablet_id;
-    key.version = version;
-    key.algo_version = RestoreDigest::kAlgoVersion;
-    key.tablet_uid = input.tablet_uid;
-    key.rowsets_sig = input.rowsets_sig;
-    // NotSupported schemas are reported here, before anything is scanned or cached.
-    RETURN_IF_ERROR(compute_restore_digest_schema_sig(*input.schema, input.keys_type,
-                                                      input.enable_mow, &key.schema_sig));
     RestoreDigestCache::DecomposedGuard guard;
     if (input.keys_type == UNIQUE_KEYS && !input.enable_mow) {
         guard.mor_boundaries = config::restore_digest_mor_prefix_boundaries;
@@ -1607,6 +1625,16 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
     if (input.enable_mow && input.delete_bitmap != nullptr) {
         guard.bitmap_keys = static_cast<int64_t>(input.delete_bitmap->delete_bitmap.size());
     }
+    RestoreDigestCache::Key key;
+    key.tablet_id = tablet_id;
+    key.version = version;
+    key.algo_version = RestoreDigest::kAlgoVersion;
+    key.tablet_uid = input.tablet_uid;
+    key.rowsets_sig = input.rowsets_sig;
+    key.bitmap_keys = guard.bitmap_keys;
+    // NotSupported schemas are reported here, before anything is scanned or cached.
+    RETURN_IF_ERROR(compute_restore_digest_schema_sig(*input.schema, input.keys_type,
+                                                      input.enable_mow, &key.schema_sig));
     RestoreDigestCache::Hit hit;
     bool cached = cache != nullptr &&
                   cache->lookup(key, result, decomposed != nullptr ? &hit : nullptr);

@@ -26,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/status.h"
@@ -193,10 +194,14 @@ public:
         TabletUid tablet_uid;
         // fingerprint of the rowsets of (0, version], see restore_digest_rowsets_sig()
         std::string rowsets_sig;
+        // MoW: number of keys of the delete bitmap snapshot at the version (the delete bitmap
+        // generation), else -1
+        int64_t bitmap_keys = -1;
         bool operator==(const Key& o) const {
             return tablet_id == o.tablet_id && version == o.version &&
                    algo_version == o.algo_version && schema_sig == o.schema_sig &&
-                   tablet_uid == o.tablet_uid && rowsets_sig == o.rowsets_sig;
+                   tablet_uid == o.tablet_uid && rowsets_sig == o.rowsets_sig &&
+                   bitmap_keys == o.bitmap_keys;
         }
     };
 
@@ -225,6 +230,10 @@ public:
     // `hit` may be null; when it is not, the decomposed digest of the entry (if any) is returned too and
     // counts as recently used by the byte limited LRU.
     bool lookup(const Key& key, LogicalDigestResult* out, Hit* hit = nullptr);
+    // Inserting a key which is not in the cache evicts the entries of the same (tablet_id, version,
+    // algo_version, schema_sig) with another tablet_uid / rowsets_sig / bitmap_keys: they are older
+    // generations of the data which can never hit again.
+    //
     // Stores the whole digest. An existing decomposed digest stays if the root is the same, else it
     // is dropped.
     void insert(const Key& key, const LogicalDigestResult& value);
@@ -258,6 +267,11 @@ private:
     struct KeyHash {
         size_t operator()(const Key& k) const;
     };
+    struct TabletVersionHash {
+        size_t operator()(const std::pair<int64_t, int64_t>& p) const {
+            return (std::hash<int64_t>()(p.first) * 1000003ULL) ^ std::hash<int64_t>()(p.second);
+        }
+    };
     struct Entry;
     using EntryList = std::list<Entry>;
     using DecomposedList = std::list<EntryList::iterator>;
@@ -280,6 +294,11 @@ private:
     mutable std::mutex _mtx;
     EntryList _lru; // front = most recently used
     std::unordered_map<Key, EntryList::iterator, KeyHash> _map;
+    // (tablet_id, version) -> the entries of that tablet and version, to find the older generations
+    // of a key. Maintained together with _map, under _mtx.
+    std::unordered_map<std::pair<int64_t, int64_t>, std::vector<EntryList::iterator>,
+                       TabletVersionHash>
+            _by_tablet_version;
     DecomposedList _decomposed_lru; // the entries holding a decomposed digest, front = most recent
     int64_t _decomposed_bytes = 0;
     std::atomic<uint64_t> _hits {0};

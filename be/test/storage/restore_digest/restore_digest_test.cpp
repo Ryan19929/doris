@@ -2115,6 +2115,75 @@ protected:
     int64_t _next_id = 880000;
 };
 
+namespace {
+struct ConfigRestore {
+    int64_t decomposed_mb = config::restore_digest_cache_decomposed_mb;
+    int32_t max_scans = config::restore_digest_prefix_max_scans;
+    int32_t boundaries = config::restore_digest_mor_prefix_boundaries;
+    ~ConfigRestore() {
+        config::restore_digest_cache_decomposed_mb = decomposed_mb;
+        config::restore_digest_prefix_max_scans = max_scans;
+        config::restore_digest_mor_prefix_boundaries = boundaries;
+    }
+};
+
+struct CachedDigest {
+    Status status = Status::InternalError("not set");
+    Status decomposed_status = Status::InternalError("not set");
+    LogicalDigestResult result;
+    std::shared_ptr<const RestoreDigestDecomposed> decomposed;
+    bool decomposed_from_cache = false;
+    uint64_t scans = 0; // scans this call started
+};
+
+CachedDigest get_cached(StorageEngine& engine, RestoreDigestCache* cache, int64_t tablet_id,
+                        int64_t version, bool want_decomposed = true) {
+    CachedDigest out;
+    const uint64_t before = restore_digest_scan_count();
+    out.status = get_tablet_logical_digest(
+            engine, tablet_id, version, 2, cache, &out.result,
+            want_decomposed ? &out.decomposed : nullptr,
+            want_decomposed ? &out.decomposed_status : nullptr,
+            want_decomposed ? &out.decomposed_from_cache : nullptr);
+    out.scans = restore_digest_scan_count() - before;
+    return out;
+}
+
+RestoreDigestCache::Key cache_key(int64_t tablet_id, int64_t version, const std::string& sig) {
+    RestoreDigestCache::Key key;
+    key.tablet_id = tablet_id;
+    key.version = version;
+    key.algo_version = RestoreDigest::kAlgoVersion;
+    key.schema_sig = sig;
+    return key;
+}
+
+// The key get_tablet_logical_digest uses for the tablet as it is now.
+RestoreDigestCache::Key tablet_cache_key(StorageEngine& engine, int64_t tablet_id, int64_t version,
+                                         const std::string& sig) {
+    RestoreDigestCache::Key key = cache_key(tablet_id, version, sig);
+    TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(tablet_id);
+    EXPECT_NE(nullptr, tablet);
+    key.tablet_uid = tablet->tablet_uid();
+    std::shared_lock lock(tablet->get_header_lock());
+    auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, version), CaptureRowsetOps {});
+    EXPECT_TRUE(ret.has_value());
+    key.rowsets_sig = restore_digest_rowsets_sig(ret->rowsets);
+    if (tablet->enable_unique_key_merge_on_write()) {
+        key.bitmap_keys = static_cast<int64_t>(
+                tablet->tablet_meta()->delete_bitmap().snapshot(version).delete_bitmap.size());
+    }
+    return key;
+}
+
+// A decomposed digest of about `parts` * 8 KB in memory, which is not a real digest.
+std::shared_ptr<const RestoreDigestDecomposed> fake_decomposed(int parts) {
+    auto d = std::make_shared<RestoreDigestDecomposed>();
+    d->rowsets.resize(static_cast<size_t>(parts));
+    return d;
+}
+} // namespace
+
 TEST_F(RestoreDigestTabletTest, MowPartialUpdateConflictRewriteNeedsTheBitmap) {
     auto tablet = create_tablet(7001, true);
     ASSERT_NE(nullptr, tablet);
@@ -3875,71 +3944,6 @@ TEST_F(RestoreDigestTabletTest, LogicalDigestComesFromTheDecomposedDigest) {
 
 // ===== the decomposed digest in the cache =====================================================
 
-namespace {
-struct ConfigRestore {
-    int64_t decomposed_mb = config::restore_digest_cache_decomposed_mb;
-    int32_t max_scans = config::restore_digest_prefix_max_scans;
-    int32_t boundaries = config::restore_digest_mor_prefix_boundaries;
-    ~ConfigRestore() {
-        config::restore_digest_cache_decomposed_mb = decomposed_mb;
-        config::restore_digest_prefix_max_scans = max_scans;
-        config::restore_digest_mor_prefix_boundaries = boundaries;
-    }
-};
-
-struct CachedDigest {
-    Status status = Status::InternalError("not set");
-    Status decomposed_status = Status::InternalError("not set");
-    LogicalDigestResult result;
-    std::shared_ptr<const RestoreDigestDecomposed> decomposed;
-    bool decomposed_from_cache = false;
-    uint64_t scans = 0; // scans this call started
-};
-
-CachedDigest get_cached(StorageEngine& engine, RestoreDigestCache* cache, int64_t tablet_id,
-                        int64_t version, bool want_decomposed = true) {
-    CachedDigest out;
-    const uint64_t before = restore_digest_scan_count();
-    out.status = get_tablet_logical_digest(
-            engine, tablet_id, version, 2, cache, &out.result,
-            want_decomposed ? &out.decomposed : nullptr,
-            want_decomposed ? &out.decomposed_status : nullptr,
-            want_decomposed ? &out.decomposed_from_cache : nullptr);
-    out.scans = restore_digest_scan_count() - before;
-    return out;
-}
-
-RestoreDigestCache::Key cache_key(int64_t tablet_id, int64_t version, const std::string& sig) {
-    RestoreDigestCache::Key key;
-    key.tablet_id = tablet_id;
-    key.version = version;
-    key.algo_version = RestoreDigest::kAlgoVersion;
-    key.schema_sig = sig;
-    return key;
-}
-
-// The key get_tablet_logical_digest uses for the tablet as it is now.
-RestoreDigestCache::Key tablet_cache_key(StorageEngine& engine, int64_t tablet_id, int64_t version,
-                                         const std::string& sig) {
-    RestoreDigestCache::Key key = cache_key(tablet_id, version, sig);
-    TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(tablet_id);
-    EXPECT_NE(nullptr, tablet);
-    key.tablet_uid = tablet->tablet_uid();
-    std::shared_lock lock(tablet->get_header_lock());
-    auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, version), CaptureRowsetOps {});
-    EXPECT_TRUE(ret.has_value());
-    key.rowsets_sig = restore_digest_rowsets_sig(ret->rowsets);
-    return key;
-}
-
-// A decomposed digest of about `parts` * 8 KB in memory, which is not a real digest.
-std::shared_ptr<const RestoreDigestDecomposed> fake_decomposed(int parts) {
-    auto d = std::make_shared<RestoreDigestDecomposed>();
-    d->rowsets.resize(static_cast<size_t>(parts));
-    return d;
-}
-} // namespace
-
 TEST_F(RestoreDigestTabletTest, HitTakesBothDigestsFromTheCacheWithoutScanning) {
     _next_id = 940000; // not the ids of another test, see the segment cache
     ConfigRestore restore;
@@ -4099,6 +4103,8 @@ TEST_F(RestoreDigestTabletTest, CompactionRecomputesTheWholeDigestAndTheDecompos
     ASSERT_TRUE(compute_tablet_restore_digest_decomposed(*_engine, 7241, 4, 2, &fresh).ok());
     EXPECT_EQ(fresh.serialize(), after.decomposed->serialize());
     EXPECT_EQ(1U, cache.decomposed_count());
+    // the entry of the old generation was evicted, not left behind
+    EXPECT_EQ(1U, cache.size());
     // the new one replaced the old one, and now it hits
     CachedDigest third = get_cached(*_engine, &cache, 7241, 4);
     EXPECT_EQ(0U, third.scans);
@@ -4476,6 +4482,66 @@ TEST_F(RestoreDigestTabletTest, PoisonedEntryIsReplacedByTheRecomputedDigest) {
     CachedDigest plain = get_cached(*_engine, &cache, 7314, 3, false);
     EXPECT_TRUE(plain.result.from_cache);
     EXPECT_EQ(direct.root, plain.result.root);
+}
+
+TEST(RestoreDigestCacheTest, OlderGenerationsOfTheSameVersionAreEvicted) {
+    ConfigRestore restore;
+    config::restore_digest_cache_decomposed_mb = 256;
+    RestoreDigestCache cache(/*capacity=*/16);
+    auto value = [](const std::string& root) {
+        LogicalDigestResult v;
+        v.root = root;
+        return v;
+    };
+    RestoreDigestCache::DecomposedGuard guard;
+    LogicalDigestResult out;
+    RestoreDigestCache::Hit hit;
+    const int64_t big = RestoreDigestCache::estimate_bytes(*fake_decomposed(40));
+    const int64_t small = RestoreDigestCache::estimate_bytes(*fake_decomposed(10));
+    ASSERT_NE(big, small);
+
+    RestoreDigestCache::Key old_gen = cache_key(1, 5, "a");
+    old_gen.rowsets_sig = "old";
+    cache.insert(old_gen, value("r_old"), fake_decomposed(40), guard);
+    // another version and another schema of the same tablet are not generations of the key
+    cache.insert(cache_key(1, 6, "a"), value("v6"), fake_decomposed(10), guard);
+    cache.insert(cache_key(1, 5, "b"), value("sb"), nullptr, guard);
+    cache.insert(cache_key(2, 5, "a"), value("t2"), nullptr, guard);
+    EXPECT_EQ(4U, cache.size());
+    EXPECT_EQ(big + small, cache.decomposed_bytes());
+
+    // the same tablet and version with another generation (rowsets, here also the delete bitmap)
+    RestoreDigestCache::Key new_gen = cache_key(1, 5, "a");
+    new_gen.rowsets_sig = "new";
+    new_gen.bitmap_keys = 3;
+    cache.insert(new_gen, value("r_new"), fake_decomposed(10), guard);
+    EXPECT_EQ(4U, cache.size());
+    EXPECT_EQ(2 * small, cache.decomposed_bytes());
+    EXPECT_EQ(2U, cache.decomposed_count());
+    EXPECT_FALSE(cache.lookup(old_gen, &out));
+    ASSERT_TRUE(cache.lookup(new_gen, &out, &hit));
+    EXPECT_EQ("r_new", out.root);
+    EXPECT_NE(nullptr, hit.decomposed);
+    EXPECT_TRUE(cache.lookup(cache_key(1, 6, "a"), &out));
+    EXPECT_TRUE(cache.lookup(cache_key(1, 5, "b"), &out));
+    EXPECT_TRUE(cache.lookup(cache_key(2, 5, "a"), &out));
+
+    // only the new generation of (1, 5, "a") is left, and it is the only entry the index knows of
+    // after an erase: a later insert of the old generation evicts it in turn
+    cache.erase(new_gen);
+    EXPECT_EQ(3U, cache.size());
+    EXPECT_EQ(small, cache.decomposed_bytes());
+    cache.insert(old_gen, value("r_old"), fake_decomposed(40), guard);
+    cache.insert(new_gen, value("r_new"), fake_decomposed(10), guard);
+    EXPECT_EQ(4U, cache.size());
+    EXPECT_EQ(2 * small, cache.decomposed_bytes());
+    cache.clear();
+    EXPECT_EQ(0U, cache.size());
+    EXPECT_EQ(0, cache.decomposed_bytes());
+    cache.insert(old_gen, value("r_old"), fake_decomposed(40), guard);
+    cache.insert(new_gen, value("r_new"), fake_decomposed(10), guard);
+    EXPECT_EQ(1U, cache.size());
+    EXPECT_EQ(small, cache.decomposed_bytes());
 }
 
 TEST(RestoreDigestCacheTest, DecomposedBytesAreLimitedByTheirOwnLru) {
