@@ -33,6 +33,7 @@
 #include <shared_mutex>
 #include <string_view>
 #include <thread>
+#include <tuple>
 
 #include "common/config.h"
 #include "common/consts.h"
@@ -1284,6 +1285,29 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
     return Status::OK();
 }
 
+std::string restore_digest_rowsets_sig(const std::vector<RowsetSharedPtr>& rowsets) {
+    struct Item {
+        int64_t start;
+        int64_t end;
+        std::string id;
+    };
+    std::vector<Item> items;
+    items.reserve(rowsets.size());
+    for (const auto& rs : rowsets) {
+        items.push_back({rs->start_version(), rs->end_version(), rs->rowset_id().to_string()});
+    }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        return std::tie(a.start, a.end, a.id) < std::tie(b.start, b.end, b.id);
+    });
+    std::string buf;
+    for (const Item& it : items) {
+        // length prefixed fields, so that no two different sets share the same byte string
+        buf.append(fmt::format("{}:{}:{}:{};", it.start, it.end, it.id.size(), it.id));
+    }
+    XXH128_hash_t h = XXH3_128bits(buf.data(), buf.size());
+    return fmt::format("{:016x}{:016x}", h.high64, h.low64);
+}
+
 namespace {
 
 // Captures the rowsets (and the delete bitmap snapshot for MoW) and the schema of a tablet at
@@ -1306,6 +1330,7 @@ Status prepare_tablet_input(StorageEngine& engine, int64_t tablet_id, int64_t ve
     input->enable_mow = tablet->enable_unique_key_merge_on_write();
     input->threads = threads;
     input->tablet = tablet;
+    input->tablet_uid = tablet->tablet_uid();
     {
         // Rowsets and the delete bitmap snapshot must be taken in the same critical section.
         std::shared_lock rdlock(tablet->get_header_lock());
@@ -1315,6 +1340,8 @@ Status prepare_tablet_input(StorageEngine& engine, int64_t tablet_id, int64_t ve
             return std::move(ret.error());
         }
         input->rowsets = std::move(ret->rowsets);
+        // the data identity, from the very rowsets which will be read
+        input->rowsets_sig = restore_digest_rowsets_sig(input->rowsets);
         if (input->enable_mow) {
             input->delete_bitmap = std::make_shared<DeleteBitmap>(
                     tablet->tablet_meta()->delete_bitmap().snapshot(version));
@@ -1366,6 +1393,9 @@ size_t RestoreDigestCache::KeyHash::operator()(const Key& k) const {
     mix(static_cast<uint64_t>(k.tablet_id));
     mix(static_cast<uint64_t>(k.version));
     mix(k.algo_version);
+    mix(static_cast<uint64_t>(k.tablet_uid.hi));
+    mix(static_cast<uint64_t>(k.tablet_uid.lo));
+    mix(std::hash<std::string>()(k.rowsets_sig));
     return h;
 }
 
@@ -1532,23 +1562,12 @@ void fill_result(const RestoreDigest& digest, LogicalDigestResult* result) {
     result->from_cache = false;
 }
 
-// Whether the decomposed digest of a cache hit still describes the rowsets which were just
-// captured (the same ids and versions, in the same order).
+// Whether the decomposed digest of a cache hit was computed under the same settings: the key
+// already identifies the rowsets (ids and versions), so only the guard is left to compare.
 bool decomposed_matches_input(const RestoreDigestDecomposed& d, const RestoreDigestInput& input,
                               const RestoreDigestCache::DecomposedGuard& cached,
                               const RestoreDigestCache::DecomposedGuard& now) {
-    if (!(cached == now) || d.rowsets.size() != input.rowsets.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < d.rowsets.size(); ++i) {
-        const RowsetSharedPtr& rs = input.rowsets[i];
-        if (d.rowsets[i].start_version != rs->start_version() ||
-            d.rowsets[i].end_version != rs->end_version() ||
-            d.rowsets[i].rowset_id != rs->rowset_id().to_string()) {
-            return false;
-        }
-    }
-    return true;
+    return cached == now && d.rowsets.size() == input.rowsets.size();
 }
 } // namespace
 
@@ -1576,6 +1595,8 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
     key.tablet_id = tablet_id;
     key.version = version;
     key.algo_version = RestoreDigest::kAlgoVersion;
+    key.tablet_uid = input.tablet_uid;
+    key.rowsets_sig = input.rowsets_sig;
     // NotSupported schemas are reported here, before anything is scanned or cached.
     RETURN_IF_ERROR(compute_restore_digest_schema_sig(*input.schema, input.keys_type,
                                                       input.enable_mow, &key.schema_sig));
@@ -1589,6 +1610,7 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
     RestoreDigestCache::Hit hit;
     bool cached = cache != nullptr &&
                   cache->lookup(key, result, decomposed != nullptr ? &hit : nullptr);
+    const std::string sig_prefix = input.rowsets_sig.substr(0, 8);
     if (decomposed != nullptr) {
         if (cached && hit.decomposed != nullptr &&
             decomposed_matches_input(*hit.decomposed, input, hit.guard, guard)) {
@@ -1606,11 +1628,12 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
                 }
                 return Status::OK();
             }
-            LOG(WARNING) << "restore digest: the cached decomposed digest of tablet " << tablet_id
-                         << " at version " << version << " composes to root "
-                         << (st.ok() ? composed.root : st.to_string())
-                         << " but the cached digest is " << result->root
-                         << ", dropping both and scanning again";
+            LOG(WARNING) << "restore digest: stale cache entry, tablet_id=" << tablet_id
+                         << ", version=" << version << ", rowsets_sig=" << sig_prefix
+                         << ", cached root=" << result->root << ", the cached decomposed digest "
+                         << "composes to " << (st.ok() ? composed.root : st.to_string())
+                         << ", dropping the entry and scanning again";
+            cache->note_stale();
             cache->erase(key);
             cached = false;
         }
@@ -1626,10 +1649,14 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
             st = fresh->compose(version, &composed);
         }
         if (st.ok() && cached && composed.root != result->root) {
-            st = Status::InternalError(
-                    "restore digest: the decomposed digest of tablet {} at version {} composes to "
-                    "root {} but the cached digest is {}",
-                    tablet_id, version, composed.root, result->root);
+            // The recomputed digest wins: the cached whole digest is dropped and replaced.
+            LOG(WARNING) << "restore digest: stale cache entry, tablet_id=" << tablet_id
+                         << ", version=" << version << ", rowsets_sig=" << sig_prefix
+                         << ", cached root=" << result->root << ", recomputed root="
+                         << composed.root << ", replacing the entry";
+            cache->note_stale();
+            cache->erase(key);
+            cached = false;
         }
         if (decomposed_status != nullptr) {
             *decomposed_status = st;
@@ -1637,6 +1664,7 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
         if (st.ok()) {
             if (!cached) {
                 fill_result(composed, result);
+                result->rowsets_sig = input.rowsets_sig;
             }
             if (cache != nullptr) {
                 // for a cached whole digest this attaches the decomposed digest to its entry
@@ -1646,8 +1674,10 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
             return Status::OK();
         }
         // The decomposed digest failed (not supported, over the scan limit, ...): only the whole
-        // digest is cached, from the cache if it is there.
+        // digest is cached, from the cache if it is there (the key identifies the data, so it
+        // describes it).
     }
+    result->rowsets_sig = input.rowsets_sig;
     if (cached) {
         return Status::OK();
     }
@@ -1655,6 +1685,7 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
     RestoreDigest digest;
     RETURN_IF_ERROR(compute_restore_digest(input, &digest));
     fill_result(digest, result);
+    result->rowsets_sig = input.rowsets_sig;
     if (cache != nullptr) {
         cache->insert(key, *result);
     }

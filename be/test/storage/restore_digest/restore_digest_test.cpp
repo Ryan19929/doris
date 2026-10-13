@@ -2045,6 +2045,73 @@ protected:
         return d;
     }
 
+    // Merges the rowsets of versions lo..hi into one rowset of the same rows (what a compaction
+    // does) and adds it to the tablet, which retires the inputs.
+    RowsetSharedPtr compact(const TabletSharedPtr& tablet, const TabletSchemaSPtr& schema,
+                            int64_t lo, int64_t hi) {
+    std::vector<RowsetSharedPtr> inputs;
+    {
+        std::shared_lock lock(tablet->get_header_lock());
+        auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, hi), CaptureRowsetOps {});
+        EXPECT_TRUE(ret.has_value());
+        for (const auto& rs : ret->rowsets) {
+            if (rs->version().first >= lo) {
+                inputs.push_back(rs);
+            }
+        }
+    }
+    EXPECT_EQ(2U, inputs.size());
+    std::vector<RowsetReaderSharedPtr> readers;
+    for (const auto& rs : inputs) {
+        RowsetReaderSharedPtr reader;
+        EXPECT_TRUE(rs->create_reader(&reader).ok());
+        readers.push_back(reader);
+    }
+    RowsetWriterContext ctx;
+    RowsetId id;
+    id.init(_next_id++);
+    ctx.rowset_id = id;
+    ctx.tablet_id = tablet->tablet_id();
+    ctx.tablet_schema_hash = tablet->schema_hash();
+    ctx.partition_id = tablet->partition_id();
+    ctx.rowset_type = BETA_ROWSET;
+    ctx.tablet_path = tablet->tablet_path();
+    ctx.data_dir = tablet->data_dir();
+    ctx.rowset_state = VISIBLE;
+    ctx.tablet_schema = schema;
+    ctx.version = {lo, hi};
+    ctx.segments_overlap = NONOVERLAPPING;
+    ctx.max_rows_per_segment = UINT32_MAX;
+    ctx.tablet = tablet;
+    auto res = RowsetFactory::create_rowset_writer(*_engine, ctx, true);
+    EXPECT_TRUE(res.has_value()) << res.error();
+    auto writer = std::move(res).value();
+    Merger::Statistics stats;
+    RowIdConversion conversion;
+    stats.rowid_conversion = &conversion;
+    EXPECT_TRUE(Merger::vertical_merge_rowsets(tablet, ReaderType::READER_BASE_COMPACTION, *schema,
+                                               readers, writer.get(), 100, 2, &stats)
+                        .ok());
+    RowsetSharedPtr merged;
+    EXPECT_TRUE(writer->build(merged).ok());
+    EXPECT_TRUE(tablet->add_rowset(merged).ok());
+
+    return merged;
+    }
+
+    // Replaces the rowset of the single version `version` by a new one with other rows (what a
+    // restore overwriting the tablet or a clone of the same version does), under the header lock.
+    void replace_rowset(const TabletSharedPtr& tablet, const TabletSchemaSPtr& schema,
+                        int64_t version, const std::vector<TabRow>& rows) {
+        RowsetSharedPtr fresh = write(tablet, schema, version, {rows}, false, false);
+        std::unique_lock lock(tablet->get_header_lock());
+        RowsetSharedPtr old = tablet->get_rowset_by_version({version, version});
+        EXPECT_NE(nullptr, old);
+        std::vector<RowsetSharedPtr> to_add {fresh};
+        std::vector<RowsetSharedPtr> to_delete {old};
+        EXPECT_TRUE(tablet->modify_rowsets(to_add, to_delete).ok());
+    }
+
     int64_t _next_id = 880000;
 };
 
@@ -2379,6 +2446,15 @@ TEST(RestoreDigestCacheTest, LruEvictionAndKey) {
     EXPECT_FALSE(cache.lookup(key(1, 6, 1, "a"), &out));
     EXPECT_FALSE(cache.lookup(key(1, 5, 2, "a"), &out));
     EXPECT_FALSE(cache.lookup(key(1, 5, 1, "b"), &out));
+    {
+        // the data identity matters too: the tablet instance and the rowsets
+        RestoreDigestCache::Key k = key(1, 5, 1, "a");
+        k.tablet_uid = TabletUid(1, 2);
+        EXPECT_FALSE(cache.lookup(k, &out));
+        k = key(1, 5, 1, "a");
+        k.rowsets_sig = "other";
+        EXPECT_FALSE(cache.lookup(k, &out));
+    }
     EXPECT_TRUE(cache.lookup(key(1, 5, 1, "a"), &out));
     // overwriting does not grow the cache
     cache.insert(key(1, 5, 1, "a"), value("r1x"));
@@ -3746,13 +3822,9 @@ TEST_F(RestoreDigestTabletTest, LogicalDigestComesFromTheDecomposedDigest) {
     ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7211, 3, 1, &cache, &plain).ok());
     EXPECT_EQ(direct.root, plain.root);
 
-    // the cache holds another root for the key: the decomposed digest is dropped, the cached value wins
+    // the cache holds another root for the key: the recomputed digest wins and replaces the entry
     RestoreDigestCache poisoned(/*capacity=*/16);
-    RestoreDigestCache::Key key;
-    key.tablet_id = 7211;
-    key.version = 3;
-    key.algo_version = RestoreDigest::kAlgoVersion;
-    key.schema_sig = direct.schema_sig;
+    const RestoreDigestCache::Key key = tablet_cache_key(*_engine, 7211, 3, direct.schema_sig);
     LogicalDigestResult bogus;
     bogus.schema_sig = direct.schema_sig;
     bogus.root = std::string(64, 'f');
@@ -3760,11 +3832,13 @@ TEST_F(RestoreDigestTabletTest, LogicalDigestComesFromTheDecomposedDigest) {
     poisoned.insert(key, bogus);
     LogicalDigestResult got;
     std::shared_ptr<const RestoreDigestDecomposed> dec3;
-    dec_status = Status::OK();
+    dec_status = Status::InternalError("not set");
     ASSERT_TRUE(get_tablet_logical_digest(*_engine, 7211, 3, 1, &poisoned, &got, &dec3, &dec_status).ok());
-    EXPECT_FALSE(dec_status.ok());
-    EXPECT_EQ(nullptr, dec3);
-    EXPECT_EQ(bogus.root, got.root);
+    EXPECT_TRUE(dec_status.ok()) << dec_status;
+    ASSERT_NE(nullptr, dec3);
+    EXPECT_FALSE(got.from_cache);
+    EXPECT_EQ(direct.root, got.root);
+    EXPECT_EQ(1U, poisoned.stale_count());
 
     // merge on read: the digest is the whole digest at the base version of the decomposed digest
     auto mor = create_tablet(7212, /*mow=*/false, /*unique=*/true);
@@ -3841,6 +3915,20 @@ RestoreDigestCache::Key cache_key(int64_t tablet_id, int64_t version, const std:
     key.version = version;
     key.algo_version = RestoreDigest::kAlgoVersion;
     key.schema_sig = sig;
+    return key;
+}
+
+// The key get_tablet_logical_digest uses for the tablet as it is now.
+RestoreDigestCache::Key tablet_cache_key(StorageEngine& engine, int64_t tablet_id, int64_t version,
+                                         const std::string& sig) {
+    RestoreDigestCache::Key key = cache_key(tablet_id, version, sig);
+    TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(tablet_id);
+    EXPECT_NE(nullptr, tablet);
+    key.tablet_uid = tablet->tablet_uid();
+    std::shared_lock lock(tablet->get_header_lock());
+    auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, version), CaptureRowsetOps {});
+    EXPECT_TRUE(ret.has_value());
+    key.rowsets_sig = restore_digest_rowsets_sig(ret->rowsets);
     return key;
 }
 
@@ -3965,7 +4053,7 @@ TEST_F(RestoreDigestTabletTest, HitTakesBothDigestsFromTheCacheWithoutScanning) 
     EXPECT_EQ(0U, get_cached(*_engine, &plain_cache, 7231, 5).scans);
 }
 
-TEST_F(RestoreDigestTabletTest, CompactionKeepsTheWholeDigestAndDropsTheDecomposedOne) {
+TEST_F(RestoreDigestTabletTest, CompactionRecomputesTheWholeDigestAndTheDecomposedOne) {
     _next_id = 941000; // not the ids of another test, see the segment cache
     ConfigRestore restore;
     config::restore_digest_cache_decomposed_mb = 256;
@@ -3992,58 +4080,15 @@ TEST_F(RestoreDigestTabletTest, CompactionKeepsTheWholeDigestAndDropsTheDecompos
     EXPECT_EQ(0U, get_cached(*_engine, &cache, 7241, 4).scans);
 
     // the compaction of versions 2..3: the same rows, other rowsets
-    std::vector<RowsetSharedPtr> inputs;
-    {
-        std::shared_lock lock(tablet->get_header_lock());
-        auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, 3), CaptureRowsetOps {});
-        ASSERT_TRUE(ret.has_value());
-        for (const auto& rs : ret->rowsets) {
-            if (rs->version().first >= 2) {
-                inputs.push_back(rs);
-            }
-        }
-    }
-    ASSERT_EQ(2U, inputs.size());
-    std::vector<RowsetReaderSharedPtr> readers;
-    for (const auto& rs : inputs) {
-        RowsetReaderSharedPtr reader;
-        ASSERT_TRUE(rs->create_reader(&reader).ok());
-        readers.push_back(reader);
-    }
-    RowsetWriterContext ctx;
-    RowsetId id;
-    id.init(_next_id++);
-    ctx.rowset_id = id;
-    ctx.tablet_id = tablet->tablet_id();
-    ctx.tablet_schema_hash = tablet->schema_hash();
-    ctx.partition_id = tablet->partition_id();
-    ctx.rowset_type = BETA_ROWSET;
-    ctx.tablet_path = tablet->tablet_path();
-    ctx.data_dir = tablet->data_dir();
-    ctx.rowset_state = VISIBLE;
-    ctx.tablet_schema = schema;
-    ctx.version = {2, 3};
-    ctx.segments_overlap = NONOVERLAPPING;
-    ctx.max_rows_per_segment = UINT32_MAX;
-    ctx.tablet = tablet;
-    auto res = RowsetFactory::create_rowset_writer(*_engine, ctx, true);
-    ASSERT_TRUE(res.has_value()) << res.error();
-    auto writer = std::move(res).value();
-    Merger::Statistics stats;
-    RowIdConversion conversion;
-    stats.rowid_conversion = &conversion;
-    ASSERT_TRUE(Merger::vertical_merge_rowsets(tablet, ReaderType::READER_BASE_COMPACTION, *schema,
-                                               readers, writer.get(), 100, 2, &stats)
-                        .ok());
-    RowsetSharedPtr merged;
-    ASSERT_TRUE(writer->build(merged).ok());
-    ASSERT_TRUE(tablet->add_rowset(merged).ok());
+    compact(tablet, schema, 2, 3);
 
     CachedDigest after = get_cached(*_engine, &cache, 7241, 4);
     ASSERT_TRUE(after.status.ok()) << after.status;
     ASSERT_TRUE(after.decomposed_status.ok()) << after.decomposed_status;
     ASSERT_NE(nullptr, after.decomposed);
-    EXPECT_TRUE(after.result.from_cache); // the whole digest does not depend on the rowsets
+    // The key holds the fingerprint of the rowsets (ids and versions), which a compaction changes:
+    // the whole digest is recomputed too, although it is the same (correctness over reuse).
+    EXPECT_FALSE(after.result.from_cache);
     EXPECT_FALSE(after.decomposed_from_cache);
     EXPECT_EQ(1U, after.scans);
     EXPECT_EQ(first.result.root, after.result.root);
@@ -4190,7 +4235,7 @@ TEST_F(RestoreDigestTabletTest, CachedDecomposedDigestWhichDisagreesIsDroppedAnd
     CachedDigest first = get_cached(*_engine, &cache, 7281, 3);
     ASSERT_NE(nullptr, first.decomposed);
     // the cached whole digest says another root than the parts compose to
-    const RestoreDigestCache::Key key = cache_key(7281, 3, direct.schema_sig);
+    const RestoreDigestCache::Key key = tablet_cache_key(*_engine, 7281, 3, direct.schema_sig);
     LogicalDigestResult bogus = first.result;
     bogus.root = std::string(64, 'f');
     bogus.from_cache = false;
@@ -4209,11 +4254,228 @@ TEST_F(RestoreDigestTabletTest, CachedDecomposedDigestWhichDisagreesIsDroppedAnd
     EXPECT_FALSE(got.result.from_cache);
     EXPECT_EQ(direct.root, got.result.root);
     EXPECT_EQ(direct.root, got.decomposed->root);
+    EXPECT_EQ(1U, cache.stale_count());
     // both were replaced by the new result
     CachedDigest next = get_cached(*_engine, &cache, 7281, 3);
     EXPECT_EQ(0U, next.scans);
     EXPECT_TRUE(next.decomposed_from_cache);
     EXPECT_EQ(direct.root, next.result.root);
+}
+
+// ===== the data identity in the key ==========================================================
+
+TEST_F(RestoreDigestTabletTest, RowsetsSigIgnoresTheOrderAndSeesTheRowsets) {
+    _next_id = 949000; // not the ids of another test, see the segment cache
+    auto tablet = create_tablet(7310, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    write(tablet, schema, 2, {{{1, 1}}}, false, true);
+    write(tablet, schema, 3, {{{2, 2}}}, false, true);
+    std::vector<RowsetSharedPtr> rowsets;
+    {
+        std::shared_lock lock(tablet->get_header_lock());
+        auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, 3), CaptureRowsetOps {});
+        ASSERT_TRUE(ret.has_value());
+        rowsets = ret->rowsets;
+    }
+    ASSERT_EQ(3U, rowsets.size());
+    const std::string sig = restore_digest_rowsets_sig(rowsets);
+    EXPECT_EQ(32U, sig.size());
+    std::vector<RowsetSharedPtr> reversed(rowsets.rbegin(), rowsets.rend());
+    EXPECT_EQ(sig, restore_digest_rowsets_sig(reversed));
+    std::vector<RowsetSharedPtr> fewer(rowsets.begin(), rowsets.end() - 1);
+    EXPECT_NE(sig, restore_digest_rowsets_sig(fewer));
+    // the same versions with another rowset id
+    replace_rowset(tablet, schema, 3, {{2, 2}});
+    std::vector<RowsetSharedPtr> replaced;
+    {
+        std::shared_lock lock(tablet->get_header_lock());
+        auto ret = tablet->capture_consistent_rowsets_unlocked(Version(0, 3), CaptureRowsetOps {});
+        ASSERT_TRUE(ret.has_value());
+        replaced = ret->rowsets;
+    }
+    ASSERT_EQ(3U, replaced.size());
+    EXPECT_NE(sig, restore_digest_rowsets_sig(replaced));
+}
+
+// The content of a tablet at the same id, version and schema is replaced: the cached digest of the
+// old content must not be returned.
+TEST_F(RestoreDigestTabletTest, ReplacedRowsetIsNotACacheHit) {
+    _next_id = 950000; // not the ids of another test, see the segment cache
+    ConfigRestore restore;
+    config::restore_digest_cache_decomposed_mb = 256;
+    auto tablet = create_tablet(7311, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    write(tablet, schema, 2, {{{1, 10}, {2, 20}}}, false, true);
+    write(tablet, schema, 3, {{{3, 30}}}, false, true);
+
+    RestoreDigestCache cache(/*capacity=*/16);
+    CachedDigest x = get_cached(*_engine, &cache, 7311, 3);
+    ASSERT_TRUE(x.status.ok()) << x.status;
+    ASSERT_TRUE(x.decomposed_status.ok()) << x.decomposed_status;
+    EXPECT_FALSE(x.result.from_cache);
+    CachedDigest x_again = get_cached(*_engine, &cache, 7311, 3);
+    EXPECT_TRUE(x_again.result.from_cache);
+    EXPECT_TRUE(x_again.decomposed_from_cache);
+    EXPECT_EQ(0U, x_again.scans);
+
+    // version 3 now holds other rows: same tablet, same version, same schema
+    replace_rowset(tablet, schema, 3, {{7, 70}, {8, 80}, {9, 90}});
+    RestoreDigest direct = tablet_digest(7311, 3);
+    ASSERT_NE(x.result.root, direct.root);
+
+    CachedDigest y = get_cached(*_engine, &cache, 7311, 3);
+    ASSERT_TRUE(y.status.ok()) << y.status;
+    ASSERT_TRUE(y.decomposed_status.ok()) << y.decomposed_status;
+    EXPECT_FALSE(y.result.from_cache);
+    EXPECT_FALSE(y.decomposed_from_cache);
+    EXPECT_EQ(1U, y.scans);
+    EXPECT_EQ(direct.root, y.result.root);
+    EXPECT_EQ(5U, y.result.rows);
+    EXPECT_EQ(direct.root, y.decomposed->root);
+    // not a stale entry: the key did not match, nothing disagreed
+    EXPECT_EQ(0U, cache.stale_count());
+    // the new content hits now
+    CachedDigest y_again = get_cached(*_engine, &cache, 7311, 3);
+    EXPECT_TRUE(y_again.result.from_cache);
+    EXPECT_EQ(direct.root, y_again.result.root);
+
+    // the same without the decomposed digest (what the RESTORE_DIGEST task of the target does)
+    replace_rowset(tablet, schema, 3, {{11, 1}});
+    RestoreDigest direct2 = tablet_digest(7311, 3);
+    ASSERT_NE(direct.root, direct2.root);
+    CachedDigest z = get_cached(*_engine, &cache, 7311, 3, /*want_decomposed=*/false);
+    ASSERT_TRUE(z.status.ok()) << z.status;
+    EXPECT_FALSE(z.result.from_cache);
+    EXPECT_EQ(1U, z.scans);
+    EXPECT_EQ(direct2.root, z.result.root);
+    EXPECT_TRUE(get_cached(*_engine, &cache, 7311, 3, false).result.from_cache);
+}
+
+// The tablet is dropped and created again with the same id, and loaded with other data at the same
+// versions (a new tablet_uid and new rowset ids).
+TEST_F(RestoreDigestTabletTest, RecreatedTabletIsNotACacheHit) {
+    _next_id = 951000; // not the ids of another test, see the segment cache
+    ConfigRestore restore;
+    config::restore_digest_cache_decomposed_mb = 256;
+    auto tablet = create_tablet(7312, false);
+    ASSERT_NE(nullptr, tablet);
+    write(tablet, tablet->tablet_schema(), 2, {{{1, 10}, {2, 20}}}, false, true);
+    write(tablet, tablet->tablet_schema(), 3, {{{3, 30}}}, false, true);
+
+    RestoreDigestCache cache(/*capacity=*/16);
+    CachedDigest x = get_cached(*_engine, &cache, 7312, 3);
+    ASSERT_TRUE(x.status.ok()) << x.status;
+    ASSERT_TRUE(x.decomposed_status.ok()) << x.decomposed_status;
+    const TabletUid old_uid = tablet->tablet_uid();
+    const int64_t replica_id = tablet->replica_id();
+    tablet.reset();
+    ASSERT_TRUE(_engine->tablet_manager()->drop_tablet(7312, replica_id, false).ok());
+
+    auto again = create_tablet(7312, false);
+    ASSERT_NE(nullptr, again);
+    EXPECT_FALSE(old_uid == again->tablet_uid());
+    write(again, again->tablet_schema(), 2, {{{5, 50}}}, false, true);
+    write(again, again->tablet_schema(), 3, {{{6, 60}, {7, 70}}}, false, true);
+    RestoreDigest direct = tablet_digest(7312, 3);
+    ASSERT_NE(x.result.root, direct.root);
+
+    CachedDigest y = get_cached(*_engine, &cache, 7312, 3);
+    ASSERT_TRUE(y.status.ok()) << y.status;
+    EXPECT_FALSE(y.result.from_cache);
+    EXPECT_EQ(1U, y.scans);
+    EXPECT_EQ(direct.root, y.result.root);
+    ASSERT_TRUE(y.decomposed_status.ok()) << y.decomposed_status;
+    EXPECT_EQ(direct.root, y.decomposed->root);
+
+    // a plain request (no decomposed digest) on yet another recreation
+    auto key_old = tablet_cache_key(*_engine, 7312, 3, direct.schema_sig);
+    EXPECT_EQ(again->tablet_uid(), key_old.tablet_uid);
+    EXPECT_FALSE(old_uid == key_old.tablet_uid);
+    EXPECT_TRUE(get_cached(*_engine, &cache, 7312, 3, false).result.from_cache);
+}
+
+// A compaction retires the rowsets and makes another one: the same rows, but the identity of the
+// data is different, so the whole digest and the decomposed digest are both computed again, and
+// come out the same as a direct computation.
+TEST_F(RestoreDigestTabletTest, CompactedRowsetsAreNotACacheHit) {
+    _next_id = 952000; // not the ids of another test, see the segment cache
+    ConfigRestore restore;
+    config::restore_digest_cache_decomposed_mb = 256;
+    auto tablet = create_tablet(7313, false);
+    ASSERT_NE(nullptr, tablet);
+    auto schema = tablet->tablet_schema();
+    write(tablet, schema, 2, {{{1, 1}, {2, 2}}}, false, true);
+    write(tablet, schema, 3, {{{3, 3}}}, false, true);
+    write(tablet, schema, 4, {{{4, 4}}}, false, true);
+
+    RestoreDigestCache cache(/*capacity=*/16);
+    CachedDigest before = get_cached(*_engine, &cache, 7313, 4);
+    ASSERT_TRUE(before.decomposed_status.ok()) << before.decomposed_status;
+    // the whole digest alone, at another version
+    CachedDigest plain_before = get_cached(*_engine, &cache, 7313, 3, false);
+    ASSERT_TRUE(plain_before.status.ok());
+
+    compact(tablet, schema, 2, 3);
+    RestoreDigest direct = tablet_digest(7313, 4);
+    EXPECT_EQ(before.result.root, direct.root);
+
+    CachedDigest after = get_cached(*_engine, &cache, 7313, 4);
+    ASSERT_TRUE(after.status.ok()) << after.status;
+    ASSERT_TRUE(after.decomposed_status.ok()) << after.decomposed_status;
+    EXPECT_FALSE(after.result.from_cache);
+    EXPECT_FALSE(after.decomposed_from_cache);
+    EXPECT_EQ(1U, after.scans);
+    EXPECT_EQ(direct.root, after.result.root);
+    EXPECT_EQ(direct.root, after.decomposed->root);
+    EXPECT_EQ(0U, cache.stale_count());
+
+    // the new entry hits, and a plain request for the same data does too
+    EXPECT_TRUE(get_cached(*_engine, &cache, 7313, 4, false).result.from_cache);
+}
+
+// The cache holds a wrong root for the key of the current data: the recomputed digest is returned,
+// the entry is replaced and counted, and the next request hits the right value.
+TEST_F(RestoreDigestTabletTest, PoisonedEntryIsReplacedByTheRecomputedDigest) {
+    _next_id = 953000; // not the ids of another test, see the segment cache
+    ConfigRestore restore;
+    config::restore_digest_cache_decomposed_mb = 256;
+    auto tablet = create_tablet(7314, false);
+    ASSERT_NE(nullptr, tablet);
+    write(tablet, tablet->tablet_schema(), 2, {{{1, 1}, {2, 2}}}, false, true);
+    write(tablet, tablet->tablet_schema(), 3, {{{3, 3}}}, false, true);
+    RestoreDigest direct = tablet_digest(7314, 3);
+
+    RestoreDigestCache cache(/*capacity=*/16);
+    const RestoreDigestCache::Key key = tablet_cache_key(*_engine, 7314, 3, direct.schema_sig);
+    LogicalDigestResult bogus;
+    bogus.algo_version = RestoreDigest::kAlgoVersion;
+    bogus.schema_sig = direct.schema_sig;
+    bogus.root = std::string(64, 'e');
+    bogus.rows = 3;
+    cache.insert(key, bogus); // no decomposed digest in the entry
+    EXPECT_EQ(0U, cache.stale_count());
+
+    CachedDigest got = get_cached(*_engine, &cache, 7314, 3);
+    ASSERT_TRUE(got.status.ok()) << got.status;
+    ASSERT_TRUE(got.decomposed_status.ok()) << got.decomposed_status;
+    EXPECT_FALSE(got.result.from_cache);
+    EXPECT_EQ(direct.root, got.result.root);
+    ASSERT_NE(nullptr, got.decomposed);
+    EXPECT_EQ(direct.root, got.decomposed->root);
+    EXPECT_EQ(1U, cache.stale_count());
+    EXPECT_EQ(1U, cache.size());
+
+    CachedDigest next = get_cached(*_engine, &cache, 7314, 3);
+    EXPECT_TRUE(next.result.from_cache);
+    EXPECT_TRUE(next.decomposed_from_cache);
+    EXPECT_EQ(0U, next.scans);
+    EXPECT_EQ(direct.root, next.result.root);
+    EXPECT_EQ(1U, cache.stale_count());
+    CachedDigest plain = get_cached(*_engine, &cache, 7314, 3, false);
+    EXPECT_TRUE(plain.result.from_cache);
+    EXPECT_EQ(direct.root, plain.result.root);
 }
 
 TEST(RestoreDigestCacheTest, DecomposedBytesAreLimitedByTheirOwnLru) {

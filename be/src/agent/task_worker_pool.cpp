@@ -1487,6 +1487,7 @@ TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t ta
         LOG(INFO) << "logical digest done, tablet_id=" << tablet_id << ", version=" << version
                   << ", rows=" << result.rows << ", root=" << result.root
                   << ", from_cache=" << result.from_cache
+                  << ", rowsets_sig=" << result.rowsets_sig.substr(0, 8)
                   << ", decomposed_from_cache=" << (prefix != nullptr && prefix->from_cache)
                   << ", cache_decomposed_entries="
                   << RestoreDigestCache::instance()->decomposed_count()

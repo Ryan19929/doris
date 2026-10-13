@@ -129,7 +129,15 @@ struct RestoreDigestInput {
     BaseTabletSPtr tablet;
     // Worker threads for the rowset / segment parallel read (Duplicate and MoW).
     int threads = 1;
+    // The tablet instance and the fingerprint of `rowsets`, captured with them (data identity for
+    // the digest cache). Empty rowsets_sig means not captured.
+    TabletUid tablet_uid;
+    std::string rowsets_sig;
 };
+
+// Fingerprint (hex XXH3-128) of a set of rowsets: the rowset id, start and end version of each,
+// sorted by (start_version, end_version, rowset_id), so independent of the order given.
+std::string restore_digest_rowsets_sig(const std::vector<RowsetSharedPtr>& rowsets);
 
 // Checks that the model and every column are supported by algo_version 1. Returns NotSupported
 // with the reason otherwise. Never computes anything.
@@ -151,12 +159,21 @@ struct LogicalDigestResult {
     std::string root;       // hex
     uint64_t rows = 0;
     bool from_cache = false;
+    // Hex of the data identity (the rowsets fingerprint) the digest was computed or looked up
+    // with, set by get_tablet_logical_digest; for logs.
+    std::string rowsets_sig;
 };
 
 struct RestoreDigestDecomposed;
 
-// In-memory LRU cache of tablet digests. A digest of a tablet at a version never changes, so the key
-// is (tablet_id, version, algo_version, schema_sig). The cache is lost when the BE restarts.
+// In-memory LRU cache of tablet digests. The digest of a given set of rowsets never changes, but the
+// content of a tablet at a version can be replaced (a non-atomic restore overwrite, a full clone, a
+// tablet dropped and recreated with the same id, a compaction), so the key carries the data identity
+// besides (tablet_id, version, algo_version, schema_sig): the tablet_uid, and a fingerprint of the
+// rowsets of (0, version] (ids and versions, captured in the same critical section as the rowsets
+// which are read). Anything which replaces the data creates new rowset ids, so it cannot hit an
+// old entry; a restart of the BE keeps the rowset ids but empties the cache anyway. A compaction
+// changes the rowsets too, so the whole digest is recomputed after it: correctness first.
 //
 // An entry may also hold the decomposed digest (the per rowset parts, which is what the source of a
 // backup needs besides the whole digest), shared and immutable. The decomposed digest describes the
@@ -172,13 +189,18 @@ public:
         int64_t version = 0;
         uint32_t algo_version = 0;
         std::string schema_sig;
+        // the tablet instance: a tablet recreated with the same id has another uid
+        TabletUid tablet_uid;
+        // fingerprint of the rowsets of (0, version], see restore_digest_rowsets_sig()
+        std::string rowsets_sig;
         bool operator==(const Key& o) const {
             return tablet_id == o.tablet_id && version == o.version &&
-                   algo_version == o.algo_version && schema_sig == o.schema_sig;
+                   algo_version == o.algo_version && schema_sig == o.schema_sig &&
+                   tablet_uid == o.tablet_uid && rowsets_sig == o.rowsets_sig;
         }
     };
 
-    // What the decomposed digest depends on besides the key and its rowset list.
+    // What the decomposed digest depends on besides the key (which identifies the rowsets).
     struct DecomposedGuard {
         // unique MoR: config::restore_digest_mor_prefix_boundaries when it was computed, else -1
         int64_t mor_boundaries = -1;
@@ -216,6 +238,10 @@ public:
     size_t size() const;
     uint64_t hits() const { return _hits; }
     uint64_t misses() const { return _misses; }
+    // How many times a cached whole digest disagreed with the digest recomputed from the data (it
+    // was replaced by the recomputed one). Not expected to be non-zero.
+    uint64_t stale_count() const { return _stale; }
+    void note_stale() { ++_stale; }
     // Statistics of the decomposed digests: count and bytes held now, and how many times a caller
     // that asked for one found it usable / not.
     size_t decomposed_count() const;
@@ -258,6 +284,7 @@ private:
     int64_t _decomposed_bytes = 0;
     std::atomic<uint64_t> _hits {0};
     std::atomic<uint64_t> _misses {0};
+    std::atomic<uint64_t> _stale {0};
     std::atomic<uint64_t> _decomposed_hits {0};
     std::atomic<uint64_t> _decomposed_misses {0};
 };
