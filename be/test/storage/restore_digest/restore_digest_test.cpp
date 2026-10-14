@@ -5863,12 +5863,12 @@ TEST_F(RestoreStageTest, AppendWithoutTheEvidenceOfTheJobIsRefusedAndNothingChan
         loaded->save_meta();
     }
     EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest)));
-    // the max version is neither the base nor the end version
+    // the evidence is there, but the snapshot dir does not hold an increment up to the version asked: refused by
+    // the check of the dir (it may be a resent task of a dir not downloaded yet), nothing changes
     mark_loaded(loaded, 1, 3);
     TRestoreIncrementalRange later = p.range;
-    later.base_version = 3;
     later.end_version = 9;
-    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, later, &p.backup_digest)));
+    EXPECT_FALSE(loader.append_increment(p.dir, loaded, later, &p.backup_digest).ok());
     EXPECT_EQ(files, tablet_files(loaded));
     EXPECT_EQ(3, loaded->max_version_unlocked());
     // and with the evidence it works
