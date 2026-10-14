@@ -2856,9 +2856,24 @@ public class Config extends ConfigBase {
     public static boolean enable_restore_partition_reuse = false;
 
     @ConfField(mutable = true, masterOnly = true, description = "The default check level of partition level reuse, "
-            + "overridden by the restore property reuse_check_level: off|sample|full|disable. Unique tables do not "
-            + "allow off, it is upgraded to sample.")
-    public static String restore_reuse_default_check_level = "sample";
+            + "overridden by the restore property reuse_check_level: off|sample|full|disable. The default is full: "
+            + "every reused partition is proved by the digest of each replica. Unless "
+            + "restore_reuse_allow_unverified_keep is true, off and sample are taken as full.")
+    public static String restore_reuse_default_check_level = "full";
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the check levels off and sample take effect "
+            + "as they are. If false (the default), they are taken as full, so a partition is kept or appended "
+            + "only if the digest of every replica proves it. If true, a partition may be kept without a digest "
+            + "(off: by the lineage stamp only, sample: the partitions not sampled), which gives no consistency "
+            + "guarantee. For experiments and observation only.")
+    public static boolean restore_reuse_allow_unverified_keep = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the tables with a hidden state that the "
+            + "digest does not cover (unique tables, merge-on-write and merge-on-read) are considered by partition "
+            + "level reuse. False by default: only duplicate tables are reused, the others are downloaded. If true, "
+            + "the behavior before the narrowing is restored, for experiments only, the data after the following "
+            + "writes is not guaranteed to be consistent with the backup.")
+    public static boolean restore_reuse_allow_hidden_state_models = false;
 
     @ConfField(mutable = true, masterOnly = true, description = "The ratio of the candidate partitions to compute "
             + "the digest for in the sample check level, at least one partition.")

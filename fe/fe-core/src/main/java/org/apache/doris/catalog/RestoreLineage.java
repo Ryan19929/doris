@@ -38,6 +38,8 @@ import java.util.Objects;
  */
 public class RestoreLineage {
     public static final long UNKNOWN_COMMIT_SEQ = -1L;
+    // The cluster id of the source cluster is unknown (a stamp written before it was recorded, or an old backup).
+    public static final long UNKNOWN_CLUSTER_ID = -1L;
 
     // The db id of the source partition.
     @SerializedName("db")
@@ -61,6 +63,10 @@ public class RestoreLineage {
     // from the source for newly created partitions, it always means the time of the restore in this cluster.
     @SerializedName("rt")
     private long restoreTime;
+    // The cluster id of the source cluster of the backup, null (not written) if unknown. It is no proof (a cluster id
+    // is not unique), it only narrows the candidates.
+    @SerializedName("cid")
+    private Long srcClusterId;
 
     // For gson.
     private RestoreLineage() {
@@ -68,6 +74,13 @@ public class RestoreLineage {
 
     public RestoreLineage(long srcDbId, long srcTableId, long srcPartitionId, long srcVersion,
             long srcCommitSeq, long backupTime, long restoreTime) {
+        this(srcDbId, srcTableId, srcPartitionId, srcVersion, srcCommitSeq, backupTime, restoreTime,
+                UNKNOWN_CLUSTER_ID);
+    }
+
+    public RestoreLineage(long srcDbId, long srcTableId, long srcPartitionId, long srcVersion,
+            long srcCommitSeq, long backupTime, long restoreTime, long srcClusterId) {
+        this.srcClusterId = srcClusterId == UNKNOWN_CLUSTER_ID ? null : srcClusterId;
         this.srcDbId = srcDbId;
         this.srcTableId = srcTableId;
         this.srcPartitionId = srcPartitionId;
@@ -105,6 +118,11 @@ public class RestoreLineage {
         return restoreTime;
     }
 
+    /** The cluster id of the source cluster, {@link #UNKNOWN_CLUSTER_ID} if unknown. */
+    public long getSrcClusterId() {
+        return srcClusterId == null ? UNKNOWN_CLUSTER_ID : srcClusterId;
+    }
+
     /**
      * Whether this lineage points to the given source partition.
      */
@@ -123,13 +141,14 @@ public class RestoreLineage {
         RestoreLineage that = (RestoreLineage) o;
         return srcDbId == that.srcDbId && srcTableId == that.srcTableId && srcPartitionId == that.srcPartitionId
                 && srcVersion == that.srcVersion && srcCommitSeq == that.srcCommitSeq
-                && backupTime == that.backupTime && restoreTime == that.restoreTime;
+                && backupTime == that.backupTime && restoreTime == that.restoreTime
+                && Objects.equals(srcClusterId, that.srcClusterId);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(srcDbId, srcTableId, srcPartitionId, srcVersion, srcCommitSeq, backupTime,
-                restoreTime);
+                restoreTime, srcClusterId);
     }
 
     @Override
@@ -137,6 +156,6 @@ public class RestoreLineage {
         return "RestoreLineage{srcDbId=" + srcDbId + ", srcTableId=" + srcTableId
                 + ", srcPartitionId=" + srcPartitionId + ", srcVersion=" + srcVersion
                 + ", srcCommitSeq=" + srcCommitSeq + ", backupTime=" + backupTime
-                + ", restoreTime=" + restoreTime + "}";
+                + ", restoreTime=" + restoreTime + ", srcClusterId=" + getSrcClusterId() + "}";
     }
 }

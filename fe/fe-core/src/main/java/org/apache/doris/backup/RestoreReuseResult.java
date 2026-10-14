@@ -25,6 +25,8 @@ import com.google.gson.annotations.SerializedName;
 
 import java.util.List;
 import java.util.Map;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
 
 /**
  * The outcome of partition level reuse in a restore job: which existing partitions keep their local data instead of
@@ -33,11 +35,13 @@ import java.util.Map;
  */
 public class RestoreReuseResult {
     // kept
-    // The partition is kept on the lineage check only (check level off), no digest was computed.
+    // The partition is kept on the lineage check only (check level off), no digest was computed. Not proved: only
+    // seen with Config.restore_reuse_allow_unverified_keep.
     public static final String KEPT_L0_ONLY = "KEPT_L0_ONLY";
     // Every replica of every tablet has the digest of the backup.
     public static final String KEPT_DIGEST_VERIFIED = "KEPT_DIGEST_VERIFIED";
-    // The partition was not sampled and the sampled partitions are all consistent (check level sample).
+    // The partition was not sampled and the sampled partitions are all consistent (check level sample). Not proved:
+    // only seen with Config.restore_reuse_allow_unverified_keep.
     public static final String KEPT_SAMPLE_PASSED = "KEPT_SAMPLE_PASSED";
 
     // incremental append (see Decision#incremental): the local partition is behind the backup, its data up to its own
@@ -67,6 +71,11 @@ public class RestoreReuseResult {
     // The job failed to verify the partition.
     public static final String DOWNLOAD_VERIFY_ERROR = "DOWNLOAD_VERIFY_ERROR";
 
+    /** Whether the reason is a keep that no digest of the partition proved. */
+    public static boolean isUnverifiedKeep(String reason) {
+        return KEPT_L0_ONLY.equals(reason) || KEPT_SAMPLE_PASSED.equals(reason);
+    }
+
     /** The decision of one candidate partition. */
     public static class Decision {
         @SerializedName("tid")
@@ -83,9 +92,14 @@ public class RestoreReuseResult {
         // the local data size of a single replica
         @SerializedName("b")
         public long bytes;
-        // off|sample|full, the check level the partition was judged with
+        // off|sample|full, the effective check level the partition was judged with (it can be raised after the
+        // selection: the sample found a mismatch, the cluster id of the source was not proved)
         @SerializedName("l")
         public String level;
+        // off|sample|full, the check level the job requested (the property or the default), before it was raised by
+        // RestoreReuseJudge#levelOfTable. Null in a decision of an older version: same as level.
+        @SerializedName("rl")
+        public String requestedLevel;
         // the local data size of all replicas, what the partition would have downloaded
         @SerializedName("ab")
         public long bytesAllReplicas;
@@ -123,12 +137,21 @@ public class RestoreReuseResult {
             return atomic ? stagingPartitionId : partitionId;
         }
 
+        /** Kept without a digest of the partition to prove it. */
+        public boolean isUnverifiedKeep() {
+            return kept && RestoreReuseResult.isUnverifiedKeep(reason);
+        }
+
         @Override
         public String toString() {
             return tableName + "." + partitionName + "(" + tableId + "," + partitionId
                     + (atomic ? ", staging " + stagingTableId + "," + stagingPartitionId : "") + ", v" + version
-                    + (incremental ? "->v" + targetVersion : "") + ", " + level + ", L0 " + l0Path + "): "
-                    + (kept ? "KEEP " : incremental ? "INCREMENTAL " : "DOWNLOAD ") + reason;
+                    + (incremental ? "->v" + targetVersion : "") + ", " + level
+                    + (requestedLevel != null && !requestedLevel.equals(level)
+                            ? " (requested " + requestedLevel + ")" : "")
+                    + ", L0 " + l0Path + "): "
+                    + (kept ? "KEEP " : incremental ? "INCREMENTAL " : "DOWNLOAD ") + reason
+                    + (isUnverifiedKeep() ? " (UNPROVEN)" : "");
         }
     }
 
@@ -254,6 +277,26 @@ public class RestoreReuseResult {
     /** The kept partitions that passed L0 by the given check. */
     public long getKeptByPath(String l0Path) {
         return decisions.stream().filter(d -> d.kept && l0Path.equals(d.l0Path)).count();
+    }
+
+    /** The kept partitions that no digest proved (KEPT_L0_ONLY, KEPT_SAMPLE_PASSED), shown as unproven. */
+    public long getKeptUnverifiedPartitions() {
+        return decisions.stream().filter(Decision::isUnverifiedKeep).count();
+    }
+
+    /**
+     * The check levels of the decisions, for SHOW RESTORE: the requested ones and the effective ones (a comma
+     * separated, sorted set, usually one value), and the number of kept partitions not proved by a digest.
+     */
+    public Map<String, Object> levelSummary() {
+        Map<String, Object> summary = Maps.newLinkedHashMap();
+        summary.put("requested", String.join(",", decisions.stream()
+                .map(d -> d.requestedLevel != null ? d.requestedLevel : d.level).filter(l -> l != null)
+                .collect(Collectors.toCollection(TreeSet::new))));
+        summary.put("effective", String.join(",", decisions.stream().map(d -> d.level).filter(l -> l != null)
+                .collect(Collectors.toCollection(TreeSet::new))));
+        summary.put("kept_unverified", getKeptUnverifiedPartitions());
+        return summary;
     }
 
     /** The candidate partitions that are downloaded for one of the reasons. */

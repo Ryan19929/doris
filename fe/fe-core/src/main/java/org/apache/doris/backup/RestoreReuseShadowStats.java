@@ -70,7 +70,9 @@ public class RestoreReuseShadowStats {
         // The partition name or range differs from the backup (table level check).
         PARTITION_MISMATCH,
         // The version of the backup differs from the visible version of the local partition.
-        VERSION_MISMATCH
+        VERSION_MISMATCH,
+        // Both the lineage and the backup know the cluster id of the source, and they differ.
+        CLUSTER_MISMATCH
     }
 
     /**
@@ -85,7 +87,15 @@ public class RestoreReuseShadowStats {
         // The logical equivalence of an aggregate table can not be proved (e.g. SUM of floating point values).
         AGGREGATE_TABLE,
         // Part of the data is cooled down to remote storage, reading it costs about the same as downloading.
-        REMOTE_STORAGE
+        REMOTE_STORAGE,
+        // A unique merge-on-write table: the rows with a delete sign (and their sequence values) and the rows
+        // deleted by a delete predicate are hidden state. The digest skips them, but the partial column update and
+        // the sequence check of the later writes read them, so two replicas with the same digest may still behave
+        // differently. Not reused unless restore_reuse_allow_hidden_state_models.
+        HIDDEN_STATE_MOW,
+        // A unique merge-on-read table: the overwritten versions of a key are hidden state, a later delete predicate
+        // makes them visible again. Not reused unless restore_reuse_allow_hidden_state_models.
+        HIDDEN_STATE_MOR
     }
 
     @SerializedName("partitions")
@@ -107,6 +117,12 @@ public class RestoreReuseShadowStats {
     private long l0PassedButAggregateTable = 0;
     @SerializedName("l0_passed_but_remote_storage")
     private long l0PassedButRemoteStorage = 0;
+    @SerializedName("l0_passed_but_hidden_state_mow")
+    private long l0PassedButHiddenStateMow = 0;
+    @SerializedName("l0_passed_but_hidden_state_mor")
+    private long l0PassedButHiddenStateMor = 0;
+    @SerializedName("cluster_mismatch")
+    private long clusterMismatch = 0;
     @SerializedName("no_local")
     private long noLocalPartition = 0;
     @SerializedName("no_lineage")
@@ -134,6 +150,16 @@ public class RestoreReuseShadowStats {
      */
     public static L0Verdict checkL0(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
             long srcVersion, long srcCommitSeq) {
+        return checkL0(localPart, srcDbId, srcTableId, srcPartitionId, srcVersion, srcCommitSeq,
+                RestoreLineage.UNKNOWN_CLUSTER_ID);
+    }
+
+    /**
+     * @param srcClusterId the cluster id of the source of the backup, {@link RestoreLineage#UNKNOWN_CLUSTER_ID} if
+     *         unknown. If both it and the one of the lineage are known they must be equal.
+     */
+    public static L0Verdict checkL0(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
+            long srcVersion, long srcCommitSeq, long srcClusterId) {
         if (localPart == null) {
             return L0Verdict.NO_LOCAL_PARTITION;
         }
@@ -144,6 +170,9 @@ public class RestoreReuseShadowStats {
         }
         if (!lineage.isSameSource(srcDbId, srcTableId, srcPartitionId)) {
             return L0Verdict.LINEAGE_MISMATCH;
+        }
+        if (RestoreReuseJudge.clusterDiffers(lineage.getSrcClusterId(), srcClusterId)) {
+            return L0Verdict.CLUSTER_MISMATCH;
         }
         // 2. no local write since the restore.
         if (localPart.getVisibleVersion() != lineage.getSrcVersion()) {
@@ -168,6 +197,12 @@ public class RestoreReuseShadowStats {
      */
     public static L0Verdict checkL0Relation(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
             long srcCommitSeq) {
+        return checkL0Relation(localPart, srcDbId, srcTableId, srcPartitionId, srcCommitSeq,
+                RestoreLineage.UNKNOWN_CLUSTER_ID);
+    }
+
+    public static L0Verdict checkL0Relation(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
+            long srcCommitSeq, long srcClusterId) {
         if (localPart == null) {
             return L0Verdict.NO_LOCAL_PARTITION;
         }
@@ -177,6 +212,9 @@ public class RestoreReuseShadowStats {
         }
         if (!lineage.isSameSource(srcDbId, srcTableId, srcPartitionId)) {
             return L0Verdict.LINEAGE_MISMATCH;
+        }
+        if (RestoreReuseJudge.clusterDiffers(lineage.getSrcClusterId(), srcClusterId)) {
+            return L0Verdict.CLUSTER_MISMATCH;
         }
         if (lineage.getSrcCommitSeq() == RestoreLineage.UNKNOWN_COMMIT_SEQ
                 || srcCommitSeq == RestoreLineage.UNKNOWN_COMMIT_SEQ
@@ -196,10 +234,27 @@ public class RestoreReuseShadowStats {
         if (localTbl.getKeysType() == KeysType.AGG_KEYS) {
             return Unsupported.AGGREGATE_TABLE;
         }
+        Unsupported hidden = checkHiddenState(localTbl);
+        if (hidden != Unsupported.NONE) {
+            return hidden;
+        }
         if (localPart.getRemoteDataSize() > 0) {
             return Unsupported.REMOTE_STORAGE;
         }
         return Unsupported.NONE;
+    }
+
+    /**
+     * Whether the table has a hidden state that the digest does not cover, so that the digest proves the visible rows
+     * only, not the behavior of the later writes. Only duplicate tables are free of it. The check is lifted by
+     * Config.restore_reuse_allow_hidden_state_models.
+     */
+    public static Unsupported checkHiddenState(OlapTable localTbl) {
+        if (Config.restore_reuse_allow_hidden_state_models || localTbl.getKeysType() != KeysType.UNIQUE_KEYS) {
+            return Unsupported.NONE;
+        }
+        return localTbl.getEnableUniqueKeyMergeOnWrite() ? Unsupported.HIDDEN_STATE_MOW
+                : Unsupported.HIDDEN_STATE_MOR;
     }
 
     /**
@@ -267,6 +322,12 @@ public class RestoreReuseShadowStats {
                     case REMOTE_STORAGE:
                         l0PassedButRemoteStorage++;
                         break;
+                    case HIDDEN_STATE_MOW:
+                        l0PassedButHiddenStateMow++;
+                        break;
+                    case HIDDEN_STATE_MOR:
+                        l0PassedButHiddenStateMor++;
+                        break;
                     default:
                         reusable++;
                         reusableBytesSingleReplica += singleReplicaBytes;
@@ -297,6 +358,9 @@ public class RestoreReuseShadowStats {
                 break;
             case COMMIT_SEQ_MISMATCH:
                 commitSeqMismatch++;
+                break;
+            case CLUSTER_MISMATCH:
+                clusterMismatch++;
                 break;
             default:
                 break;
@@ -337,6 +401,18 @@ public class RestoreReuseShadowStats {
 
     public long getL0PassedButRemoteStorage() {
         return l0PassedButRemoteStorage;
+    }
+
+    public long getL0PassedButHiddenStateMow() {
+        return l0PassedButHiddenStateMow;
+    }
+
+    public long getL0PassedButHiddenStateMor() {
+        return l0PassedButHiddenStateMor;
+    }
+
+    public long getClusterMismatch() {
+        return clusterMismatch;
     }
 
     public long getNoLocalPartition() {
@@ -385,6 +461,8 @@ public class RestoreReuseShadowStats {
         json.addProperty("kept_a", actual.getKeptByPath(RestoreReuseJudge.L0_FORWARD));
         json.addProperty("kept_b", actual.getKeptByPath(RestoreReuseJudge.L0_REVERSE));
         json.addProperty("kept_c", actual.getKeptByPath(RestoreReuseJudge.L0_TABLE));
+        // the check level (requested and effective), and the kept partitions not proved by a digest
+        json.add("check_level", GsonUtils.GSON.toJsonTree(actual.levelSummary()));
         json.addProperty("download_digest_mismatch", actual.countReasons(
                 RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH));
         json.addProperty("download_timeout", actual.countReasons(RestoreReuseResult.DOWNLOAD_TIMEOUT));

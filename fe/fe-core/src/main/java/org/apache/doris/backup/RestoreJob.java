@@ -31,6 +31,7 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.EnvFactory;
 import org.apache.doris.catalog.FsBroker;
 import org.apache.doris.catalog.Index;
+import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.LocalReplica;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
@@ -2797,16 +2798,21 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             long incrementalLocalBytes = reuseResult == null ? 0 : reuseResult.getIncrementalLocalBytesAllReplicas();
             if (downloadStats != null) {
                 info.add(downloadStats.toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes,
-                        incrementalLocalBytes));
+                        incrementalLocalBytes, reuseLevelSummary()));
             } else if (keptBytes > 0 || incrementalLocalBytes > 0) {
                 // everything was kept, nothing was downloaded
                 info.add(new RestoreDownloadStats().toJson(countSnapshotsToDownload(), keptBytes, keptAtomicBytes,
-                        incrementalLocalBytes));
+                        incrementalLocalBytes, reuseLevelSummary()));
             } else {
                 info.add(FeConstants.null_string);
             }
         }
         return info;
+    }
+
+    // The requested and the effective check levels, and the kept partitions not proved, null if reuse did not decide.
+    private Map<String, Object> reuseLevelSummary() {
+        return reuseResult == null || reuseResult.isEmpty() ? null : reuseResult.levelSummary();
     }
 
     public RestoreReuseShadowStats getReuseShadowStats() {
@@ -2824,7 +2830,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     static RestoreLineage buildRestoreLineage(BackupJobInfo jobInfo, BackupOlapTableInfo tblInfo,
             BackupPartitionInfo partInfo, long restoreTime) {
         return new RestoreLineage(jobInfo.dbId, tblInfo.id, partInfo.id, partInfo.version,
-                getSrcCommitSeq(jobInfo, tblInfo.id), jobInfo.backupTime, restoreTime);
+                getSrcCommitSeq(jobInfo, tblInfo.id), jobInfo.backupTime, restoreTime,
+                jobInfo.getSrcClusterIdOrUnknown());
     }
 
     public RestoreReuseResult getReuseResult() {
@@ -2873,6 +2880,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             LOG.info("partition level reuse is disabled by the property of the job {}", jobId);
             return keys;
         }
+        CheckLevel effectiveJobLevel = RestoreReuseJudge.levelOfTable(jobLevel, KeysType.DUP_KEYS);
         try {
             RestoreReuseResult result = new RestoreReuseResult();
             List<ReuseCandidate> candidates = Lists.newArrayList();
@@ -2947,9 +2955,17 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         candidate.bytes = in.getSingleReplicaBytes();
                         candidate.bytesAllReplicas = RestoreReuseShadowStats.getAllReplicasLocalDataSize(localPart);
                         candidate.l0Path = in.l0Path;
+                        candidate.requestedLevel = jobLevel;
                         candidate.level = level;
+                        candidate.clusterProven = in.clusterProven;
                         candidate.backupPartition = in.backupPartition;
-                        if (level == CheckLevel.OFF && !incremental) {
+                        if (level == CheckLevel.OFF && !incremental && !candidate.clusterProven) {
+                            // (only with restore_reuse_allow_unverified_keep) the lineage stamp is the only proof of
+                            // a keep at the level off, and it is no proof if the cluster id of the source was not
+                            // compared on both sides (an old stamp or backup): verify it by the digest.
+                            candidate.level = CheckLevel.FULL;
+                        }
+                        if (candidate.level == CheckLevel.OFF && !incremental) {
                             candidate.decide(true, RestoreReuseResult.KEPT_L0_ONLY);
                         }
                         candidates.add(candidate);
@@ -2963,8 +2979,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             for (ReuseCandidate candidate : candidates) {
                 keys.add(Pair.of(candidate.tableId, candidate.partitionId));
             }
-            LOG.info("restore reuse: {} candidate partitions, check level {}, not candidates: {}, job: {}",
-                    candidates.size(), jobLevel.lower(), result.getRejected(), jobId);
+            LOG.info("restore reuse: {} candidate partitions, check level {} (requested {}, allow unverified keep "
+                    + "{}), not candidates: {}, job: {}", candidates.size(), effectiveJobLevel.lower(),
+                    jobLevel.lower(), Config.restore_reuse_allow_unverified_keep, result.getRejected(), jobId);
         } catch (Exception e) {
             LOG.warn("failed to select the candidate partitions of restore reuse, download all. job: {}", jobId, e);
             reuseCandidates.clear();
@@ -3498,6 +3515,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         in.backupPartition = partInfo;
         in.srcCommitSeq = getSrcCommitSeq(jobInfo, tblInfo.id);
         in.localDbId = dbId;
+        in.localClusterId = getLocalClusterId();
         in.localTable = localTbl;
         in.localPartition = localPart;
         BackupStamps stamps = backupStamps.get(backupTableName);
@@ -3507,6 +3525,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             in.backupLineage = stamps.partitionLineage.get(partitionName);
         }
         return in;
+    }
+
+    // The cluster id of this cluster, UNKNOWN_CLUSTER_ID if it can not be told.
+    private static long getLocalClusterId() {
+        try {
+            return Env.getCurrentEnv().getClusterId();
+        } catch (Exception e) {
+            return RestoreLineage.UNKNOWN_CLUSTER_ID;
+        }
     }
 
     // A candidate partition of partition level reuse, not persisted.
@@ -3521,7 +3548,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         long bytes;
         long bytesAllReplicas;
         String l0Path;
+        // The effective check level (may be raised later), and the one the job requested.
         CheckLevel level;
+        CheckLevel requestedLevel;
+        // The cluster id of the source was compared on both sides and equal, see RestoreReuseJudge#clusterProven.
+        boolean clusterProven = false;
         BackupPartitionInfo backupPartition;
         // The local partition is behind the backup: if the digest tasks pass, it is restored by appending the rowsets
         // of the versions after digestVersion (the local version) up to version (the backup).
@@ -3569,6 +3600,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             decision.bytesAllReplicas = bytesAllReplicas;
             decision.l0Path = l0Path;
             decision.level = level.lower();
+            decision.requestedLevel = (requestedLevel == null ? level : requestedLevel).lower();
             decision.kept = kept;
             decision.incremental = incremental;
             decision.reason = reason;
@@ -3591,6 +3623,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     // The check level the estimate is computed with: the level of the job, as for the actual judgement. If the
     // feature is off or disabled for the job, the estimate follows the default level, as if it were enabled.
+    // Note: DISABLE is taken as OFF, which levelOfTable raises to FULL unless
+    // restore_reuse_allow_unverified_keep, so the estimate counts the L0 paths that need a digest too (reverse, table
+    // level), as the actual judgement with the default level does. Before the narrowing the default was SAMPLE, which
+    // allowed them as well, but DISABLE as OFF counted the forward path only.
     private CheckLevel estimateLevel(OlapTable localTbl) {
         CheckLevel level = CheckLevel.parse(properties.get(PROP_REUSE_CHECK_LEVEL),
                 Config.restore_reuse_default_check_level);
@@ -3740,7 +3776,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
             try {
                 BackupOlapTableInfo tblInfo = tblEntry.getValue();
-                olapTbl.setRestoreSource(new RestoreSource(jobInfo.dbId, tblInfo.id));
+                olapTbl.setRestoreSource(new RestoreSource(jobInfo.dbId, tblInfo.id,
+                        jobInfo.getSrcClusterIdOrUnknown()));
                 for (Map.Entry<String, BackupPartitionInfo> partEntry : tblInfo.partitions.entrySet()) {
                     Partition part = olapTbl.getPartition(partEntry.getKey(), false);
                     if (part == null) {

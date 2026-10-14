@@ -48,6 +48,7 @@ import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.persist.EditLog;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
@@ -99,6 +100,9 @@ public class RestoreReuseTest {
     private static final String ROOT_P1 = "aa11";
     private static final String ROOT_P2 = "bb22";
     private static final String SIG = "sig-1";
+    // the cluster id of the source of the backup, and the one of this cluster
+    private static final long SRC_CLUSTER = 777;
+    private static final long LOCAL_CLUSTER = 555;
 
     private final Env env = Mockito.mock(Env.class);
     private final InternalCatalog catalog = Mockito.mock(InternalCatalog.class);
@@ -120,6 +124,8 @@ public class RestoreReuseTest {
     private long origMinBytes;
     private boolean origForceFull;
     private int origTimeout;
+    private boolean origUnverified;
+    private boolean origHidden;
 
     @BeforeEach
     public void setUp() throws Exception {
@@ -131,8 +137,14 @@ public class RestoreReuseTest {
         origMinBytes = Config.restore_reuse_min_partition_bytes;
         origTimeout = Config.restore_digest_timeout_s;
         origForceFull = Config.restore_reuse_force_full_for_relation;
+        origUnverified = Config.restore_reuse_allow_unverified_keep;
+        origHidden = Config.restore_reuse_allow_hidden_state_models;
         Config.enable_restore_partition_reuse = true;
         Config.restore_reuse_default_check_level = "full";
+        // The tests of the mechanics (the sample, the level off, the unique tables) run with the narrowing lifted,
+        // the tests of the narrowing set the configs back.
+        Config.restore_reuse_allow_unverified_keep = true;
+        Config.restore_reuse_allow_hidden_state_models = true;
         Config.restore_reuse_min_partition_bytes = 100;
 
         db = CatalogMocker.mockDb();
@@ -145,6 +157,7 @@ public class RestoreReuseTest {
         mockedEnvStatic.when(Env::getCurrentSystemInfo).thenReturn(systemInfo);
         Mockito.when(env.getInternalCatalog()).thenReturn(catalog);
         Mockito.when(env.getEditLog()).thenReturn(editLog);
+        Mockito.when(env.getClusterId()).thenReturn((int) LOCAL_CLUSTER);
         Mockito.when(catalog.getDbNullable(Mockito.anyLong())).thenReturn(db);
         Mockito.when(catalog.getDbOrMetaException(Mockito.anyLong())).thenReturn(db);
         CatalogMgr catalogMgr = Mockito.mock(CatalogMgr.class);
@@ -207,6 +220,8 @@ public class RestoreReuseTest {
         Config.restore_reuse_min_partition_bytes = origMinBytes;
         Config.restore_digest_timeout_s = origTimeout;
         Config.restore_reuse_force_full_for_relation = origForceFull;
+        Config.restore_reuse_allow_unverified_keep = origUnverified;
+        Config.restore_reuse_allow_hidden_state_models = origHidden;
         if (mockedExecutor != null) {
             mockedExecutor.close();
         }
@@ -254,6 +269,7 @@ public class RestoreReuseTest {
         info.dbId = db.getId();
         info.dbName = db.getFullName();
         info.success = true;
+        info.srcClusterId = SRC_CLUSTER;
         info.tableCommitSeqMap = Maps.newHashMap();
         info.tableCommitSeqMap.put(tbl2.getId(), COMMIT_SEQ);
         BackupOlapTableInfo tblInfo = new BackupOlapTableInfo();
@@ -496,7 +512,8 @@ public class RestoreReuseTest {
     }
 
     private RestoreLineage lineageToLocal(Partition part, long version) {
-        return new RestoreLineage(db.getId(), tbl2.getId(), part.getId(), version, COMMIT_SEQ, BACKUP_TIME, 1);
+        return new RestoreLineage(db.getId(), tbl2.getId(), part.getId(), version, COMMIT_SEQ, BACKUP_TIME, 1,
+                LOCAL_CLUSTER);
     }
 
     // The input of a partition that fails the forward check: the local partition has no lineage.
@@ -920,30 +937,30 @@ public class RestoreReuseTest {
         // commit writes the source of this job, never the one of the backup meta
         BackupJobInfo info = Deencapsulation.getField(job, "jobInfo");
         job.stampRestoreLineage(db, 1);
-        Assertions.assertEquals(new RestoreSource(info.dbId, tbl2.getId()), tbl2.getRestoreSource());
+        Assertions.assertEquals(new RestoreSource(info.dbId, tbl2.getId(), SRC_CLUSTER), tbl2.getRestoreSource());
         Assertions.assertNotEquals(upstream, tbl2.getRestoreSource());
         // a second restore overwrites it
         BackupJobInfo other = selfBackupJobInfo();
         other.dbId = 8001;
         Deencapsulation.setField(job, "jobInfo", other);
         job.stampRestoreLineage(db, 2);
-        Assertions.assertEquals(new RestoreSource(8001, tbl2.getId()), tbl2.getRestoreSource());
+        Assertions.assertEquals(new RestoreSource(8001, tbl2.getId(), SRC_CLUSTER), tbl2.getRestoreSource());
     }
 
     @Test
     public void testRestoreSourcePersists() throws Exception {
         tbl2.setRestoreSource(new RestoreSource(11, 22));
-        OlapTable copy = org.apache.doris.persist.gson.GsonUtils.GSON.fromJson(
-                org.apache.doris.persist.gson.GsonUtils.GSON.toJson(tbl2), OlapTable.class);
+        OlapTable copy = GsonUtils.GSON.fromJson(
+                GsonUtils.GSON.toJson(tbl2), OlapTable.class);
         Assertions.assertEquals(new RestoreSource(11, 22), copy.getRestoreSource());
         // the deep copy of a backup carries it too, which is why it is cleared in the backup meta
         OlapTable backupCopy = tbl2.selectiveCopy(null, IndexExtState.VISIBLE, true);
         Assertions.assertEquals(new RestoreSource(11, 22), backupCopy.getRestoreSource());
         // an old table without it
         tbl2.setRestoreSource(null);
-        String json = org.apache.doris.persist.gson.GsonUtils.GSON.toJson(tbl2);
+        String json = GsonUtils.GSON.toJson(tbl2);
         Assertions.assertFalse(json.contains("\"rsrc\""));
-        Assertions.assertNull(org.apache.doris.persist.gson.GsonUtils.GSON.fromJson(json, OlapTable.class)
+        Assertions.assertNull(GsonUtils.GSON.fromJson(json, OlapTable.class)
                 .getRestoreSource());
     }
 
@@ -1036,6 +1053,393 @@ public class RestoreReuseTest {
     // ---------------------------------------------------------------------------------------------
     // levels, sampling, comparison
     // ---------------------------------------------------------------------------------------------
+
+    @Test
+    public void testConfigDefaults() {
+        // as captured before setUp changed them
+        Assertions.assertEquals("full", origLevel);
+        Assertions.assertFalse(origUnverified);
+        Assertions.assertFalse(origHidden);
+    }
+
+    @Test
+    public void testEffectiveLevelWithoutUnverifiedKeep() {
+        Config.restore_reuse_allow_unverified_keep = false;
+        for (KeysType keysType : new KeysType[] {KeysType.DUP_KEYS, KeysType.UNIQUE_KEYS}) {
+            Assertions.assertEquals(CheckLevel.FULL, RestoreReuseJudge.levelOfTable(CheckLevel.OFF, keysType));
+            Assertions.assertEquals(CheckLevel.FULL, RestoreReuseJudge.levelOfTable(CheckLevel.SAMPLE, keysType));
+            Assertions.assertEquals(CheckLevel.FULL, RestoreReuseJudge.levelOfTable(CheckLevel.FULL, keysType));
+            Assertions.assertEquals(CheckLevel.DISABLE, RestoreReuseJudge.levelOfTable(CheckLevel.DISABLE, keysType));
+        }
+        // lifted: as requested, except that a unique table does not allow off
+        Config.restore_reuse_allow_unverified_keep = true;
+        Assertions.assertEquals(CheckLevel.OFF, RestoreReuseJudge.levelOfTable(CheckLevel.OFF, KeysType.DUP_KEYS));
+        Assertions.assertEquals(CheckLevel.SAMPLE,
+                RestoreReuseJudge.levelOfTable(CheckLevel.SAMPLE, KeysType.DUP_KEYS));
+        Assertions.assertEquals(CheckLevel.DISABLE,
+                RestoreReuseJudge.levelOfTable(CheckLevel.DISABLE, KeysType.DUP_KEYS));
+    }
+
+    private void assertTakenAsFull(String requested) {
+        Config.restore_reuse_allow_unverified_keep = false;
+        Config.restore_reuse_sample_ratio = 0.1;
+        RestoreJob job = prepareJob(requested);
+        // every partition is digested, none is kept on the lineage or the sample
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size(), requested);
+        reportAll(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getKeptPartitions(), requested);
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertEquals(RestoreReuseResult.KEPT_DIGEST_VERIFIED, decision.reason);
+            Assertions.assertEquals("full", decision.level);
+            Assertions.assertEquals(requested, decision.requestedLevel);
+            Assertions.assertFalse(decision.isUnverifiedKeep());
+        }
+        // SHOW RESTORE: the requested and the effective level
+        List<String> info = job.getInfo(false);
+        com.google.gson.JsonObject estimate = com.google.gson.JsonParser.parseString(
+                info.get(info.size() - 3)).getAsJsonObject();
+        Assertions.assertEquals(requested, estimate.getAsJsonObject("check_level").get("requested").getAsString());
+        Assertions.assertEquals("full", estimate.getAsJsonObject("check_level").get("effective").getAsString());
+        Assertions.assertEquals(0, estimate.getAsJsonObject("check_level").get("kept_unverified").getAsLong());
+        com.google.gson.JsonObject download = com.google.gson.JsonParser.parseString(
+                info.get(info.size() - 1)).getAsJsonObject();
+        Assertions.assertEquals("full", download.getAsJsonObject("check_level").get("effective").getAsString());
+        Assertions.assertEquals(requested, download.getAsJsonObject("check_level").get("requested").getAsString());
+        // a decision persisted by the older version has no requested level: same as the level
+        result.getDecisions().forEach(d -> d.requestedLevel = null);
+        Assertions.assertEquals("full", result.levelSummary().get("requested"));
+    }
+
+    @Test
+    public void testSampleTakenAsFullByTheJob() {
+        assertTakenAsFull("sample");
+    }
+
+    @Test
+    public void testOffTakenAsFullByTheJob() {
+        assertTakenAsFull("off");
+    }
+
+    @Test
+    public void testFullStaysFullByTheJob() {
+        assertTakenAsFull("full");
+    }
+
+    @Test
+    public void testDefaultLevelIsFullByTheJob() {
+        // no property: the default level of the config, full
+        Config.restore_reuse_allow_unverified_keep = false;
+        Config.restore_reuse_default_check_level = origLevel;
+        RestoreJob job = prepareJob(null);
+        toVerifying(job);
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), newDigestTasks().size());
+    }
+
+    @Test
+    public void testUnverifiedKeepWhenAllowed() {
+        Config.restore_reuse_allow_unverified_keep = true;
+        // off: kept on the lineage stamp, the cluster id of the source is equal on both sides
+        RestoreJob job = prepareJob("off");
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getKeptPartitions());
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertEquals(RestoreReuseResult.KEPT_L0_ONLY, decision.reason);
+            Assertions.assertEquals("off", decision.level);
+            Assertions.assertEquals("off", decision.requestedLevel);
+            Assertions.assertTrue(decision.isUnverifiedKeep());
+            Assertions.assertTrue(decision.toString().contains("UNPROVEN"), decision.toString());
+        }
+        Assertions.assertEquals(2, result.getKeptUnverifiedPartitions());
+        Assertions.assertEquals("2", String.valueOf(result.levelSummary().get("kept_unverified")));
+    }
+
+    @Test
+    public void testSampleKeepsTheRestUnprovenWhenAllowed() {
+        Config.restore_reuse_allow_unverified_keep = true;
+        Config.restore_reuse_force_full_for_relation = true;
+        Config.restore_reuse_sample_ratio = 0.1;
+        RestoreJob job = prepareJob("sample");
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getKeptPartitions());
+        Assertions.assertEquals(1, result.getKeptUnverifiedPartitions());
+        Assertions.assertEquals(1L, result.getDecisions().stream()
+                .filter(d -> RestoreReuseResult.KEPT_SAMPLE_PASSED.equals(d.reason)).count());
+    }
+
+    @Test
+    public void testOffWithoutClusterIdIsVerifiedByTheDigest() {
+        Config.restore_reuse_allow_unverified_keep = true;
+        // the local stamps were written before the cluster id was recorded
+        for (Partition part : Lists.newArrayList(p1(), p2())) {
+            RestoreLineage l = part.getRestoreLineage();
+            part.setRestoreLineage(new RestoreLineage(l.getSrcDbId(), l.getSrcTableId(), l.getSrcPartitionId(),
+                    l.getSrcVersion(), l.getSrcCommitSeq(), l.getBackupTime(), l.getRestoreTime()));
+        }
+        RestoreJob job = prepareJob("off");
+        // not kept on the stamp: candidates for the digest, whose level is raised to full
+        Assertions.assertTrue(job.getReuseResult().getDecisions().isEmpty());
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        reportAll(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        for (RestoreReuseResult.Decision decision : job.getReuseResult().getDecisions()) {
+            Assertions.assertEquals(RestoreReuseResult.KEPT_DIGEST_VERIFIED, decision.reason);
+            Assertions.assertEquals("full", decision.level);
+            Assertions.assertEquals("off", decision.requestedLevel);
+        }
+    }
+
+    @Test
+    public void testOffWithOldBackupIsVerifiedByTheDigest() {
+        Config.restore_reuse_allow_unverified_keep = true;
+        BackupJobInfo info = selfBackupJobInfo();
+        info.srcClusterId = null;
+        RestoreJob job = newJob(info, "off");
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+        Assertions.assertTrue(job.getReuseResult().getDecisions().isEmpty());
+        toVerifying(job);
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), newDigestTasks().size());
+    }
+
+    @Test
+    public void testClusterIdForward() {
+        RestoreReuseJudge.Input in = input(CheckLevel.FULL);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertTrue(in.clusterProven);
+        // another cluster: the ids of the db, table and partition may coincide
+        in.jobInfo.srcClusterId = SRC_CLUSTER + 1;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH,
+                RestoreReuseJudge.FORWARD_L0.check(in));
+        Assertions.assertEquals("L0_CLUSTER_MISMATCH", RestoreReuseJudge.firstReject(in));
+        in.relationOnly = true;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH,
+                RestoreReuseJudge.FORWARD_L0.check(in));
+        in.relationOnly = false;
+        // an old backup: still a candidate, but the cluster is not proved
+        in.jobInfo.srcClusterId = null;
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertFalse(in.clusterProven);
+        // an old stamp
+        in = input(CheckLevel.FULL);
+        RestoreLineage l = p1().getRestoreLineage();
+        p1().setRestoreLineage(new RestoreLineage(l.getSrcDbId(), l.getSrcTableId(), l.getSrcPartitionId(),
+                l.getSrcVersion(), l.getSrcCommitSeq(), l.getBackupTime(), l.getRestoreTime()));
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertFalse(in.clusterProven);
+        // both are old
+        in.jobInfo.srcClusterId = null;
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertFalse(in.clusterProven);
+        // the estimate counts the mismatch
+        RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
+        stats.add(RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH, RestoreReuseShadowStats.Unsupported.NONE, 1);
+        Assertions.assertEquals(1, stats.getClusterMismatch());
+        Assertions.assertEquals(0, stats.getReusable());
+    }
+
+    @Test
+    public void testClusterIdReverse() {
+        RestoreReuseJudge.Input in = inputWithoutForward(CheckLevel.FULL);
+        in.localDbId = db.getId();
+        in.localClusterId = LOCAL_CLUSTER;
+        in.backupLineage = lineageToLocal(p1(), V1);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.REVERSE_L0.check(in));
+        Assertions.assertTrue(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_REVERSE));
+        // the backup table was restored from a table of another cluster with the same ids
+        in.backupLineage = new RestoreLineage(db.getId(), tbl2.getId(), p1().getId(), V1, COMMIT_SEQ, BACKUP_TIME, 1,
+                LOCAL_CLUSTER + 1);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH,
+                RestoreReuseJudge.REVERSE_L0.check(in));
+        Assertions.assertNotNull(RestoreReuseJudge.firstReject(in));
+        // an old stamp in the backup: a candidate, not proved
+        in.backupLineage = new RestoreLineage(db.getId(), tbl2.getId(), p1().getId(), V1, COMMIT_SEQ, BACKUP_TIME, 1);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.REVERSE_L0.check(in));
+        Assertions.assertFalse(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_REVERSE));
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        Assertions.assertEquals(RestoreReuseJudge.L0_REVERSE, in.l0Path);
+        Assertions.assertFalse(in.clusterProven);
+        // the local cluster id is unknown
+        in.backupLineage = lineageToLocal(p1(), V1);
+        in.localClusterId = RestoreLineage.UNKNOWN_CLUSTER_ID;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.REVERSE_L0.check(in));
+        Assertions.assertFalse(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_REVERSE));
+    }
+
+    @Test
+    public void testClusterIdTableLevel() {
+        RestoreReuseJudge.Input in = inputWithoutForward(CheckLevel.FULL);
+        in.localDbId = db.getId();
+        in.localClusterId = LOCAL_CLUSTER;
+        // forward: the local table was restored from the source table of the backup
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id, SRC_CLUSTER));
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertTrue(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_TABLE));
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id, SRC_CLUSTER + 1));
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        // an old stamp
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id));
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertFalse(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_TABLE));
+        // an old backup
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id, SRC_CLUSTER));
+        in.jobInfo.srcClusterId = null;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertFalse(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_TABLE));
+        in.jobInfo.srcClusterId = SRC_CLUSTER;
+
+        // reverse: the source table in the backup was restored from the local table
+        tbl2.setRestoreSource(null);
+        in.backupTableSource = new RestoreSource(db.getId(), tbl2.getId(), LOCAL_CLUSTER);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertTrue(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_TABLE));
+        in.backupTableSource = new RestoreSource(db.getId(), tbl2.getId(), LOCAL_CLUSTER + 1);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH,
+                RestoreReuseJudge.TABLE_L0.check(in));
+        in.backupTableSource = new RestoreSource(db.getId(), tbl2.getId());
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertFalse(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_TABLE));
+        // the forward direction with a wrong cluster does not make the reverse one wrong, and vice versa
+        tbl2.setRestoreSource(new RestoreSource(in.jobInfo.dbId, in.backupTable.id, SRC_CLUSTER + 1));
+        in.backupTableSource = new RestoreSource(db.getId(), tbl2.getId(), LOCAL_CLUSTER);
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseJudge.TABLE_L0.check(in));
+        Assertions.assertTrue(RestoreReuseJudge.clusterProven(in, RestoreReuseJudge.L0_TABLE));
+        // no relation at all stays no relation
+        tbl2.setRestoreSource(null);
+        in.backupTableSource = null;
+        Assertions.assertEquals(RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION,
+                RestoreReuseJudge.TABLE_L0.check(in));
+    }
+
+    @Test
+    public void testClusterIdStampedFromTheBackup() {
+        BackupJobInfo info = selfBackupJobInfo();
+        BackupOlapTableInfo tblInfo = info.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME);
+        RestoreLineage stamp = RestoreJob.buildRestoreLineage(info, tblInfo, tblInfo.getPartInfo(p1().getName()), 1);
+        Assertions.assertEquals(SRC_CLUSTER, stamp.getSrcClusterId());
+        info.srcClusterId = null;
+        stamp = RestoreJob.buildRestoreLineage(info, tblInfo, tblInfo.getPartInfo(p1().getName()), 1);
+        Assertions.assertEquals(RestoreLineage.UNKNOWN_CLUSTER_ID, stamp.getSrcClusterId());
+        info.srcClusterId = SRC_CLUSTER;
+        RestoreJob job = newJob(info, "full");
+        job.stampRestoreLineage(db, 1);
+        Assertions.assertEquals(SRC_CLUSTER, p1().getRestoreLineage().getSrcClusterId());
+        Assertions.assertEquals(SRC_CLUSTER, tbl2.getRestoreSource().getSrcClusterId());
+    }
+
+    @Test
+    public void testClusterIdGsonCompatibility() {
+        // the new field is absent in the json of an old version
+        RestoreLineage oldLineage = GsonUtils.GSON.fromJson(
+                "{\"db\":1,\"tbl\":2,\"part\":3,\"ver\":4,\"seq\":5,\"bt\":6,\"rt\":7}", RestoreLineage.class);
+        Assertions.assertEquals(RestoreLineage.UNKNOWN_CLUSTER_ID, oldLineage.getSrcClusterId());
+        Assertions.assertTrue(oldLineage.isSameSource(1, 2, 3));
+        // and an unknown cluster id is not written, so the format of the old stamps is unchanged
+        Assertions.assertFalse(GsonUtils.GSON.toJson(oldLineage).contains("cid"));
+        RestoreSource oldSource = GsonUtils.GSON.fromJson("{\"db\":1,\"tbl\":2}",
+                RestoreSource.class);
+        Assertions.assertEquals(RestoreLineage.UNKNOWN_CLUSTER_ID, oldSource.getSrcClusterId());
+        // the new one round trips, and an old reader ignores it (gson skips unknown fields)
+        RestoreLineage lineage = new RestoreLineage(1, 2, 3, 4, 5, 6, 7, 99);
+        Assertions.assertEquals(lineage,
+                GsonUtils.GSON.fromJson(GsonUtils.GSON.toJson(lineage), RestoreLineage.class));
+        Assertions.assertTrue(GsonUtils.GSON.toJson(lineage).contains("\"cid\":99"));
+        Assertions.assertEquals(new RestoreSource(1, 2, 99),
+                GsonUtils.GSON.fromJson(GsonUtils.GSON.toJson(new RestoreSource(1, 2, 99)),
+                        RestoreSource.class));
+        // the job info of an old backup has no scid, and does not write it
+        BackupJobInfo info = new BackupJobInfo();
+        Assertions.assertFalse(GsonUtils.GSON.toJson(info).contains("scid"));
+        Assertions.assertEquals(RestoreLineage.UNKNOWN_CLUSTER_ID, info.getSrcClusterIdOrUnknown());
+        info.srcClusterId = 12L;
+        BackupJobInfo read = GsonUtils.GSON.fromJson(GsonUtils.GSON.toJson(info),
+                BackupJobInfo.class);
+        Assertions.assertEquals(12L, read.getSrcClusterIdOrUnknown());
+        // a decision of an old version has no requested level
+        RestoreReuseResult.Decision decision = GsonUtils.GSON.fromJson(
+                "{\"l\":\"sample\",\"k\":true}", RestoreReuseResult.Decision.class);
+        Assertions.assertNull(decision.requestedLevel);
+    }
+
+    @Test
+    public void testOnlyDuplicateTablesAreReused() {
+        Config.restore_reuse_allow_hidden_state_models = false;
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
+
+        // unique merge-on-write
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        Assertions.assertEquals("HIDDEN_STATE_MOW", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Assertions.assertEquals("HIDDEN_STATE_MOW", RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
+        Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW,
+                RestoreReuseShadowStats.checkUnsupported(false, tbl2, p1()));
+        // unique merge-on-read
+        tbl2.setEnableUniqueKeyMergeOnWrite(false);
+        Assertions.assertEquals("HIDDEN_STATE_MOR", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Assertions.assertEquals("HIDDEN_STATE_MOR", RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
+        Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOR,
+                RestoreReuseShadowStats.checkUnsupported(false, tbl2, p1()));
+        // the incremental chain rejects them too
+        Assertions.assertEquals("HIDDEN_STATE_MOR",
+                RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
+        // the experiment switch restores the behavior before the narrowing
+        Config.restore_reuse_allow_hidden_state_models = true;
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
+        // back to duplicate
+        Config.restore_reuse_allow_hidden_state_models = false;
+        Deencapsulation.setField(tbl2, "keysType", KeysType.DUP_KEYS);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+    }
+
+    @Test
+    public void testHiddenStateTablesAreDownloadedByTheJob() {
+        Config.restore_reuse_allow_hidden_state_models = false;
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        RestoreJob job = prepareJob("full");
+        // no candidate, everything is downloaded
+        Assertions.assertTrue(job.getReuseResult().getDecisions().isEmpty());
+        Assertions.assertEquals(2L, (long) job.getReuseResult().getRejected().get("HIDDEN_STATE_MOW"));
+        Assertions.assertEquals(2, versionInfo(job).size());
+        // the estimate does not count them as reusable
+        RestoreReuseShadowStats estimate = job.getReuseShadowStats();
+        Assertions.assertEquals(0, estimate.getReusable());
+        Assertions.assertEquals(2, estimate.getL0PassedButHiddenStateMow());
+        Assertions.assertEquals(0, estimate.getL0PassedButHiddenStateMor());
+    }
+
+    @Test
+    public void testShadowStatsDoNotCountHiddenStateAsReusable() {
+        RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
+        stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW,
+                100);
+        stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOR,
+                100);
+        stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOR,
+                100, RestoreReuseJudge.L0_REVERSE);
+        Assertions.assertEquals(3, stats.getPartitions());
+        Assertions.assertEquals(0, stats.getReusable());
+        Assertions.assertEquals(0, stats.getReusableBytesSingleReplica());
+        Assertions.assertEquals(0, stats.getReusableForward() + stats.getReusableReverse() + stats.getReusableTable());
+        Assertions.assertEquals(1, stats.getL0PassedButHiddenStateMow());
+        Assertions.assertEquals(2, stats.getL0PassedButHiddenStateMor());
+        stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseShadowStats.Unsupported.NONE, 100);
+        Assertions.assertEquals(1, stats.getReusable());
+    }
 
     @Test
     public void testCheckLevel() {
@@ -1576,7 +1980,7 @@ public class RestoreReuseTest {
         RestoreJob job = prepareJob(null);
         RestoreJob replayed = writeAndRead(job);
         Assertions.assertNull(replayed.getReuseResult());
-        String json = org.apache.doris.persist.gson.GsonUtils.GSON.toJson(job);
+        String json = GsonUtils.GSON.toJson(job);
         Assertions.assertFalse(json.contains("\"rru\""));
         // the working state is not persisted
         Assertions.assertFalse(json.contains("digestResults"));
