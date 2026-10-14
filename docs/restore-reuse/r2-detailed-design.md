@@ -272,7 +272,7 @@ ccr-syncer 默认用原子恢复做全量同步（总体方案第 9 章风险）
 
 ### 16.2 谱系戳带来源集群身份
 
-- 备份：`BackupJobInfo` 新增可选字段 `src_cluster_id`（json 名 `scid`），值为源端集群 ID；旧备份没有这个字段。
+- 备份：`BackupJobInfo` 新增可选字段，json 名 `scid`（代码字段 `srcClusterId`），值为源端集群 ID；旧备份没有这个字段。
 - 谱系戳 `RestoreLineage` 新增 `cid`，表级关联 `RestoreSource` 同样新增 `cid`，取自备份的 `scid`，缺失为 -1（未知）。新增字段都是可选的，旧版本读到会忽略。
 - 比较：正向，谱系戳的 `cid` 对备份的 `scid`；反向（b），备份里的谱系戳的 `cid` 对本地集群 ID；表级（c），正向用本地表来源的 `cid` 对备份的 `scid`，反向用备份表来源的 `cid` 对本地集群 ID。两边都已知且不相等，不作为候选；任一边未知，仍可作为候选，由摘要兜底。
 - `restore_reuse_allow_unverified_keep=true` 且档位为 `off` 时，如果集群 ID 没有在两边都比较过（缺失），不能免校验保留，该分区改为做摘要。
