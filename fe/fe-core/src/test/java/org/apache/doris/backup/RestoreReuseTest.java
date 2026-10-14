@@ -2388,6 +2388,9 @@ public class RestoreReuseTest {
             Assertions.assertEquals(V1, move.getIncrementalRange().getBaseVersion());
             Assertions.assertEquals(V2, move.getIncrementalRange().getEndVersion());
             Assertions.assertTrue(move.toThrift().isSetIncremental());
+            // the non atomic restore does not load from a local source: no evidence is judged by the backend
+            Assertions.assertFalse(move.isLocalSourceLoaded());
+            Assertions.assertFalse(move.toThrift().isSetLocalSourceLoaded());
         }
 
         // persisted and replayed
@@ -3398,6 +3401,8 @@ public class RestoreReuseTest {
             Assertions.assertEquals(SIG, move.toThrift().getBackupLogicalDigest().getSchemaSig());
             Assertions.assertEquals(1, move.toThrift().getBackupLogicalDigest().getAlgoVersion());
             Assertions.assertEquals("OK", move.toThrift().getBackupLogicalDigest().getStatusCode());
+            Assertions.assertTrue(move.isLocalSourceLoaded());
+            Assertions.assertTrue(move.toThrift().isLocalSourceLoaded());
             Assertions.assertEquals(job.getJobId(), move.toThrift().getJobId());
         }
     }
@@ -3533,6 +3538,28 @@ public class RestoreReuseTest {
                     RestoreJob.RESTORE_NOT_RETRYABLE + " boom")));
             Assertions.assertEquals(RestoreJobState.SNAPSHOTING, plain.getState());
             Assertions.assertEquals(100, whole.getFailedTimes());
+        } finally {
+            Config.restore_local_source_task_max_retry = origMax;
+        }
+    }
+
+    @Test
+    public void testTheFailureOfANonAtomicIncrementalAppendIsNotConverged() {
+        newHandler();
+        int origMax = Config.restore_local_source_task_max_retry;
+        Config.restore_local_source_task_max_retry = 1;
+        try {
+            RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+            toCommitting(job);
+            // an incremental append of a tablet which was not loaded from a local source (the non atomic restore)
+            DirMoveTask append = new DirMoveTask(null, CatalogMocker.BACKEND1_ID, 777002L, job.getJobId(), db.getId(),
+                    tbl2.getId(), p1().getId(), p1().getBaseIndex().getId(), tabletOf(p1()), "/path/snapshot", 1, true);
+            append.setIncrementalRange(V1, V2);
+            Assertions.assertFalse(append.isLocalSourceLoaded());
+            failed(append, 100);
+            Assertions.assertFalse(job.finishDirMoveTask(append, failure(TStatusCode.INTERNAL_ERROR,
+                    RestoreJob.RESTORE_NOT_RETRYABLE + " not for this task")));
+            Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
         } finally {
             Config.restore_local_source_task_max_retry = origMax;
         }

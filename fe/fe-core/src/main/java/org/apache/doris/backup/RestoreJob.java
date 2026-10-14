@@ -607,7 +607,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
-        if (task.getIncrementalRange() != null && task.getJobId() == jobId
+        if (task.getIncrementalRange() != null && task.isLocalSourceLoaded() && task.getJobId() == jobId
                 && cancelOnLocalSourceTaskFailure(task, request, RestoreJobState.COMMITTING)) {
             return false;
         }
@@ -2566,6 +2566,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             RestoreReuseResult.Decision incremental = getIncrementalDecision(info.getTblId(), info.getPartitionId());
             if (incremental != null) {
                 task.setIncrementalRange(incremental.version, incremental.targetVersion);
+                // only the atomic restore loads the tablet from a local source (with the evidence)
+                task.setLocalSourceLoaded(incremental.atomic);
                 if (backupTabletIds == null) {
                     backupTabletIds = buildBackupTabletIds();
                 }

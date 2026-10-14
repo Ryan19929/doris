@@ -32,6 +32,8 @@ public class DirMoveTask extends AgentTask {
     // Append the rowsets of the range to the tablet instead of replacing it, null for the plain restore.
     private TRestoreIncrementalRange incrementalRange;
     private TRestoreBackupDigest backupLogicalDigest;
+    // The tablet was loaded from a local source by the atomic restore (the backend judges the task by the evidence).
+    private boolean localSourceLoaded = false;
 
     public DirMoveTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId,
             long tableId, long partitionId, long indexId, long tabletId, String src, int schemaHash,
@@ -73,6 +75,14 @@ public class DirMoveTask extends AgentTask {
         this.backupLogicalDigest = backupLogicalDigest;
     }
 
+    public void setLocalSourceLoaded(boolean localSourceLoaded) {
+        this.localSourceLoaded = localSourceLoaded;
+    }
+
+    public boolean isLocalSourceLoaded() {
+        return localSourceLoaded;
+    }
+
     public TRestoreBackupDigest getBackupLogicalDigest() {
         return backupLogicalDigest;
     }
@@ -81,6 +91,9 @@ public class DirMoveTask extends AgentTask {
         TMoveDirReq req = new TMoveDirReq(tabletId, schemaHash, src, jobId, overwrite);
         if (incrementalRange != null) {
             req.setIncremental(incrementalRange);
+            if (localSourceLoaded) {
+                req.setLocalSourceLoaded(true);
+            }
             if (backupLogicalDigest != null) {
                 req.setBackupLogicalDigest(backupLogicalDigest);
             }
