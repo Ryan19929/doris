@@ -5589,7 +5589,7 @@ TEST_F(RestoreStageTest, TabletMetaKeepsTheStageAcrossSerialization) {
     ASSERT_NE(nullptr, tablet);
     EXPECT_FALSE(tablet->tablet_meta()->has_restore_stage());
     TabletMetaPB pb;
-    tablet->tablet_meta()->to_meta_pb(&pb);
+    tablet->tablet_meta()->to_meta_pb(&pb, false);
     EXPECT_FALSE(pb.has_restore_stage());
 
     mark_loaded(tablet, 42, 3, RestoreStagePB::APPENDED, 6);
@@ -5611,7 +5611,7 @@ TEST_F(RestoreStageTest, TabletMetaKeepsTheStageAcrossSerialization) {
     EXPECT_FALSE(restored == copy);
     // the file of a snapshot dir
     TabletMetaPB file_pb;
-    restored.to_meta_pb(&file_pb);
+    restored.to_meta_pb(&file_pb, false);
     std::string file = tablet->tablet_path() + "/stage_roundtrip.hdr";
     ASSERT_TRUE(TabletMeta::save(file, file_pb).ok());
     TabletMetaPB loaded;
