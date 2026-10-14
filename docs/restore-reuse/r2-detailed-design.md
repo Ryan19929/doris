@@ -9,6 +9,7 @@
 首版边界（不变）：
 - 只走**非原子恢复**中"分区已存在、range 一致"的路径（A1 分支）；原子恢复放到二期；
 - 支持 Duplicate、Unique MoW、Unique MoR（含 sequence 列）；Aggregate 和摘要返回 NOT_SUPPORTED 的情况一律下载；
+- **2026-10-14 收窄：首版只复用 Duplicate 表，Unique 表默认整体下载**，见第 16 节，以第 16 节为准；
 - 不改变恢复的最终结果：保留下来的分区，数据、版本、tablet meta 都要和完整下载一致（总体方案 2.2 的 I6）。
 
 ## 2. 总体流程
@@ -54,8 +55,8 @@ jobInfo 每个 tablet 记：                          ③ 按启用条件和档�
 | 档位 | 做法 | 适用 |
 | --- | --- | --- |
 | `off` | 只凭 L0 判定，不算摘要 | 只允许非 Unique 表，并且分区是由 Restore 建出来的（谱系戳存在即满足）。Unique 表一律不允许 |
-| `sample` | 候选分区里抽一部分（`restore_reuse_sample_ratio`，默认 10%，至少 1 个）算摘要。只要有一个抽中的分区不一致，其余候选分区全部升级为 `full` | **默认** |
-| `full` | 所有候选分区都算摘要 | 要求最严时 |
+| `sample` | 候选分区里抽一部分（`restore_reuse_sample_ratio`，默认 10%，至少 1 个）算摘要。只要有一个抽中的分区不一致，其余候选分区全部升级为 `full` | 原默认；2026-10-14 起默认按 `full` 执行（第 16 节） |
+| `full` | 所有候选分区都算摘要 | **默认**（2026-10-14 起） |
 
 ### 4.3 摘要任务
 
@@ -120,7 +121,7 @@ PENDING ──checkAndPrepareMeta──► VERIFYING ──全部摘要返回或
 
 1. 备份侧：备份属性 `logical_digest = "true"` 时才算摘要，默认关，由 syncer 或用户开启。
 2. 摘要缓存：首版只放内存，BE 重启后重算。
-3. 默认档位 `sample`（抽 10%，至少 1 个）；Unique 表不允许 `off`。
+3. 默认档位原为 `sample`（抽 10%，至少 1 个）；Unique 表不允许 `off`。**2026-10-14 改为默认 `full`，见第 16 节。**
 4. 提交前复查版本失败：恢复任务失败，给出明确原因。
 5. 最小分区阈值：1 GB。
 
@@ -255,3 +256,43 @@ ccr-syncer 默认用原子恢复做全量同步（总体方案第 9 章风险）
 - **开关**：沿用 `enable_restore_incremental_append`，不新增开关。
 
 **进度**：完成（2026-10-08，HEAD `cfe1c1d889b`，内部实测记录）。
+
+## 16. 复用范围收窄（2026-10-14）
+
+目标：每个实际复用的分区都有独立证明，证明不了就整体下载。摘要证明的是**在备份版本上查询结果相同**（不含隐藏列，如 `__DORIS_VERSION_COL__`）；复用还要求**底层状态足以让之后的写入行为相同**。只有对两者等价的表模型才复用。本节优先于前文。
+
+### 16.1 默认每个复用分区都做摘要校验
+
+- `restore_reuse_default_check_level` 默认值从 `sample` 改为 `full`。
+- 新增 FE 配置 `restore_reuse_allow_unverified_keep`（mutable，masterOnly，默认 false）。为 false 时，`sample` 和 `off` 都按 `full` 生效：提升放在 `RestoreReuseJudge.levelOfTable` 里，选候选和影子统计的估算都经过它。`disable` 不变。
+- 为 true 时保持原行为（`sample` 没抽中的分区、`off` 档的分区不算摘要就保留），只供实验和观测，不提供一致性保证。这类保留在 `SHOW RESTORE` 中标为未证明（`KEPT_L0_ONLY`、`KEPT_SAMPLE_PASSED`，`check_level.kept_unverified` 计数）。
+- `SHOW RESTORE` 的 `ReuseEstimate` 和 `DownloadStats` 里有 `check_level`：请求的档位（`requested`）、实际生效的档位（`effective`）、未证明的保留数。
+- 估算口径的变化：`DISABLE` 在估算时当作 `OFF`，再被提升为 `FULL`，所以默认配置下估算会把需要摘要的反向、表级路径也算上；原来 `DISABLE` 当 `OFF` 只算正向路径。
+- 校验开销增大，开启复用后需要在发布说明里写明。
+
+### 16.2 谱系戳带来源集群身份
+
+- 备份：`BackupJobInfo` 新增可选字段 `src_cluster_id`（json 名 `scid`），值为源端集群 ID；旧备份没有这个字段。
+- 谱系戳 `RestoreLineage` 新增 `cid`，表级关联 `RestoreSource` 同样新增 `cid`，取自备份的 `scid`，缺失为 -1（未知）。新增字段都是可选的，旧版本读到会忽略。
+- 比较：正向，谱系戳的 `cid` 对备份的 `scid`；反向（b），备份里的谱系戳的 `cid` 对本地集群 ID；表级（c），正向用本地表来源的 `cid` 对备份的 `scid`，反向用备份表来源的 `cid` 对本地集群 ID。两边都已知且不相等，不作为候选；任一边未知，仍可作为候选，由摘要兜底。
+- `restore_reuse_allow_unverified_keep=true` 且档位为 `off` 时，如果集群 ID 没有在两边都比较过（缺失），不能免校验保留，该分区改为做摘要。
+- 局限：集群 ID 是初始化时生成的随机整数，不是全局唯一标识；运维可能把两套集群配成同一个值；用源端镜像冷备搭建的灾备集群，集群 ID 相同。所以它只用来缩小候选，不当作证明，这也是默认必须 `full` 的原因。
+
+### 16.3 只复用 Duplicate 表
+
+| 表模型 | 结论 | 原因 |
+| --- | --- | --- |
+| Duplicate（含 DELETE 条件） | 复用 | 没有被覆盖的旧版本；DELETE 条件删掉的行永久删除，之后的写入不会让它们重现 |
+| Unique MoW（无论有无 sequence 列） | 拒绝：`HIDDEN_STATE_MOW` | 删除标记行是隐藏状态：部分列更新查找旧行时只看 delete bitmap、不看删除标记，"最新一行是删除标记"和"key 不存在"行为不同；摘要跳过删除标记行，两端摘要相同时，同一笔写入（如 `partial_update_new_key_behavior=ERROR` 的部分列更新）可能一边成功一边失败，两端 compaction 进度不同就会触发。带 sequence 列时，删除标记行的 sequence 值还影响之后的写入是否被接受 |
+| Unique MoR | 拒绝：`HIDDEN_STATE_MOR` | 被覆盖的旧版本是隐藏状态，之后的 DELETE 条件会让它们重现 |
+| Aggregate | 拒绝 | 逻辑等价无法证明 |
+
+- 整分区保留和增量补齐两条路径都拒绝。影子统计新增 `l0_passed_but_hidden_state_mow`、`l0_passed_but_hidden_state_mor` 两个计数，不把它们算作可复用。
+- FE 配置 `restore_reuse_allow_hidden_state_models`（mutable，masterOnly，默认 false）：为 true 时恢复收窄前的行为，仅供实验，不保证一致。
+- BE 和摘要算法不改，MoR 的前缀摘要等代码保留，默认用不到。
+- 以后放开 MoW 的方向：摘要算法 v2，对没被 delete bitmap 标记的全部物理行算摘要（包括删除标记行和被 light delete 删除条件命中的行），每行带标志位和 sequence 值，证明的是写入路径看到的状态；两端 compaction 进度不同时摘要会不同，退回整体下载（保守）。需要升级 `algo_version` 并重新审查。MoR 同理，代价更高。
+
+### 16.4 测试
+
+- FE 单测：默认档位；`allow_unverified_keep` 开关下 sample、off 的有效档位；集群 ID 在正向、反向、表级路径上相同、不同、缺失的组合；MoW、MoR 的拒绝原因与开关；影子统计；新字段缺失时可读。
+- 回归：`test_backup_restore_reuse_scope`：Duplicate 整分区保留后与整体下载逐行一致；MoW 一端有删除标记行、另一端该 key 不存在，可见结果相同时必须被拒绝并整体下载，之后部分列更新两端一致；MoR 被拒绝；默认生效档位为 `full`。涉及 Unique 表复用机制的既有用例显式打开 `restore_reuse_allow_hidden_state_models`，结束时恢复。
