@@ -85,6 +85,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -3176,5 +3177,364 @@ public class RestoreReuseTest {
         // untouched without an atomic restore
         Config.enable_restore_atomic_reuse = false;
         Assertions.assertFalse(new RestoreDownloadStats().toJson(0, 0).contains("atomic"));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // the protection of the staging partitions loaded from a local source, and the failure of the tasks
+    // ---------------------------------------------------------------------------------------------
+
+    private BackupHandler newHandler() {
+        BackupHandler handler = new BackupHandler(env);
+        Mockito.when(env.getBackupHandler()).thenReturn(handler);
+        return handler;
+    }
+
+    // An atomic restore of the incremental backup, up to SNAPSHOTING: the staging partitions are loaded from the
+    // local source and the snapshot tasks are sent.
+    private RestoreJob atomicIncrementalJob(Map<Long, String> verdicts) {
+        Config.enable_restore_incremental_append = true;
+        RestoreJob job = prepareAtomicJob(incrementalJobInfo(), "full");
+        toVerifying(job);
+        reportPrefix(job, newDigestTasks(), verdicts);
+        waitDigests(job);
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        return job;
+    }
+
+    private Set<Long> stagingPartitionIds(RestoreJob job, Partition... locals) {
+        OlapTable stagingTbl = staging(job);
+        Set<Long> ids = Sets.newHashSet();
+        for (Partition local : locals) {
+            ids.add(stagingTbl.getPartition(local.getName()).getId());
+        }
+        return ids;
+    }
+
+    // To COMMITTING with the move tasks of the job (incremental appends), in AgentTaskQueue's place: `submitted`.
+    private List<DirMoveTask> toCommitting(RestoreJob job) {
+        finishSnapshots(job, snapshotTasks(submitted), 700, 0);
+        Deencapsulation.invoke(job, "waitingAllSnapshotsFinished");
+        submitted.clear();
+        Deencapsulation.invoke(job, "downloadSnapshots");
+        Deencapsulation.setField(job, "state", RestoreJobState.COMMIT);
+        submitted.clear();
+        job.commit();
+        Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
+        return submitted.stream().filter(t -> t instanceof DirMoveTask).map(t -> (DirMoveTask) t)
+                .collect(Collectors.toList());
+    }
+
+    private static TFinishTaskRequest failure(TStatusCode code, String msg) {
+        TFinishTaskRequest request = new TFinishTaskRequest();
+        TStatus status = new TStatus(code);
+        status.setErrorMsgs(Lists.newArrayList(msg));
+        request.setTaskStatus(status);
+        return request;
+    }
+
+    // what MasterImpl does before it hands a failed task to the job
+    private static void failed(AgentTask task, int times) {
+        for (int i = 0; i < times; i++) {
+            task.failed();
+        }
+    }
+
+    @Test
+    public void testLocalSourceStagingPartitionsAreBuiltBeforeTheSnapshotsAndClearedWhenFinished() {
+        BackupHandler handler = newHandler();
+        RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+        // the staging partitions of the 2 incremental partitions, not the partitions of the table being replaced
+        Set<Long> expected = stagingPartitionIds(job, p1(), p2());
+        Assertions.assertEquals(2, expected.size());
+        Assertions.assertEquals(expected, job.getLocalSourceStagingPartitions());
+        for (Long id : expected) {
+            Assertions.assertTrue(job.isLocalSourceStagingPartition(id));
+        }
+        Assertions.assertFalse(job.isLocalSourceStagingPartition(p1().getId()));
+        Assertions.assertTrue(handler.hasJobsWithLocalSource());
+        Assertions.assertEquals(Sets.newHashSet(job.getJobId()), handler.getJobsWithLocalSource());
+        // the set is immutable: it is only replaced as a whole
+        Assertions.assertThrows(UnsupportedOperationException.class,
+                () -> job.getLocalSourceStagingPartitions().clear());
+
+        toCommitting(job);
+        Assertions.assertEquals(expected, job.getLocalSourceStagingPartitions());
+        Status st = job.allTabletCommitted(false);
+        Assertions.assertTrue(st.ok(), st.toString());
+        Assertions.assertTrue(job.getLocalSourceStagingPartitions().isEmpty());
+        Assertions.assertFalse(handler.hasJobsWithLocalSource());
+    }
+
+    @Test
+    public void testOnlyThePartitionsLoadedFromTheLocalSourceAreProtected() {
+        BackupHandler handler = newHandler();
+        // p2 is downloaded as a whole: its staging partition is a normal one
+        Map<Long, String> verdicts = Maps.newHashMap();
+        verdicts.put(p2().getId(), "NOT_BOUNDARY");
+        RestoreJob job = atomicIncrementalJob(verdicts);
+        Assertions.assertEquals(stagingPartitionIds(job, p1()), job.getLocalSourceStagingPartitions());
+        Assertions.assertFalse(job.isLocalSourceStagingPartition(stagingPartitionIds(job, p2()).iterator().next()));
+        Assertions.assertTrue(handler.hasJobsWithLocalSource());
+    }
+
+    @Test
+    public void testKeptAtomicPartitionsAreProtected() {
+        BackupHandler handler = newHandler();
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(2, job.getReuseResult().getKeptAtomicPartitions());
+        Assertions.assertEquals(stagingPartitionIds(job, p1(), p2()), job.getLocalSourceStagingPartitions());
+        Assertions.assertTrue(handler.hasJobsWithLocalSource());
+    }
+
+    @Test
+    public void testNothingIsProtectedWithoutLocalSourcePartitions() {
+        BackupHandler handler = newHandler();
+        // a plain atomic restore (no reuse)
+        Config.enable_restore_atomic_reuse = false;
+        RestoreJob job = newAtomicJob(selfBackupJobInfo(), "full");
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertTrue(job.getLocalSourceStagingPartitions().isEmpty());
+        Assertions.assertFalse(handler.hasJobsWithLocalSource());
+        // a non atomic restore which keeps a partition
+        RestoreJob nonAtomic = prepareJob("full");
+        toVerifying(nonAtomic);
+        reportAll(nonAtomic, newDigestTasks(), Maps.newHashMap());
+        waitDigests(nonAtomic);
+        Assertions.assertEquals(2, nonAtomic.getReuseResult().getKeptPartitions());
+        Assertions.assertTrue(nonAtomic.getLocalSourceStagingPartitions().isEmpty());
+        Assertions.assertFalse(handler.hasJobsWithLocalSource());
+    }
+
+    @Test
+    public void testCancelClearsTheProtection() {
+        BackupHandler handler = newHandler();
+        RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+        Assertions.assertTrue(handler.hasJobsWithLocalSource());
+        job.cancel();
+        Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertTrue(job.getLocalSourceStagingPartitions().isEmpty());
+        Assertions.assertFalse(handler.hasJobsWithLocalSource());
+    }
+
+    @Test
+    public void testReplayRebuildsTheProtectionOfARunningJobOnly() throws Exception {
+        RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+        Set<Long> expected = Sets.newHashSet(job.getLocalSourceStagingPartitions());
+        // the edit log of the job entering DOWNLOAD / the image: the set is not persisted, it is rebuilt from the
+        // decisions
+        RestoreJob replayed = writeAndRead(job);
+        Assertions.assertEquals(expected, replayed.getLocalSourceStagingPartitions());
+        // the replayed object replaces the job in the handler: the handler follows the new object
+        BackupHandler handler = newHandler();
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", db.getId(), job);
+        handler.replayAddJob(replayed);
+        Assertions.assertEquals(Sets.newHashSet(job.getJobId()), handler.getJobsWithLocalSource());
+        Assertions.assertSame(replayed, handler.getJob(db.getId()));
+
+        // finished: the same persisted decisions, but nothing is protected
+        toCommitting(job);
+        Assertions.assertTrue(job.allTabletCommitted(false).ok());
+        RestoreJob finished = writeAndRead(job);
+        Assertions.assertEquals(RestoreJobState.FINISHED, finished.getState());
+        Assertions.assertFalse(finished.getReuseResult().getDecisions().isEmpty());
+        Assertions.assertTrue(finished.getLocalSourceStagingPartitions().isEmpty());
+        // and the replay of the finished state follows
+        finished.setEnv(env);
+        handler.replayAddJob(finished);
+        Assertions.assertFalse(handler.hasJobsWithLocalSource());
+    }
+
+    @Test
+    public void testHandlerKeepsTheJobSetWhenTheObjectIsReplacedOrEvicted() throws Exception {
+        BackupHandler handler = newHandler();
+        RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+        Assertions.assertTrue(handler.getJobsWithLocalSource().contains(job.getJobId()));
+
+        // the object is replaced by a deserialized one of the same job in a terminal state: no leak
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", db.getId(), job);
+        RestoreJob copy = writeAndRead(job);
+        Deencapsulation.setField(copy, "state", RestoreJobState.CANCELLED);
+        Deencapsulation.setField(copy, "localSourceStagingPartitions", java.util.Collections.emptySet());
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", db.getId(), copy);
+        Assertions.assertFalse(handler.hasJobsWithLocalSource());
+        // replaced by one which is still running: kept
+        RestoreJob running = writeAndRead(job);
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", db.getId(), running);
+        Assertions.assertTrue(handler.getJobsWithLocalSource().contains(job.getJobId()));
+
+        // evicted by the limit of the jobs of the database
+        int origNum = Config.max_backup_restore_job_num_per_db;
+        try {
+            Config.max_backup_restore_job_num_per_db = 1;
+            RestoreJob other = newJob(selfBackupJobInfo(), "full");
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", db.getId(), other);
+            Assertions.assertFalse(handler.hasJobsWithLocalSource());
+            Assertions.assertSame(other, handler.getJob(db.getId()));
+        } finally {
+            Config.max_backup_restore_job_num_per_db = origNum;
+        }
+    }
+
+    @Test
+    public void testTheMoveTasksCarryTheDigestOfTheBackup() {
+        newHandler();
+        RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+        // the local source snapshot tasks carry the job id
+        for (SnapshotTask task : snapshotTasks(submitted)) {
+            Assertions.assertTrue(task.isRestoreLocalSource());
+            Assertions.assertTrue(task.toThrift().isSetJobId());
+            Assertions.assertEquals(job.getJobId(), task.toThrift().getJobId());
+        }
+        List<DirMoveTask> moves = toCommitting(job);
+        Assertions.assertFalse(moves.isEmpty());
+        for (DirMoveTask move : moves) {
+            Assertions.assertNotNull(move.getBackupLogicalDigest());
+            Assertions.assertTrue(move.toThrift().isSetBackupLogicalDigest());
+            Assertions.assertEquals(SIG, move.toThrift().getBackupLogicalDigest().getSchemaSig());
+            Assertions.assertEquals(1, move.toThrift().getBackupLogicalDigest().getAlgoVersion());
+            Assertions.assertEquals("OK", move.toThrift().getBackupLogicalDigest().getStatusCode());
+            Assertions.assertEquals(job.getJobId(), move.toThrift().getJobId());
+        }
+    }
+
+    @Test
+    public void testNotRetryableErrorOfTheAppendCancelsAtOnce() {
+        newHandler();
+        RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+        List<DirMoveTask> moves = toCommitting(job);
+        DirMoveTask move = moves.get(0);
+        failed(move, 1);
+        // the status message is wrapped by the backend: (host)[INTERNAL_ERROR][RESTORE_NOT_RETRYABLE] ...
+        Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.INTERNAL_ERROR,
+                "(127.0.0.1)[INTERNAL_ERROR]" + RestoreJob.RESTORE_NOT_RETRYABLE + " no evidence")));
+        Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertTrue(job.getStatus().getErrMsg().contains(RestoreJob.RESTORE_NOT_RETRYABLE),
+                job.getStatus().getErrMsg());
+        Assertions.assertTrue(job.getLocalSourceStagingPartitions().isEmpty());
+    }
+
+    @Test
+    public void testOtherErrorsOfTheAppendCancelAfterTheMaxRetry() {
+        newHandler();
+        int origMax = Config.restore_local_source_task_max_retry;
+        Config.restore_local_source_task_max_retry = 3;
+        try {
+            RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+            DirMoveTask move = toCommitting(job).get(0);
+            for (int i = 1; i <= 3; i++) {
+                failed(move, 1);
+                Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.INTERNAL_ERROR, "boom")));
+                Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState(), "failure " + i);
+            }
+            // a failure to obtain the locks is not counted: it is taken back
+            failed(move, 1);
+            Assertions.assertEquals(4, move.getFailedTimes());
+            Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.OBTAIN_LOCK_FAILED, "locks")));
+            Assertions.assertEquals(3, move.getFailedTimes());
+            Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
+            // the 4th failure which counts
+            failed(move, 1);
+            Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.INTERNAL_ERROR, "boom")));
+            Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+            Assertions.assertTrue(job.getStatus().getErrMsg().contains("boom"), job.getStatus().getErrMsg());
+        } finally {
+            Config.restore_local_source_task_max_retry = origMax;
+        }
+    }
+
+    @Test
+    public void testLocalSourceSnapshotFailuresCancelTheSameWay() {
+        newHandler();
+        int origMax = Config.restore_local_source_task_max_retry;
+        Config.restore_local_source_task_max_retry = 2;
+        try {
+            RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+            List<SnapshotTask> snapshots = snapshotTasks(submitted);
+            SnapshotTask task = snapshots.get(0);
+            for (int i = 1; i <= 2; i++) {
+                failed(task, 1);
+                Assertions.assertFalse(job.finishTabletSnapshotTask(task, failure(TStatusCode.INTERNAL_ERROR, "boom")));
+                Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+            }
+            failed(task, 1);
+            Assertions.assertFalse(job.finishTabletSnapshotTask(task, failure(TStatusCode.INTERNAL_ERROR, "boom")));
+            Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+
+            // the not retryable error of another task of another job: at once
+            RestoreJob other = atomicIncrementalJob(Maps.newHashMap());
+            SnapshotTask otherTask = snapshotTasks(submitted).get(0);
+            failed(otherTask, 1);
+            Assertions.assertFalse(other.finishTabletSnapshotTask(otherTask, failure(TStatusCode.INTERNAL_ERROR,
+                    "[INTERNAL_ERROR]" + RestoreJob.RESTORE_NOT_RETRYABLE + " another job")));
+            Assertions.assertEquals(RestoreJobState.CANCELLED, other.getState());
+        } finally {
+            Config.restore_local_source_task_max_retry = origMax;
+        }
+    }
+
+    @Test
+    public void testTheFailureOfTheOtherTasksIsNotConverged() {
+        newHandler();
+        int origMax = Config.restore_local_source_task_max_retry;
+        Config.restore_local_source_task_max_retry = 1;
+        try {
+            RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+            toCommitting(job);
+            // a whole move (no incremental range), way over the limit and with the not retryable prefix: only
+            // recorded, the task is resent by the normal flow, the job goes on
+            DirMoveTask whole = new DirMoveTask(null, CatalogMocker.BACKEND1_ID, 777001L, job.getJobId(), db.getId(),
+                    tbl2.getId(), p1().getId(), p1().getBaseIndex().getId(), tabletOf(p1()), "/path/snapshot", 1, true);
+            Assertions.assertNull(whole.getIncrementalRange());
+            failed(whole, 100);
+            Assertions.assertFalse(job.finishDirMoveTask(whole, failure(TStatusCode.INTERNAL_ERROR, "boom")));
+            Assertions.assertFalse(job.finishDirMoveTask(whole, failure(TStatusCode.INTERNAL_ERROR,
+                    RestoreJob.RESTORE_NOT_RETRYABLE + " not for this task")));
+            Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
+            Assertions.assertEquals(100, whole.getFailedTimes());
+
+        } finally {
+            Config.restore_local_source_task_max_retry = origMax;
+        }
+    }
+
+    @Test
+    public void testAFailureAfterTheJobMovedOnIsIgnored() {
+        newHandler();
+        RestoreJob job = atomicIncrementalJob(Maps.newHashMap());
+        DirMoveTask move = toCommitting(job).get(0);
+        // the move task of a job which is no longer COMMITTING (the late report of a task): not cancelled twice
+        Deencapsulation.setField(job, "state", RestoreJobState.DOWNLOADING);
+        failed(move, 1);
+        Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.INTERNAL_ERROR,
+                RestoreJob.RESTORE_NOT_RETRYABLE + " late")));
+        Assertions.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+    }
+
+    @Test
+    public void testTheFailureOfAWholeSnapshotIsNotConverged() {
+        newHandler();
+        int origMax = Config.restore_local_source_task_max_retry;
+        Config.restore_local_source_task_max_retry = 1;
+        try {
+            Config.enable_restore_atomic_reuse = false;
+            RestoreJob plain = newAtomicJob(selfBackupJobInfo(), "full");
+            Deencapsulation.invoke(plain, "checkAndPrepareMeta");
+            Deencapsulation.invoke(plain, "allReplicasCreated");
+            Assertions.assertEquals(RestoreJobState.SNAPSHOTING, plain.getState());
+            SnapshotTask whole = snapshotTasks(submitted).get(0);
+            Assertions.assertFalse(whole.isRestoreLocalSource());
+            failed(whole, 100);
+            Assertions.assertFalse(plain.finishTabletSnapshotTask(whole, failure(TStatusCode.INTERNAL_ERROR,
+                    RestoreJob.RESTORE_NOT_RETRYABLE + " boom")));
+            Assertions.assertEquals(RestoreJobState.SNAPSHOTING, plain.getState());
+            Assertions.assertEquals(100, whole.getFailedTimes());
+        } finally {
+            Config.restore_local_source_task_max_retry = origMax;
+        }
     }
 }
