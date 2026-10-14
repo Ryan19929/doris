@@ -135,6 +135,10 @@ public final class RestoreReuseJudge {
      * Whether the L0 check that passed also compared the cluster id of the source on both sides, and they are equal.
      * If not (an old stamp or backup has no cluster id) the partition is only a candidate for the digest, and must
      * not be kept without one (check level off with Config.restore_reuse_allow_unverified_keep).
+     *
+     * <p>Note: only the check level off consumes it, and the reverse (b) and table level (c) checks return
+     * LEVEL_NOT_ALLOWED at off, so the b and c branches are not reached in that use today. They are kept so that the
+     * answer stays right if another caller (or a later level) asks for a b or c path.
      */
     public static boolean clusterProven(Input in, String l0Path) {
         if (L0_FORWARD.equals(l0Path)) {

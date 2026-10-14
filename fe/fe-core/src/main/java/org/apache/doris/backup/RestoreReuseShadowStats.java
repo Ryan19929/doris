@@ -462,7 +462,9 @@ public class RestoreReuseShadowStats {
         json.addProperty("kept_b", actual.getKeptByPath(RestoreReuseJudge.L0_REVERSE));
         json.addProperty("kept_c", actual.getKeptByPath(RestoreReuseJudge.L0_TABLE));
         // the check level (requested and effective), and the kept partitions not proved by a digest
-        json.add("check_level", GsonUtils.GSON.toJsonTree(actual.levelSummary()));
+        if (!actual.isEmpty()) {
+            json.add("check_level", GsonUtils.GSON.toJsonTree(actual.levelSummary()));
+        }
         json.addProperty("download_digest_mismatch", actual.countReasons(
                 RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH));
         json.addProperty("download_timeout", actual.countReasons(RestoreReuseResult.DOWNLOAD_TIMEOUT));

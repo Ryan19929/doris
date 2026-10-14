@@ -931,13 +931,13 @@ public class BackupJobInfo implements GsonPostProcessable {
      * Whether this backup has a manifest that this version can check. A manifest of an unknown (newer) version
      * is not checked, never fails a restore.
      */
+    public boolean hasManifest() {
+        return manifestVersion != null && manifestVersion == MANIFEST_VERSION;
+    }
+
     /** The cluster id of the source cluster, {@link RestoreLineage#UNKNOWN_CLUSTER_ID} for an old backup. */
     public long getSrcClusterIdOrUnknown() {
         return srcClusterId == null ? RestoreLineage.UNKNOWN_CLUSTER_ID : srcClusterId;
-    }
-
-    public boolean hasManifest() {
-        return manifestVersion != null && manifestVersion == MANIFEST_VERSION;
     }
 
     // Returns the manifest root of a tablet in the backup, null if absent.

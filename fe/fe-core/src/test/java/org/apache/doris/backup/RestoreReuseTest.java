@@ -1114,6 +1114,58 @@ public class RestoreReuseTest {
         Assertions.assertEquals("full", result.levelSummary().get("requested"));
     }
 
+    private void assertAtomicTakenAsFull(String requested) {
+        // the two new switches are false: the partitions of an atomic restore are all digested, whatever is requested
+        Config.restore_reuse_allow_unverified_keep = false;
+        Config.restore_reuse_allow_hidden_state_models = false;
+        Config.restore_reuse_sample_ratio = 0.1;
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), requested);
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size(), requested);
+        reportAll(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getKeptAtomicPartitions(), requested);
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertTrue(decision.atomic);
+            Assertions.assertEquals(RestoreReuseResult.KEPT_DIGEST_VERIFIED, decision.reason);
+            Assertions.assertEquals("full", decision.level);
+            Assertions.assertEquals(requested, decision.requestedLevel);
+        }
+    }
+
+    @Test
+    public void testAtomicJobOffIsTakenAsFullByDefault() {
+        assertAtomicTakenAsFull("off");
+    }
+
+    @Test
+    public void testAtomicJobSampleIsTakenAsFullByDefault() {
+        assertAtomicTakenAsFull("sample");
+    }
+
+    @Test
+    public void testIncrementalCandidatesAreDigestedByDefault() {
+        Config.restore_reuse_allow_unverified_keep = false;
+        Config.restore_reuse_allow_hidden_state_models = false;
+        Config.restore_reuse_sample_ratio = 0.1;
+        RestoreJob job = prepareIncrementalJob("off");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        // both partitions are incremental candidates, none is skipped by the level
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        reportPrefix(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(2, result.getIncrementalPartitions());
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            Assertions.assertTrue(decision.incremental);
+            Assertions.assertEquals("full", decision.level);
+            Assertions.assertEquals("off", decision.requestedLevel);
+        }
+    }
+
     @Test
     public void testSampleTakenAsFullByTheJob() {
         assertTakenAsFull("sample");

@@ -34,6 +34,7 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     String dbA = "${suiteName}_a"
     String dbB = "${suiteName}_b"
     String dbC = "${suiteName}_c"
+    String dbD = "${suiteName}_d"
     String dupTable = "${suiteName}_dup"
     String mowTable = "${suiteName}_mow"
     String morTable = "${suiteName}_mor"
@@ -59,7 +60,7 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     setConfig("enable_restore_partition_reuse", "true")
     setConfig("restore_reuse_min_partition_bytes", "0")
 
-    for (String db : [dbA, dbB, dbC]) {
+    for (String db : [dbA, dbB, dbC, dbD]) {
         sql "DROP DATABASE IF EXISTS ${db} FORCE"
         sql "CREATE DATABASE ${db}"
     }
@@ -286,6 +287,7 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
         } finally {
             sql "SET partial_update_new_key_behavior = \"APPEND\""
             sql "SET enable_unique_key_partial_update = false"
+            sql "SET enable_insert_strict = true"
         }
         return outcome
     }
@@ -298,6 +300,29 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     sql "sync"
     assertEquals(rowsOf(dbA, mowTable), rowsOf(dbB, mowTable))
     assertEquals(versionsOf(dbA, mowTable), versionsOf(dbB, mowTable))
+
+    // The control group: with the experiment switch on, the same partition IS reused, and then the same partial update
+    // behaves differently on the two sides. This is why the reuse of a unique table is rejected by default.
+    // C is built as B was before the rejected restore: restored from the first backup, then a key that A does not have
+    // is written and deleted, so it has the same version and the same visible rows as A at the second backup.
+    // D is a whole download of the second backup, the pristine copy of A (A itself was changed by the updates above).
+    restoreAndWait(dbC, snapMow1, tsMow1, [mowTable], null)
+    sql "INSERT INTO ${dbC}.${mowTable} VALUES (900, 'transient', 1)"
+    sql "DELETE FROM ${dbC}.${mowTable} WHERE id = 900"
+    sql "sync"
+    restoreAndWait(dbD, snapMow2, tsMow2, [mowTable], "disable")
+    assertEquals(rowsOf(dbD, mowTable), rowsOf(dbC, mowTable))
+    assertEquals(versionsOf(dbD, mowTable), versionsOf(dbC, mowTable))
+    setConfig("restore_reuse_allow_hidden_state_models", "true")
+    restoreAndWait(dbC, snapMow2, tsMow2, [mowTable], null)
+    setConfig("restore_reuse_allow_hidden_state_models", "false")
+    assertEquals(1, keptPartitions())
+    assertEquals(rowsOf(dbD, mowTable), rowsOf(dbC, mowTable))
+    // key 5: a delete sign row in D, no row in C
+    String outcomeD = partialUpdate(dbD, 5)
+    String outcomeC = partialUpdate(dbC, 5)
+    assertEquals("OK", outcomeD)
+    assertEquals("ERROR", outcomeC)
 
     // ------------------------------------------------------------------------------------------------
     // 3. merge-on-read: rejected, downloaded as a whole
@@ -342,7 +367,7 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     // ------------------------------------------------------------------------------------------------
     setConfig("restore_reuse_min_partition_bytes", "0")
     setConfig("enable_restore_partition_reuse", "false")
-    for (String db : [dbA, dbB, dbC]) {
+    for (String db : [dbA, dbB, dbC, dbD]) {
         sql "DROP DATABASE ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
