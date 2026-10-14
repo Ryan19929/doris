@@ -2606,7 +2606,8 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
 
 Status SnapshotLoader::append_increment(const std::string& snapshot_path, TabletSharedPtr tablet,
                                         const TRestoreIncrementalRange& range,
-                                        const TRestoreBackupDigest* backup_digest) {
+                                        const TRestoreBackupDigest* backup_digest,
+                                        bool local_source_loaded) {
     restore_debug_delay("SnapshotLoader.append_increment.delay", tablet->tablet_id());
     auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(snapshot_path);
 
@@ -2626,6 +2627,22 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
     if (tablet_id != snapshot_tablet_id || schema_hash != snapshot_schema_hash) {
         return Status::InternalError("path does not match. snapshot: {}, tablet path: {}",
                                      snapshot_path, tablet_path);
+    }
+    if (!local_source_loaded) {
+        // Not loaded from a local source by a restore job (the non atomic incremental restore appends to the
+        // tablet being restored): no evidence, as before.
+        bool legacy_exists = false;
+        RETURN_IF_ERROR(io::global_local_filesystem()->exists(snapshot_path, &legacy_exists));
+        if (!legacy_exists) {
+            return Status::InternalError("snapshot path does not exist: {}", snapshot_path);
+        }
+        bool already_loaded = false;
+        RETURN_IF_ERROR(io::global_local_filesystem()->exists(get_loaded_tag_path(snapshot_path),
+                                                              &already_loaded));
+        if (already_loaded) {
+            LOG(INFO) << "snapshot path already appended: " << snapshot_path;
+            return Status::OK();
+        }
     }
     // The same locks as the full / incremental clone and the move of the restore. They are taken before the
     // judgement of a resent task, so that no compaction or push changes the tablet meanwhile; the header lock is
@@ -2647,53 +2664,60 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
     }
 
     // Judge by the evidence of this job in the tablet meta.
-    RestoreTabletState state = read_restore_tablet_state(tablet);
-    if (!state.has_stage || state.stage.job_id() != _job_id) {
-        return restore_not_retryable(fmt::format(
-                "tablet {} has no evidence that the restore job {} loaded it (evidence of job {}), "
-                "the increment ({}, {}] can not be appended",
-                tablet_id, _job_id, state.has_stage ? state.stage.job_id() : -1, range.base_version,
-                range.end_version));
-    }
-    if (state.stage.stage() == RestoreStagePB::APPENDED) {
-        if (state.max_version == range.end_version &&
-            state.stage.end_version() == range.end_version) {
-            LOG(INFO) << "the increment (" << range.base_version << ", " << range.end_version
-                      << "] is already appended to tablet " << tablet_id << " by job " << _job_id;
+    RestoreTabletState state;
+    if (local_source_loaded) {
+        state = read_restore_tablet_state(tablet);
+        if (!state.has_stage || state.stage.job_id() != _job_id) {
+            return restore_not_retryable(
+                    fmt::format("tablet {} has no evidence that the restore job {} loaded it "
+                                "(evidence of job {}), "
+                                "the increment ({}, {}] can not be appended",
+                                tablet_id, _job_id, state.has_stage ? state.stage.job_id() : -1,
+                                range.base_version, range.end_version));
+        }
+        if (state.stage.stage() == RestoreStagePB::APPENDED) {
+            if (state.max_version == range.end_version &&
+                state.stage.end_version() == range.end_version) {
+                LOG(INFO) << "the increment (" << range.base_version << ", " << range.end_version
+                          << "] is already appended to tablet " << tablet_id << " by job "
+                          << _job_id;
+                return Status::OK();
+            }
+            return restore_not_retryable(
+                    fmt::format("tablet {} has the evidence of the append up to version {} by job "
+                                "{}, but its max "
+                                "version is {}, not the requested {}",
+                                tablet_id, state.stage.end_version(), _job_id, state.max_version,
+                                range.end_version));
+        }
+        if (state.stage.base_version() != range.base_version) {
+            return restore_not_retryable(fmt::format(
+                    "tablet {} was loaded to version {} by job {}, not to the base version {} of "
+                    "the "
+                    "increment",
+                    tablet_id, state.stage.base_version(), _job_id, range.base_version));
+        }
+        if (state.max_version == range.end_version) {
+            // The increment is in the tablet but the evidence of it is not. The protection of the scheduler and the
+            // single save of the append make it impossible; if it happens check the data itself against the backup.
+            RETURN_IF_ERROR(_check_appended_tablet_equals_backup(tablet, range, backup_digest));
+            std::lock_guard wrlock(tablet->get_header_lock());
+            RestoreStagePB appended = state.stage;
+            appended.set_stage(RestoreStagePB::APPENDED);
+            appended.set_end_version(range.end_version);
+            tablet->tablet_meta()->set_restore_stage(appended);
+            tablet->save_meta();
+            LOG(INFO) << "the tablet " << tablet_id << " is at version " << range.end_version
+                      << " and equals the backup, the evidence of the append of job " << _job_id
+                      << " is written";
             return Status::OK();
         }
-        return restore_not_retryable(fmt::format(
-                "tablet {} has the evidence of the append up to version {} by job {}, but its max "
-                "version is {}, not the requested {}",
-                tablet_id, state.stage.end_version(), _job_id, state.max_version,
-                range.end_version));
-    }
-    if (state.stage.base_version() != range.base_version) {
-        return restore_not_retryable(fmt::format(
-                "tablet {} was loaded to version {} by job {}, not to the base version {} of the "
-                "increment",
-                tablet_id, state.stage.base_version(), _job_id, range.base_version));
-    }
-    if (state.max_version == range.end_version) {
-        // The increment is in the tablet but the evidence of it is not. The protection of the scheduler and the
-        // single save of the append make it impossible; if it happens check the data itself against the backup.
-        RETURN_IF_ERROR(_check_appended_tablet_equals_backup(tablet, range, backup_digest));
-        std::lock_guard wrlock(tablet->get_header_lock());
-        RestoreStagePB appended = state.stage;
-        appended.set_stage(RestoreStagePB::APPENDED);
-        appended.set_end_version(range.end_version);
-        tablet->tablet_meta()->set_restore_stage(appended);
-        tablet->save_meta();
-        LOG(INFO) << "the tablet " << tablet_id << " is at version " << range.end_version
-                  << " and equals the backup, the evidence of the append of job " << _job_id
-                  << " is written";
-        return Status::OK();
-    }
-    if (state.max_version != range.base_version) {
-        return restore_not_retryable(fmt::format(
-                "the max version of tablet {} is {}, neither the base version {} nor the end "
-                "version {} of the increment",
-                tablet_id, state.max_version, range.base_version, range.end_version));
+        if (state.max_version != range.base_version) {
+            return restore_not_retryable(fmt::format(
+                    "the max version of tablet {} is {}, neither the base version {} nor the end "
+                    "version {} of the increment",
+                    tablet_id, state.max_version, range.base_version, range.end_version));
+        }
     }
 
     bool exists = false;
@@ -2818,15 +2842,21 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
         }
     });
     const RestoreStagePB stage_before = state.stage;
+    if (!local_source_loaded) {
+        skip_stage = true;
+    }
     if (!skip_stage) {
         RestoreStagePB appended = stage_before;
         appended.set_stage(RestoreStagePB::APPENDED);
         appended.set_end_version(range.end_version);
         tablet->tablet_meta()->set_restore_stage(appended);
     }
+    const bool inject_failure = skip_stage && local_source_loaded;
     Status st = tablet->revise_tablet_meta(rowsets, {}, true);
     if (!st.ok()) {
-        tablet->tablet_meta()->set_restore_stage(stage_before);
+        if (local_source_loaded) {
+            tablet->tablet_meta()->set_restore_stage(stage_before);
+        }
         if (mow) {
             tablet->tablet_meta()->delete_bitmap() = std::move(*bitmap_before);
         }
@@ -2837,7 +2867,7 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
                      << ", the tablet is unchanged: " << st;
         return st;
     }
-    if (skip_stage) {
+    if (inject_failure) {
         return Status::InternalError(
                 "injected failure after the append of tablet {} and before the evidence is "
                 "written",

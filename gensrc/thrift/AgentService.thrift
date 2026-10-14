@@ -574,6 +574,9 @@ struct TMoveDirReq {
     // with incremental: the logical digest of the backup of the tablet at incremental.end_version, to tell whether
     // the data of the tablet is already the backup when the evidence of the append is missing
     7: optional TRestoreBackupDigest backup_logical_digest
+    // with incremental: the tablet was loaded from a local source by this (atomic) restore job, the backend judges
+    // the task by the evidence in the tablet meta. Unset / false (non atomic incremental restore): as without it.
+    8: optional bool local_source_loaded
 }
 
 enum TAgentServiceVersion {

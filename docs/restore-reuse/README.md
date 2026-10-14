@@ -42,3 +42,9 @@
 **已知未修复**：原子恢复 + 增量补齐在多副本下，可能因副本修复竞争卡在 COMMITTING。根因和修复方案见 [stuck-append-analysis.md](./stuck-append-analysis.md) 和 [stuck-append-fix-plan.md](./stuck-append-fix-plan.md)，修复方案已审查、尚未实现。
 
 测试环境的实测结论：灾备来回切换演练中，下载量减少约 71%，错误复用为 0；在下载较慢的单机测试环境、数据量较大时，端到端耗时加速约 2～3 倍，数据量较小（约 2 GB）时因固定开销占大头只有约 1.2～1.6 倍。目标规模和万兆网络下的收益仍需复测。
+
+## 部署与回滚
+
+- **升级顺序。** 先把所有 FE 和所有 BE 升级完成，再打开复用开关（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）。原子恢复的增量补齐依赖 FE 下发的作业 ID 和备份摘要，以及 BE 写在 tablet 元数据里的完成证据（`restore_stage`）；FE 和 BE 版本混跑时不要打开开关。
+- **降级前。** 先关掉上面的复用开关，等进行中的恢复作业全部结束（FINISHED 或 CANCELLED）再降级。旧版本 BE 读写 tablet 元数据时会丢掉 `restore_stage`，之后它不能证明恢复进度。
+- **旧 FE 接管进行中的作业。** 主节点切换到没有该功能的旧 FE 时，进行中的增量恢复作业会失败，原子恢复下原表不受影响，不会写错数据；升级后重新恢复一次即可。

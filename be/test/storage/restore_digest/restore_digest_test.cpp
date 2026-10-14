@@ -5584,6 +5584,42 @@ protected:
     }
 };
 
+// The non atomic incremental restore appends to the tablet being restored, which no restore job loaded from a local
+// source: no evidence is needed or written, the judgement is the one before the evidence (base version, loaded tag).
+TEST_F(RestoreStageTest, NonAtomicAppendNeedsNoEvidenceAndIsIdempotentByTheLoadedTag) {
+    _next_id = 1130000;
+    auto src = create_tablet(7841, false);
+    auto local = create_tablet(7842, false);
+    build_source(src, false);
+    build_local(local, false);
+    ASSERT_FALSE(local->tablet_meta()->has_restore_stage());
+    std::string dir = make_increment_dir(src, local, 3, 6);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    TRestoreIncrementalRange range;
+    range.base_version = 3;
+    range.end_version = 6;
+    // the wrong base version: a plain error, not the one which cancels the job
+    TRestoreIncrementalRange wrong = range;
+    wrong.base_version = 2;
+    Status st = loader.append_increment(dir, local, wrong, nullptr, false);
+    EXPECT_FALSE(st.ok());
+    EXPECT_FALSE(not_retryable(st)) << st;
+    EXPECT_EQ(3, local->max_version_unlocked());
+    st = loader.append_increment(dir, local, range, nullptr, false);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(6, local->max_version_unlocked());
+    EXPECT_FALSE(local->tablet_meta()->has_restore_stage());
+    EXPECT_TRUE(digests_equal(tablet_digest(src->tablet_id(), 6),
+                              tablet_digest(local->tablet_id(), 6)));
+    // resent: the loaded tag of the snapshot dir says it is done
+    auto files = tablet_files(local);
+    EXPECT_TRUE(loader.append_increment(dir, local, range, nullptr, false).ok());
+    EXPECT_EQ(files, tablet_files(local));
+    EXPECT_EQ(6, local->max_version_unlocked());
+    // the debug point which appends without the evidence changes nothing without evidence
+    EXPECT_FALSE(local->tablet_meta()->has_restore_stage());
+}
+
 TEST_F(RestoreStageTest, TabletMetaKeepsTheStageAcrossSerialization) {
     auto tablet = create_tablet(7701, false);
     ASSERT_NE(nullptr, tablet);

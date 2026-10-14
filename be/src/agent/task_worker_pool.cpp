@@ -162,13 +162,15 @@ void finish_task(const TFinishTaskRequest& finish_task_request) {
     // value, any if unset), times (how many reports are lost after the debug point is added, default 1).
     DBUG_EXECUTE_IF("WorkPool.finish_task.lost", {
         static std::mutex lost_mutex;
-        static const DebugPoint* lost_for = nullptr;
+        static std::weak_ptr<DebugPoint> lost_for;
         static int lost_times = 0;
         auto ptype = dp->param<int>("task_type", -1);
         if (ptype < 0 || ptype == static_cast<int>(finish_task_request.task_type)) {
             std::lock_guard lock(lost_mutex);
-            if (lost_for != dp.get()) {
-                lost_for = dp.get();
+            // a debug point added again is another object; an expired weak_ptr never equals a live one,
+            // so the count is reset even if the address is reused
+            if (lost_for.lock() != dp) {
+                lost_for = dp;
                 lost_times = 0;
             }
             if (lost_times < dp->param<int>("times", 1)) {
@@ -1892,10 +1894,11 @@ void move_dir_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
         SnapshotLoader loader(engine, env, move_dir_req.job_id, move_dir_req.tablet_id);
         SCOPED_ATTACH_TASK(loader.resource_ctx());
         if (move_dir_req.__isset.incremental) {
-            status = loader.append_increment(move_dir_req.src, tablet, move_dir_req.incremental,
-                                             move_dir_req.__isset.backup_logical_digest
-                                                     ? &move_dir_req.backup_logical_digest
-                                                     : nullptr);
+            status = loader.append_increment(
+                    move_dir_req.src, tablet, move_dir_req.incremental,
+                    move_dir_req.__isset.backup_logical_digest ? &move_dir_req.backup_logical_digest
+                                                               : nullptr,
+                    move_dir_req.__isset.local_source_loaded && move_dir_req.local_source_loaded);
         } else {
             status = loader.move(move_dir_req.src, tablet, true);
         }

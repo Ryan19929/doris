@@ -327,6 +327,10 @@ public:
     // range.base_version, which then has the max version range.end_version. All or nothing: on failure the
     // tablet (rowsets, delete bitmap, files) is as before. Idempotent per snapshot dir.
     //
+    // local_source_loaded: the tablet was loaded from a local source by the atomic restore. Only then the judgement
+    // below by the evidence is done; otherwise (the non atomic incremental restore) the tablet is checked for the
+    // base version only and a snapshot dir already appended is skipped by its loaded tag, as before.
+    //
     // The restore job (the job id of the loader) must have loaded the local source into the tablet (the evidence
     // RestoreStagePB of the tablet meta), and the evidence of the append is saved with the append. A resent task is
     // judged by the evidence: appended -> OK; loaded and still at the base version -> append; loaded and already at
@@ -335,7 +339,8 @@ public:
     // error whose message has the prefix kRestoreNotRetryable, the FE cancels the job on it.
     Status append_increment(const std::string& snapshot_path, TabletSharedPtr tablet,
                             const TRestoreIncrementalRange& range,
-                            const TRestoreBackupDigest* backup_digest = nullptr);
+                            const TRestoreBackupDigest* backup_digest = nullptr,
+                            bool local_source_loaded = true);
 
     // The prefix of the error messages which make the FE cancel the restore job instead of resending the task.
     static constexpr const char* kRestoreNotRetryable = "[RESTORE_NOT_RETRYABLE]";

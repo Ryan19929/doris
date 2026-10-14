@@ -844,6 +844,8 @@ message TabletMetaCloudPB {
     optional TabletRolePB tablet_role = 41 [default = TABLET_ROLE_DATA];
     // Used by a base tablet to find its paired row-binlog tablet.
     optional int64 binlog_tablet_id = 42;
+    // The completion evidence of the restore job which loaded the data of this tablet.
+    optional RestoreStagePB restore_stage = 43;
 
     // Use for selectdb-cloud
     optional string table_name = 101;
