@@ -295,6 +295,11 @@ public:
 
     Status move(const std::string& snapshot_path, TabletSharedPtr tablet, bool overwrite);
 
+    // move(), the tablet meta saved with the loaded tablet has restore_stage as the evidence of the restore job
+    // (none if null). The restore stage of the source snapshot is always dropped.
+    Status move_with_restore_stage(const std::string& snapshot_path, TabletSharedPtr tablet,
+                                   bool overwrite, const RestoreStagePB* restore_stage);
+
     // Atomic restore with partition level reuse, a tablet whose increment is to be downloaded: the tablet being
     // replaced (request.ref_tablet_id) is the source of the data up to request.version, the version the increment
     // starts from. Make the snapshot of it (see TSnapshotRequest.restore_local_source), load it into the tablet of the
@@ -321,8 +326,19 @@ public:
     // Append the rowsets of the increment, downloaded into the snapshot dir, to the tablet whose max version is
     // range.base_version, which then has the max version range.end_version. All or nothing: on failure the
     // tablet (rowsets, delete bitmap, files) is as before. Idempotent per snapshot dir.
+    //
+    // The restore job (the job id of the loader) must have loaded the local source into the tablet (the evidence
+    // RestoreStagePB of the tablet meta), and the evidence of the append is saved with the append. A resent task is
+    // judged by the evidence: appended -> OK; loaded and still at the base version -> append; loaded and already at
+    // the end version (the append was done without the evidence) -> OK if the digest of the tablet at the end
+    // version equals backup_digest (the digest of the backup of the tablet), else an error. Anything else is an
+    // error whose message has the prefix kRestoreNotRetryable, the FE cancels the job on it.
     Status append_increment(const std::string& snapshot_path, TabletSharedPtr tablet,
-                            const TRestoreIncrementalRange& range);
+                            const TRestoreIncrementalRange& range,
+                            const TRestoreBackupDigest* backup_digest = nullptr);
+
+    // The prefix of the error messages which make the FE cancel the restore job instead of resending the task.
+    static constexpr const char* kRestoreNotRetryable = "[RESTORE_NOT_RETRYABLE]";
 
     // The manifest root of each tablet uploaded by upload().
     const std::map<int64_t, std::string>& uploaded_manifest_roots() const {
@@ -363,6 +379,12 @@ public:
     }
 
 private:
+    // OK if the digest of the tablet at range.end_version equals the one of the backup (algorithm, schema and
+    // status checked), else an error of kRestoreNotRetryable. Not for a unique key tablet.
+    Status _check_appended_tablet_equals_backup(const TabletSharedPtr& tablet,
+                                                const TRestoreIncrementalRange& range,
+                                                const TRestoreBackupDigest* backup_digest);
+
     // Download the files of a tablet from the remote path to the local path, see download().
     Status _download_tablet_from_remote(const std::string& remote_path,
                                         const std::string& local_path, int64_t local_tablet_id,

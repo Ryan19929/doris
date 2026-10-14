@@ -204,7 +204,8 @@ Status SnapshotManager::release_snapshot(const string& snapshot_path) {
 
 Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
         const std::string& clone_dir, int64_t tablet_id, int64_t replica_id, int64_t table_id,
-        int64_t partition_id, int32_t schema_hash) {
+        int64_t partition_id, int32_t schema_hash, bool reset_restore_stage,
+        const RestoreStagePB* restore_stage) {
     SCOPED_SWITCH_THREAD_MEM_TRACKER_LIMITER(_mem_tracker);
     std::vector<PendingRowsetGuard> guards;
     // check clone dir existed
@@ -247,6 +248,14 @@ Result<std::vector<PendingRowsetGuard>> SnapshotManager::convert_rowset_ids(
         new_tablet_meta_pb.set_partition_id(partition_id);
     }
     new_tablet_meta_pb.set_schema_hash(schema_hash);
+    if (reset_restore_stage) {
+        // The evidence of the source (the tablet of an earlier restore) is not the evidence of the
+        // tablet being loaded. The one of this restore job, if any, is saved with the same meta.
+        new_tablet_meta_pb.clear_restore_stage();
+        if (restore_stage != nullptr) {
+            *new_tablet_meta_pb.mutable_restore_stage() = *restore_stage;
+        }
+    }
     TabletSchemaSPtr tablet_schema = std::make_shared<TabletSchema>();
     tablet_schema->init_from_pb(new_tablet_meta_pb.schema());
 

@@ -498,6 +498,10 @@ struct TSnapshotRequest {
     // restore_incremental the snapshot is loaded into the tablet at once (as the move of the restore does), and an
     // empty snapshot dir is made for the increment to be downloaded into.
     18: optional bool restore_local_source
+    // restore only: the id of the restore job. With restore_local_source, the evidence that the local source is
+    // loaded into the tablet by this job is saved with the tablet meta, to tell a resent task from a tablet
+    // which was changed.
+    19: optional i64 job_id
 }
 
 // Where to read the decomposed digest file (rdigest) of the tablet of a backup, for the incremental restore
@@ -549,6 +553,16 @@ struct TPartitionVersionInfo {
     4: optional i64 commit_tso = -1
 }
 
+// The logical digest of the tablet of a backup, as TLogicalDigest of MasterService.thrift (which can not be
+// included here), see there for the fields.
+struct TRestoreBackupDigest {
+    1: optional i32 algo_version
+    2: optional string schema_sig
+    3: optional string root
+    4: optional i64 rows
+    5: optional string status_code
+}
+
 struct TMoveDirReq {
     1: required Types.TTabletId tablet_id
     2: required Types.TSchemaHash schema_hash
@@ -557,6 +571,9 @@ struct TMoveDirReq {
     5: required bool overwrite
     // append the downloaded rowsets of this range to the tablet, instead of replacing the tablet
     6: optional TRestoreIncrementalRange incremental
+    // with incremental: the logical digest of the backup of the tablet at incremental.end_version, to tell whether
+    // the data of the tablet is already the backup when the evidence of the append is missing
+    7: optional TRestoreBackupDigest backup_logical_digest
 }
 
 enum TAgentServiceVersion {

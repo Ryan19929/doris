@@ -33,11 +33,14 @@
 #include <rapidjson/writer.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <istream>
 #include <set>
+#include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -58,13 +61,16 @@
 #include "io/hdfs_builder.h"
 #include "runtime/cluster_info.h"
 #include "runtime/exec_env.h"
+#include "service/backend_options.h"
 #include "service/http/http_client.h"
 #include "storage/data_dir.h"
+#include "storage/restore_digest/restore_digest.h"
 #include "storage/snapshot/snapshot_manager.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet/tablet.h"
 #include "storage/tablet/tablet_manager.h"
 #include "util/client_cache.h"
+#include "util/debug_points.h"
 #include "util/defer_op.h"
 #include "util/md5.h"
 #include "util/s3_uri.h"
@@ -74,6 +80,55 @@
 #include "util/thrift_rpc_helper.h"
 
 namespace doris {
+
+namespace {
+
+Status restore_not_retryable(const std::string& msg) {
+    return Status::InternalError("{} {}", SnapshotLoader::kRestoreNotRetryable, msg);
+}
+
+// Sleeps for the debug point `name` (param sleep_ms), if it is for this tablet (param tablet_id, any if unset)
+// and this backend (param backend, the host of the backend, any if unset).
+void restore_debug_delay(const char* name, int64_t tablet_id) {
+    DBUG_EXECUTE_IF(name, {
+        auto ptablet = dp->param<int64_t>("tablet_id", 0);
+        auto pbackend = dp->param<std::string>("backend", "");
+        if ((ptablet == 0 || ptablet == tablet_id) &&
+            (pbackend.empty() || pbackend == BackendOptions::get_localhost())) {
+            int64_t ms = dp->param<int64_t>("sleep_ms", 1000);
+            LOG(INFO) << "debug point " << name << ": sleep " << ms << " ms, tablet " << tablet_id;
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+    });
+}
+
+// What the restore job judges the staging tablet by: the evidence in the tablet meta, the max version, and whether
+// the tablet is still the one created by the job (only the empty initial rowset).
+struct RestoreTabletState {
+    bool has_stage = false;
+    RestoreStagePB stage;
+    int64_t max_version = -1;
+    bool initial_only = false;
+};
+
+RestoreTabletState read_restore_tablet_state(const TabletSharedPtr& tablet) {
+    RestoreTabletState state;
+    std::shared_lock rdlock(tablet->get_header_lock());
+    state.has_stage = tablet->tablet_meta()->has_restore_stage();
+    if (state.has_stage) {
+        state.stage = tablet->tablet_meta()->restore_stage();
+    }
+    state.max_version = tablet->max_version_unlocked();
+    const auto& metas = tablet->tablet_meta()->all_rs_metas();
+    if (metas.size() == 1) {
+        const auto& rs_meta = metas.begin()->second;
+        state.initial_only = rs_meta->start_version() == 0 && rs_meta->num_rows() == 0 &&
+                             rs_meta->num_segments() == 0 && !rs_meta->has_delete_predicate();
+    }
+    return state;
+}
+
+} // namespace
 
 struct LocalFileStat {
     uint64_t size;
@@ -2295,6 +2350,12 @@ Status SnapshotLoader::remote_http_download(
 // MUST hold tablet's header lock, push lock, cumulative lock and base compaction lock
 Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr tablet,
                             bool overwrite) {
+    return move_with_restore_stage(snapshot_path, tablet, overwrite, nullptr);
+}
+
+Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
+                                               TabletSharedPtr tablet, bool overwrite,
+                                               const RestoreStagePB* restore_stage) {
     // Take a lock to protect the local snapshot path.
     auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(snapshot_path);
 
@@ -2355,9 +2416,11 @@ Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr ta
     }
 
     // rename the rowset ids and tabletid info in rowset meta
-    auto res = _engine.snapshot_mgr()->convert_rowset_ids(snapshot_path, tablet_id,
-                                                          tablet->replica_id(), tablet->table_id(),
-                                                          tablet->partition_id(), schema_hash);
+    // The restore stage of the source is dropped (the snapshot of a tablet which an earlier restore
+    // loaded has it), the one of this restore, if any, is saved with the tablet meta by the reload.
+    auto res = _engine.snapshot_mgr()->convert_rowset_ids(
+            snapshot_path, tablet_id, tablet->replica_id(), tablet->table_id(),
+            tablet->partition_id(), schema_hash, true, restore_stage);
     if (!res.has_value()) [[unlikely]] {
         auto err_msg =
                 fmt::format("failed to convert rowsetids in snapshot: {}, tablet path: {}, err: {}",
@@ -2459,30 +2522,84 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
         return Status::Error<ErrorCode::TABLE_NOT_FOUND>("failed to get tablet. tablet={}",
                                                          request.tablet_id);
     }
-    TSnapshotRequest source_request = request;
-    source_request.__set_restore_incremental(false);
-    std::string source_path;
-    bool allow_incremental_clone = false; // not used
-    RETURN_IF_ERROR(_engine.snapshot_mgr()->make_snapshot(source_request, &source_path,
-                                                          &allow_incremental_clone, stats));
-    Defer release_source {[&]() {
-        Status st = _engine.snapshot_mgr()->release_snapshot(source_path);
-        if (!st.ok()) {
-            LOG(WARNING) << "failed to release the local source snapshot " << source_path << ": "
-                         << st;
+    restore_debug_delay("SnapshotLoader.make_local_source.delay", request.tablet_id);
+    const int64_t job_id = request.__isset.job_id ? request.job_id : _job_id;
+    if (job_id <= 0 || !request.__isset.version) {
+        return restore_not_retryable(
+                fmt::format("the snapshot task of tablet {} has no restore job id or no version",
+                            request.tablet_id));
+    }
+    const int64_t base_version = request.version;
+    bool already_loaded = false;
+    {
+        // A resent task: judge the tablet by the evidence of this job, never by the shape of the tablet.
+        RestoreTabletState state = read_restore_tablet_state(tablet);
+        if (state.has_stage) {
+            if (state.stage.job_id() != job_id) {
+                return restore_not_retryable(
+                        fmt::format("tablet {} was loaded by the restore job {}, not by job {}",
+                                    request.tablet_id, state.stage.job_id(), job_id));
+            }
+            const bool version_ok = state.stage.base_version() == base_version &&
+                                    ((state.stage.stage() == RestoreStagePB::LOCAL_LOADED &&
+                                      state.max_version == base_version) ||
+                                     (state.stage.stage() == RestoreStagePB::APPENDED &&
+                                      state.max_version == state.stage.end_version()));
+            if (!version_ok) {
+                return restore_not_retryable(fmt::format(
+                        "tablet {} has the evidence of job {} (stage {}, base version {}, end "
+                        "version {}) but its max version is {}, the local source of version {} "
+                        "can not be taken as loaded",
+                        request.tablet_id, job_id, static_cast<int>(state.stage.stage()),
+                        state.stage.base_version(), state.stage.end_version(), state.max_version,
+                        base_version));
+            }
+            already_loaded = true;
+        } else if (!state.initial_only) {
+            // overwriting is only allowed for the clean tablet the job created
+            return restore_not_retryable(fmt::format(
+                    "tablet {} has no evidence of the restore job {} and is not the empty tablet "
+                    "created by it, max version {}",
+                    request.tablet_id, job_id, state.max_version));
         }
-    }};
-    RETURN_IF_ERROR(
-            move(fmt::format("{}/{}/{}", source_path, request.tablet_id, request.schema_hash),
-                 tablet, true));
+    }
+    if (already_loaded) {
+        LOG(INFO) << "the local source of tablet " << request.tablet_id
+                  << " is already loaded by job " << job_id << ", skip loading it";
+    } else {
+        TSnapshotRequest source_request = request;
+        source_request.__set_restore_incremental(false);
+        std::string source_path;
+        bool allow_incremental_clone = false; // not used
+        RETURN_IF_ERROR(_engine.snapshot_mgr()->make_snapshot(source_request, &source_path,
+                                                              &allow_incremental_clone, stats));
+        Defer release_source {[&]() {
+            Status st = _engine.snapshot_mgr()->release_snapshot(source_path);
+            if (!st.ok()) {
+                LOG(WARNING) << "failed to release the local source snapshot " << source_path
+                             << ": " << st;
+            }
+        }};
+        // saved with the tablet meta of the load, so the evidence and the data are one step
+        RestoreStagePB stage;
+        stage.set_job_id(job_id);
+        stage.set_stage(RestoreStagePB::LOCAL_LOADED);
+        stage.set_base_version(base_version);
+        RETURN_IF_ERROR(move_with_restore_stage(
+                fmt::format("{}/{}/{}", source_path, request.tablet_id, request.schema_hash),
+                tablet, true, &stage));
+    }
     TSnapshotRequest empty_request = request;
     empty_request.__set_restore_local_source(false);
+    bool allow_incremental_clone = false; // not used
     return _engine.snapshot_mgr()->make_snapshot(empty_request, snapshot_path,
                                                  &allow_incremental_clone, nullptr);
 }
 
 Status SnapshotLoader::append_increment(const std::string& snapshot_path, TabletSharedPtr tablet,
-                                        const TRestoreIncrementalRange& range) {
+                                        const TRestoreIncrementalRange& range,
+                                        const TRestoreBackupDigest* backup_digest) {
+    restore_debug_delay("SnapshotLoader.append_increment.delay", tablet->tablet_id());
     auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(snapshot_path);
 
     auto tablet_path = tablet->tablet_path();
@@ -2502,17 +2619,79 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
         return Status::InternalError("path does not match. snapshot: {}, tablet path: {}",
                                      snapshot_path, tablet_path);
     }
+    // The same locks as the full / incremental clone and the move of the restore. They are taken before the
+    // judgement of a resent task, so that no compaction or push changes the tablet meanwhile; the header lock is
+    // not held by the judgement, as the digest it may compute takes the shared header lock.
+    std::unique_lock migration_lock(tablet->get_migration_lock(), std::try_to_lock);
+    std::unique_lock base_compact_lock(tablet->get_base_compaction_lock(), std::try_to_lock);
+    std::unique_lock cumu_compact_lock(tablet->get_cumulative_compaction_lock(), std::try_to_lock);
+    std::unique_lock cold_compact_lock(tablet->get_cold_compaction_lock(), std::try_to_lock);
+    std::unique_lock build_idx_lock(tablet->get_build_inverted_index_lock(), std::try_to_lock);
+    std::unique_lock meta_store_lock(tablet->get_meta_store_lock(), std::try_to_lock);
+    std::unique_lock push_lock(tablet->get_push_lock(), std::try_to_lock);
+    std::unique_lock rowset_update_lock(tablet->get_rowset_update_lock(), std::try_to_lock);
+    if (!migration_lock.owns_lock() || !base_compact_lock.owns_lock() ||
+        !cumu_compact_lock.owns_lock() || !cold_compact_lock.owns_lock() ||
+        !build_idx_lock.owns_lock() || !meta_store_lock.owns_lock() || !push_lock.owns_lock() ||
+        !rowset_update_lock.owns_lock()) {
+        // retryable, nothing is changed
+        return Status::ObtainLockFailed("failed to get tablet locks, tablet: {}", tablet_id);
+    }
+
+    // Judge by the evidence of this job in the tablet meta.
+    RestoreTabletState state = read_restore_tablet_state(tablet);
+    if (!state.has_stage || state.stage.job_id() != _job_id) {
+        return restore_not_retryable(fmt::format(
+                "tablet {} has no evidence that the restore job {} loaded it (evidence of job {}), "
+                "the increment ({}, {}] can not be appended",
+                tablet_id, _job_id, state.has_stage ? state.stage.job_id() : -1, range.base_version,
+                range.end_version));
+    }
+    if (state.stage.stage() == RestoreStagePB::APPENDED) {
+        if (state.max_version == range.end_version &&
+            state.stage.end_version() == range.end_version) {
+            LOG(INFO) << "the increment (" << range.base_version << ", " << range.end_version
+                      << "] is already appended to tablet " << tablet_id << " by job " << _job_id;
+            return Status::OK();
+        }
+        return restore_not_retryable(fmt::format(
+                "tablet {} has the evidence of the append up to version {} by job {}, but its max "
+                "version is {}, not the requested {}",
+                tablet_id, state.stage.end_version(), _job_id, state.max_version,
+                range.end_version));
+    }
+    if (state.stage.base_version() != range.base_version) {
+        return restore_not_retryable(fmt::format(
+                "tablet {} was loaded to version {} by job {}, not to the base version {} of the "
+                "increment",
+                tablet_id, state.stage.base_version(), _job_id, range.base_version));
+    }
+    if (state.max_version == range.end_version) {
+        // The increment is in the tablet but the evidence of it is not. The protection of the scheduler and the
+        // single save of the append make it impossible; if it happens check the data itself against the backup.
+        RETURN_IF_ERROR(_check_appended_tablet_equals_backup(tablet, range, backup_digest));
+        std::lock_guard wrlock(tablet->get_header_lock());
+        RestoreStagePB appended = state.stage;
+        appended.set_stage(RestoreStagePB::APPENDED);
+        appended.set_end_version(range.end_version);
+        tablet->tablet_meta()->set_restore_stage(appended);
+        tablet->save_meta();
+        LOG(INFO) << "the tablet " << tablet_id << " is at version " << range.end_version
+                  << " and equals the backup, the evidence of the append of job " << _job_id
+                  << " is written";
+        return Status::OK();
+    }
+    if (state.max_version != range.base_version) {
+        return restore_not_retryable(fmt::format(
+                "the max version of tablet {} is {}, neither the base version {} nor the end "
+                "version {} of the increment",
+                tablet_id, state.max_version, range.base_version, range.end_version));
+    }
+
     bool exists = false;
     RETURN_IF_ERROR(io::global_local_filesystem()->exists(snapshot_path, &exists));
     if (!exists) {
         return Status::InternalError("snapshot path does not exist: {}", snapshot_path);
-    }
-    bool already_loaded = false;
-    RETURN_IF_ERROR(io::global_local_filesystem()->exists(get_loaded_tag_path(snapshot_path),
-                                                          &already_loaded));
-    if (already_loaded) {
-        LOG(INFO) << "snapshot path already appended: " << snapshot_path;
-        return Status::OK();
     }
 
     // rename the rowset ids and tablet id info in the rowset metas (and the segment files)
@@ -2550,22 +2729,6 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
                                      snapshot_path, range.end_version);
     }
 
-    // The same locks as the full / incremental clone and the move of the restore.
-    std::unique_lock migration_lock(tablet->get_migration_lock(), std::try_to_lock);
-    std::unique_lock base_compact_lock(tablet->get_base_compaction_lock(), std::try_to_lock);
-    std::unique_lock cumu_compact_lock(tablet->get_cumulative_compaction_lock(), std::try_to_lock);
-    std::unique_lock cold_compact_lock(tablet->get_cold_compaction_lock(), std::try_to_lock);
-    std::unique_lock build_idx_lock(tablet->get_build_inverted_index_lock(), std::try_to_lock);
-    std::unique_lock meta_store_lock(tablet->get_meta_store_lock(), std::try_to_lock);
-    std::unique_lock push_lock(tablet->get_push_lock(), std::try_to_lock);
-    std::unique_lock rowset_update_lock(tablet->get_rowset_update_lock(), std::try_to_lock);
-    if (!migration_lock.owns_lock() || !base_compact_lock.owns_lock() ||
-        !cumu_compact_lock.owns_lock() || !cold_compact_lock.owns_lock() ||
-        !build_idx_lock.owns_lock() || !meta_store_lock.owns_lock() || !push_lock.owns_lock() ||
-        !rowset_update_lock.owns_lock()) {
-        // retryable, nothing is changed
-        return Status::ObtainLockFailed("failed to get tablet locks, tablet: {}", tablet_id);
-    }
     std::lock_guard wrlock(tablet->get_header_lock());
 
     // The local tablet must be what the increment was verified against.
@@ -2636,8 +2799,26 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
     if (mow) {
         bitmap_before = std::make_unique<DeleteBitmap>(tablet->tablet_meta()->delete_bitmap().snapshot());
     }
+    // The evidence of the append is saved by the same save_meta as the rowsets. With the debug point the append is
+    // done without it and fails afterwards: a tablet appended with no evidence, as a crash between the two
+    // steps of an implementation with separate saves would leave it.
+    bool skip_stage = false;
+    DBUG_EXECUTE_IF("SnapshotLoader.append_increment.fail_before_stage", {
+        auto ptablet = dp->param<int64_t>("tablet_id", 0);
+        if (ptablet == 0 || ptablet == tablet_id) {
+            skip_stage = true;
+        }
+    });
+    const RestoreStagePB stage_before = state.stage;
+    if (!skip_stage) {
+        RestoreStagePB appended = stage_before;
+        appended.set_stage(RestoreStagePB::APPENDED);
+        appended.set_end_version(range.end_version);
+        tablet->tablet_meta()->set_restore_stage(appended);
+    }
     Status st = tablet->revise_tablet_meta(rowsets, {}, true);
     if (!st.ok()) {
+        tablet->tablet_meta()->set_restore_stage(stage_before);
         if (mow) {
             tablet->tablet_meta()->delete_bitmap() = std::move(*bitmap_before);
         }
@@ -2648,10 +2829,58 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
                      << ", the tablet is unchanged: " << st;
         return st;
     }
+    if (skip_stage) {
+        return Status::InternalError(
+                "injected failure after the append of tablet {} and before the evidence is "
+                "written",
+                tablet_id);
+    }
     RETURN_IF_ERROR(write_loaded_tag(snapshot_path, tablet_id));
     LOG(INFO) << "finished to append the increment (" << range.base_version << ", "
               << range.end_version << "] to tablet " << tablet_id << ", " << rowsets.size()
               << " rowsets, job: " << _job_id << ", task id: " << _task_id;
+    return Status::OK();
+}
+
+Status SnapshotLoader::_check_appended_tablet_equals_backup(
+        const TabletSharedPtr& tablet, const TRestoreIncrementalRange& range,
+        const TRestoreBackupDigest* backup_digest) {
+    const int64_t tablet_id = tablet->tablet_id();
+    if (tablet->keys_type() == UNIQUE_KEYS) {
+        return restore_not_retryable(fmt::format(
+                "tablet {} is at version {} with no evidence of the append, and the digest can not "
+                "prove the hidden state of a unique key tablet",
+                tablet_id, range.end_version));
+    }
+    if (backup_digest == nullptr || !backup_digest->__isset.root ||
+        !backup_digest->__isset.schema_sig || !backup_digest->__isset.algo_version ||
+        !backup_digest->__isset.status_code || backup_digest->status_code != "OK") {
+        return restore_not_retryable(fmt::format(
+                "tablet {} is at version {} with no evidence of the append, and the request has no "
+                "usable digest of the backup to check it against",
+                tablet_id, range.end_version));
+    }
+    if (backup_digest->algo_version != static_cast<int32_t>(RestoreDigest::kAlgoVersion)) {
+        return restore_not_retryable(
+                fmt::format("the algorithm version {} of the digest of the backup is not {}",
+                            backup_digest->algo_version, RestoreDigest::kAlgoVersion));
+    }
+    LogicalDigestResult local;
+    Status st = get_tablet_logical_digest(_engine, tablet_id, range.end_version, 1,
+                                          RestoreDigestCache::instance(), &local);
+    if (!st.ok()) {
+        return restore_not_retryable(
+                fmt::format("failed to compute the digest of tablet {} at version {}: {}",
+                            tablet_id, range.end_version, st.to_string()));
+    }
+    if (local.algo_version != static_cast<uint32_t>(backup_digest->algo_version) ||
+        local.schema_sig != backup_digest->schema_sig || local.root != backup_digest->root ||
+        (backup_digest->__isset.rows && local.rows != static_cast<uint64_t>(backup_digest->rows))) {
+        return restore_not_retryable(fmt::format(
+                "tablet {} is at version {} with no evidence of the append and its digest differs "
+                "from the backup (local {}, backup {})",
+                tablet_id, range.end_version, local.root, backup_digest->root));
+    }
     return Status::OK();
 }
 

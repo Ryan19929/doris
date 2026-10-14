@@ -158,6 +158,17 @@ void remove_task_info(const TTaskType::type task_type, int64_t signature) {
 }
 
 void finish_task(const TFinishTaskRequest& finish_task_request) {
+    // Debug point: do not report the task (lost report), to see the FE resend it. Params: task_type (the
+    // TTaskType value, any if unset); use the execute limit of the debug point to lose it a limited number of times.
+    DBUG_EXECUTE_IF("WorkPool.finish_task.lost", {
+        auto ptype = dp->param<int>("task_type", -1);
+        if (ptype < 0 || ptype == static_cast<int>(finish_task_request.task_type)) {
+            LOG(INFO) << "debug point " << DP_NAME << ": the report of task type "
+                      << finish_task_request.task_type
+                      << " signature=" << finish_task_request.signature << " is lost";
+            return;
+        }
+    });
     // Return result to FE
     TMasterResult result;
     uint32_t try_time = 0;
@@ -1684,7 +1695,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     Status status;
     if (local_source && snapshot_request.__isset.restore_incremental &&
         snapshot_request.restore_incremental) {
-        SnapshotLoader loader(engine, ExecEnv::GetInstance(), 0, snapshot_request.tablet_id);
+        SnapshotLoader loader(engine, ExecEnv::GetInstance(),
+                              snapshot_request.__isset.job_id ? snapshot_request.job_id : 0,
+                              snapshot_request.tablet_id);
         SCOPED_ATTACH_TASK(loader.resource_ctx());
         status = loader.make_local_source_snapshot_and_load(snapshot_request, &snapshot_path,
                                                             &local_source_stats);
@@ -1868,7 +1881,10 @@ void move_dir_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
         SnapshotLoader loader(engine, env, move_dir_req.job_id, move_dir_req.tablet_id);
         SCOPED_ATTACH_TASK(loader.resource_ctx());
         if (move_dir_req.__isset.incremental) {
-            status = loader.append_increment(move_dir_req.src, tablet, move_dir_req.incremental);
+            status = loader.append_increment(move_dir_req.src, tablet, move_dir_req.incremental,
+                                             move_dir_req.__isset.backup_logical_digest
+                                                     ? &move_dir_req.backup_logical_digest
+                                                     : nullptr);
         } else {
             status = loader.move(move_dir_req.src, tablet, true);
         }
