@@ -94,6 +94,7 @@ import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TRemoteTabletSnapshot;
+import org.apache.doris.thrift.TRestoreBackupDigest;
 import org.apache.doris.thrift.TRestoreDigestPrefixSource;
 import org.apache.doris.thrift.TRestoreIncrementalRange;
 import org.apache.doris.thrift.TStatusCode;
@@ -243,6 +244,16 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // written when entering DOWNLOAD), kept after the job finishes.
     @SerializedName("rru")
     private RestoreReuseResult reuseResult;
+
+    // The ids of the staging partitions of an atomic restore whose data is loaded from a local source (kept or
+    // incrementally appended partitions): the tablet scheduler must not repair their replicas by clone while the job
+    // runs, a clone would replace the data the job loaded. Immutable, only replaced as a whole, so the tablet
+    // scheduler reads it without any lock. Built in finishVerifying (before the snapshot tasks are sent), empty
+    // before that and when the job is done, rebuilt from reuseResult when the job is replayed.
+    private volatile Set<Long> localSourceStagingPartitions = Collections.emptySet();
+
+    // The prefix of the error message of a backend which says that retrying the task cannot succeed.
+    public static final String RESTORE_NOT_RETRYABLE = "[RESTORE_NOT_RETRYABLE]";
     // The working state of partition level reuse while PENDING..VERIFYING, never persisted: the job is redone
     // from PENDING after a restart or a master switch.
     private transient List<ReuseCandidate> reuseCandidates = Lists.newArrayList();
@@ -377,6 +388,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishTabletSnapshotTask(SnapshotTask task, TFinishTaskRequest request) {
+        if (task.isRestoreLocalSource() && task.getJobId() == jobId
+                && cancelOnLocalSourceTaskFailure(task, request, RestoreJobState.SNAPSHOTING)) {
+            return false;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -592,6 +607,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
+        if (task.getIncrementalRange() != null && task.getJobId() == jobId
+                && cancelOnLocalSourceTaskFailure(task, request, RestoreJobState.COMMITTING)) {
+            return false;
+        }
         if (checkTaskStatus(task, task.getJobId(), request)) {
             return false;
         }
@@ -604,6 +623,52 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
 
         taskErrMsg.remove(task.getSignature());
+        return true;
+    }
+
+    /**
+     * The failure of a task of the local source (the snapshot task which loads the local source into a staging
+     * tablet, the move task which appends the increment): other tasks are resent without end, but these two cannot
+     * succeed forever if the tablet is not what the job expects, so the job is cancelled (an atomic restore leaves
+     * the original table alone) when
+     *  - the backend says that retrying is useless (the error has RESTORE_NOT_RETRYABLE), or
+     *  - the task failed more than Config.restore_local_source_task_max_retry times. A failure to obtain the tablet
+     *    locks is not counted: it is retried at once by design.
+     * The failure of the other tasks (whole snapshot, download, move) is not touched.
+     *
+     * @return true if the job is cancelled
+     */
+    private boolean cancelOnLocalSourceTaskFailure(AgentTask task, TFinishTaskRequest request,
+                                                   RestoreJobState expectedState) {
+        if (request.getTaskStatus().getStatusCode() == TStatusCode.OK) {
+            return false;
+        }
+        String errMsg = request.getTaskStatus().isSetErrorMsgs()
+                ? Joiner.on(",").join(request.getTaskStatus().getErrorMsgs()) : "";
+        if (request.getTaskStatus().getStatusCode() == TStatusCode.OBTAIN_LOCK_FAILED) {
+            // not counted
+            task.revertFailed();
+            return false;
+        }
+        boolean notRetryable = errMsg.contains(RESTORE_NOT_RETRYABLE);
+        if (!notRetryable && task.getFailedTimes() <= Config.restore_local_source_task_max_retry) {
+            return false;
+        }
+        taskErrMsg.put(task.getSignature(), errMsg);
+        if (state != expectedState) {
+            LOG.warn("ignore the failure of {} task {} in state {}: {}. {}", task.getTaskType(), task.getSignature(),
+                    state, errMsg, this);
+            return false;
+        }
+        LOG.warn("cancel restore job, {} task {} of tablet {} failed {} times on backend {}{}: {}. {}",
+                task.getTaskType(), task.getSignature(), task.getTabletId(), task.getFailedTimes(),
+                task.getBackendId(), notRetryable ? ", retrying is useless" : "", errMsg, this);
+        status = new Status(ErrCode.COMMON_ERROR, (notRetryable
+                ? "the backend " + task.getBackendId() + " cannot go on with tablet " + task.getTabletId()
+                : task.getTaskType() + " task of tablet " + task.getTabletId() + " failed "
+                        + task.getFailedTimes() + " times on backend " + task.getBackendId())
+                + ": " + errMsg);
+        cancelInternal(false);
         return true;
     }
 
@@ -2489,6 +2554,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         taskErrMsg.clear();
         AgentBoundedBatchTask batchTask = new AgentBoundedBatchTask(
                 Config.backup_restore_batch_task_num_per_rpc, Config.restore_task_concurrency_per_be);
+        // the tablet in the backup of each tablet of the restore, for the digest sent with an incremental append
+        Map<Long, Long> backupTabletIds = null;
         // tablet id->(be id -> download info)
         for (Cell<Long, Long, SnapshotInfo> cell : snapshotInfos.cellSet()) {
             SnapshotInfo info = cell.getValue();
@@ -2499,6 +2566,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             RestoreReuseResult.Decision incremental = getIncrementalDecision(info.getTblId(), info.getPartitionId());
             if (incremental != null) {
                 task.setIncrementalRange(incremental.version, incremental.targetVersion);
+                if (backupTabletIds == null) {
+                    backupTabletIds = buildBackupTabletIds();
+                }
+                task.setBackupLogicalDigest(getBackupLogicalDigest(backupTabletIds, info.getTabletId()));
             }
             batchTask.addTask(task);
             unfinishedSignatureToId.put(signature, info.getTabletId());
@@ -2511,6 +2582,36 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // No log here
         LOG.info("finished to send move dir tasks. num: {}. {}", batchTask.getTaskNum(), this);
         return;
+    }
+
+    // The tablet of the backup for each tablet of the restore, by the file mapping.
+    private Map<Long, Long> buildBackupTabletIds() {
+        Map<Long, Long> ids = Maps.newHashMap();
+        for (Map.Entry<IdChain, IdChain> entry : fileMapping.getMapping().entrySet()) {
+            ids.put(entry.getKey().getTabletId(), entry.getValue().getTabletId());
+        }
+        return ids;
+    }
+
+    /**
+     * The logical digest of the backup of a tablet to send with its incremental append, null if the backup has none.
+     * With it the backend can tell that a tablet at the end version without the evidence of the append equals the
+     * backup, otherwise it fails the task.
+     */
+    @VisibleForTesting
+    TRestoreBackupDigest getBackupLogicalDigest(Map<Long, Long> backupTabletIds, long tabletId) {
+        Long backupTabletId = backupTabletIds.get(tabletId);
+        LogicalDigestInfo digest = backupTabletId == null || jobInfo == null ? null
+                : jobInfo.getLogicalDigest(backupTabletId);
+        if (digest == null || !digest.hasDigest() || digest.algoVersion == null || digest.schemaSig == null) {
+            return null;
+        }
+        TRestoreBackupDigest thrift = new TRestoreBackupDigest();
+        thrift.setAlgoVersion(digest.algoVersion);
+        thrift.setSchemaSig(digest.schemaSig);
+        thrift.setRoot(digest.root);
+        thrift.setStatusCode("OK");
+        return thrift;
     }
 
     protected void waitingAllTabletsCommitted() {
@@ -2620,12 +2721,16 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
             finishedTime = commitTime;
             state = RestoreJobState.FINISHED;
+            clearLocalSourceStagingPartitions();
             env.getEditLog().logRestoreJob(this);
 
             // Only send release snapshot tasks after the job is finished.
             releaseSnapshots(savedSnapshotInfos, true);
         }
         showState = RestoreJobState.FINISHED;
+        if (isReplay) {
+            clearLocalSourceStagingPartitions();
+        }
 
         LOG.info("job is finished. is replay: {}. {}", isReplay, this);
         return Status.OK;
@@ -3382,6 +3487,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         fileMapping.removePartitions(kept);
         reuseResult = result;
+        // From now on the staging replicas are loaded from the local source, the tablet scheduler leaves them alone
+        // until the job is done.
+        setLocalSourceStagingPartitions(computeLocalSourceStagingPartitions(result));
         // The data of the partitions to download is about to change.
         invalidateRestoreLineageOfOverwrittenPartitions(db);
         clearReuseWorkingState();
@@ -3392,6 +3500,45 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         prepareAndSendSnapshotTaskForOlapTable(db);
         setState(RestoreJobState.SNAPSHOTING);
+    }
+
+    /** The staging partitions whose data is loaded from a local source, see localSourceStagingPartitions. */
+    @VisibleForTesting
+    static Set<Long> computeLocalSourceStagingPartitions(RestoreReuseResult result) {
+        if (result == null) {
+            return Collections.emptySet();
+        }
+        Set<Long> partitions = Sets.newHashSet();
+        for (RestoreReuseResult.Decision decision : result.getDecisions()) {
+            if (decision.atomic && (decision.kept || decision.incremental)) {
+                partitions.add(decision.stagingPartitionId);
+            }
+        }
+        return partitions.isEmpty() ? Collections.emptySet() : Collections.unmodifiableSet(partitions);
+    }
+
+    /** Whether the replicas of the partition are protected from repair by the tablet scheduler. Takes no lock. */
+    public boolean isLocalSourceStagingPartition(long partitionId) {
+        return localSourceStagingPartitions.contains(partitionId);
+    }
+
+    @VisibleForTesting
+    Set<Long> getLocalSourceStagingPartitions() {
+        return localSourceStagingPartitions;
+    }
+
+    /** Replaces the set and tells the backup handler, which keeps the ids of the jobs with a non-empty set. */
+    private void setLocalSourceStagingPartitions(Set<Long> partitions) {
+        this.localSourceStagingPartitions = partitions;
+        BackupHandler handler = env == null ? null : env.getBackupHandler();
+        if (handler != null) {
+            handler.syncLocalSourceJob(this);
+        }
+    }
+
+    /** The job is done: the staging partitions are no longer protected. */
+    private void clearLocalSourceStagingPartitions() {
+        setLocalSourceStagingPartitions(Collections.emptySet());
     }
 
     private boolean isStillAtVersion(Database db, ReuseCandidate candidate) {
@@ -3887,6 +4034,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             RestoreJobState curState = state;
             finishedTime = System.currentTimeMillis();
             setState(RestoreJobState.CANCELLED);
+            clearLocalSourceStagingPartitions();
             // log
             env.getEditLog().logRestoreJob(this);
             for (ColocatePersistInfo info : colocatePersistInfos) {
@@ -3904,6 +4052,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return;
         }
 
+        // replay
+        clearLocalSourceStagingPartitions();
         LOG.info("finished to cancel restore job. is replay: {}. {}", isReplay, this);
     }
 
@@ -4287,6 +4437,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         isAtomicRestore = Boolean.parseBoolean(properties.get(PROP_ATOMIC_RESTORE));
         isForceReplace = Boolean.parseBoolean(properties.get(PROP_FORCE_REPLACE));
         showState = state;
+        // The set is not persisted: rebuild it from the persisted decisions of a job which is not done. The backup
+        // handler learns about it when it adds the job (BackupHandler.addBackupOrRestoreJob).
+        if (state != RestoreJobState.FINISHED && state != RestoreJobState.CANCELLED) {
+            localSourceStagingPartitions = computeLocalSourceStagingPartitions(reuseResult);
+        }
     }
 
     @Override

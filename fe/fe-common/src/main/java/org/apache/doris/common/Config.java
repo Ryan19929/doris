@@ -2875,6 +2875,13 @@ public class Config extends ConfigBase {
             + "writes is not guaranteed to be consistent with the backup.")
     public static boolean restore_reuse_allow_hidden_state_models = false;
 
+    @ConfField(mutable = true, masterOnly = true, description = "The number of failures of an incremental append "
+            + "task or a local source snapshot task of an atomic restore after which the restore job is cancelled. "
+            + "An error which the backend says can not be retried (with the prefix [RESTORE_NOT_RETRYABLE]) cancels "
+            + "the job at once, a failure to obtain the tablet locks is not counted. The other tasks of the "
+            + "restore are resent without a limit as before.")
+    public static int restore_local_source_task_max_retry = 10;
+
     @ConfField(mutable = true, masterOnly = true, description = "The ratio of the candidate partitions to compute "
             + "the digest for in the sample check level, at least one partition.")
     public static double restore_reuse_sample_ratio = 0.1;

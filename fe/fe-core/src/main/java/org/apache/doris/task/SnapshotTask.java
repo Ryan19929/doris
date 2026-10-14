@@ -168,6 +168,8 @@ public class SnapshotTask extends AgentTask {
         }
         if (restoreLocalSource) {
             request.setRestoreLocalSource(true);
+            // the backend saves the evidence that this job loaded the local source with the tablet
+            request.setJobId(jobId);
         }
         return request;
     }
