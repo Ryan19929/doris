@@ -53,6 +53,7 @@
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
 #include "runtime/snapshot_loader.h"
+#include "service/backend_options.h"
 #include "storage/data_dir.h"
 #include "storage/delete/delete_handler.h"
 #include "storage/merger.h"
@@ -4974,6 +4975,23 @@ protected:
         return names;
     }
 
+    // The evidence that the restore job `job_id` loaded the local source of `base` into the tablet, which the append
+    // needs (the load of the local source writes it, these tablets are built by hand).
+    static void mark_loaded(const TabletSharedPtr& tablet, int64_t job_id, int64_t base,
+                            RestoreStagePB::Stage stage = RestoreStagePB::LOCAL_LOADED,
+                            int64_t end = 0) {
+        RestoreStagePB pb;
+        pb.set_job_id(job_id);
+        pb.set_stage(stage);
+        pb.set_base_version(base);
+        if (stage == RestoreStagePB::APPENDED) {
+            pb.set_end_version(end);
+        }
+        std::lock_guard lock(tablet->get_header_lock());
+        tablet->tablet_meta()->set_restore_stage(pb);
+        tablet->save_meta();
+    }
+
     void run_append(Kind kind, int64_t base_id) {
         _next_id = 940000 + base_id;
         auto src = create_kind(base_id, kind);
@@ -4984,6 +5002,7 @@ protected:
         ASSERT_NE(nullptr, whole);
         build_source(src, kind);
         build_local(local, kind);
+        mark_loaded(local, 1, 3);
         // the local data equals the source at the base version, laid out differently
         EXPECT_TRUE(digests_equal(tablet_digest(src->tablet_id(), 3), tablet_digest(local->tablet_id(), 3)));
         RestoreDigest local_before = tablet_digest(local->tablet_id(), 3);
@@ -5050,6 +5069,7 @@ TEST_F(RestoreIncrementalAppendTest, DeletePredicateIsAppendedWithTheRowset) {
         auto local = create_kind(base_id + 1, kind);
         build_source(src, kind);
         build_local(local, kind);
+        mark_loaded(local, 1, 3);
         std::string dir = make_increment_dir(src, local, 3, 6);
         SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
         TRestoreIncrementalRange range;
@@ -5076,6 +5096,7 @@ TEST_F(RestoreIncrementalAppendTest, WrongBaseVersionIsRefusedAndNothingChanges)
     auto local = create_tablet(7422, false);
     build_source(src, false);
     build_local(local, false);
+    mark_loaded(local, 1, 3);
     std::string dir = make_increment_dir(src, local, 3, 6);
     auto files_before = tablet_files(local);
     SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
@@ -5099,6 +5120,7 @@ TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
     auto whole = create_tablet(7433, true);
     build_source(src, true);
     build_local(local, true);
+    mark_loaded(local, 1, 3);
     std::string dir = make_increment_dir(src, local, 3, 6);
     auto files_before = tablet_files(local);
     RestoreDigest before = tablet_digest(7432, 3);
@@ -5120,6 +5142,9 @@ TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
     EXPECT_EQ(files_before, tablet_files(local));
     EXPECT_TRUE(digests_equal(before, tablet_digest(7432, 3)));
     EXPECT_FALSE(compute_tablet_restore_digest(*_engine, 7432, 4, &before).ok());
+    // the evidence is as before too: loaded, not appended
+    EXPECT_TRUE(local->tablet_meta()->has_restore_stage());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, local->tablet_meta()->restore_stage().stage());
 
     // the failure is gone: appending the same dir again works and equals the whole download
     DebugPoints::instance()->clear();
@@ -5471,6 +5496,532 @@ TEST_F(RestoreLocalSourceIncrementalTest, FailureLeavesNoSnapshot) {
     missing.__set_restore_incremental(true);
     EXPECT_FALSE(loader.make_local_source_snapshot_and_load(missing, &path, &stats).ok());
     EXPECT_EQ(dirs, snapshot_dirs(target));
+}
+
+// The evidence of the restore job in the tablet meta (RestoreStagePB): the judgement of the resent snapshot (load of
+// the local source) and move (append of the increment) tasks.
+class RestoreStageTest : public RestoreLocalSourceIncrementalTest {
+protected:
+    struct Prepared {
+        TabletSharedPtr backup;
+        TabletSharedPtr origin;
+        TabletSharedPtr target;
+        std::string dir;
+        TRestoreIncrementalRange range;
+        TRestoreBackupDigest backup_digest;
+    };
+
+    static bool not_retryable(const Status& st) {
+        return !st.ok() &&
+               st.to_string().find(SnapshotLoader::kRestoreNotRetryable) != std::string::npos;
+    }
+
+    TRestoreBackupDigest digest_of(const TabletSharedPtr& tablet, int64_t version) {
+        LogicalDigestResult result;
+        Status st = get_tablet_logical_digest(*_engine, tablet->tablet_id(), version, 1,
+                                              RestoreDigestCache::instance(), &result);
+        EXPECT_TRUE(st.ok()) << st;
+        TRestoreBackupDigest digest;
+        digest.__set_algo_version(static_cast<int32_t>(result.algo_version));
+        digest.__set_schema_sig(result.schema_sig);
+        digest.__set_root(result.root);
+        digest.__set_rows(static_cast<int64_t>(result.rows));
+        digest.__set_status_code("OK");
+        return digest;
+    }
+
+    TSnapshotRequest load_request(const Prepared& p, int64_t job_id) {
+        TSnapshotRequest req = local_source_request(p.origin, p.target, 3);
+        req.__set_restore_incremental(true);
+        req.__set_job_id(job_id);
+        return req;
+    }
+
+    // backup (data at 6), origin (equal to it at 3), and a fresh target
+    Prepared prepare(Kind kind, int64_t base_id) {
+        _next_id = 1100000 + base_id;
+        Prepared p;
+        p.backup = create_kind(base_id, kind);
+        p.origin = create_kind(base_id + 1, kind);
+        p.target = create_kind(base_id + 2, kind);
+        build_source(p.backup, kind);
+        build_local(p.origin, kind);
+        p.range.base_version = 3;
+        p.range.end_version = 6;
+        p.backup_digest = digest_of(p.backup, 6);
+        return p;
+    }
+
+    // the snapshot task of the restore job: loads the local source into the target, returns the empty dir
+    Status load(Prepared& p, SnapshotLoader& loader, int64_t job_id, LocalSourceStats* stats) {
+        std::string dir_path;
+        Status st = loader.make_local_source_snapshot_and_load(load_request(p, job_id), &dir_path,
+                                                               stats);
+        if (st.ok()) {
+            p.dir = fmt::format("{}/{}/{}", dir_path, p.target->tablet_id(),
+                                p.target->schema_hash());
+        }
+        return st;
+    }
+
+    TabletSharedPtr current(const TabletSharedPtr& tablet) {
+        return _engine->tablet_manager()->get_tablet(tablet->tablet_id());
+    }
+
+    RestoreStagePB stage_of(const TabletSharedPtr& tablet) {
+        auto t = current(tablet);
+        EXPECT_TRUE(t->tablet_meta()->has_restore_stage());
+        return t->tablet_meta()->restore_stage();
+    }
+
+    void debug_on() {
+        config::enable_debug_points = true;
+        DebugPoints::instance()->clear();
+    }
+    void debug_off() {
+        DebugPoints::instance()->clear();
+        config::enable_debug_points = false;
+    }
+};
+
+TEST_F(RestoreStageTest, TabletMetaKeepsTheStageAcrossSerialization) {
+    auto tablet = create_tablet(7701, false);
+    ASSERT_NE(nullptr, tablet);
+    EXPECT_FALSE(tablet->tablet_meta()->has_restore_stage());
+    TabletMetaPB pb;
+    tablet->tablet_meta()->to_meta_pb(&pb);
+    EXPECT_FALSE(pb.has_restore_stage());
+
+    mark_loaded(tablet, 42, 3, RestoreStagePB::APPENDED, 6);
+    std::string binary;
+    tablet->tablet_meta()->serialize(&binary);
+    TabletMeta restored;
+    ASSERT_TRUE(restored.deserialize(binary).ok());
+    ASSERT_TRUE(restored.has_restore_stage());
+    EXPECT_EQ(42, restored.restore_stage().job_id());
+    EXPECT_EQ(RestoreStagePB::APPENDED, restored.restore_stage().stage());
+    EXPECT_EQ(3, restored.restore_stage().base_version());
+    EXPECT_EQ(6, restored.restore_stage().end_version());
+    // the copy and the comparison know it
+    TabletMeta copy(restored);
+    EXPECT_TRUE(copy.has_restore_stage());
+    EXPECT_EQ(42, copy.restore_stage().job_id());
+    copy.clear_restore_stage();
+    EXPECT_FALSE(copy.has_restore_stage());
+    EXPECT_FALSE(restored == copy);
+    // the file of a snapshot dir
+    TabletMetaPB file_pb;
+    restored.to_meta_pb(&file_pb);
+    std::string file = tablet->tablet_path() + "/stage_roundtrip.hdr";
+    ASSERT_TRUE(TabletMeta::save(file, file_pb).ok());
+    TabletMetaPB loaded;
+    ASSERT_TRUE(TabletMeta::load_from_file(file, &loaded).ok());
+    EXPECT_EQ(42, loaded.restore_stage().job_id());
+    std::filesystem::remove(file);
+}
+
+// the snapshot of a tablet which an earlier restore loaded has its evidence, the load drops it; the evidence of this
+// job is saved by the same step; a move of the tablet to another disk (convert without reset) keeps it
+TEST_F(RestoreStageTest, ConvertRowsetIdsDropsTheSourceEvidenceAndWritesTheOneOfTheJob) {
+    _next_id = 1110000;
+    auto src = create_tablet(7711, false);
+    build_source(src, false);
+    mark_loaded(src, 7, 3, RestoreStagePB::APPENDED, 6);
+    auto make_dir = [&](const TabletSharedPtr& target) {
+        TSnapshotRequest req;
+        req.__set_tablet_id(src->tablet_id());
+        req.__set_schema_hash(src->schema_hash());
+        req.__set_version(6);
+        std::string path;
+        bool allow = false;
+        EXPECT_TRUE(_engine->snapshot_mgr()->make_snapshot(req, &path, &allow).ok());
+        return fmt::format("{}/{}/{}", path, src->tablet_id(), src->schema_hash());
+    };
+    auto hdr_stage = [&](const std::string& dir, bool* has) {
+        TabletMetaPB pb;
+        EXPECT_TRUE(TabletMeta::load_from_file(fmt::format("{}/{}.hdr", dir, src->tablet_id()), &pb)
+                            .ok());
+        *has = pb.has_restore_stage();
+        return pb.restore_stage();
+    };
+    bool has = false;
+    // the snapshot of the source carries the evidence (that is the trap)
+    std::string dir1 = make_dir(src);
+    EXPECT_EQ(7, hdr_stage(dir1, &has).job_id());
+    EXPECT_TRUE(has);
+    // without reset (storage migration, clone) it is kept
+    auto guards1 = _engine->snapshot_mgr()->convert_rowset_ids(
+            dir1, src->tablet_id(), src->replica_id(), src->table_id(), src->partition_id(),
+            src->schema_hash());
+    ASSERT_TRUE(guards1.has_value());
+    EXPECT_EQ(7, hdr_stage(dir1, &has).job_id());
+    EXPECT_TRUE(has);
+    // reset: dropped
+    std::string dir2 = make_dir(src);
+    auto guards2 = _engine->snapshot_mgr()->convert_rowset_ids(
+            dir2, src->tablet_id(), src->replica_id(), src->table_id(), src->partition_id(),
+            src->schema_hash(), true);
+    ASSERT_TRUE(guards2.has_value());
+    hdr_stage(dir2, &has);
+    EXPECT_FALSE(has);
+    // reset and the evidence of this job
+    std::string dir3 = make_dir(src);
+    RestoreStagePB mine;
+    mine.set_job_id(9);
+    mine.set_stage(RestoreStagePB::LOCAL_LOADED);
+    mine.set_base_version(3);
+    auto guards3 = _engine->snapshot_mgr()->convert_rowset_ids(
+            dir3, src->tablet_id(), src->replica_id(), src->table_id(), src->partition_id(),
+            src->schema_hash(), true, &mine);
+    ASSERT_TRUE(guards3.has_value());
+    auto stage = hdr_stage(dir3, &has);
+    EXPECT_TRUE(has);
+    EXPECT_EQ(9, stage.job_id());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage.stage());
+    EXPECT_EQ(3, stage.base_version());
+}
+
+// the four branches of the load of the local source
+TEST_F(RestoreStageTest, LoadWritesTheEvidenceAndTheResentTaskIsSkipped) {
+    Prepared p = prepare(Kind::DUP, 7721);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    TabletUid uid_before = p.target->tablet_uid();
+    LocalSourceStats stats;
+    // branch 3: no evidence, the empty initial tablet: loaded, with the evidence of the job
+    ASSERT_TRUE(load(p, loader, 1, &stats).ok());
+    EXPECT_EQ(1, stats.tablets);
+    auto loaded = current(p.target);
+    EXPECT_EQ(3, loaded->max_version_unlocked());
+    RestoreStagePB stage = stage_of(p.target);
+    EXPECT_EQ(1, stage.job_id());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage.stage());
+    EXPECT_EQ(3, stage.base_version());
+    // the load changed the uid of the tablet (convert_rowset_ids generates one), the judgement does not depend on it
+    EXPECT_NE(uid_before, loaded->tablet_uid());
+    auto files = tablet_files(loaded);
+    TabletUid uid_loaded = loaded->tablet_uid();
+    // branch 1: resent, the evidence of this job and the version: nothing is loaded again
+    LocalSourceStats again;
+    ASSERT_TRUE(load(p, loader, 1, &again).ok());
+    EXPECT_EQ(0, again.tablets);
+    EXPECT_EQ(uid_loaded, current(p.target)->tablet_uid());
+    EXPECT_EQ(files, tablet_files(current(p.target)));
+    // and the empty dir for the increment is there for the download
+    EXPECT_TRUE(std::filesystem::exists(p.dir));
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
+}
+
+TEST_F(RestoreStageTest, LoadRefusesTheEvidenceOfAnotherJobAndTheTabletWhichIsNotClean) {
+    Prepared p = prepare(Kind::DUP, 7731);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto files = tablet_files(current(p.target));
+    // branch 2: the evidence of another job
+    SnapshotLoader other(*_engine, ExecEnv::GetInstance(), 2L, 2L);
+    Status st = load(p, other, 2, nullptr);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    // branch 1 with a version which is not the evidence: the max version is not the base version
+    mark_loaded(current(p.target), 1, 3, RestoreStagePB::APPENDED, 6);
+    st = load(p, loader, 1, nullptr);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    // the request asks for another local source version than the evidence
+    mark_loaded(current(p.target), 1, 2);
+    st = load(p, loader, 1, nullptr);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    // nothing is replaced by the refused tasks
+    EXPECT_EQ(files, tablet_files(current(p.target)));
+    EXPECT_EQ(3, current(p.target)->max_version_unlocked());
+
+    // branch 4: no evidence, the tablet is not the empty one the job created
+    Prepared q = prepare(Kind::DUP, 7741);
+    write(q.target, q.target->tablet_schema(), 2, {{{1, 10}}}, false, true);
+    auto q_files = tablet_files(q.target);
+    st = load(q, loader, 1, nullptr);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    EXPECT_EQ(q_files, tablet_files(q.target));
+    EXPECT_EQ(2, q.target->max_version_unlocked());
+    // no job id: refused as well
+    TSnapshotRequest no_job = load_request(q, 1);
+    no_job.__isset.job_id = false;
+    SnapshotLoader no_id(*_engine, ExecEnv::GetInstance(), 0L, 2L);
+    std::string path;
+    st = no_id.make_local_source_snapshot_and_load(no_job, &path, nullptr);
+    EXPECT_TRUE(not_retryable(st)) << st;
+}
+
+// an empty local source, and the evidence lost: the shape of the loaded tablet (empty rowsets) is not taken for
+// the clean tablet of the job, the judgement is by the evidence only
+TEST_F(RestoreStageTest, EmptyLoadedTabletIsNotTakenForACleanOneWithoutEvidence) {
+    _next_id = 1120000;
+    auto origin = create_tablet(7751, false);
+    auto target = create_tablet(7752, false);
+    write(origin, origin->tablet_schema(), 2, {}, false, true);
+    write(origin, origin->tablet_schema(), 3, {}, false, true);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    TSnapshotRequest req = local_source_request(origin, target, 3);
+    req.__set_restore_incremental(true);
+    req.__set_job_id(1);
+    std::string path;
+    ASSERT_TRUE(loader.make_local_source_snapshot_and_load(req, &path, nullptr).ok());
+    auto loaded = current(target);
+    EXPECT_EQ(3, loaded->max_version_unlocked());
+    EXPECT_TRUE(loaded->tablet_meta()->has_restore_stage());
+    // resent: skipped by the evidence
+    LocalSourceStats again;
+    ASSERT_TRUE(loader.make_local_source_snapshot_and_load(req, &path, &again).ok());
+    EXPECT_EQ(0, again.tablets);
+    // after a compaction of the empty rowsets the evidence is still there
+    // the evidence is lost: it is refused, not loaded over
+    {
+        std::lock_guard lock(loaded->get_header_lock());
+        loaded->tablet_meta()->clear_restore_stage();
+        loaded->save_meta();
+    }
+    Status st = loader.make_local_source_snapshot_and_load(req, &path, nullptr);
+    EXPECT_TRUE(not_retryable(st)) << st;
+}
+
+// compaction keeps the evidence, the append is judged by the max version, not by the rowsets
+TEST_F(RestoreStageTest, CompactionBetweenLoadAndAppendDoesNotChangeTheJudgement) {
+    Prepared p = prepare(Kind::DUP, 7761);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    // compact the rowsets of version 2 and 3 into one, as a compaction of the staging tablet would
+    compact(loaded, loaded->tablet_schema(), 2, 3);
+    EXPECT_EQ(3, loaded->max_version_unlocked());
+    EXPECT_TRUE(loaded->tablet_meta()->has_restore_stage());
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    Status st = loader.append_increment(p.dir, loaded, p.range, &p.backup_digest);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(6, loaded->max_version_unlocked());
+    EXPECT_EQ(RestoreStagePB::APPENDED, stage_of(p.target).stage());
+    EXPECT_TRUE(digests_equal(tablet_digest(p.backup->tablet_id(), 6),
+                              tablet_digest(p.target->tablet_id(), 6)));
+}
+
+// the append branches 1 and 2, then the load resent after the append
+TEST_F(RestoreStageTest, AppendWritesTheEvidenceWithTheAppendAndTheResentTaskIsOk) {
+    Prepared p = prepare(Kind::DUP, 7771);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    ASSERT_TRUE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
+    RestoreStagePB stage = stage_of(p.target);
+    EXPECT_EQ(RestoreStagePB::APPENDED, stage.stage());
+    EXPECT_EQ(1, stage.job_id());
+    EXPECT_EQ(3, stage.base_version());
+    EXPECT_EQ(6, stage.end_version());
+    // the evidence is in the saved tablet meta, not only in memory
+    {
+        std::string binary;
+        loaded->tablet_meta()->serialize(&binary);
+        TabletMeta saved;
+        ASSERT_TRUE(saved.deserialize(binary).ok());
+        EXPECT_EQ(RestoreStagePB::APPENDED, saved.restore_stage().stage());
+    }
+    auto files = tablet_files(loaded);
+    // branch 1 again (no digest needed)
+    EXPECT_TRUE(loader.append_increment(p.dir, loaded, p.range).ok());
+    EXPECT_EQ(files, tablet_files(loaded));
+    // even if the snapshot dir is gone
+    std::filesystem::remove_all(p.dir);
+    EXPECT_TRUE(loader.append_increment(p.dir, loaded, p.range).ok());
+    // the snapshot task resent after the append: skipped, the tablet is not replaced
+    LocalSourceStats again;
+    ASSERT_TRUE(load(p, loader, 1, &again).ok());
+    EXPECT_EQ(0, again.tablets);
+    EXPECT_EQ(6, current(p.target)->max_version_unlocked());
+    // the append of another range or by another job is refused
+    TRestoreIncrementalRange other = p.range;
+    other.end_version = 7;
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, other)));
+    SnapshotLoader other_job(*_engine, ExecEnv::GetInstance(), 5L, 2L);
+    EXPECT_TRUE(not_retryable(other_job.append_increment(p.dir, loaded, p.range)));
+}
+
+TEST_F(RestoreStageTest, AppendWithoutTheEvidenceOfTheJobIsRefusedAndNothingChanges) {
+    Prepared p = prepare(Kind::DUP, 7781);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    auto files = tablet_files(loaded);
+    // another job
+    SnapshotLoader other(*_engine, ExecEnv::GetInstance(), 2L, 2L);
+    EXPECT_TRUE(not_retryable(other.append_increment(p.dir, loaded, p.range, &p.backup_digest)));
+    // loaded from another base version than the one the increment starts from
+    TRestoreIncrementalRange wrong = p.range;
+    wrong.base_version = 2;
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, wrong, &p.backup_digest)));
+    // no evidence at all
+    {
+        std::lock_guard lock(loaded->get_header_lock());
+        loaded->tablet_meta()->clear_restore_stage();
+        loaded->save_meta();
+    }
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest)));
+    // the max version is neither the base nor the end version
+    mark_loaded(loaded, 1, 3);
+    TRestoreIncrementalRange later = p.range;
+    later.base_version = 3;
+    later.end_version = 9;
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, later, &p.backup_digest)));
+    EXPECT_EQ(files, tablet_files(loaded));
+    EXPECT_EQ(3, loaded->max_version_unlocked());
+    // and with the evidence it works
+    EXPECT_TRUE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
+}
+
+// the increment is in the tablet but the evidence of it is not (debug point: the append is done without it and
+// fails): branch 3, the digest of the tablet is checked against the one of the backup
+TEST_F(RestoreStageTest, AppendedWithoutEvidenceIsOkWhenTheDigestEqualsTheBackup) {
+    Prepared p = prepare(Kind::DUP, 7791);
+    debug_on();
+    Defer defer([this]() { debug_off(); });
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    DebugPoints::instance()->add_with_params(
+            "SnapshotLoader.append_increment.fail_before_stage",
+            {{"tablet_id", std::to_string(p.target->tablet_id())}});
+    Status st = loader.append_increment(p.dir, loaded, p.range, &p.backup_digest);
+    EXPECT_FALSE(st.ok());
+    EXPECT_FALSE(not_retryable(st)) << st;
+    DebugPoints::instance()->clear();
+    // the data is appended, the evidence is still the one of the load
+    EXPECT_EQ(6, loaded->max_version_unlocked());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
+    // resent: the digest equals the backup: OK and the evidence is written
+    st = loader.append_increment(p.dir, loaded, p.range, &p.backup_digest);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(RestoreStagePB::APPENDED, stage_of(p.target).stage());
+    EXPECT_EQ(6, stage_of(p.target).end_version());
+    EXPECT_EQ(6, loaded->max_version_unlocked());
+    // once more: branch 1
+    EXPECT_TRUE(loader.append_increment(p.dir, loaded, p.range).ok());
+}
+
+TEST_F(RestoreStageTest, AppendedWithoutEvidenceFailsWhenTheDigestDiffersOrIsMissing) {
+    Prepared p = prepare(Kind::DUP, 7801);
+    debug_on();
+    Defer defer([this]() { debug_off(); });
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    DebugPoints::instance()->add("SnapshotLoader.append_increment.fail_before_stage");
+    EXPECT_FALSE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
+    DebugPoints::instance()->clear();
+    ASSERT_EQ(6, loaded->max_version_unlocked());
+
+    // no digest of the backup
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range)));
+    // the digest of the backup is another one (another version of it)
+    TRestoreBackupDigest other = digest_of(p.backup, 3);
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range, &other)));
+    // the algorithm, the schema, the status
+    TRestoreBackupDigest bad = p.backup_digest;
+    bad.__set_algo_version(bad.algo_version + 1);
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range, &bad)));
+    bad = p.backup_digest;
+    bad.__set_schema_sig("0000");
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range, &bad)));
+    bad = p.backup_digest;
+    bad.__set_status_code("ERROR");
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range, &bad)));
+    bad = p.backup_digest;
+    bad.__isset.root = false;
+    EXPECT_TRUE(not_retryable(loader.append_increment(p.dir, loaded, p.range, &bad)));
+    // none of them wrote the evidence
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
+    // the right digest works
+    EXPECT_TRUE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
+}
+
+// a unique key tablet: the digest does not prove the hidden state, so it fails even with an equal digest
+TEST_F(RestoreStageTest, AppendedWithoutEvidenceFailsForUniqueKeyTablets) {
+    Prepared p = prepare(Kind::MOW, 7811);
+    debug_on();
+    Defer defer([this]() { debug_off(); });
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    DebugPoints::instance()->add("SnapshotLoader.append_increment.fail_before_stage");
+    EXPECT_FALSE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
+    DebugPoints::instance()->clear();
+    ASSERT_EQ(6, loaded->max_version_unlocked());
+    EXPECT_TRUE(digests_equal(tablet_digest(p.backup->tablet_id(), 6),
+                              tablet_digest(p.target->tablet_id(), 6)));
+    Status st = loader.append_increment(p.dir, loaded, p.range, &p.backup_digest);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
+}
+
+// the failure of the append keeps the evidence of the load, so the retry appends
+TEST_F(RestoreStageTest, FailedAppendKeepsTheEvidenceOfTheLoadAndTheRetryAppends) {
+    Prepared p = prepare(Kind::DUP, 7821);
+    debug_on();
+    Defer defer([this]() { debug_off(); });
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    DebugPoints::instance()->add_with_params(
+            "Tablet.revise_tablet_meta_fail",
+            {{"tablet_id", std::to_string(p.target->tablet_id())}});
+    Status st = loader.append_increment(p.dir, loaded, p.range, &p.backup_digest);
+    EXPECT_FALSE(st.ok());
+    EXPECT_FALSE(not_retryable(st)) << st;
+    EXPECT_EQ(3, loaded->max_version_unlocked());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
+    DebugPoints::instance()->clear();
+    ASSERT_TRUE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
+    EXPECT_EQ(6, loaded->max_version_unlocked());
+    EXPECT_EQ(RestoreStagePB::APPENDED, stage_of(p.target).stage());
+}
+
+// the delay debug points: for the tablet and the backend they are set for
+TEST_F(RestoreStageTest, DelayDebugPointsDelayTheTaskOfTheTabletOnly) {
+    Prepared p = prepare(Kind::DUP, 7831);
+    debug_on();
+    Defer defer([this]() { debug_off(); });
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    auto elapsed_ms = [](const std::function<void()>& f) {
+        auto start = std::chrono::steady_clock::now();
+        f();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                .count();
+    };
+    // a debug point for another tablet or another backend: no delay
+    DebugPoints::instance()->add_with_params("SnapshotLoader.make_local_source.delay",
+                                             {{"sleep_ms", "400"}, {"tablet_id", "1"}});
+    EXPECT_LT(elapsed_ms([&]() { ASSERT_TRUE(load(p, loader, 1, nullptr).ok()); }), 400);
+    DebugPoints::instance()->add_with_params("SnapshotLoader.make_local_source.delay",
+                                             {{"sleep_ms", "400"}, {"backend", "no.such.host"}});
+    EXPECT_LT(elapsed_ms([&]() { ASSERT_TRUE(load(p, loader, 1, nullptr).ok()); }), 400);
+    // the tablet
+    DebugPoints::instance()->add_with_params(
+            "SnapshotLoader.make_local_source.delay",
+            {{"sleep_ms", "400"}, {"tablet_id", std::to_string(p.target->tablet_id())}});
+    EXPECT_GE(elapsed_ms([&]() { ASSERT_TRUE(load(p, loader, 1, nullptr).ok()); }), 400);
+    DebugPoints::instance()->clear();
+
+    auto loaded = current(p.target);
+    put_increment(p.backup, p.target, p.dir, 3, 6);
+    DebugPoints::instance()->add_with_params(
+            "SnapshotLoader.append_increment.delay",
+            {{"sleep_ms", "400"}, {"backend", BackendOptions::get_localhost()}});
+    EXPECT_GE(
+            elapsed_ms([&]() {
+                ASSERT_TRUE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
+            }),
+            400);
 }
 
 } // namespace doris
