@@ -1,6 +1,6 @@
 # Restore / CCR 全量同步的本地数据复用
 
-目标是让 Restore 和 CCR 全量同步时，目标端已有且内容一致的数据不再重复下载。证明不了一致就照常下载，结果与完整下载相同；所有新能力默认关闭。
+目标是让 Restore 和 CCR 全量同步时，目标端已有且内容一致的数据不再重复下载。证明不了一致就照常下载，结果与完整下载相同；复用相关的能力默认关闭。注意"复用开关全关"不等于没有任何新行为：备份文件清单（Manifest）默认会生成，文件集合与大小校验默认开启，备份侧会多一次文件清单的计算和存储，开销见 [manifest-design.md](./manifest-design.md)。
 
 ## 代码位置
 
@@ -20,6 +20,13 @@
 | [stuck-append-analysis.md](./stuck-append-analysis.md) | 原子恢复 + 增量补齐卡在 COMMITTING 的根因分析 |
 | [stuck-append-fix-plan.md](./stuck-append-fix-plan.md) | 上述问题的修复方案（已两轮审查） |
 
+## 复用范围（首版）
+
+- **只复用 Duplicate 表。** Unique 表（MoW、MoR）的删除标记行、被覆盖的旧版本等隐藏状态不在摘要里，摘要相同的两个分区，之后同一笔写入的结果可能不同，所以默认整体下载，原因记为 `HIDDEN_STATE_MOW`、`HIDDEN_STATE_MOR`。FE 配置 `restore_reuse_allow_hidden_state_models`（默认 false）可以恢复旧行为，仅供实验，不保证一致。
+- **默认每个复用的分区都有摘要证明。** `restore_reuse_default_check_level` 默认 `full`；`off`、`sample` 默认也按 `full` 执行，除非打开 `restore_reuse_allow_unverified_keep`（默认 false，仅供实验和观测，不提供一致性保证）。`SHOW RESTORE` 里同时显示请求的档位和实际生效的档位。
+- **谱系戳带来源集群 ID。** 备份记录源端集群 ID，谱系戳随之记录，两边都有且不相等时不作为候选。集群 ID 是初始化时生成的随机整数，不是全局唯一标识，只用来缩小候选范围，不当作证明；任何一边缺失（旧备份、旧谱系戳）时仍可作为候选，由摘要兜底。
+- **"查询结果相同"的含义。** 摘要证明的是在备份版本上的可见数据相同，不含隐藏列（如 `__DORIS_VERSION_COL__`，它随写入历史而不同，`show_hidden_columns=true` 时可见）。
+
 ## 当前状态
 
 已实现：
@@ -28,7 +35,7 @@
 - 备份完整性校验；
 - 复用观测；
 - 分区级复用（逻辑摘要）；
-- 增量补齐（含 MoR、带 DELETE 条件的 MoW）；
+- 增量补齐（实现上含 MoR、带 DELETE 条件的 MoW，但首版按上面的范围，默认只对 Duplicate 表生效）；
 - 原子恢复路径；
 - 摘要缓存修复。
 

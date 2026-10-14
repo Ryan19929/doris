@@ -156,7 +156,7 @@
    - **改法**：只有当暂存 tablet **只有一个 0 段的初始 rowset `[0, V_b]`** 时才允许替换，否则跳过并返回 OK。这个判据在 BE 重启、迁移、GC 之后都成立，也不会留下残留文件。
    - 前面第 2 条那种"装载后被冲成空的 V_b"，克隆出来的是带数据段的 rowset，不会被误认为初始 rowset，所以不会再次替换。这种情况交给 (a) 判定，作业失败。
 
-5. **FE 在 COMMITTING 阶段重启：增量分区可能少一段数据（已核实）。** `unfinishedSignatureToId` 不持久化（`AbstractJob.java:89`）。`replayRun` 只处理 DOWNLOAD 和 FINISHED（`RestoreJob.java:621-633`）。重启后 COMMITTING 状态下这个集合是空的，`waitingAllTabletsCommitted`（`:2515-2523`）会立即提交。Doris 原有的整体移动也有这个问题，后果是"目录没有替换"；增量路径的后果是"少追加一段数据"。
+5. **FE 在 COMMITTING 阶段重启：增量分区可能少一段数据（已核实）。** `unfinishedSignatureToId` 不持久化（`AbstractJob.java:89`）。`replayRun` 只处理 DOWNLOAD 和 FINISHED（`RestoreJob.java:621-633`）。COMMITTING 不写编辑日志，重启后（或切主后）作业回放到的最后状态是 COMMIT，会重新下发移动任务；所以要求重发的移动任务可以安全重做。如果仍然在 COMMITTING 状态下运行而 `unfinishedSignatureToId` 为空，`waitingAllTabletsCommitted`（`:2515-2523`）会立即提交，这是需要避免的路径，以下修复针对它。Doris 原有的整体移动也有这个问题，后果是"目录没有替换"；增量路径的后果是"少追加一段数据"。
    - **改法（只对有增量决定的作业）**：用一个不持久化的标记，记录"本进程是否已下发过 COMMITTING 的移动任务"。如果作业处于 COMMITTING、有增量决定、但本进程还没下发过，就退回 COMMIT，重新下发移动任务。重发是安全的：已完成的追加由 loaded tag 和 (a) 判定为已存在，直接返回 OK。
    - 没有增量决定的作业保持原有行为。
 
