@@ -158,15 +158,26 @@ void remove_task_info(const TTaskType::type task_type, int64_t signature) {
 }
 
 void finish_task(const TFinishTaskRequest& finish_task_request) {
-    // Debug point: do not report the task (lost report), to see the FE resend it. Params: task_type (the
-    // TTaskType value, any if unset); use the execute limit of the debug point to lose it a limited number of times.
+    // Debug point: the report of the task is lost, to see the FE resend the task. Params: task_type (the TTaskType
+    // value, any if unset), times (how many reports are lost after the debug point is added, default 1).
     DBUG_EXECUTE_IF("WorkPool.finish_task.lost", {
+        static std::mutex lost_mutex;
+        static const DebugPoint* lost_for = nullptr;
+        static int lost_times = 0;
         auto ptype = dp->param<int>("task_type", -1);
         if (ptype < 0 || ptype == static_cast<int>(finish_task_request.task_type)) {
-            LOG(INFO) << "debug point " << DP_NAME << ": the report of task type "
-                      << finish_task_request.task_type
-                      << " signature=" << finish_task_request.signature << " is lost";
-            return;
+            std::lock_guard lock(lost_mutex);
+            if (lost_for != dp.get()) {
+                lost_for = dp.get();
+                lost_times = 0;
+            }
+            if (lost_times < dp->param<int>("times", 1)) {
+                ++lost_times;
+                LOG(INFO) << "debug point " << DP_NAME << ": the report of task type "
+                          << finish_task_request.task_type
+                          << " signature=" << finish_task_request.signature << " is lost";
+                return;
+            }
         }
     });
     // Return result to FE

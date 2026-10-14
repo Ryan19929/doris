@@ -2356,6 +2356,14 @@ Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr ta
 Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
                                                TabletSharedPtr tablet, bool overwrite,
                                                const RestoreStagePB* restore_stage) {
+    // Debug point: the move fails (params: tablet_id, any if unset), for the failure of the whole move.
+    DBUG_EXECUTE_IF("SnapshotLoader.move.fail", {
+        auto ptablet = dp->param<int64_t>("tablet_id", 0);
+        if (ptablet == 0 || ptablet == tablet->tablet_id()) {
+            return Status::InternalError("injected failure of the move of tablet {}",
+                                         tablet->tablet_id());
+        }
+    });
     // Take a lock to protect the local snapshot path.
     auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(snapshot_path);
 
