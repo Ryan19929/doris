@@ -93,12 +93,68 @@ public final class RestoreReuseJudge {
         }
     }
 
-    /** The check level that the partitions of a table are judged with. Unique tables do not allow OFF. */
+    /**
+     * The effective check level that the partitions of a table are judged with, from the level requested by the job
+     * (the property or the default). Every caller (the selection of the candidates, the estimate of the shadow
+     * statistics) gets the level here, so the downstream code only sees the effective one.
+     *
+     * <p>Unless Config.restore_reuse_allow_unverified_keep is true, OFF and SAMPLE are taken as FULL: a partition is
+     * kept or appended only if the digest of every replica proves it, the lineage stamp and L0 only select the
+     * candidates. If it is true, the requested level takes effect as before, and a unique table does not allow OFF
+     * (it is upgraded to SAMPLE). DISABLE is never changed.
+     */
     public static CheckLevel levelOfTable(CheckLevel jobLevel, KeysType keysType) {
+        if (jobLevel == CheckLevel.DISABLE) {
+            return jobLevel;
+        }
+        if (!Config.restore_reuse_allow_unverified_keep) {
+            return CheckLevel.FULL;
+        }
         if (jobLevel == CheckLevel.OFF && keysType == KeysType.UNIQUE_KEYS) {
             return CheckLevel.SAMPLE;
         }
         return jobLevel;
+    }
+
+    // ---- the cluster id of the source ----
+
+    private static boolean clusterKnown(long clusterId) {
+        return clusterId != RestoreLineage.UNKNOWN_CLUSTER_ID;
+    }
+
+    /** Both cluster ids are known and differ. An unknown one (an old stamp or backup) does not differ. */
+    public static boolean clusterDiffers(long a, long b) {
+        return clusterKnown(a) && clusterKnown(b) && a != b;
+    }
+
+    private static boolean clusterKnownEqual(long a, long b) {
+        return clusterKnown(a) && clusterKnown(b) && a == b;
+    }
+
+    /**
+     * Whether the L0 check that passed also compared the cluster id of the source on both sides, and they are equal.
+     * If not (an old stamp or backup has no cluster id) the partition is only a candidate for the digest, and must
+     * not be kept without one (check level off with Config.restore_reuse_allow_unverified_keep).
+     */
+    public static boolean clusterProven(Input in, String l0Path) {
+        if (L0_FORWARD.equals(l0Path)) {
+            RestoreLineage lineage = in.localPartition == null ? null : in.localPartition.getRestoreLineage();
+            return lineage != null
+                    && clusterKnownEqual(lineage.getSrcClusterId(), in.jobInfo.getSrcClusterIdOrUnknown());
+        } else if (L0_REVERSE.equals(l0Path)) {
+            return in.backupLineage != null
+                    && clusterKnownEqual(in.backupLineage.getSrcClusterId(), in.localClusterId);
+        } else if (L0_TABLE.equals(l0Path)) {
+            RestoreSource localSource = in.localTable.getRestoreSource();
+            if (localSource != null && localSource.isSameSource(in.jobInfo.dbId, in.backupTable.id)
+                    && clusterKnownEqual(localSource.getSrcClusterId(), in.jobInfo.getSrcClusterIdOrUnknown())) {
+                return true;
+            }
+            return in.backupTableSource != null
+                    && in.backupTableSource.isSameSource(in.localDbId, in.localTable.getId())
+                    && clusterKnownEqual(in.backupTableSource.getSrcClusterId(), in.localClusterId);
+        }
+        return false;
     }
 
     /** What a condition needs to know about a partition to restore. */
@@ -117,6 +173,8 @@ public final class RestoreReuseJudge {
         public BackupPartitionInfo backupPartition;
         public long srcCommitSeq;
         public long localDbId;
+        // The cluster id of this cluster (Env#getClusterId), for the reverse checks.
+        public long localClusterId = RestoreLineage.UNKNOWN_CLUSTER_ID;
         public OlapTable localTable;
         public Partition localPartition;
         // What the backup meta carried before it was cleared (see RestoreJob#clearRestoreLineageInBackupMeta), for
@@ -127,6 +185,8 @@ public final class RestoreReuseJudge {
         public OlapTable backupOlapTable;
         // Set by checkL0: the L0 check that passed, null if none did.
         public String l0Path;
+        // Set with l0Path: the cluster id of the source was compared on both sides and equal, see clusterProven.
+        public boolean clusterProven;
         // The incremental append is allowed (the FE configs enable_restore_incremental_append and
         // enable_restore_partition_reuse), see firstRejectIncremental.
         public boolean incrementalEnabled;
@@ -170,10 +230,12 @@ public final class RestoreReuseJudge {
         RestoreReuseShadowStats.L0Verdict check(Input in) {
             if (in.relationOnly) {
                 return RestoreReuseShadowStats.checkL0Relation(in.localPartition, in.jobInfo.dbId,
-                        in.backupTable.id, in.backupPartition.id, in.srcCommitSeq);
+                        in.backupTable.id, in.backupPartition.id, in.srcCommitSeq,
+                        in.jobInfo.getSrcClusterIdOrUnknown());
             }
             return RestoreReuseShadowStats.checkL0(in.localPartition, in.jobInfo.dbId, in.backupTable.id,
-                    in.backupPartition.id, in.backupPartition.version, in.srcCommitSeq);
+                    in.backupPartition.id, in.backupPartition.version, in.srcCommitSeq,
+                    in.jobInfo.getSrcClusterIdOrUnknown());
         }
     };
 
@@ -195,6 +257,9 @@ public final class RestoreReuseJudge {
             }
             if (!in.backupLineage.isSameSource(in.localDbId, in.localTable.getId(), in.localPartition.getId())) {
                 return RestoreReuseShadowStats.L0Verdict.LINEAGE_MISMATCH;
+            }
+            if (clusterDiffers(in.backupLineage.getSrcClusterId(), in.localClusterId)) {
+                return RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH;
             }
             if (!in.relationOnly && in.backupPartition.version != in.localPartition.getVisibleVersion()) {
                 return RestoreReuseShadowStats.L0Verdict.VERSION_MISMATCH;
@@ -223,6 +288,14 @@ public final class RestoreReuseJudge {
                     && in.backupTableSource.isSameSource(in.localDbId, in.localTable.getId());
             if (!forward && !reverse) {
                 return RestoreReuseShadowStats.L0Verdict.NO_TABLE_RELATION;
+            }
+            // the source cluster: forward, the one the local table was restored from against the one of the backup;
+            // reverse, the one the backup table was restored from against this cluster. Unknown is not a mismatch.
+            forward = forward && !clusterDiffers(localSource.getSrcClusterId(),
+                    in.jobInfo.getSrcClusterIdOrUnknown());
+            reverse = reverse && !clusterDiffers(in.backupTableSource.getSrcClusterId(), in.localClusterId);
+            if (!forward && !reverse) {
+                return RestoreReuseShadowStats.L0Verdict.CLUSTER_MISMATCH;
             }
             if (!sameRange(in)) {
                 return RestoreReuseShadowStats.L0Verdict.PARTITION_MISMATCH;
@@ -336,6 +409,7 @@ public final class RestoreReuseJudge {
         RestoreReuseShadowStats.L0Verdict[] first = new RestoreReuseShadowStats.L0Verdict[1];
         in.l0Path = passedL0(in, first);
         if (in.l0Path != null) {
+            in.clusterProven = clusterProven(in, in.l0Path);
             return null;
         }
         return "L0_" + (first[0] == null ? "FAILED" : first[0].name());
@@ -455,6 +529,7 @@ public final class RestoreReuseJudge {
         if (in.l0Path == null) {
             return "L0_" + (first[0] == null ? "FAILED" : first[0].name());
         }
+        in.clusterProven = clusterProven(in, in.l0Path);
         long localVersion = in.localPartition.getVisibleVersion();
         if (localVersion >= in.backupPartition.version) {
             return localVersion == in.backupPartition.version ? "INCREMENTAL_SAME_VERSION"
@@ -470,6 +545,11 @@ public final class RestoreReuseJudge {
     // is checkDigestPresent / checkIncrementalSources.
     static String checkIncrementalModel(Input in) {
         KeysType keysType = in.localTable.getKeysType();
+        // the unique tables have a hidden state that the digest does not cover, see checkSupported
+        RestoreReuseShadowStats.Unsupported hidden = RestoreReuseShadowStats.checkHiddenState(in.localTable);
+        if (hidden != RestoreReuseShadowStats.Unsupported.NONE) {
+            return hidden.name();
+        }
         if (keysType == KeysType.DUP_KEYS || keysType == KeysType.UNIQUE_KEYS) {
             // A table with binlog is fine: a restore never carries the binlog of the snapshot, the whole download
             // does not either.

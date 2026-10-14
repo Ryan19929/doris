@@ -208,6 +208,13 @@ public class RestoreLineageTest {
         String json = GsonUtils.GSON.toJson(lineage);
         Assertions.assertEquals("{\"db\":1,\"tbl\":2,\"part\":3,\"ver\":4,\"seq\":5,\"bt\":6,\"rt\":7}", json);
         Assertions.assertEquals(lineage, GsonUtils.GSON.fromJson(json, RestoreLineage.class));
+        // the cluster id of the source is written only if known
+        RestoreLineage withCluster = new RestoreLineage(1, 2, 3, 4, 5, 6, 7, 8);
+        String clusterJson = GsonUtils.GSON.toJson(withCluster);
+        Assertions.assertEquals("{\"db\":1,\"tbl\":2,\"part\":3,\"ver\":4,\"seq\":5,\"bt\":6,\"rt\":7,"
+                + "\"cid\":8}", clusterJson);
+        Assertions.assertEquals(withCluster, GsonUtils.GSON.fromJson(clusterJson, RestoreLineage.class));
+        Assertions.assertNotEquals(lineage, withCluster);
     }
 
     @Test
@@ -512,7 +519,8 @@ public class RestoreLineageTest {
         Assertions.assertEquals("{\"partitions\":4,\"reusable\":1,\"reusable_bytes_single_replica\":" + bytes
                 + ",\"reusable_a\":1,\"reusable_b\":0,\"reusable_c\":0,"
                 + "\"l0_passed_but_atomic_restore\":0,\"l0_passed_but_aggregate_table\":0,"
-                + "\"l0_passed_but_remote_storage\":0,\"no_local\":2,\"no_lineage\":0,\"lineage_mismatch\":0,"
+                + "\"l0_passed_but_remote_storage\":0,\"l0_passed_but_hidden_state_mow\":0,"
+                + "\"l0_passed_but_hidden_state_mor\":0,\"cluster_mismatch\":0,\"no_local\":2,\"no_lineage\":0,\"lineage_mismatch\":0,"
                 + "\"local_version_changed\":1,\"source_version_changed\":0,\"commit_seq_mismatch\":0}", shown);
         Assertions.assertEquals(ShowRestoreCommand.BRIEF_TITLE_NAMES.size(), job.getBriefInfo().size());
 

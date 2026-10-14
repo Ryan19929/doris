@@ -18,6 +18,7 @@
 package org.apache.doris.backup;
 
 import org.apache.doris.backup.RestoreFileMapping.IdChain;
+import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OdbcCatalogResource;
@@ -25,6 +26,7 @@ import org.apache.doris.catalog.OdbcTable;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Resource;
+import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Tablet;
@@ -114,6 +116,12 @@ public class BackupJobInfo implements GsonPostProcessable {
 
     @SerializedName("table_commit_seq_map")
     public Map<Long, Long> tableCommitSeqMap;
+
+    // The cluster id of the cluster that took the backup (Env#getClusterId). Null (absent in the json) for a backup by
+    // an old version. It is not unique (a random int made when the cluster is initialized, and a standby cluster
+    // built from a cold copy of the image shares it), so it only narrows the candidates of partition level reuse.
+    @SerializedName("scid")
+    public Long srcClusterId;
 
     // The version of the manifest. The manifest of each tablet snapshot (the complete list of its files) is a file
     // next to the tablet data, one level up; the job info only records its SHA-256, the manifest root, see
@@ -666,6 +674,7 @@ public class BackupJobInfo implements GsonPostProcessable {
         jobInfo.metaVersion = FeConstants.meta_version;
         jobInfo.content = content;
         jobInfo.tableCommitSeqMap = tableCommitSeqMap;
+        jobInfo.srcClusterId = (long) Env.getCurrentEnv().getClusterId();
         jobInfo.majorVersion = Version.DORIS_BUILD_VERSION_MAJOR;
         jobInfo.minorVersion = Version.DORIS_BUILD_VERSION_MINOR;
         jobInfo.patchVersion = Version.DORIS_BUILD_VERSION_PATCH;
@@ -922,6 +931,11 @@ public class BackupJobInfo implements GsonPostProcessable {
      * Whether this backup has a manifest that this version can check. A manifest of an unknown (newer) version
      * is not checked, never fails a restore.
      */
+    /** The cluster id of the source cluster, {@link RestoreLineage#UNKNOWN_CLUSTER_ID} for an old backup. */
+    public long getSrcClusterIdOrUnknown() {
+        return srcClusterId == null ? RestoreLineage.UNKNOWN_CLUSTER_ID : srcClusterId;
+    }
+
     public boolean hasManifest() {
         return manifestVersion != null && manifestVersion == MANIFEST_VERSION;
     }

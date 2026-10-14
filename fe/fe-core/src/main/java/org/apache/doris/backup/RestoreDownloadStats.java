@@ -232,6 +232,15 @@ public class RestoreDownloadStats {
      */
     public String toJson(long currentTotalReplicas, long keptBytes, long keptAtomicBytes,
             long incrementalLocalBytes) {
+        return toJson(currentTotalReplicas, keptBytes, keptAtomicBytes, incrementalLocalBytes, null);
+    }
+
+    /**
+     * @param checkLevel the check levels of partition level reuse (requested, effective, kept without proof), see
+     *         {@link RestoreReuseResult#levelSummary()}, not shown if null
+     */
+    public String toJson(long currentTotalReplicas, long keptBytes, long keptAtomicBytes,
+            long incrementalLocalBytes, Map<String, Object> checkLevel) {
         long total = isFixed() ? totalReplicas : currentTotalReplicas;
         Map<String, Object> json = new LinkedHashMap<>();
         json.put("linked_bytes", linkedBytes);
@@ -253,6 +262,9 @@ public class RestoreDownloadStats {
             atomic.put("copied_bytes", localSourceCopiedBytes);
             atomic.put("copied_files", localSourceCopiedFiles);
             json.put("atomic_local", atomic);
+        }
+        if (checkLevel != null) {
+            json.put("check_level", checkLevel);
         }
         json.put("reuse_ratio", getReuseRatio(keptBytes, incrementalLocalBytes));
         json.put("linked_files", linkedFiles);

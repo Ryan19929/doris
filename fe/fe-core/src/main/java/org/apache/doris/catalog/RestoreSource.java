@@ -36,14 +36,26 @@ public class RestoreSource {
     private long srcDbId;
     @SerializedName("tbl")
     private long srcTableId;
+    // The cluster id of the source cluster, null (not written) if unknown. No proof, see RestoreLineage.
+    @SerializedName("cid")
+    private Long srcClusterId;
 
     // For gson.
     private RestoreSource() {
     }
 
     public RestoreSource(long srcDbId, long srcTableId) {
+        this(srcDbId, srcTableId, RestoreLineage.UNKNOWN_CLUSTER_ID);
+    }
+
+    public RestoreSource(long srcDbId, long srcTableId, long srcClusterId) {
         this.srcDbId = srcDbId;
         this.srcTableId = srcTableId;
+        this.srcClusterId = srcClusterId == RestoreLineage.UNKNOWN_CLUSTER_ID ? null : srcClusterId;
+    }
+
+    public long getSrcClusterId() {
+        return srcClusterId == null ? RestoreLineage.UNKNOWN_CLUSTER_ID : srcClusterId;
     }
 
     public long getSrcDbId() {
@@ -67,16 +79,18 @@ public class RestoreSource {
             return false;
         }
         RestoreSource that = (RestoreSource) o;
-        return srcDbId == that.srcDbId && srcTableId == that.srcTableId;
+        return srcDbId == that.srcDbId && srcTableId == that.srcTableId
+                && Objects.equals(srcClusterId, that.srcClusterId);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(srcDbId, srcTableId);
+        return Objects.hash(srcDbId, srcTableId, srcClusterId);
     }
 
     @Override
     public String toString() {
-        return "RestoreSource{srcDbId=" + srcDbId + ", srcTableId=" + srcTableId + "}";
+        return "RestoreSource{srcDbId=" + srcDbId + ", srcTableId=" + srcTableId
+                + ", srcClusterId=" + getSrcClusterId() + "}";
     }
 }
