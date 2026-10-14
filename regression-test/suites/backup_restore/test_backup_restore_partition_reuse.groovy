@@ -40,7 +40,11 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
     }
     setConfig("enable_restore_partition_reuse", "true")
     setConfig("restore_reuse_min_partition_bytes", "0")
-    setConfig("restore_reuse_default_check_level", "sample")
+    setConfig("restore_reuse_default_check_level", "full")
+    // The tables of this case include unique tables (hidden state: delete sign rows, overwritten versions), which
+    // partition level reuse only reuses with the experiment switch below (default false: only duplicate tables are
+    // reused). Turn it on to cover the mechanics of the unique tables, and restore it at the end.
+    setConfig("restore_reuse_allow_hidden_state_models", "true")
 
     for (String db : [srcDbName, dbName, fullDbName]) {
         sql "DROP DATABASE IF EXISTS ${db} FORCE"
@@ -254,7 +258,7 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
     assertSameAsSource(dbName)
     assertTrue((stats.kept_bytes as long) > 0)
     assertTrue((stats.reuse_ratio as double) < 1.0)
-    // the default level (sample) gives the same result
+    // the default level (full) gives the same result
     sql "INSERT INTO ${srcDbName}.${dupTable} VALUES (1005, 'new2')"
     sql "sync"
     String snap3 = "${suiteName}_snap3"
@@ -278,6 +282,8 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
     }
 
     setConfig("restore_reuse_min_partition_bytes", "0")
+    setConfig("restore_reuse_allow_hidden_state_models", "false")
+    setConfig("restore_reuse_default_check_level", "full")
     for (String db : [srcDbName, dbName, fullDbName]) {
         sql "DROP DATABASE ${db} FORCE"
     }
