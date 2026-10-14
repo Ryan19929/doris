@@ -42,7 +42,11 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
     setConfig("enable_restore_partition_reuse", "true")
     setConfig("enable_restore_incremental_append", "true")
     setConfig("restore_reuse_min_partition_bytes", "0")
-    setConfig("restore_reuse_default_check_level", "sample")
+    setConfig("restore_reuse_default_check_level", "full")
+    // The tables of this case include unique tables (hidden state: delete sign rows, overwritten versions), which
+    // partition level reuse only reuses with the experiment switch below (default false: only duplicate tables are
+    // reused). Turn it on to cover the mechanics of the unique tables, and restore it at the end.
+    setConfig("restore_reuse_allow_hidden_state_models", "true")
 
     for (String db : [dbA, dbB]) {
         sql "DROP DATABASE IF EXISTS ${db} FORCE"
@@ -98,7 +102,7 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
             FROM `${repoName}`
             ON (${dupTable}, ${uniqTable})
             PROPERTIES ("backup_timestamp" = "${timestamp}", "reserve_replica" = "true",
-                        "reuse_check_level" = "sample")
+                        "reuse_check_level" = "full")
         """
         syncer.waitAllRestoreFinish(db)
         def result = sql_return_maparray """ SHOW RESTORE FROM ${db} WHERE Label = "${snapshot}" """
@@ -198,6 +202,8 @@ suite("test_backup_restore_incremental_append", "backup_restore") {
     assertSame(dbA, dbB)
 
     setConfig("restore_reuse_min_partition_bytes", "0")
+    setConfig("restore_reuse_allow_hidden_state_models", "false")
+    setConfig("restore_reuse_default_check_level", "full")
     for (String db : [dbA, dbB]) {
         sql "DROP DATABASE ${db} FORCE"
     }
