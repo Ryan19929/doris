@@ -45,6 +45,25 @@
 
 ## 部署与回滚
 
-- **升级顺序。** 先把所有 FE 和所有 BE 升级完成，再打开复用开关（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）。原子恢复的增量补齐依赖 FE 下发的作业 ID 和备份摘要，以及 BE 写在 tablet 元数据里的完成证据（`restore_stage`）；FE 和 BE 版本混跑时不要打开开关。
-- **降级前。** 先关掉上面的复用开关，等进行中的恢复作业全部结束（FINISHED 或 CANCELLED）再降级。旧版本 BE 读写 tablet 元数据时会丢掉 `restore_stage`，之后它不能证明恢复进度。
-- **旧 FE 接管进行中的作业。** 主节点切换到没有该功能的旧 FE 时，进行中的增量恢复作业会失败，原子恢复下原表不受影响，不会写错数据；升级后重新恢复一次即可。
+先说明保护机制，再说步骤。
+
+**自动避开混跑。** FE 和 BE 在心跳里上报复用能力（`restore_reuse_capability`，本版本为 1，旧版本不带这个字段，按 0 处理）。恢复作业开始判定复用时，检查所有 FOLLOWER FE（Master 自己算，Observer 不会接管作业，不检查）和所有存活的 BE：任何一个能力小于 1，或者主节点还没收到它的心跳，本作业就不复用，整体下载，不下发摘要任务、本地来源快照和增量补齐，并在 `SHOW RESTORE` 的 `ReuseEstimate` 里记录原因 `MIXED_VERSIONS`。开关是 FE 配置 `restore_reuse_require_capability`（可动态修改，默认 true）；关掉它等于不检查，只用于实验。这个检查只在作业开始时做一次，作业进行中发生的升级、降级或切主，由下面的文件层保护和步骤兜底。
+
+**文件层保护。**
+
+- 只含增量的快照，其元数据文件命名为 `<tablet_id>.hdr.increment`，目录里没有 `<tablet_id>.hdr`。旧版本 BE 的整体替换找不到 `.hdr` 会直接失败，不会把增量当成完整快照去替换 tablet；新版本 BE 的整体替换发现 `.hdr.increment` 同样拒绝，返回不可重试错误，tablet 不变。
+- 快照与备份清单不符，BE 以 `INTERNAL_ERROR` 回报，错误信息带前缀 `[RESTORE_MANIFEST_MISMATCH]`，FE 按前缀识别并立即取消作业。没有新增 thrift 状态码，旧 FE 收到的是它认识的错误，不会出错。
+
+**升级。**
+
+1. 先升级所有 BE，再升级所有 FE。升级期间保持复用开关关闭（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）。
+2. 全部节点升级完成后，确认心跳已经收到（`restore_reuse_require_capability` 为 true 时，作业会自己判断），再打开复用开关。
+
+**回滚。**
+
+1. 先关闭上面三个复用开关。
+2. 等待或取消所有在途的恢复作业：用 `SHOW RESTORE` 检查，确认没有处于 PENDING 到 COMMITTING 之间的作业，必要时 `CANCEL RESTORE`。关闭开关不会撤销进行中作业已经做出的复用决定，所以这一步不能省。
+3. 先回滚 FE，再回滚 BE。
+4. 回滚可能丢失谱系戳：旧版本 FE 写镜像或者重写包含分区、表的编辑日志时，会丢掉它不认识的字段（谱系戳、来源等）。丢失是安全的，只是失去复用依据；再次升级后的第一个恢复作业会整体下载，之后重新建立谱系戳。BE 上的 `restore_stage` 可能被旧版本保留，也可能丢失，二者都没有害处：判定时会核对作业 ID 和基础版本，证据丢失时作业被取消。
+
+**作业期间意外切到旧 FE。** 旧 FE 不认识复用相关的字段，会把增量作业当作普通恢复继续下发整体替换。此时由文件层保护兜底：BE 找不到 `.hdr` 会让任务失败，不会冲掉本地数据。旧 FE 会一直重发任务直到作业超时，所以发现后应该手动 `CANCEL RESTORE`；原子恢复下原表不受影响，非原子恢复按“重新恢复一次”处理。保留分区那一侧不会出现数据错误，只是没有按预期保留。升级后重新恢复一次即可。
