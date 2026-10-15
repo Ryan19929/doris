@@ -204,6 +204,12 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         DebugPoint.enableDebugPoint(lateBe.Host.toString(), lateBe.HttpPort as int, NodeType.BE, name,
                 params.collectEntries { k, v -> [(k): v.toString()] })
     }
+    def enableDebugOnOtherBes = { String name, Map params ->
+        aliveBackends.findAll { it.BackendId.toString() != lateBe.BackendId.toString() }.each { be ->
+            DebugPoint.enableDebugPoint(be.Host.toString(), be.HttpPort as int, NodeType.BE, name,
+                    params.collectEntries { k, v -> [(k): v.toString()] })
+        }
+    }
     def disableDebug = { String name ->
         GetDebugPoint().disableDebugPointForAllBEs(name)
     }
@@ -240,7 +246,12 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         String snap1 = "${suiteName}_1"
         String ts1 = backupAndWait(snap1, dupTable)
         String since1 = feNow()
-        enableDebugOnLateBe("SnapshotLoader.append_increment.delay", [sleep_ms: lateMs, execute: 1])
+        // As in the original incident: every replica is loaded to V_l and reported (the FE takes them all as
+        // behind, no healthy source yet), then the other replicas append and report V_b while the late one is
+        // still waiting, so the scheduler has a source to clone the late replica from. The waits are longer than
+        // a tablet report (60 s) plus a tablet check (20 s).
+        enableDebugOnOtherBes("SnapshotLoader.append_increment.delay", [sleep_ms: 80000, execute: 1])
+        enableDebugOnLateBe("SnapshotLoader.append_increment.delay", [sleep_ms: 220000, execute: 1])
         job = restoreAndWait(dbB, snap1, ts1, dupTable)
         assertEquals("FINISHED", job.State)
         assertTrue(incrementalPartitions(job) > 0)
