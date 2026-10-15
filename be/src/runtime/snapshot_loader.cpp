@@ -784,6 +784,17 @@ Status install_increment_hdr(const std::string& local_path, int64_t tablet_id,
             fmt::format("{}/{}.hdr", local_path, tablet_id));
 }
 
+Status remove_increment_hdr(const std::string& local_path, int64_t tablet_id) {
+    std::string file = fmt::format("{}/{}{}", local_path, tablet_id, kIncrementHdrSuffix);
+    bool exists = false;
+    RETURN_IF_ERROR(io::global_local_filesystem()->exists(file, &exists));
+    if (!exists) {
+        return Status::OK();
+    }
+    LOG(INFO) << "delete the leftover tablet meta of an increment: " << file;
+    return io::global_local_filesystem()->delete_file(file);
+}
+
 Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t local_tablet_id,
                                       const SnapshotManifest& manifest, bool check_digest,
                                       ManifestCheckResult* result) {
@@ -1511,6 +1522,9 @@ Status SnapshotHttpDownloader::download() {
     }
 
     // Step 2: get all local files
+    // The tablet meta of an increment left by an earlier task of the same snapshot dir is not a file of the
+    // remote snapshot, and a whole snapshot must not keep it (the move rejects it).
+    RETURN_IF_ERROR(remove_increment_hdr(_local_path, _local_tablet_id));
     if (_disable_reuse) {
         // Download all the files again, without reusing any local file.
         RETURN_IF_ERROR(_snapshot_loader._clear_local_snapshot_files(_local_path));
@@ -2165,6 +2179,8 @@ Status SnapshotLoader::_download_tablet_by_manifest(const std::string& remote_pa
                                                     const SnapshotManifest& manifest,
                                                     int* report_counter, int finished_num,
                                                     int total_num, SnapshotDownloadStats* stats) {
+    // see SnapshotHttpDownloader::download()
+    RETURN_IF_ERROR(remove_increment_hdr(local_path, local_tablet_id));
     std::vector<std::string> existing_files;
     RETURN_IF_ERROR(_get_existing_files_from_local(local_path, &existing_files));
     std::set<std::string> local_files(existing_files.begin(), existing_files.end());

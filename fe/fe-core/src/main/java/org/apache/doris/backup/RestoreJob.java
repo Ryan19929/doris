@@ -3001,7 +3001,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             Env env = Env.getCurrentEnv();
             SystemInfoService.HostInfo self = env.getSelfNode();
             for (Frontend fe : env.getFrontends(FrontendNodeType.FOLLOWER)) {
-                boolean isSelf = self != null && fe.getHost().equals(self.getHost());
+                // the host and the port: several frontends may run on a host
+                boolean isSelf = self != null && fe.getHost().equals(self.getHost())
+                        && fe.getEditLogPort() == self.getPort();
                 int capability = isSelf ? RESTORE_REUSE_CAPABILITY : fe.getRestoreReuseCapability();
                 if (capability < RESTORE_REUSE_CAPABILITY) {
                     return "frontend " + fe.getHost() + " (capability " + capability + ")";

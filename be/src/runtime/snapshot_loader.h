@@ -153,6 +153,9 @@ inline constexpr std::string_view kIncrementHdrSuffix = ".hdr.increment";
 Status install_increment_hdr(const std::string& local_path, int64_t tablet_id,
                              const TabletMetaPB& increment);
 
+// Deletes "<local_path>/<tablet_id>.hdr.increment" if it exists.
+Status remove_increment_hdr(const std::string& local_path, int64_t tablet_id);
+
 // Check the files of a downloaded local tablet snapshot against the manifest of the source tablet
 // snapshot:
 //  - the set of files must be the same, no more and no less;

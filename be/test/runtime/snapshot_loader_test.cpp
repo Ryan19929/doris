@@ -1476,6 +1476,35 @@ TEST_F(SnapshotLoaderTest, HttpDownloadOfAWholeTabletKeepsTheHdrName) {
     EXPECT_FALSE(file_exists(remote_snapshot.local_snapshot_path + "/3201.hdr.increment"));
 }
 
+// The same snapshot dir was used by an increment before: the tablet meta of the increment is deleted by the whole
+// download (it is no file of the remote snapshot), so that the move is not refused.
+TEST_F(SnapshotLoaderTest, HttpWholeDownloadDeletesTheLeftoverIncrementHdr) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3401, 3402, 3403, 3411, 3412, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest_root(
+            write_remote_manifest(remote_snapshot.remote_snapshot_path, 3411, false));
+    const std::string leftover = remote_snapshot.local_snapshot_path + "/3401.hdr.increment";
+    write_test_file(leftover, "the increment of an earlier task");
+    ASSERT_TRUE(file_exists(leftover));
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 34L, 3401);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_FALSE(file_exists(leftover));
+    EXPECT_TRUE(file_exists(remote_snapshot.local_snapshot_path + "/3401.hdr"));
+
+    TabletSharedPtr tablet = engine_ref->tablet_manager()->get_tablet(3401);
+    ASSERT_TRUE(tablet != nullptr);
+    status = loader.move(remote_snapshot.local_snapshot_path, tablet, true);
+    EXPECT_TRUE(status.ok()) << status;
+
+    // the helper: no file is fine
+    EXPECT_TRUE(remove_increment_hdr(remote_snapshot.local_snapshot_path, 3401).ok());
+}
+
 // A leftover tablet meta of an increment is not a file to check against the manifest, like the loaded tag.
 TEST_F(SnapshotLoaderTest, ManifestCheckIgnoresTheIncrementHdr) {
     std::string dir = fmt::format("{}/manifest_check_increment_hdr", storage_root_path);

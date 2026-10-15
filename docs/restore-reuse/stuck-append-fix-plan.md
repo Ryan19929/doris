@@ -44,7 +44,7 @@
 
 **范围**：只在 `DirMoveTask.getIncrementalRange() != null` 时生效（`DirMoveTask.java:60-66`）。这个字段只在增量分区下发时设置（`RestoreJob.java:2491-2494`），任务对象在任务队列中复用，重发不会丢。整体移动任务（这个字段为 null）的处理完全不变。
 
-1. **错误码**：新增 `RESTORE_INCREMENT_STATE_MISMATCH`，照 `RESTORE_MANIFEST_MISMATCH` 的做法加到 `Status.thrift`（`:118` 附近）和 `status.h`（`:82` 附近）。`to_thrift` 对大于 0 的错误码会原样传递（`status.cpp:69`）。
+1. **错误码**：不新增 thrift 状态码。`RESTORE_INCREMENT_STATE_MISMATCH` 照现在的 `RESTORE_MANIFEST_MISMATCH` 做法，在 `status.h` 里定义为内部负值错误码，`to_thrift` 把它映射成 `INTERNAL_ERROR`，`code_as_string()` 对它特判，让错误信息带前缀 `[RESTORE_INCREMENT_STATE_MISMATCH]`，FE 用 `contains` 按前缀识别（和 `[RESTORE_NOT_RETRYABLE]` 一样）。
 2. **FE 处理**（`RestoreJob.finishDirMoveTask`）：
    - 收到 `RESTORE_INCREMENT_STATE_MISMATCH`：设置作业 status，立即 `cancelInternal(false)`，与现有的 `handleManifestMismatch`（`:527-541`）一致。`cancelInternal` 在 COMMITTING 分支会清掉所有 MOVE 任务（`:3805-3808`）。
    - 其他错误：直接用 `task.getFailedTimes()`（`AgentTask.java:120`；`MasterImpl.finishTask` 每次收到非 OK 回报都会调用 `task.failed()`，`MasterImpl.java:158`），不再另建计数。超过 `restore_incremental_append_max_retry`（新增 FE 配置，mutable，默认 10）就取消，未超过则保持原有的重发行为。
@@ -149,7 +149,7 @@
 
 ### 中等
 
-3. **新错误码与旧 FE 混跑会退化成原来的卡死。** 旧 FE 不认识新的状态码，Java thrift 反序列化得到 null，`MasterImpl.java:160` 处会抛 NPE，任务留在队列里被无限重发。现有的 `RESTORE_MANIFEST_MISMATCH` 也有同样的问题。
+3. **与旧 FE 混跑。** 因为不新增 thrift 状态码，旧 FE 收到的是它认识的 `INTERNAL_ERROR`，不会在 `MasterImpl` 处因状态码为 null 而 NPE；旧 FE 不识别前缀，任务按普通失败处理。`RESTORE_MANIFEST_MISMATCH` 也已改成这种做法。
    - **改法**：BE 只有在 `TMoveDirReq` 带了新的摘要字段时，才返回新错误码，因为带这个字段说明 FE 是新版本；否则返回普通的 InternalError。
 
 4. **(d) 改用 meta 判据，不再用标记文件。** 标记文件在存储迁移时会丢失，也识别不出"已装载后又被全量克隆冲掉"的情况。

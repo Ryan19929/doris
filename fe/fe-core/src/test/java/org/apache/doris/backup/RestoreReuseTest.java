@@ -3621,6 +3621,19 @@ public class RestoreReuseTest {
         Assertions.assertFalse(newDigestTasks().isEmpty());
     }
 
+    // two frontends on one host: only the one with the port of this master is itself
+    @Test
+    public void testFrontendsOnTheSameHost() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 0);
+        Frontend other = new Frontend(FrontendNodeType.FOLLOWER, "fe1_9011", "fe1", 9011);
+        frontends.add(other);
+        backend(1, 1);
+        Assertions.assertNotNull(RestoreJob.findNodeWithoutReuseCapability());
+        other.setRestoreReuseCapability(1);
+        Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+    }
+
     @Test
     public void testObserverDoesNotTakePart() {
         mockCluster();
