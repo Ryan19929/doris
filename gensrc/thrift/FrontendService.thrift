@@ -885,6 +885,8 @@ struct TFrontendPingFrontendResult {
     9: optional i64 processUUID
     10: optional i32 arrowFlightSqlPort
     11: optional string localResourceGroup
+    // The version of the restore reuse protocol the FE understands, 0 or not set for a FE without it.
+    200: optional i32 restoreReuseCapability
 }
 
 struct TPropertyVal {

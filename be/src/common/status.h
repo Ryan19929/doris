@@ -78,8 +78,7 @@ namespace ErrorCode {
     TStatusError(SNAPSHOT_EXPIRED, 75, false);                \
     TStatusError(DELETE_BITMAP_LOCK_ERROR, 100, false);       \
     TStatusError(SC_COMPACTION_CONFLICT, 101, false);         \
-    TStatusError(FINISHED, 76, false);                        \
-    TStatusError(RESTORE_MANIFEST_MISMATCH, 77, false);
+    TStatusError(FINISHED, 76, false);
 // E error_name, error_code, print_stacktrace
 #define APPLY_FOR_OLAP_ERROR_CODES(E)                        \
     E(OK, 0, false);                                         \
@@ -302,6 +301,7 @@ namespace ErrorCode {
     E(INVALID_TABLET_STATE, -7211, false);                   \
     E(ROWSETS_EXPIRED, -7311, false);                        \
     E(CGROUP_ERROR, -7411, false);                           \
+    E(RESTORE_MANIFEST_MISMATCH, -7600, false);              \
     E(FATAL_ERROR, -7412, true);
 
 // Define constexpr int error_code_name = error_code_value

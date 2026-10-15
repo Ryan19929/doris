@@ -412,13 +412,14 @@ public class RestoreManifestTest {
 
     @Test
     public void testManifestMismatchCancelsTheJobAtOnce() {
-        String errMsg = "restore manifest check failed, tablet 201, path /p: size mismatch of file 1.dat, "
-                + "expected 100, actual 99";
+        // as the backend reports it: an INTERNAL_ERROR, the prefix is in the error message
+        String errMsg = "(127.0.0.1)" + RestoreJob.RESTORE_MANIFEST_MISMATCH + "restore manifest check failed, "
+                + "tablet 201, path /p: size mismatch of file 1.dat, expected 100, actual 99";
         RestoreJob job = newRestoreJob(jobInfoWithManifest(TABLET_1));
         Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
         DownloadTask task = new DownloadTask(null, 10001, 1, job.getJobId(), db.getId(), Lists.newArrayList());
         Assertions.assertFalse(job.finishTabletDownloadTask(task,
-                downloadFailed(TStatusCode.RESTORE_MANIFEST_MISMATCH, errMsg)));
+                downloadFailed(TStatusCode.INTERNAL_ERROR, errMsg)));
         Assertions.assertEquals(RestoreJob.RestoreJobState.CANCELLED, job.getState());
         Assertions.assertEquals(Status.ErrCode.COMMON_ERROR, job.getStatus().getErrCode());
         Assertions.assertTrue(job.getStatus().getErrMsg().contains("restore manifest check failed on backend 10001"),
@@ -439,7 +440,7 @@ public class RestoreManifestTest {
 
         // a late report after the job is done changes nothing
         Assertions.assertFalse(job.finishTabletDownloadTask(task,
-                downloadFailed(TStatusCode.RESTORE_MANIFEST_MISMATCH, errMsg)));
+                downloadFailed(TStatusCode.INTERNAL_ERROR, errMsg)));
         Assertions.assertEquals(RestoreJob.RestoreJobState.CANCELLED, job.getState());
     }
 

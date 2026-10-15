@@ -2919,6 +2919,16 @@ public class Config extends ConfigBase {
             + "not touched). Disabled by default, the atomic restore behaves as before if disabled.")
     public static boolean enable_restore_atomic_reuse = false;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether a restore job uses partition level reuse "
+            + "(the digest tasks, the local source snapshot and the incremental append) only if every follower "
+            + "frontend (the master included, the observers excluded) and every alive backend reports the capability "
+            + "of it in the heartbeat. A node of an old version does not report it, then the job downloads all the "
+            + "data as before and the reason MIXED_VERSIONS is recorded. It is checked once, when the job starts to "
+            + "decide the reuse. If false, the check is skipped: a restore job may then send tasks that an old "
+            + "backend does not know, and be taken over by an old frontend, which fails the job or makes it "
+            + "wait. For experiments only.")
+    public static boolean restore_reuse_require_capability = true;
+
     @ConfField(mutable = true, description = "The time after which a BE is considered unavailable if no heartbeat is "
             + "received.")
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

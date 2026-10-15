@@ -28,6 +28,7 @@ import org.apache.doris.service.FeDiskInfo;
 import org.apache.doris.system.HeartbeatResponse.HbStatus;
 import org.apache.doris.system.SystemInfoService.HostInfo;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.gson.annotations.SerializedName;
 
 import java.io.DataInput;
@@ -66,6 +67,10 @@ public class Frontend implements Writable {
     private boolean isAlive = false;
 
     private long processUUID = 0;
+
+    // The version of the restore reuse protocol the frontend reports in the heartbeat, 0 for an old frontend and
+    // before the first heartbeat. Only the master handles it, it is not persisted.
+    private volatile int restoreReuseCapability = 0;
 
     public Frontend() {
     }
@@ -183,6 +188,9 @@ public class Frontend implements Writable {
             }
 
             isAlive = true;
+            if (!isReplay) {
+                restoreReuseCapability = hbResponse.getRestoreReuseCapability();
+            }
             version = hbResponse.getVersion();
             queryPort = hbResponse.getQueryPort();
             rpcPort = hbResponse.getRpcPort();
@@ -231,6 +239,15 @@ public class Frontend implements Writable {
         sb.append(", ").append(host).append(":").append(editLogPort);
         sb.append(", is alive: ").append(isAlive);
         return sb.toString();
+    }
+
+    public int getRestoreReuseCapability() {
+        return restoreReuseCapability;
+    }
+
+    @VisibleForTesting
+    public void setRestoreReuseCapability(int restoreReuseCapability) {
+        this.restoreReuseCapability = restoreReuseCapability;
     }
 
     public void setHost(String host) {

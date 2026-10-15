@@ -71,6 +71,7 @@ import org.apache.doris.common.util.DynamicPartitionUtil;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.common.util.TimeUtils;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.nereids.trees.plans.commands.BackupCommand;
 import org.apache.doris.nereids.trees.plans.commands.RestoreCommand;
 import org.apache.doris.persist.ColocatePersistInfo;
@@ -80,6 +81,8 @@ import org.apache.doris.persist.gson.GsonUtilsBase;
 import org.apache.doris.qe.GlobalVariable;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
+import org.apache.doris.system.Frontend;
+import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentBoundedBatchTask;
 import org.apache.doris.task.AgentTask;
@@ -97,6 +100,7 @@ import org.apache.doris.thrift.TRemoteTabletSnapshot;
 import org.apache.doris.thrift.TRestoreBackupDigest;
 import org.apache.doris.thrift.TRestoreDigestPrefixSource;
 import org.apache.doris.thrift.TRestoreIncrementalRange;
+import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TStorageMedium;
 import org.apache.doris.thrift.TStorageType;
@@ -254,6 +258,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     // The prefix of the error message of a backend which says that retrying the task cannot succeed.
     public static final String RESTORE_NOT_RETRYABLE = "[RESTORE_NOT_RETRYABLE]";
+    // The version of the restore reuse protocol of this build, reported in the heartbeat of the frontend and the
+    // backend. A node of an old version reports none (0). Partition level reuse needs 1: the RESTORE_DIGEST task, the
+    // local source snapshot and the incremental download, which an old node does not understand.
+    public static final int RESTORE_REUSE_CAPABILITY = 1;
+    // The reason of downloading all the data when a node does not have the capability.
+    public static final String MIXED_VERSIONS = "MIXED_VERSIONS";
+    // The prefix of the error message of a downloaded snapshot which does not match the manifest of the backup.
+    public static final String RESTORE_MANIFEST_MISMATCH = "[RESTORE_MANIFEST_MISMATCH]";
     // The working state of partition level reuse while PENDING..VERIFYING, never persisted: the job is redone
     // from PENDING after a restart or a master switch.
     private transient List<ReuseCandidate> reuseCandidates = Lists.newArrayList();
@@ -448,9 +460,18 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         return true;
     }
 
+    // The backend reports the mismatch of a downloaded snapshot with the manifest of the backup as an INTERNAL_ERROR
+    // (an old frontend does not know a new status code), with the prefix RESTORE_MANIFEST_MISMATCH in the message.
+    @VisibleForTesting
+    static boolean isManifestMismatch(TStatus taskStatus) {
+        if (taskStatus == null || taskStatus.getStatusCode() == TStatusCode.OK || !taskStatus.isSetErrorMsgs()) {
+            return false;
+        }
+        return Joiner.on(",").join(taskStatus.getErrorMsgs()).contains(RESTORE_MANIFEST_MISMATCH);
+    }
+
     public synchronized boolean finishTabletDownloadTask(DownloadTask task, TFinishTaskRequest request) {
-        if (request.getTaskStatus().getStatusCode() == TStatusCode.RESTORE_MANIFEST_MISMATCH
-                && task.getJobId() == jobId) {
+        if (isManifestMismatch(request.getTaskStatus()) && task.getJobId() == jobId) {
             // The downloaded snapshot does not match the manifest of the backup even after the backend downloaded
             // it again: the backup is broken, waiting until the timeout does not help. Cancel the job at once.
             handleManifestMismatch(task, request);
@@ -2952,6 +2973,53 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     /**
+     * Whether every node which the reuse of this job depends on understands it: every follower frontend (the master
+     * included, the observers excluded: they never take over a job) and every alive backend must report
+     * the capability in the heartbeat. A node which has not been heard from since the master started counts as not
+     * having it. Nothing is checked if restore_reuse_require_capability is false.
+     *
+     * @return the first node without the capability, null if there is none
+     */
+    @VisibleForTesting
+    static String findNodeWithoutReuseCapability() {
+        return findNodeWithoutReuseCapability(true);
+    }
+
+    /**
+     * @param unknownIsIncapable whether the failure to read the nodes is taken as a node without the capability (the
+     *         decision of the job), or as none (the estimate, which only records the reason)
+     */
+    private static String findNodeWithoutReuseCapability(boolean unknownIsIncapable) {
+        if (!Config.restore_reuse_require_capability) {
+            return null;
+        }
+        if (DebugPointUtil.isEnable("RestoreJob.restoreReuseCapability.mixedVersions")) {
+            // a node of an old version, for the regression test
+            return "debug point";
+        }
+        try {
+            Env env = Env.getCurrentEnv();
+            SystemInfoService.HostInfo self = env.getSelfNode();
+            for (Frontend fe : env.getFrontends(FrontendNodeType.FOLLOWER)) {
+                boolean isSelf = self != null && fe.getHost().equals(self.getHost());
+                int capability = isSelf ? RESTORE_REUSE_CAPABILITY : fe.getRestoreReuseCapability();
+                if (capability < RESTORE_REUSE_CAPABILITY) {
+                    return "frontend " + fe.getHost() + " (capability " + capability + ")";
+                }
+            }
+            for (Backend be : Env.getCurrentSystemInfo().getAllClusterBackends(true)) {
+                if (be.getRestoreReuseCapability() < RESTORE_REUSE_CAPABILITY) {
+                    return "backend " + be.getHost() + " (capability " + be.getRestoreReuseCapability() + ")";
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            LOG.warn("failed to check the restore reuse capability of the nodes", e);
+            return unknownIsIncapable ? "unknown nodes" : null;
+        }
+    }
+
+    /**
      * Select the existing partitions that may keep their local data, by the chain of conditions in
      * {@link RestoreReuseJudge}. Only the partitions of the A1 branch (existing partition, see restoredVersionInfo)
      * are looked at, so it must be called after the meta is prepared and before the lineage of the overwritten
@@ -2988,6 +3056,20 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             return keys;
         }
         CheckLevel effectiveJobLevel = RestoreReuseJudge.levelOfTable(jobLevel, KeysType.DUP_KEYS);
+        String incapableNode = findNodeWithoutReuseCapability();
+        if (incapableNode != null) {
+            // Download all the data as before: no digest task, local source snapshot or increment is sent.
+            RestoreReuseResult result = new RestoreReuseResult();
+            for (BackupOlapTableInfo tblInfo : jobInfo.backupOlapTableObjects.values()) {
+                for (int i = 0; i < tblInfo.partitions.size(); i++) {
+                    result.addRejected(MIXED_VERSIONS);
+                }
+            }
+            reuseResult = result;
+            LOG.info("restore reuse: {} does not have the capability of it, download all. job: {}", incapableNode,
+                    jobId);
+            return keys;
+        }
         try {
             RestoreReuseResult result = new RestoreReuseResult();
             List<ReuseCandidate> candidates = Lists.newArrayList();
@@ -3800,6 +3882,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         try {
             RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
+            // only the reason is recorded, the estimate is of the data, not of the nodes
+            boolean mixedVersions = findNodeWithoutReuseCapability(false) != null;
             for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
                 BackupOlapTableInfo tblInfo = tblEntry.getValue();
                 Table localTbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
@@ -3836,6 +3920,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             unsupported = RestoreReuseShadowStats.checkUnsupported(isAtomicRestore, localOlapTbl,
                                     localPart);
                             bytes = RestoreReuseShadowStats.getSingleReplicaLocalDataSize(localPart);
+                            if (mixedVersions && unsupported == RestoreReuseShadowStats.Unsupported.NONE) {
+                                unsupported = RestoreReuseShadowStats.Unsupported.MIXED_VERSIONS;
+                            }
                         }
                         stats.add(verdict, unsupported, bytes, l0Path);
                     }

@@ -52,6 +52,11 @@ template Status Status::create<true>(const PStatus& pstatus);
 template Status Status::create<false>(const PStatus& pstatus);
 
 std::string Status::code_as_string() const {
+    if (_code == ErrorCode::RESTORE_MANIFEST_MISMATCH) {
+        // An internal error code (not in TStatusCode, so that an old FE can understand the status: to_thrift
+        // reports it as INTERNAL_ERROR). The FE recognizes it by this name in the error message.
+        return "RESTORE_MANIFEST_MISMATCH";
+    }
     return (int)_code >= 0 ? doris::to_string(static_cast<TStatusCode::type>(_code))
                            : fmt::format("E{}", (int16_t)_code);
 }

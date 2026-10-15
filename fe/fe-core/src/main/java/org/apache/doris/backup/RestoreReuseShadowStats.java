@@ -95,7 +95,10 @@ public class RestoreReuseShadowStats {
         HIDDEN_STATE_MOW,
         // A unique merge-on-read table: the overwritten versions of a key are hidden state, a later delete predicate
         // makes them visible again. Not reused unless restore_reuse_allow_hidden_state_models.
-        HIDDEN_STATE_MOR
+        HIDDEN_STATE_MOR,
+        // A frontend or a backend of the cluster does not report the capability of partition level reuse (an old
+        // version, a rolling upgrade or rollback), the job downloads all the data. Only the reason is counted.
+        MIXED_VERSIONS
     }
 
     @SerializedName("partitions")
@@ -121,6 +124,8 @@ public class RestoreReuseShadowStats {
     private long l0PassedButHiddenStateMow = 0;
     @SerializedName("l0_passed_but_hidden_state_mor")
     private long l0PassedButHiddenStateMor = 0;
+    @SerializedName("l0_passed_but_mixed_versions")
+    private long l0PassedButMixedVersions = 0;
     @SerializedName("cluster_mismatch")
     private long clusterMismatch = 0;
     @SerializedName("no_local")
@@ -328,6 +333,9 @@ public class RestoreReuseShadowStats {
                     case HIDDEN_STATE_MOR:
                         l0PassedButHiddenStateMor++;
                         break;
+                    case MIXED_VERSIONS:
+                        l0PassedButMixedVersions++;
+                        break;
                     default:
                         reusable++;
                         reusableBytesSingleReplica += singleReplicaBytes;
@@ -411,6 +419,10 @@ public class RestoreReuseShadowStats {
         return l0PassedButHiddenStateMor;
     }
 
+    public long getL0PassedButMixedVersions() {
+        return l0PassedButMixedVersions;
+    }
+
     public long getClusterMismatch() {
         return clusterMismatch;
     }
@@ -464,6 +476,11 @@ public class RestoreReuseShadowStats {
         // the check level (requested and effective), and the kept partitions not proved by a digest
         if (!actual.isEmpty()) {
             json.add("check_level", GsonUtils.GSON.toJsonTree(actual.levelSummary()));
+        }
+        long mixedVersions = actual.getRejected().getOrDefault(RestoreJob.MIXED_VERSIONS, 0L);
+        if (mixedVersions > 0) {
+            // the job did not decide the reuse, a node does not have the capability of it
+            json.addProperty("mixed_versions", mixedVersions);
         }
         json.addProperty("download_digest_mismatch", actual.countReasons(
                 RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH));

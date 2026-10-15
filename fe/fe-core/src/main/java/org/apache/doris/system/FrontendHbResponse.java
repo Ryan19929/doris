@@ -45,6 +45,8 @@ public class FrontendHbResponse extends HeartbeatResponse implements Writable {
     private long processUUID;
     private List<FeDiskInfo> diskInfos;
     private String localResourceGroup;
+    // Not persisted in the edit log, only the master handles it.
+    private transient int restoreReuseCapability = 0;
 
     public FrontendHbResponse() {
         super(HeartbeatResponse.Type.FRONTEND);
@@ -115,6 +117,15 @@ public class FrontendHbResponse extends HeartbeatResponse implements Writable {
 
     public String getLocalResourceGroup() {
         return localResourceGroup;
+    }
+
+    public int getRestoreReuseCapability() {
+        return restoreReuseCapability;
+    }
+
+    public FrontendHbResponse setRestoreReuseCapability(int restoreReuseCapability) {
+        this.restoreReuseCapability = restoreReuseCapability;
+        return this;
     }
 
     @Override

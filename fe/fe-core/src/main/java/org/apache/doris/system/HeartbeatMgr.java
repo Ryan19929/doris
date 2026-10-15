@@ -17,6 +17,7 @@
 
 package org.apache.doris.system;
 
+import org.apache.doris.backup.RestoreJob;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.FsBroker;
 import org.apache.doris.cloud.proto.Cloud.ClusterStatus;
@@ -55,6 +56,7 @@ import org.apache.doris.thrift.TPaloBrokerService;
 import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -377,9 +379,11 @@ public class HeartbeatMgr extends MasterDaemon {
                         isShutDown = tBackendInfo.isIsShutdown();
                     }
                     long beMemory = tBackendInfo.isSetBeMem() ? tBackendInfo.getBeMem() : 0;
+                    int restoreReuseCapability = restoreReuseCapabilityOf(tBackendInfo);
                     return new BackendHbResponse(backendId, bePort, httpPort, brpcPort,
                             System.currentTimeMillis(), beStartTime, version, nodeRole,
-                            fragmentNum, lastFragmentUpdateTime, isShutDown, arrowFlightSqlPort, beMemory);
+                            fragmentNum, lastFragmentUpdateTime, isShutDown, arrowFlightSqlPort, beMemory)
+                            .setRestoreReuseCapability(restoreReuseCapability);
                 } else {
                     return new BackendHbResponse(backendId, backend.getHost(), backend.getLastUpdateMs(),
                             result.getStatus().getErrorMsgs().isEmpty()
@@ -399,6 +403,17 @@ public class HeartbeatMgr extends MasterDaemon {
                 }
             }
         }
+    }
+
+    // The version of the restore reuse protocol a node reports, 0 if it does not (a node of an old version).
+    @VisibleForTesting
+    static int restoreReuseCapabilityOf(TBackendInfo info) {
+        return info.isSetRestoreReuseCapability() ? info.getRestoreReuseCapability() : 0;
+    }
+
+    @VisibleForTesting
+    static int restoreReuseCapabilityOf(TFrontendPingFrontendResult result) {
+        return result.isSetRestoreReuseCapability() ? result.getRestoreReuseCapability() : 0;
     }
 
     // frontend heartbeat
@@ -424,7 +439,8 @@ public class HeartbeatMgr extends MasterDaemon {
                             System.currentTimeMillis(),
                             Version.DORIS_BUILD_VERSION + "-" + Version.DORIS_BUILD_SHORT_HASH,
                             ExecuteEnv.getInstance().getStartupTime(), ExecuteEnv.getInstance().getDiskInfos(),
-                            ExecuteEnv.getInstance().getProcessUUID(), Config.local_resource_group);
+                            ExecuteEnv.getInstance().getProcessUUID(), Config.local_resource_group)
+                            .setRestoreReuseCapability(RestoreJob.RESTORE_REUSE_CAPABILITY);
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), "not ready");
                 }
@@ -448,7 +464,8 @@ public class HeartbeatMgr extends MasterDaemon {
                             result.getRpcPort(), result.getArrowFlightSqlPort(), result.getReplayedJournalId(),
                             System.currentTimeMillis(), result.getVersion(), result.getLastStartupTime(),
                             FeDiskInfo.fromThrifts(result.getDiskInfos()), result.getProcessUUID(),
-                            result.getLocalResourceGroup());
+                            result.getLocalResourceGroup())
+                            .setRestoreReuseCapability(restoreReuseCapabilityOf(result));
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), result.getMsg());
                 }

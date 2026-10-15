@@ -27,6 +27,7 @@ import org.apache.doris.auth.certificate.ForwardedCertificateInfo;
 import org.apache.doris.auth.certificate.StreamLoadCertificateAuthHelper;
 import org.apache.doris.backup.BackupJobInfo;
 import org.apache.doris.backup.BackupMeta;
+import org.apache.doris.backup.RestoreJob;
 import org.apache.doris.backup.Snapshot;
 import org.apache.doris.binlog.BinlogLagInfo;
 import org.apache.doris.catalog.AutoIncrementGenerator;
@@ -3310,6 +3311,7 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         result.setRpcPort(0);
         result.setReplayedJournalId(0);
         result.setVersion(Version.DORIS_BUILD_VERSION + "-" + Version.DORIS_BUILD_SHORT_HASH);
+        result.setRestoreReuseCapability(RestoreJob.RESTORE_REUSE_CAPABILITY);
         if (isReady) {
             if (request.getClusterId() != Env.getCurrentEnv().getClusterId()) {
                 result.setStatus(TFrontendPingFrontendStatusCode.FAILED);
