@@ -16,6 +16,8 @@
 // under the License.
 
 import groovy.json.JsonSlurper
+import org.apache.doris.regression.util.DebugPoint
+import org.apache.doris.regression.util.NodeType
 
 // The staging partitions of an atomic restore which are loaded from a local source (kept or incrementally appended
 // partitions), and the tasks which load them: the original problem was an incremental append stuck in COMMITTING
@@ -62,7 +64,9 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
     // longer than the interval of the tablet report plus the one of the tablet checker, so that the FE sees the
     // late replica as behind and the scheduler gets a chance to repair it by clone
     long lateMs = 110000
-    String lateBe = aliveBackends[0].Host
+    // The late backend. All backends of a test cluster may share one host, so the late one is picked by its http
+    // port: the debug point is enabled on it only.
+    def lateBe = aliveBackends[0]
 
     def syncer = getSyncer()
     syncer.createS3Repository(repoName)
@@ -196,6 +200,10 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
     def enableDebug = { String name, Map params ->
         GetDebugPoint().enableDebugPointForAllBEs(name, params)
     }
+    def enableDebugOnLateBe = { String name, Map params ->
+        DebugPoint.enableDebugPoint(lateBe.Host.toString(), lateBe.HttpPort as int, NodeType.BE, name,
+                params.collectEntries { k, v -> [(k): v.toString()] })
+    }
     def disableDebug = { String name ->
         GetDebugPoint().disableDebugPointForAllBEs(name)
     }
@@ -232,7 +240,7 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         String snap1 = "${suiteName}_1"
         String ts1 = backupAndWait(snap1, dupTable)
         String since1 = feNow()
-        enableDebug("SnapshotLoader.append_increment.delay", [sleep_ms: lateMs, backend: lateBe, execute: 1])
+        enableDebugOnLateBe("SnapshotLoader.append_increment.delay", [sleep_ms: lateMs, execute: 1])
         job = restoreAndWait(dbB, snap1, ts1, dupTable)
         assertEquals("FINISHED", job.State)
         assertTrue(incrementalPartitions(job) > 0)
@@ -251,7 +259,7 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         String snap2 = "${suiteName}_2"
         String ts2 = backupAndWait(snap2, dupTable)
         String since2 = feNow()
-        enableDebug("SnapshotLoader.make_local_source.delay", [sleep_ms: lateMs, backend: lateBe, execute: 1])
+        enableDebugOnLateBe("SnapshotLoader.make_local_source.delay", [sleep_ms: lateMs, execute: 1])
         job = restoreAndWait(dbB, snap2, ts2, dupTable)
         assertEquals("FINISHED", job.State)
         assertSameAsSource(dbB, dupTable)
@@ -392,7 +400,7 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         writeIntoP1(mowTable)
         String snapM1 = "${suiteName}_m1"
         String tsM1 = backupAndWait(snapM1, mowTable)
-        enableDebug("SnapshotLoader.append_increment.delay", [sleep_ms: lateMs, backend: lateBe, execute: 1])
+        enableDebugOnLateBe("SnapshotLoader.append_increment.delay", [sleep_ms: lateMs, execute: 1])
         job = restoreAndWait(dbB, snapM1, tsM1, mowTable)
         disableDebug("SnapshotLoader.append_increment.delay")
         assertEquals("FINISHED", job.State)
