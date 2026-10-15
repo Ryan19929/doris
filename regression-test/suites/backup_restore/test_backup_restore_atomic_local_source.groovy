@@ -176,11 +176,22 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         assertEquals(rowsOf(dbA, tbl), rowsOf(db, tbl))
         assertEquals(versionsOf(dbA, tbl), versionsOf(db, tbl))
     }
-    // the number of clone tasks the tablet scheduler has made
-    def cloneTasks = {
-        def rows = sql "SHOW PROC '/cluster_balance/sched_stat'"
-        def row = rows.find { it[0].toString() == "num of clone task" }
-        return row == null ? -1L : (row[1] as long)
+    // The tablet scheduler history (SHOW PROC '/cluster_balance/history_tablets'): a finished clone has a
+    // destination backend, a tablet the restore job protects is cancelled with the reason below. Times are FE
+    // times, so they compare with the FE now() as strings of the same format.
+    def feNow = { -> sql("SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')")[0][0].toString() }
+    def schedHistorySince = { String since ->
+        def rows = sql_return_maparray "SHOW PROC '/cluster_balance/history_tablets'"
+        return rows.findAll { it.Create.toString() >= since }
+    }
+    def clonesSince = { String since, Set tabletIds = null ->
+        return schedHistorySince(since).count {
+            it.State.toString() == "FINISHED" && it.DestBe.toString() != "-1"
+                    && (tabletIds == null || tabletIds.contains(it.TabletId.toString()))
+        }
+    }
+    def protectedSince = { String since ->
+        return schedHistorySince(since).count { it.ErrMsg.toString().contains("loaded from a local source") }
     }
     def enableDebug = { String name, Map params ->
         GetDebugPoint().enableDebugPointForAllBEs(name, params)
@@ -220,14 +231,16 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         writeIntoP1(dupTable)
         String snap1 = "${suiteName}_1"
         String ts1 = backupAndWait(snap1, dupTable)
-        long clonesBefore = cloneTasks()
+        String since1 = feNow()
         enableDebug("SnapshotLoader.append_increment.delay", [sleep_ms: lateMs, backend: lateBe, execute: 1])
         job = restoreAndWait(dbB, snap1, ts1, dupTable)
         assertEquals("FINISHED", job.State)
         assertTrue(incrementalPartitions(job) > 0)
         assertSameAsSource(dbB, dupTable)
-        // no clone was made for the staging replicas (nor anything else: the cluster is otherwise idle)
-        assertEquals(clonesBefore, cloneTasks())
+        // no clone was made for the staging replicas (nor anything else: the cluster is otherwise idle), and the
+        // scheduler did meet the protection (the late replica was VERSION_INCOMPLETE), so the case is not empty
+        assertEquals(0, clonesSince(since1))
+        assertTrue(protectedSince(since1) > 0, "the scheduler never met the protection of the staging replicas")
     } finally {
         disableDebug("SnapshotLoader.append_increment.delay")
     }
@@ -237,12 +250,13 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         writeIntoP1(dupTable)
         String snap2 = "${suiteName}_2"
         String ts2 = backupAndWait(snap2, dupTable)
-        long clonesBefore = cloneTasks()
+        String since2 = feNow()
         enableDebug("SnapshotLoader.make_local_source.delay", [sleep_ms: lateMs, backend: lateBe, execute: 1])
         job = restoreAndWait(dbB, snap2, ts2, dupTable)
         assertEquals("FINISHED", job.State)
         assertSameAsSource(dbB, dupTable)
-        assertEquals(clonesBefore, cloneTasks())
+        assertEquals(0, clonesSince(since2))
+        logger.info("protected tablet schedules in case 2: ${protectedSince(since2)}")
     } finally {
         disableDebug("SnapshotLoader.make_local_source.delay")
     }
@@ -336,10 +350,11 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
     sleep(70000)
     def tabletsOfB = sql_return_maparray "SHOW TABLETS FROM ${dbB}.${dupTable}"
     def victim = tabletsOfB[0]
-    long clonesBeforeRepair = cloneTasks()
+    String since8 = feNow()
     sql """ADMIN SET REPLICA STATUS PROPERTIES("tablet_id" = "${victim.TabletId}",
             "backend_id" = "${victim.BackendId}", "status" = "bad")"""
-    assertTrue(waitUntil(300) { cloneTasks() > clonesBeforeRepair })
+    assertTrue(waitUntil(300) { clonesSince(since8, [victim.TabletId.toString()] as Set) > 0 },
+            "the bad replica of tablet ${victim.TabletId} is not repaired by a clone")
     // the same backup restores now
     job = restoreAndWait(dbB, snap8, ts8, dupTable)
     assertEquals("FINISHED", job.State)
