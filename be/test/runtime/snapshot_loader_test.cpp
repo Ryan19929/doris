@@ -46,6 +46,7 @@
 #include "io/fs/file_reader.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
+#include "io/fs/remote_file_system.h"
 #include "load/delta_writer/delta_writer.h"
 #include "load/memtable/memtable_memory_limiter.h"
 #include "runtime/cluster_info.h"
@@ -996,8 +997,10 @@ TEST_F(SnapshotLoaderTest, HttpDownloadManifestRootMismatch) {
               std::string::npos)
             << status;
     EXPECT_TRUE(loader.manifest_verified_tablets().empty());
-    // reported to FE with the dedicated code
-    EXPECT_EQ(TStatusCode::RESTORE_MANIFEST_MISMATCH, status.to_thrift().status_code);
+    // reported to FE as an internal error with the prefix in the message
+    EXPECT_EQ(TStatusCode::INTERNAL_ERROR, status.to_thrift().status_code);
+    EXPECT_NE(status.to_thrift().error_msgs[0].find("[RESTORE_MANIFEST_MISMATCH]"),
+              std::string::npos);
 }
 
 TEST_F(SnapshotLoaderTest, HttpDownloadIgnoresRemoteFilesNotInManifest) {
@@ -1040,7 +1043,9 @@ TEST_F(SnapshotLoaderTest, HttpDownloadManifestMismatchRetryFails) {
     // retried without reusing local files: all the files are downloaded
     EXPECT_GT(loader.get_http_download_files_num(), 0);
     EXPECT_TRUE(loader.manifest_verified_tablets().empty());
-    EXPECT_EQ(TStatusCode::RESTORE_MANIFEST_MISMATCH, status.to_thrift().status_code);
+    EXPECT_EQ(TStatusCode::INTERNAL_ERROR, status.to_thrift().status_code);
+    EXPECT_NE(status.to_thrift().error_msgs[0].find("[RESTORE_MANIFEST_MISMATCH]"),
+              std::string::npos);
 }
 
 TEST_F(SnapshotLoaderTest, HttpDownloadLinkedFileTamperedRetrySucceeds) {
@@ -1388,4 +1393,241 @@ TEST_F(SnapshotLoaderTest, DownloadStatsClassifyAndMerge) {
     EXPECT_EQ(1, total.unmatched_version_mismatch);
     EXPECT_FALSE(total.to_string().empty());
 }
+
+// ---------------------------------------------------------------------------------------------
+// The snapshot which holds only an increment: its tablet meta is "<tablet id>.hdr.increment", and there is no
+// "<tablet id>.hdr" (an old version then fails to move it instead of replacing the tablet with the increment).
+
+static bool file_exists(const std::string& path) {
+    bool exists = false;
+    EXPECT_TRUE(io::global_local_filesystem()->exists(path, &exists).ok());
+    return exists;
+}
+
+// The range (base, end] of the last rowset of the tablet meta file.
+static TRestoreIncrementalRange last_rowset_range(const std::string& hdr) {
+    TabletMetaPB meta;
+    EXPECT_TRUE(TabletMeta::load_from_file(hdr, &meta).ok());
+    int64_t start = 0;
+    int64_t end = 0;
+    for (const auto& rs : meta.rs_metas()) {
+        if (rs.end_version() >= end) {
+            start = rs.start_version();
+            end = rs.end_version();
+        }
+    }
+    TRestoreIncrementalRange range;
+    range.base_version = start - 1;
+    range.end_version = end;
+    return range;
+}
+
+static void expect_increment_only_dir(const std::string& dir, int64_t tablet_id,
+                                      const TRestoreIncrementalRange& range) {
+    EXPECT_FALSE(file_exists(fmt::format("{}/{}.hdr", dir, tablet_id)));
+    ASSERT_TRUE(file_exists(fmt::format("{}/{}.hdr.increment", dir, tablet_id)));
+    TabletMetaPB increment;
+    ASSERT_TRUE(TabletMeta::load_from_file(fmt::format("{}/{}.hdr.increment", dir, tablet_id),
+                                           &increment)
+                        .ok());
+    ASSERT_EQ(1, increment.rs_metas_size());
+    EXPECT_EQ(range.base_version + 1, increment.rs_metas(0).start_version());
+    EXPECT_EQ(range.end_version, increment.rs_metas(0).end_version());
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadOfAnIncrementLeavesOnlyTheIncrementHdr) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3101, 3102, 3103, 3111, 3112, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest_root(
+            write_remote_manifest(remote_snapshot.remote_snapshot_path, 3111, false));
+    TRestoreIncrementalRange range =
+            last_rowset_range(fmt::format("{}/{}.hdr", remote_snapshot.remote_snapshot_path, 3111));
+    ASSERT_GE(range.base_version, 1);
+    remote_snapshot.__set_incremental(range);
+
+    // the second round is a resent task: the increment tablet meta of the first one is still in the dir, which is
+    // neither a mismatch with the manifest nor a reason to fail
+    for (int round = 0; round < 2; ++round) {
+        std::vector<int64_t> downloaded_tablet_ids;
+        SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 31L + round, 3101);
+        auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+        ASSERT_TRUE(status.ok()) << "round " << round << ": " << status;
+        expect_increment_only_dir(remote_snapshot.local_snapshot_path, 3101, range);
+        EXPECT_EQ(std::vector<int64_t> {3101}, loader.manifest_verified_tablets());
+        EXPECT_EQ(1, loader.download_stats().tablets_incremental);
+    }
+}
+
+// the download of a whole tablet keeps the name of the tablet meta file
+TEST_F(SnapshotLoaderTest, HttpDownloadOfAWholeTabletKeepsTheHdrName) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3201, 3202, 3203, 3211, 3212, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest_root(
+            write_remote_manifest(remote_snapshot.remote_snapshot_path, 3211, false));
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 32L, 3201);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_TRUE(file_exists(remote_snapshot.local_snapshot_path + "/3201.hdr"));
+    EXPECT_FALSE(file_exists(remote_snapshot.local_snapshot_path + "/3201.hdr.increment"));
+}
+
+// A leftover tablet meta of an increment is not a file to check against the manifest, like the loaded tag.
+TEST_F(SnapshotLoaderTest, ManifestCheckIgnoresTheIncrementHdr) {
+    std::string dir = fmt::format("{}/manifest_check_increment_hdr", storage_root_path);
+    ASSERT_TRUE(io::global_local_filesystem()->delete_directory(dir).ok());
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(dir).ok());
+    write_test_file(dir + "/4001.hdr", "header");
+    write_test_file(dir + "/4001.hdr.increment", "the increment");
+    SnapshotManifest manifest;
+    manifest.tablet_id = 4001;
+    manifest.files = {
+            SnapshotManifestFile {.name = "4001.hdr", .size = 6, .md5 = "", .sha256 = ""}};
+    ManifestCheckResult result;
+    Status st = check_tablet_snapshot_manifest(dir, 4001, manifest, false, &result);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(result.checked);
+    // a file of another name is still unexpected
+    write_test_file(dir + "/4001.hdr.other", "x");
+    st = check_tablet_snapshot_manifest(dir, 4001, manifest, false, &result);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+}
+
+// The mismatch with the manifest is an internal error code, an old FE understands it as INTERNAL_ERROR, and the
+// current FE recognizes it by the prefix of the message.
+TEST_F(SnapshotLoaderTest, ManifestMismatchIsReportedAsInternalErrorWithPrefix) {
+    Status st = Status::Error<ErrorCode::RESTORE_MANIFEST_MISMATCH, false>(
+            "size mismatch of file {}", "1.dat");
+    ASSERT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
+    EXPECT_LT(ErrorCode::RESTORE_MANIFEST_MISMATCH, 0);
+    TStatus thrift = st.to_thrift();
+    EXPECT_EQ(TStatusCode::INTERNAL_ERROR, thrift.status_code);
+    ASSERT_EQ(1, thrift.error_msgs.size());
+    EXPECT_NE(thrift.error_msgs[0].find("[RESTORE_MANIFEST_MISMATCH]size mismatch of file 1.dat"),
+              std::string::npos)
+            << thrift.error_msgs[0];
+    EXPECT_NE(st.to_string().find("[RESTORE_MANIFEST_MISMATCH]"), std::string::npos);
+    // the Status read back from the thrift one is a plain internal error
+    EXPECT_FALSE(Status::create<false>(thrift).is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
+}
+
+// A remote file system over the local disk, only to download from: <remote path> is a local path.
+class LocalDirRemoteFileSystem : public io::RemoteFileSystem {
+public:
+    LocalDirRemoteFileSystem() : RemoteFileSystem("", "local_dir_remote", io::FileSystemType::S3) {}
+
+protected:
+    Status create_file_impl(const io::Path&, io::FileWriterPtr*,
+                            const io::FileWriterOptions*) override {
+        return Status::NotSupported("create_file");
+    }
+    Status create_directory_impl(const io::Path&, bool) override {
+        return Status::NotSupported("create_directory");
+    }
+    Status delete_file_impl(const io::Path&) override { return Status::NotSupported("delete"); }
+    Status batch_delete_impl(const std::vector<io::Path>&) override {
+        return Status::NotSupported("delete");
+    }
+    Status delete_directory_impl(const io::Path&) override {
+        return Status::NotSupported("delete");
+    }
+    Status exists_impl(const io::Path& path, bool* res) const override {
+        return io::global_local_filesystem()->exists(path, res);
+    }
+    Status file_size_impl(const io::Path& path, int64_t* size) const override {
+        return io::global_local_filesystem()->file_size(path, size);
+    }
+    Status list_impl(const io::Path& dir, bool, std::vector<io::FileInfo>* files,
+                     bool* exists) override {
+        return io::global_local_filesystem()->list(dir, true, files, exists);
+    }
+    Status rename_impl(const io::Path&, const io::Path&) override {
+        return Status::NotSupported("rename");
+    }
+    Status upload_impl(const io::Path&, const io::Path&) override {
+        return Status::NotSupported("upload");
+    }
+    Status batch_upload_impl(const std::vector<io::Path>&, const std::vector<io::Path>&) override {
+        return Status::NotSupported("upload");
+    }
+    Status download_impl(const io::Path& remote_file, const io::Path& local_file) override {
+        // a download replaces the local file, as the remote file systems do
+        bool exists = false;
+        RETURN_IF_ERROR(io::global_local_filesystem()->exists(local_file, &exists));
+        if (exists) {
+            RETURN_IF_ERROR(io::global_local_filesystem()->delete_file(local_file));
+        }
+        return io::global_local_filesystem()->copy_path(remote_file, local_file);
+    }
+    Status open_file_internal(const io::Path& file, io::FileReaderSPtr* reader,
+                              const io::FileReaderOptions&) override {
+        return io::global_local_filesystem()->open_file(file, reader);
+    }
+};
+
+class RepositoryTestLoader : public SnapshotLoader {
+public:
+    using SnapshotLoader::SnapshotLoader;
+    void use_remote_fs(std::shared_ptr<io::RemoteFileSystem> fs) { _remote_fs = std::move(fs); }
+};
+
+TEST_F(SnapshotLoaderTest, RepositoryDownloadOfAnIncrementLeavesOnlyTheIncrementHdr) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3301, 3302, 3303, 3311, 3312, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    TRestoreIncrementalRange range =
+            last_rowset_range(fmt::format("{}/{}.hdr", remote_snapshot.remote_snapshot_path, 3311));
+    ASSERT_GE(range.base_version, 1);
+
+    // The repository: .../__idx_1/__3311/<file>.<md5> and .../__idx_1/__manifest__3311.<root>
+    std::string idx_dir = fmt::format("{}/repo_3311/__idx_1", storage_root_path);
+    std::string repo_path = idx_dir + "/__3311";
+    ASSERT_TRUE(io::global_local_filesystem()->delete_directory(idx_dir).ok());
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(repo_path).ok());
+    SnapshotManifest manifest;
+    manifest.tablet_id = 3311;
+    std::vector<io::FileInfo> files;
+    bool exists = false;
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->list(remote_snapshot.remote_snapshot_path, true, &files, &exists)
+                        .ok());
+    for (const auto& file : files) {
+        std::string src = remote_snapshot.remote_snapshot_path + "/" + file.file_name;
+        std::string md5;
+        ASSERT_TRUE(io::global_local_filesystem()->md5sum(src, &md5).ok());
+        ASSERT_TRUE(
+                io::global_local_filesystem()
+                        ->copy_path(src, fmt::format("{}/{}.{}", repo_path, file.file_name, md5))
+                        .ok());
+        manifest.files.push_back(SnapshotManifestFile {
+                .name = file.file_name, .size = file.file_size, .md5 = md5, .sha256 = ""});
+    }
+    std::string root;
+    ASSERT_TRUE(write_snapshot_manifest(manifest, idx_dir + "/manifest.tmp", &root).ok());
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->rename(idx_dir + "/manifest.tmp",
+                                 idx_dir + "/" + SnapshotManifest::remote_file_name(3311, root))
+                        .ok());
+
+    // a resent task: the second round finds the increment tablet meta of the first one
+    for (int round = 0; round < 2; ++round) {
+        RepositoryTestLoader loader(*engine_ref, ExecEnv::GetInstance(), 33L + round, 3301);
+        loader.use_remote_fs(std::make_shared<LocalDirRemoteFileSystem>());
+        loader.set_manifest_roots({{repo_path, root}});
+        loader.set_incremental_ranges({{repo_path, range}});
+        std::vector<int64_t> downloaded_tablet_ids;
+        Status st = loader.download({{repo_path, remote_snapshot.local_snapshot_path}},
+                                    &downloaded_tablet_ids);
+        ASSERT_TRUE(st.ok()) << "round " << round << ": " << st;
+        expect_increment_only_dir(remote_snapshot.local_snapshot_path, 3301, range);
+        EXPECT_EQ(std::vector<int64_t> {3301}, loader.manifest_verified_tablets());
+        EXPECT_EQ(1, loader.download_stats().tablets_incremental);
+    }
+}
+
 } // namespace doris

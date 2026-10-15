@@ -4942,7 +4942,7 @@ protected:
                 }
             }
         }
-        EXPECT_TRUE(TabletMeta::save(fmt::format("{}/{}.hdr", dir, local->tablet_id()), inc).ok());
+        EXPECT_TRUE(install_increment_hdr(dir, local->tablet_id(), inc).ok());
         return dir;
     }
 
@@ -5106,6 +5106,85 @@ TEST_F(RestoreIncrementalAppendTest, WrongBaseVersionIsRefusedAndNothingChanges)
     EXPECT_FALSE(loader.append_increment(dir, local, range).ok());
     EXPECT_EQ(3, local->max_version_unlocked());
     EXPECT_EQ(files_before, tablet_files(local));
+}
+
+// The snapshot dir of an increment holds "<tablet id>.hdr.increment" and no "<tablet id>.hdr", and the append reads
+// the former.
+TEST_F(RestoreIncrementalAppendTest, AppendReadsTheIncrementHdr) {
+    _next_id = 970000;
+    auto src = create_tablet(7501, false);
+    auto local = create_tablet(7502, false);
+    build_source(src, false);
+    build_local(local, false);
+    mark_loaded(local, 1, 3);
+    std::string dir = make_increment_dir(src, local, 3, 6);
+    bool exists = true;
+    ASSERT_TRUE(
+            io::global_local_filesystem()->exists(fmt::format("{}/7502.hdr", dir), &exists).ok());
+    EXPECT_FALSE(exists);
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->exists(fmt::format("{}/7502.hdr.increment", dir), &exists)
+                        .ok());
+    EXPECT_TRUE(exists);
+
+    // a dir with the tablet meta of a full snapshot only is not an increment: nothing is appended
+    std::string full_dir = dir + "_full";
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(full_dir).ok());
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->copy_path(fmt::format("{}/7502.hdr.increment", dir),
+                                    fmt::format("{}/7502.hdr", full_dir))
+                        .ok());
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    TRestoreIncrementalRange range;
+    range.base_version = 3;
+    range.end_version = 6;
+    EXPECT_FALSE(loader.append_increment(full_dir, local, range).ok());
+    EXPECT_EQ(3, local->max_version_unlocked());
+
+    Status st = loader.append_increment(dir, local, range);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(6, local->max_version_unlocked());
+}
+
+// move() replaces the tablet with the snapshot, it must refuse a snapshot which holds only an increment, with
+// or without the tablet meta of a full snapshot in the dir, and change nothing.
+TEST_F(RestoreIncrementalAppendTest, MoveRefusesASnapshotWithAnIncrementHdr) {
+    _next_id = 980000;
+    auto src = create_tablet(7511, false);
+    auto local = create_tablet(7512, false);
+    build_source(src, false);
+    build_local(local, false);
+    mark_loaded(local, 1, 3);
+    std::string dir = make_increment_dir(src, local, 3, 6);
+    auto files_before = tablet_files(local);
+    RestoreDigest before = tablet_digest(7512, 3);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+
+    auto expect_refused = [&](const std::string& what) {
+        Status st = loader.move(dir, local, true);
+        EXPECT_FALSE(st.ok()) << what;
+        EXPECT_NE(st.to_string().find("[RESTORE_NOT_RETRYABLE]"), std::string::npos)
+                << what << ": " << st;
+        EXPECT_NE(st.to_string().find("holds only an increment"), std::string::npos)
+                << what << ": " << st;
+        // the tablet is what it was, and the snapshot is not marked as moved
+        auto tablet = _engine->tablet_manager()->get_tablet(7512);
+        ASSERT_NE(nullptr, tablet);
+        EXPECT_EQ(3, tablet->max_version_unlocked()) << what;
+        EXPECT_EQ(files_before, tablet_files(tablet)) << what;
+        EXPECT_TRUE(digests_equal(before, tablet_digest(7512, 3))) << what;
+        bool exists = true;
+        EXPECT_TRUE(io::global_local_filesystem()->exists(dir + "/LOADED", &exists).ok());
+        EXPECT_FALSE(exists) << what;
+    };
+    // 1. only the tablet meta of the increment
+    expect_refused("only the increment hdr");
+    // 2. both: the tablet meta of a full snapshot beside it
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->copy_path(fmt::format("{}/7512.hdr.increment", dir),
+                                    fmt::format("{}/7512.hdr", dir))
+                        .ok());
+    expect_refused("the full hdr and the increment hdr");
 }
 
 TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
@@ -5368,7 +5447,7 @@ protected:
                 }
             }
         }
-        ASSERT_TRUE(TabletMeta::save(fmt::format("{}/{}.hdr", dir, target->tablet_id()), inc).ok());
+        ASSERT_TRUE(install_increment_hdr(dir, target->tablet_id(), inc).ok());
     }
 
     void run_incremental(bool mow, int64_t base_id, bool copy) {

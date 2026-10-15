@@ -47,10 +47,12 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
+import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
+import org.apache.doris.system.Frontend;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.task.AgentBatchTask;
 import org.apache.doris.task.AgentTask;
@@ -3563,5 +3565,188 @@ public class RestoreReuseTest {
         } finally {
             Config.restore_local_source_task_max_retry = origMax;
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // the capability of the nodes: a cluster with an old node downloads all the data
+    // ---------------------------------------------------------------------------------------------
+
+    private final List<Frontend> frontends = Lists.newArrayList();
+    private final List<Backend> aliveBackends = Lists.newArrayList();
+
+    private Frontend frontend(FrontendNodeType role, String host, int capability) {
+        Frontend fe = new Frontend(role, host, host, 9010);
+        fe.setRestoreReuseCapability(capability);
+        frontends.add(fe);
+        return fe;
+    }
+
+    private Backend backend(long id, int capability) {
+        Backend be = new Backend(id, "be" + id, 9050);
+        be.setRestoreReuseCapability(capability);
+        aliveBackends.add(be);
+        return be;
+    }
+
+    // the cluster as the master (fe1) sees it
+    private void mockCluster() {
+        Mockito.when(env.getSelfNode()).thenReturn(new SystemInfoService.HostInfo("fe1", 9010));
+        Mockito.when(env.getFrontends(Mockito.any())).thenAnswer(inv -> {
+            FrontendNodeType type = inv.getArgument(0);
+            return frontends.stream().filter(fe -> type == null || fe.getRole() == type)
+                    .collect(Collectors.toList());
+        });
+        Mockito.when(systemInfo.getAllClusterBackends(true)).thenAnswer(inv -> Lists.newArrayList(aliveBackends));
+    }
+
+    @Test
+    public void testAllNodesCapableReuses() {
+        mockCluster();
+        // the master itself has not been heard from (0), it is this build
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 0);
+        frontend(FrontendNodeType.FOLLOWER, "fe2", 1);
+        backend(1, 1);
+        backend(2, 1);
+        Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+        RestoreJob job = prepareJob("full");
+        assertReused(job);
+    }
+
+    // the candidates are decided by the digests of the replicas, the digest tasks are sent
+    private void assertReused(RestoreJob job) {
+        Assertions.assertEquals(2, job.getReuseShadowStats().getReusable());
+        Assertions.assertEquals(0, job.getReuseShadowStats().getL0PassedButMixedVersions());
+        Assertions.assertTrue(job.getReuseResult().getRejected().isEmpty(), job.getReuseResult().toString());
+        toVerifying(job);
+        Assertions.assertFalse(newDigestTasks().isEmpty());
+    }
+
+    @Test
+    public void testObserverDoesNotTakePart() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 0);
+        frontend(FrontendNodeType.FOLLOWER, "fe2", 1);
+        frontend(FrontendNodeType.OBSERVER, "fe3", 0);
+        backend(1, 1);
+        Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+        assertReused(prepareJob("full"));
+    }
+
+    private void assertNotReused(RestoreJob job) {
+        // the partitions are judged to be the same, but the job downloads all the data, for this reason
+        RestoreReuseShadowStats estimate = job.getReuseShadowStats();
+        Assertions.assertEquals(0, estimate.getReusable());
+        Assertions.assertEquals(2, estimate.getL0PassedButMixedVersions());
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertNotNull(result);
+        Assertions.assertTrue(result.getDecisions().isEmpty());
+        Assertions.assertEquals(2L, (long) result.getRejected().get(RestoreJob.MIXED_VERSIONS));
+        Assertions.assertEquals(0, result.getKeptPartitions());
+        Assertions.assertTrue(job.toString().length() > 0);
+        // the partitions are restored as before: the versions are set by the job, nothing is kept
+        Assertions.assertFalse(versionInfo(job).isEmpty());
+        // ReuseEstimate shows the reason
+        Assertions.assertTrue(estimate.toJson(result).contains("\"mixed_versions\":2"), estimate.toJson(result));
+        // no digest task is sent
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+        Assertions.assertTrue(newDigestTasks().isEmpty());
+    }
+
+    @Test
+    public void testFollowerWithoutCapabilityDownloadsAll() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 1);
+        frontend(FrontendNodeType.FOLLOWER, "fe2", 0);
+        backend(1, 1);
+        Assertions.assertTrue(RestoreJob.findNodeWithoutReuseCapability().contains("fe2"));
+        assertNotReused(prepareJob("full"));
+    }
+
+    @Test
+    public void testBackendWithoutCapabilityDownloadsAll() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 1);
+        backend(1, 1);
+        backend(2, 0);
+        Assertions.assertTrue(RestoreJob.findNodeWithoutReuseCapability().contains("be2"));
+        assertNotReused(prepareJob("full"));
+    }
+
+    @Test
+    public void testBeforeTheFirstHeartbeatIsNotCapable() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 0);
+        // a backend just added to the master: its capability is not heard yet
+        aliveBackends.add(new Backend(3, "be3", 9050));
+        Assertions.assertTrue(RestoreJob.findNodeWithoutReuseCapability().contains("be3"));
+        assertNotReused(prepareJob("full"));
+    }
+
+    @Test
+    public void testDeadBackendDoesNotTakePart() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 1);
+        backend(1, 1);
+        // a dead backend is not in the list of the alive ones
+        new Backend(2, "be2", 9050).setRestoreReuseCapability(0);
+        Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+    }
+
+    @Test
+    public void testCapabilityIsNotCheckedIfNotRequired() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 1);
+        frontend(FrontendNodeType.FOLLOWER, "fe2", 0);
+        backend(1, 0);
+        boolean orig = Config.restore_reuse_require_capability;
+        Config.restore_reuse_require_capability = false;
+        try {
+            Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+            assertReused(prepareJob("full"));
+        } finally {
+            Config.restore_reuse_require_capability = orig;
+        }
+    }
+
+    // The unknown state of the nodes is taken as not capable.
+    @Test
+    public void testFailureToReadTheNodesIsNotCapable() {
+        Mockito.when(env.getSelfNode()).thenThrow(new IllegalStateException("boom"));
+        Assertions.assertNotNull(RestoreJob.findNodeWithoutReuseCapability());
+    }
+
+    // The backend says the downloaded snapshot does not match the manifest as an internal error with the prefix. The
+    // report of a digest task is a degrade (the partition is downloaded), the job is not cancelled by it.
+    @Test
+    public void testManifestMismatchReportOfADigestTask() {
+        TFinishTaskRequest report = new TFinishTaskRequest();
+        TStatus status = new TStatus(TStatusCode.INTERNAL_ERROR);
+        status.setErrorMsgs(Lists.newArrayList("(127.0.0.1)" + RestoreJob.RESTORE_MANIFEST_MISMATCH
+                + "decomposed digest of tablet 1 does not match the root"));
+        report.setTaskStatus(status);
+        // recognized by the prefix, not by the status code
+        Assertions.assertTrue(RestoreJob.isManifestMismatch(report.getTaskStatus()));
+        Assertions.assertFalse(RestoreJob.isManifestMismatch(new TStatus(TStatusCode.INTERNAL_ERROR)));
+        TStatus plain = new TStatus(TStatusCode.INTERNAL_ERROR);
+        plain.setErrorMsgs(Lists.newArrayList("(127.0.0.1)[INTERNAL_ERROR]boom"));
+        Assertions.assertFalse(RestoreJob.isManifestMismatch(plain));
+
+        RestoreJob job = prepareJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Map<Long, TFinishTaskRequest> faulty = Maps.newHashMap();
+        for (RestoreDigestTask task : tasks) {
+            if (task.getPartitionId() == p1().getId()) {
+                faulty.put(task.getSignature(), report);
+            }
+        }
+        reportAll(job, tasks, faulty);
+        waitDigests(job);
+        Assertions.assertNotEquals(RestoreJobState.CANCELLED, job.getState());
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertEquals(1, result.getKeptPartitions());
+        Assertions.assertTrue(result.isKept(tbl2.getId(), p2().getId()));
+        Assertions.assertFalse(result.isKept(tbl2.getId(), p1().getId()));
     }
 }
