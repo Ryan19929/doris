@@ -122,7 +122,7 @@ suite("test_backup_restore_atomic_local_source_docker", "backup_restore,docker")
         }
         def rowsOf = { String db ->
             def r = sql """SELECT COUNT(*), SUM(CRC32(CONCAT(CAST(id AS STRING), '|', value))) FROM ${db}.${tbl}"""
-            return "${r[0][0]}:${r[0][1]}"
+            return "${r[0][0]}:${r[0][1]}".toString()
         }
         def writeIntoP1 = {
             ++writes
