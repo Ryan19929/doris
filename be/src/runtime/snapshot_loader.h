@@ -142,12 +142,24 @@ struct ManifestCheckResult {
     bool digest_checked = false;
 };
 
+// The tablet meta file of a snapshot which holds only an increment (see select_incremental_rowsets) is
+// "<tablet id>.hdr.increment", and the snapshot has no "<tablet id>.hdr". An old version, which does not know
+// the increment, then fails to move such a snapshot instead of replacing the tablet with the increment.
+inline constexpr std::string_view kIncrementHdrSuffix = ".hdr.increment";
+
+// Saves `increment` as "<local_path>/<tablet_id>.hdr.increment", then deletes "<local_path>/<tablet_id>.hdr". To
+// be called after the snapshot is checked against the manifest. If it is interrupted in the middle both files
+// exist, which the move of the snapshot rejects as well.
+Status install_increment_hdr(const std::string& local_path, int64_t tablet_id,
+                             const TabletMetaPB& increment);
+
 // Check the files of a downloaded local tablet snapshot against the manifest of the source tablet
 // snapshot:
 //  - the set of files must be the same, no more and no less;
 //  - the size of each file must be the same;
 //  - if check_digest is true, the SHA-256 of each file must be the same, if the manifest has it. The
 //    tablet meta file is excluded, it is rewritten in restore.
+//  - the file "<tablet id>.hdr.increment" is ignored, like the loaded tag, it is not in the manifest.
 // The names in the manifest are those of the source tablet, the tablet meta file "<source tablet id>.hdr"
 // is expected as "<local_tablet_id>.hdr", as it is renamed when downloading.
 //

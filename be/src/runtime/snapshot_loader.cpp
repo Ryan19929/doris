@@ -776,6 +776,14 @@ Status cut_manifest_to_increment(const SnapshotManifest& manifest, const TabletM
 
 static constexpr std::string_view kLoadedTagFileName = "LOADED";
 
+Status install_increment_hdr(const std::string& local_path, int64_t tablet_id,
+                             const TabletMetaPB& increment) {
+    RETURN_IF_ERROR(TabletMeta::save(
+            fmt::format("{}/{}{}", local_path, tablet_id, kIncrementHdrSuffix), increment));
+    return io::global_local_filesystem()->delete_file(
+            fmt::format("{}/{}.hdr", local_path, tablet_id));
+}
+
 Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t local_tablet_id,
                                       const SnapshotManifest& manifest, bool check_digest,
                                       ManifestCheckResult* result) {
@@ -807,7 +815,7 @@ Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t loc
                 local_tablet_id, local_path);
     }
     for (const auto& file : files) {
-        if (file.file_name == kLoadedTagFileName) {
+        if (file.file_name == kLoadedTagFileName || file.file_name.ends_with(kIncrementHdrSuffix)) {
             continue;
         }
         local_files.emplace(file.file_name, file.file_size);
@@ -1481,8 +1489,7 @@ Status SnapshotHttpDownloader::_cut_to_increment() {
 }
 
 Status SnapshotHttpDownloader::_install_increment_hdr() {
-    std::string local_hdr = fmt::format("{}/{}.hdr", _local_path, _local_tablet_id);
-    RETURN_IF_ERROR(TabletMeta::save(local_hdr, _increment));
+    RETURN_IF_ERROR(install_increment_hdr(_local_path, _local_tablet_id, _increment));
     _stats.tablets_incremental = 1;
     _stats.incremental_files = _stats.downloaded_files;
     _stats.incremental_bytes = _stats.downloaded_bytes;
@@ -2022,8 +2029,9 @@ Status SnapshotLoader::_download_tablet_incremental(
         if (result.checked) {
             _add_manifest_verified_tablet(local_tablet_id, result.digest_checked);
         }
-        // 3. the tablet meta of the snapshot is the increment only
-        RETURN_IF_ERROR(TabletMeta::save(local_hdr, increment));
+        // 3. the tablet meta of the snapshot is the increment only, in a file of another name than the tablet
+        // meta of a full snapshot
+        RETURN_IF_ERROR(install_increment_hdr(local_path, local_tablet_id, increment));
         stats->tablets_incremental = 1;
         stats->incremental_files = stats->downloaded_files;
         stats->incremental_bytes = stats->downloaded_bytes;
@@ -2423,6 +2431,22 @@ Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
         return Status::OK();
     }
 
+    // A snapshot which holds only an increment can only be appended to the tablet, never replace it. Reject it
+    // before anything is converted or removed, whether the snapshot has the tablet meta file of a full snapshot
+    // or not.
+    {
+        std::vector<std::string> files;
+        RETURN_IF_ERROR(_get_existing_files_from_local(snapshot_path, &files));
+        for (const auto& file : files) {
+            if (file.ends_with(kIncrementHdrSuffix)) {
+                return restore_not_retryable(
+                        fmt::format("the snapshot {} holds only an increment ({}), it can not "
+                                    "replace tablet {}",
+                                    snapshot_path, file, tablet_id));
+            }
+        }
+    }
+
     // rename the rowset ids and tabletid info in rowset meta
     // The restore stage of the source is dropped (the snapshot of a tablet which an earlier restore
     // loaded has it), the one of this restore, if any, is saved with the tablet meta by the reload.
@@ -2727,9 +2751,10 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
     }
 
     // rename the rowset ids and tablet id info in the rowset metas (and the segment files)
+    // (the tablet meta of the increment is "<tablet id>.hdr.increment")
     auto converted = _engine.snapshot_mgr()->convert_rowset_ids(
             snapshot_path, tablet_id, tablet->replica_id(), tablet->table_id(),
-            tablet->partition_id(), schema_hash);
+            tablet->partition_id(), schema_hash, false, nullptr, kIncrementHdrSuffix);
     if (!converted.has_value()) [[unlikely]] {
         return Status::InternalError("failed to convert rowset ids in snapshot {}: {}",
                                      snapshot_path, converted.error());
@@ -2738,8 +2763,8 @@ Status SnapshotLoader::append_increment(const std::string& snapshot_path, Tablet
     auto pending_guards = std::move(converted.value());
 
     auto cloned_meta = std::make_shared<TabletMeta>();
-    RETURN_IF_ERROR(
-            cloned_meta->create_from_file(fmt::format("{}/{}.hdr", snapshot_path, tablet_id)));
+    RETURN_IF_ERROR(cloned_meta->create_from_file(
+            fmt::format("{}/{}{}", snapshot_path, tablet_id, kIncrementHdrSuffix)));
     std::vector<RowsetMetaSharedPtr> rs_metas;
     for (const auto& [version, rs_meta] : cloned_meta->all_rs_metas()) {
         rs_metas.push_back(rs_meta);
