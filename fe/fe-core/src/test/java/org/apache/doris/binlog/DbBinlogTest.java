@@ -579,6 +579,50 @@ public class DbBinlogTest {
     }
 
     @Test
+    public void testReplaceTableTooOldAfterGc() {
+        // db binlog enabled, all binlogs with timestamp <= expiredTime will be gc'd
+        long expiredTime = 10;
+        Map<String, Long> ttlMap = Maps.newHashMap();
+        MockBinlogConfigCache binlogConfigCache = BinlogTestUtils.newMockBinlogConfigCache(ttlMap);
+        binlogConfigCache.addDbBinlogConfig(dbId, true, expiredTime);
+        binlogConfigCache.addTableBinlogConfig(dbId, baseTableId, true, expiredTime);
+
+        DBBinlog dbBinlog = new DBBinlog(binlogConfigCache,
+                BinlogTestUtils.newBinlog(dbId, baseTableId, 1, 1));
+        dbBinlog.addBinlog(BinlogTestUtils.newBinlog(dbId, baseTableId, 1, 1), null);
+        // non-swap replace at commitSeq 2, not expired
+        TBinlog replaceBinlog = BinlogTestUtils.newBinlog(dbId, baseTableId, 2, expiredTime + 10);
+        replaceBinlog.setType(TBinlogType.REPLACE_TABLE);
+        ReplaceTableOperationLog replaceLog = ReplaceTableOperationLog.fromJson(
+                "{\"origTblId\":" + baseTableId + ",\"swapTable\":false}");
+        dbBinlog.addBinlog(replaceBinlog, replaceLog);
+
+        // gc the binlog at commitSeq 1, the drop record at commitSeq 2 is kept
+        dbBinlog.gc();
+        Assert.assertEquals(1, dbBinlog.getDroppedTables().size());
+
+        // a consumer older than the gc point gets TOO_OLD with the dummy binlog, as for a
+        // live table, so that it can recover by a full sync instead of being told the
+        // table is not found
+        Pair<TStatus, List<TBinlog>> binlogResult = dbBinlog.getBinlog(baseTableId, 0, 10);
+        Assert.assertEquals(TStatusCode.BINLOG_TOO_OLD_COMMIT_SEQ, binlogResult.first.getStatusCode());
+        Assert.assertEquals(TBinlogType.DUMMY, binlogResult.second.get(0).getType());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.getBinlogLag(baseTableId, 0).first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK,
+                dbBinlog.lockBinlog(baseTableId, "job1", 0).first.getStatusCode());
+
+        // the REPLACE_TABLE binlog itself is still served
+        binlogResult = dbBinlog.getBinlog(baseTableId, 1, 10);
+        Assert.assertEquals(TStatusCode.OK, binlogResult.first.getStatusCode());
+        Assert.assertEquals(TBinlogType.REPLACE_TABLE, binlogResult.second.get(0).getType());
+
+        // drained
+        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
+                dbBinlog.getBinlog(baseTableId, 2, 10).first.getStatusCode());
+    }
+
+    @Test
     public void testDroppedTableSignalClearedByGc() {
         // db binlog enabled, all binlogs with timestamp <= expiredTime will be gc'd
         long expiredTime = 10;

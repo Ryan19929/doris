@@ -124,9 +124,10 @@ public class TableBinlog {
         }
     }
 
-    // Whether getBinlog(prevCommitSeq) would return binlogs, i.e. prevCommitSeq is not too old
-    // and there is at least one binlog after it.
-    public boolean hasBinlogAfter(long prevCommitSeq) {
+    // Whether a consumer at prevCommitSeq has consumed all binlogs, i.e. getBinlog(prevCommitSeq)
+    // would return BINLOG_TOO_NEW_COMMIT_SEQ. A prevCommitSeq older than the first binlog is not
+    // drained, it is too old.
+    public boolean isDrained(long prevCommitSeq) {
         lock.readLock().lock();
         try {
             if (binlogs.first().getCommitSeq() > prevCommitSeq) {
@@ -134,7 +135,7 @@ public class TableBinlog {
             }
             TBinlog guard = new TBinlog();
             guard.setCommitSeq(prevCommitSeq);
-            return binlogs.higher(guard) != null;
+            return binlogs.higher(guard) == null;
         } finally {
             lock.readLock().unlock();
         }
