@@ -124,6 +124,22 @@ public class TableBinlog {
         }
     }
 
+    // Whether getBinlog(prevCommitSeq) would return binlogs, i.e. prevCommitSeq is not too old
+    // and there is at least one binlog after it.
+    public boolean hasBinlogAfter(long prevCommitSeq) {
+        lock.readLock().lock();
+        try {
+            if (binlogs.first().getCommitSeq() > prevCommitSeq) {
+                return false;
+            }
+            TBinlog guard = new TBinlog();
+            guard.setCommitSeq(prevCommitSeq);
+            return binlogs.higher(guard) != null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     public Pair<TStatus, BinlogLagInfo> getBinlogLag(long prevCommitSeq) {
         lock.readLock().lock();
         try {
