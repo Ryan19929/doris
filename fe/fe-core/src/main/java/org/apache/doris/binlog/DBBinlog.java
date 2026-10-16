@@ -311,13 +311,11 @@ public class DBBinlog {
                 return lockDbBinlog(jobUniqueId, lockCommitSeq);
             }
 
+            // A lock only records the consumed position to speed up gc, it does not read
+            // binlogs, so it is not affected by the dropped state: the latest position (-1)
+            // and the last consumed position of a dropped table are both valid. The dropped
+            // signal is reported by getBinlog and getBinlogLag.
             tableBinlog = tableBinlogMap.get(tableId);
-            // Locking the latest binlog of a dropped table is meaningless; a lock below the
-            // drop is still allowed so that the unconsumed binlogs are retained.
-            if (isTableDropped(tableId) && (lockCommitSeq < 0 || isDrained(tableBinlog, lockCommitSeq))) {
-                LOG.warn("table is dropped. dbId: {}, tableId: {}, lockCommitSeq: {}", dbId, tableId, lockCommitSeq);
-                return Pair.of(new TStatus(TStatusCode.BINLOG_NOT_FOUND_TABLE), -1L);
-            }
         } finally {
             lock.writeLock().unlock();
         }

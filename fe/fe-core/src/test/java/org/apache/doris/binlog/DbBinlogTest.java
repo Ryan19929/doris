@@ -478,17 +478,19 @@ public class DbBinlogTest {
         Assert.assertEquals(TStatusCode.OK,
                 dbBinlog.lockBinlog(baseTableId, "job1", 1).first.getStatusCode());
 
-        // once they are consumed, all table level APIs return BINLOG_NOT_FOUND_TABLE
+        // once they are consumed, getBinlog and getBinlogLag return BINLOG_NOT_FOUND_TABLE
         binlogResult = dbBinlog.getBinlog(baseTableId, 2, 10);
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, binlogResult.first.getStatusCode());
         Pair<TStatus, BinlogLagInfo> lagResult = dbBinlog.getBinlogLag(baseTableId, 2);
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, lagResult.first.getStatusCode());
+        // lockBinlog is not affected by the dropped state: locking the last consumed position
+        // and the latest position (-1) are both valid
         Pair<TStatus, Long> lockResult = dbBinlog.lockBinlog(baseTableId, "job1", 2);
-        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, lockResult.first.getStatusCode());
-        Assert.assertEquals(-1L, (long) lockResult.second);
-        // locking the latest binlog of a dropped table is rejected
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(2L, (long) lockResult.second);
         lockResult = dbBinlog.lockBinlog(baseTableId, "job3", -1);
-        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE, lockResult.first.getStatusCode());
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(2L, (long) lockResult.second);
 
         // db level binlog (tableId = -1) is not affected by dropped tables
         Assert.assertNotEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
@@ -574,8 +576,14 @@ public class DbBinlogTest {
                 dbBinlog.getBinlog(baseTableId, 4, 10).first.getStatusCode());
         Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
                 dbBinlog.getBinlogLag(baseTableId, 4).first.getStatusCode());
-        Assert.assertEquals(TStatusCode.BINLOG_NOT_FOUND_TABLE,
-                dbBinlog.lockBinlog(baseTableId, "job1", 4).first.getStatusCode());
+        // locking the REPLACE_TABLE position, or the latest position at the start of a full
+        // sync that still uses the orig table id, is valid
+        Pair<TStatus, Long> lockResult = dbBinlog.lockBinlog(baseTableId, "job1", 4);
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(4L, (long) lockResult.second);
+        lockResult = dbBinlog.lockBinlog(baseTableId, "job2", -1);
+        Assert.assertEquals(TStatusCode.OK, lockResult.first.getStatusCode());
+        Assert.assertEquals(4L, (long) lockResult.second);
     }
 
     @Test
