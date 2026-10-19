@@ -1314,6 +1314,7 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
             engine, env, upload_request.job_id, req.signature, upload_request.broker_addr,
             upload_request.broker_prop);
     SCOPED_ATTACH_TASK(loader->resource_ctx());
+    loader->set_skip_manifest(upload_request.__isset.skip_manifest && upload_request.skip_manifest);
     Status status =
             loader->init(upload_request.__isset.storage_backend ? upload_request.storage_backend
                                                                 : TStorageBackendType::type::BROKER,
@@ -1340,7 +1341,9 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_tablet_files(tablet_files);
     if (status.ok()) {
-        finish_task_request.__set_manifest_roots(loader->uploaded_manifest_roots());
+        if (!loader->skip_manifest()) {
+            finish_task_request.__set_manifest_roots(loader->uploaded_manifest_roots());
+        }
         if (!loader->uploaded_prefix_digest_roots().empty()) {
             finish_task_request.__set_prefix_digest_roots(loader->uploaded_prefix_digest_roots());
         }
@@ -1704,6 +1707,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     std::string manifest_root;
     const bool local_source =
             snapshot_request.__isset.restore_local_source && snapshot_request.restore_local_source;
+    // The frontend does not want the manifest (enable_backup_manifest is false): list the files only.
+    const bool skip_manifest =
+            snapshot_request.__isset.skip_manifest && snapshot_request.skip_manifest;
     LocalSourceStats local_source_stats;
     Status status;
     if (local_source && snapshot_request.__isset.restore_incremental &&
@@ -1751,7 +1757,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
                 }
                 manifest.files.push_back(std::move(manifest_file));
             }
-            if (status.ok()) {
+            if (status.ok() && !skip_manifest) {
                 status = write_snapshot_manifest(
                         manifest,
                         fmt::format("{}/{}/{}", snapshot_path, snapshot_request.tablet_id,
@@ -1801,7 +1807,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_snapshot_path(snapshot_path);
     finish_task_request.__set_snapshot_files(snapshot_files);
-    if (status.ok() && snapshot_request.__isset.list_files) {
+    if (status.ok() && snapshot_request.__isset.list_files && !skip_manifest) {
         finish_task_request.__set_manifest_root(manifest_root);
     }
     if (logical_digest.has_value()) {

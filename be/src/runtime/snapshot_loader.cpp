@@ -1714,17 +1714,21 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
             RETURN_IF_ERROR(upload_with_checksum(*_remote_fs, local_path, remote_path, md5sum));
         } // end for each tablet's local files
 
-        // 2.4 upload the manifest after all the data files of the tablet
+        // 2.4 upload the manifest after all the data files of the tablet, unless the frontend does not want it
         std::string manifest_root;
-        RETURN_IF_ERROR(_upload_manifest(src_path, dest_path, tablet_id, std::move(manifest_files),
-                                         &manifest_root));
+        if (!_skip_manifest) {
+            RETURN_IF_ERROR(_upload_manifest(src_path, dest_path, tablet_id,
+                                             std::move(manifest_files), &manifest_root));
+        }
 
         // 2.5 and the decomposed digest, if the snapshot has one
         std::string prefix_root;
         RETURN_IF_ERROR(_upload_prefix_digest(src_path, dest_path, tablet_id, &prefix_root));
 
         tablet_files->emplace(tablet_id, local_files_with_checksum);
-        _uploaded_manifest_roots.emplace(tablet_id, std::move(manifest_root));
+        if (!_skip_manifest) {
+            _uploaded_manifest_roots.emplace(tablet_id, std::move(manifest_root));
+        }
         if (!prefix_root.empty()) {
             _uploaded_prefix_digest_roots.emplace(tablet_id, std::move(prefix_root));
         }

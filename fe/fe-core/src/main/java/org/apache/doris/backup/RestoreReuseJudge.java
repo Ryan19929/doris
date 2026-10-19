@@ -443,6 +443,11 @@ public final class RestoreReuseJudge {
             for (BackupTabletInfo backupTablet : backupIdx.sortedTabletInfoList) {
                 LogicalDigestInfo digest = in.jobInfo.getLogicalDigest(backupTablet.id);
                 if (digest == null || !digest.hasDigest()) {
+                    String skipReason = in.jobInfo.logicalDigestSkipReason;
+                    if (digest == null && skipReason != null && skipReason.startsWith(RestoreJob.TOO_MANY_TABLETS)) {
+                        // the backup did not record the digest because it has too many tablets
+                        return "NO_DIGEST_TOO_MANY_TABLETS";
+                    }
                     return "NO_DIGEST";
                 }
             }

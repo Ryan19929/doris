@@ -2929,6 +2929,27 @@ public class Config extends ConfigBase {
             + "wait. For experiments only.")
     public static boolean restore_reuse_require_capability = true;
 
+    @ConfField(mutable = true, masterOnly = true, description = "The maximum number of tablets of a backup job for "
+            + "which the logical digest is recorded. If a backup involves more tablets, the backup does not ask the "
+            + "backends to compute the logical digest and does not write it (nor the decomposed digest) into the job "
+            + "info, the reason (TOO_MANY_TABLETS) is shown in the column LogicalDigest of SHOW BACKUP, and the backup "
+            + "still succeeds. A restore of such a backup does not reuse partitions. 0 (the default) means no limit.")
+    public static long backup_logical_digest_max_tablets = 0;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The maximum number of tablets of the backup that a "
+            + "restore job may consider for partition level reuse. If the backup involves more tablets, the job does "
+            + "not reuse any partition (the check level is forced to disable), all the data is downloaded as before "
+            + "and the reason TOO_MANY_TABLETS is counted in the ReuseEstimate of SHOW RESTORE. 0 (the default) "
+            + "means no limit.")
+    public static long restore_reuse_max_tablets = 0;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether a backup writes the manifest of each tablet "
+            + "snapshot (the complete list of its files, one small file per tablet) and records its root in the job "
+            + "info (about 83 bytes per tablet). The manifest lets a restore check the downloaded files. If false, "
+            + "no manifest is written and the job info has no manifest roots, a restore of the backup downloads "
+            + "without the manifest check, as a backup of an old version does. True by default.")
+    public static boolean enable_backup_manifest = true;
+
     @ConfField(mutable = true, description = "The time after which a BE is considered unavailable if no heartbeat is "
             + "received.")
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

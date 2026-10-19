@@ -424,6 +424,8 @@ struct TUploadReq {
     4: optional map<string, string> broker_prop
     5: optional Types.TStorageBackendType storage_backend = Types.TStorageBackendType.BROKER
     6: optional string location // root path
+    // do not upload the manifest of the tablet snapshots (the frontend config enable_backup_manifest is false)
+    7: optional bool skip_manifest
 }
 
 // The versions (base_version, end_version] of a remote tablet snapshot to append to a local tablet whose
@@ -502,6 +504,9 @@ struct TSnapshotRequest {
     // loaded into the tablet by this job is saved with the tablet meta, to tell a resent task from a tablet
     // which was changed.
     19: optional i64 job_id
+    // backup only: do not write the manifest of the snapshot (the frontend config enable_backup_manifest is false),
+    // list_files only lists the files
+    20: optional bool skip_manifest
 }
 
 // Where to read the decomposed digest file (rdigest) of the tablet of a backup, for the incremental restore

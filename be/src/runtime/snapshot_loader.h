@@ -360,6 +360,11 @@ public:
     // The prefix of the error messages which make the FE cancel the restore job instead of resending the task.
     static constexpr const char* kRestoreNotRetryable = "[RESTORE_NOT_RETRYABLE]";
 
+    // Do not upload the manifest of the tablet snapshots in upload() (enable_backup_manifest of the frontend is
+    // false), no manifest root is reported then.
+    void set_skip_manifest(bool skip_manifest) { _skip_manifest = skip_manifest; }
+    bool skip_manifest() const { return _skip_manifest; }
+
     // The manifest root of each tablet uploaded by upload().
     const std::map<int64_t, std::string>& uploaded_manifest_roots() const {
         return _uploaded_manifest_roots;
@@ -477,6 +482,7 @@ private:
 
     std::map<std::string, std::string> _manifest_roots;
     std::map<std::string, TRestoreIncrementalRange> _incremental_ranges;
+    bool _skip_manifest = false;
     std::map<int64_t, std::string> _uploaded_manifest_roots;
     std::map<int64_t, std::string> _uploaded_prefix_digest_roots;
     std::vector<int64_t> _manifest_verified_tablets;

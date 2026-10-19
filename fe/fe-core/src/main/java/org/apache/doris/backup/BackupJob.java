@@ -21,6 +21,7 @@ import org.apache.doris.backup.Status.ErrCode;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.FsBroker;
+import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OdbcTable;
@@ -85,6 +86,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(BackupJob.class);
     private static final String TABLE_COMMIT_SEQ_PREFIX = "table_commit_seq:";
     private static final String SNAPSHOT_COMMIT_SEQ = "commit_seq";
+    // internal properties of the job (not set by the user), decided when the snapshot tasks are made
+    private static final String PROP_LOGICAL_DIGEST_SKIP = "logical_digest_skip";
+    private static final String PROP_NO_MANIFEST = "no_manifest";
 
     public enum BackupJobState {
         PENDING, // Job is newly created. Send snapshot tasks and save copied meta info, then transfer to SNAPSHOTING
@@ -131,6 +135,10 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     // backup properties && table commit seq with table id
     @SerializedName("prop")
     private Map<String, String> properties = Maps.newHashMap();
+
+    // The outcome of the logical digest, for the column LogicalDigest of SHOW BACKUP. Null before it is recorded.
+    @SerializedName("ldsm")
+    private String logicalDigestSummary;
 
     // Record table IDs that were dropped during backup
     @SerializedName("dt")
@@ -201,12 +209,44 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         return Boolean.parseBoolean(properties.get(BackupCommand.PROP_LOGICAL_DIGEST));
     }
 
-    private boolean computeLogicalDigestInSnapshot() {
-        return isLogicalDigest() && !Config.isCloudMode();
+    // Why the job does not record the logical digest although it is asked to (e.g. TOO_MANY_TABLETS:<n>><limit>),
+    // null if it records it. Decided when the snapshot tasks are made, see Config.backup_logical_digest_max_tablets.
+    public String getLogicalDigestSkipReason() {
+        return properties.get(PROP_LOGICAL_DIGEST_SKIP);
+    }
+
+    /**
+     * Whether the backend computes the logical digest of the tablets of the table in the snapshot task. A unique
+     * table (merge-on-write or merge-on-read) is not reused by a restore unless the source cluster allows the hidden
+     * state models (restore_reuse_allow_hidden_state_models), so its digest is neither computed nor recorded
+     * otherwise.
+     */
+    private boolean computeLogicalDigestInSnapshot(OlapTable table) {
+        if (!isLogicalDigest() || Config.isCloudMode() || getLogicalDigestSkipReason() != null) {
+            return false;
+        }
+        return Config.restore_reuse_allow_hidden_state_models || table.getKeysType() != KeysType.UNIQUE_KEYS;
+    }
+
+    // Whether the job writes no manifest (enable_backup_manifest was false when the snapshot tasks were made).
+    private boolean isManifestDisabled() {
+        return Boolean.parseBoolean(properties.get(PROP_NO_MANIFEST));
     }
 
     private boolean computeDigestInSnapshot() {
-        return repoId == Repository.KEEP_ON_LOCAL_REPO_ID && isManifestDigest();
+        return repoId == Repository.KEEP_ON_LOCAL_REPO_ID && isManifestDigest() && !isManifestDisabled();
+    }
+
+    // What SHOW BACKUP shows in the column LogicalDigest.
+    private String getLogicalDigestStatus() {
+        if (!isLogicalDigest()) {
+            return "OFF";
+        }
+        String skipReason = getLogicalDigestSkipReason();
+        if (skipReason != null) {
+            return "SKIPPED:" + skipReason;
+        }
+        return logicalDigestSummary != null ? logicalDigestSummary : "ON";
     }
 
     public BackupContent getContent() {
@@ -258,7 +298,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     task.getVersion(),
                     task.getSchemaHash(), timeoutMs, false /* not restore task */);
             newTask.setComputeDigest(computeDigestInSnapshot());
-            newTask.setComputeLogicalDigest(computeLogicalDigestInSnapshot());
+            // the same as the task it replaces
+            newTask.setComputeLogicalDigest(task.isComputeLogicalDigest());
+            newTask.setSkipManifest(task.isSkipManifest());
             unfinishedTaskIds.put(signature, beId);
 
             //send task
@@ -598,6 +640,13 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         unfinishedTaskIds.clear();
         taskProgress.clear();
         taskErrMsg.clear();
+        // decided again whenever the tasks are made again (e.g. after a restart)
+        properties.remove(PROP_LOGICAL_DIGEST_SKIP);
+        properties.remove(PROP_NO_MANIFEST);
+        logicalDigestSummary = null;
+        if (!Config.enable_backup_manifest) {
+            properties.put(PROP_NO_MANIFEST, "true");
+        }
         // copy all related schema at this moment
         List<Table> copiedTables = Lists.newArrayList();
         List<Resource> copiedResources = Lists.newArrayList();
@@ -661,6 +710,19 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             LOG.warn(msg);
             status = new Status(ErrCode.COMMON_ERROR, msg);
             return;
+        }
+
+        // Too many tablets: do not compute and record the logical digest (nor the decomposed digest), the backup
+        // itself is not affected.
+        long digestLimit = Config.backup_logical_digest_max_tablets;
+        if (isLogicalDigest() && !Config.isCloudMode() && digestLimit > 0 && unfinishedTaskIds.size() > digestLimit) {
+            String reason = String.format("TOO_MANY_TABLETS:%d>%d", unfinishedTaskIds.size(), digestLimit);
+            properties.put(PROP_LOGICAL_DIGEST_SKIP, reason);
+            for (AgentTask task : batchTask.getAllTasks()) {
+                ((SnapshotTask) task).setComputeLogicalDigest(false);
+            }
+            LOG.info("the logical digest is not recorded: {}, change config `backup_logical_digest_max_tablets` to "
+                    + "change this limitation. {}", reason, this);
         }
 
         backupMeta = new BackupMeta(copiedTables, copiedResources);
@@ -761,7 +823,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                             visibleVersion,
                             schemaHash, timeoutMs, false /* not restore task */);
                     task.setComputeDigest(computeDigestInSnapshot());
-                    task.setComputeLogicalDigest(computeLogicalDigestInSnapshot());
+                    task.setComputeLogicalDigest(computeLogicalDigestInSnapshot(olapTable));
+                    task.setSkipManifest(isManifestDisabled());
                     batchTask.addTask(task);
                     unfinishedTaskIds.put(signature, beId);
                 }
@@ -879,6 +942,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                         brokers.get(0),
                         repo.getFileSystemDescriptor().getBackendConfigProperties(),
                         repo.getFileSystemDescriptor().getThriftStorageType(), repo.getLocation());
+                task.setSkipManifest(isManifestDisabled());
                 batchTask.addTask(task);
                 unfinishedTaskIds.put(signature, beId);
             }
@@ -1015,15 +1079,30 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             // required by the manifest_digest property.
             String digestAlgorithm = repoId != Repository.KEEP_ON_LOCAL_REPO_ID || isManifestDigest()
                     ? BackupJobInfo.DIGEST_SHA256 : BackupJobInfo.DIGEST_NONE;
-            boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos, digestAlgorithm);
-            LOG.info("backup manifest: {}, digest algorithm: {}. {}", hasManifest, jobInfo.digestAlgorithm, this);
+            if (isManifestDisabled()) {
+                LOG.info("backup manifest: disabled by enable_backup_manifest. {}", this);
+            } else {
+                boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos, digestAlgorithm);
+                LOG.info("backup manifest: {}, digest algorithm: {}. {}", hasManifest, jobInfo.digestAlgorithm,
+                        this);
+            }
             if (isLogicalDigest()) {
-                int withDigest = jobInfo.buildLogicalDigests(filteredSnapshotInfos);
-                LOG.info("backup logical digest: {} of {} tablets have a digest. {}", withDigest,
-                        filteredSnapshotInfos.size(), this);
-                int withPrefix = jobInfo.buildPrefixDigests(filteredSnapshotInfos);
-                LOG.info("backup decomposed digest: {} of {} tablets have a decomposed digest file. {}",
-                        withPrefix, filteredSnapshotInfos.size(), this);
+                String skipReason = getLogicalDigestSkipReason();
+                if (skipReason != null) {
+                    jobInfo.logicalDigestSkipReason = skipReason;
+                    logicalDigestSummary = null;
+                } else {
+                    int withDigest = jobInfo.buildLogicalDigests(filteredSnapshotInfos);
+                    int notAsked = (int) filteredSnapshotInfos.values().stream()
+                            .filter(info -> info.getLogicalDigest() == null).count();
+                    LOG.info("backup logical digest: {} of {} tablets have a digest, {} tablets were not asked for "
+                            + "it. {}", withDigest, filteredSnapshotInfos.size(), notAsked, this);
+                    int withPrefix = jobInfo.buildPrefixDigests(filteredSnapshotInfos);
+                    LOG.info("backup decomposed digest: {} of {} tablets have a decomposed digest file. {}",
+                            withPrefix, filteredSnapshotInfos.size(), this);
+                    logicalDigestSummary = String.format("RECORDED:digest=%d,no_digest=%d,not_asked=%d", withDigest,
+                            filteredSnapshotInfos.size() - withDigest - notAsked, notAsked);
+                }
             }
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
@@ -1251,6 +1330,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         info.add(taskErrMsgStr);
         info.add(status.toString());
         info.add(String.valueOf(timeoutMs / 1000));
+        info.add(getLogicalDigestStatus());
         return info;
     }
 

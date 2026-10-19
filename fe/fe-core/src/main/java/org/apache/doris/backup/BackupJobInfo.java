@@ -134,12 +134,14 @@ public class BackupJobInfo implements GsonPostProcessable {
     @SerializedName("digest_algorithm")
     public String digestAlgorithm;
 
-    // tablet id -> manifest root, built from the manifest roots of all indexes on demand, not persisted.
-    private Map<Long, String> manifestRootIndex;
-    // tablet id -> logical digest, built on demand, not persisted.
-    private Map<Long, LogicalDigestInfo> logicalDigestIndex;
-    // tablet id -> decomposed digest root, built on demand, not persisted.
-    private Map<Long, String> prefixDigestRootIndex;
+    // Why the backup did not record the logical digest although it was asked to (e.g. TOO_MANY_TABLETS:<n>><limit>),
+    // see Config.backup_logical_digest_max_tablets. Null (absent in the json) if it did, or was not asked to.
+    @SerializedName("ldskip")
+    public String logicalDigestSkipReason;
+
+    // tablet id -> the index it belongs to, built on demand, not persisted. The manifest root, the logical digest
+    // and the decomposed digest root of a tablet are read from its index, so no per tablet copy of them is kept.
+    private Map<Long, BackupIndexInfo> tabletIndex;
 
     public static class ExtraInfo {
         public static class NetworkAddrss {
@@ -455,8 +457,25 @@ public class BackupJobInfo implements GsonPostProcessable {
         // Null if the backup has no manifest.
         @SerializedName("manifest_roots")
         public Map<Long, String> manifestRoots;
-        // tablet id -> the logical digest of the tablet snapshot, see LogicalDigestInfo. Null if the backup has no
-        // logical digest (the logical_digest property is off, or an old version). Not written if null.
+        // The logical digest of the tablet snapshots, see LogicalDigestInfo. Null if the backup has no logical digest
+        // (the logical_digest property is off, an old version, or the backup has too many tablets). Not written if
+        // null. The schema signature and the algorithm version are the same for the tablets of an index, so they
+        // are recorded once for the index, and each tablet only records its root:
+        // tablet id -> the root (lower case hex) of the tablets which have a digest.
+        @SerializedName("ldr")
+        public Map<Long, String> logicalDigestRoots;
+        // tablet id -> the reason (LogicalDigestInfo.REASON_*) of the tablets which have no digest. A tablet in
+        // neither map was not asked for a digest (e.g. a unique table).
+        @SerializedName("ldn")
+        public Map<Long, String> logicalDigestNone;
+        // the schema signature and the algorithm version of the digests in logicalDigestRoots
+        @SerializedName("lds")
+        public String logicalDigestSchemaSig;
+        @SerializedName("lda")
+        public Integer logicalDigestAlgo;
+        // Only read, for a backup of a version before the digest was recorded as above: tablet id -> the digest of
+        // the tablet. It is never written by this version (a version which does not know ldr fails on a changed
+        // "ld", so the name of the old field is not reused for the new format).
         @SerializedName("ld")
         public Map<Long, LogicalDigestInfo> logicalDigests;
         // tablet id -> the SHA-256 (lower case hex) of the decomposed digest file of the tablet snapshot, from which
@@ -474,8 +493,80 @@ public class BackupJobInfo implements GsonPostProcessable {
             return manifestRoots == null ? null : manifestRoots.get(tabletId);
         }
 
+        // The logical digest of the tablet put together from the index and the tablet, null if the backup has none
+        // for the tablet.
         public LogicalDigestInfo getLogicalDigest(long tabletId) {
+            String root = logicalDigestRoots == null ? null : logicalDigestRoots.get(tabletId);
+            if (root != null) {
+                if (logicalDigestSchemaSig == null || logicalDigestAlgo == null) {
+                    return LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR);
+                }
+                return LogicalDigestInfo.of(logicalDigestAlgo, logicalDigestSchemaSig, root);
+            }
+            String reason = logicalDigestNone == null ? null : logicalDigestNone.get(tabletId);
+            if (reason != null) {
+                return LogicalDigestInfo.none(reason);
+            }
             return logicalDigests == null ? null : logicalDigests.get(tabletId);
+        }
+
+        // Record the logical digest of a tablet in the format of ldr/ldn/lds/lda. A digest which does not have the
+        // schema signature or the algorithm version of the others of the index can not be recorded once for the
+        // index, it is recorded as a tablet without digest (MIXED_SCHEMA).
+        public void putLogicalDigest(long tabletId, LogicalDigestInfo digest) {
+            if (digest.hasDigest() && digest.schemaSig != null && digest.algoVersion != null) {
+                if (logicalDigestSchemaSig == null) {
+                    logicalDigestSchemaSig = digest.schemaSig;
+                    logicalDigestAlgo = digest.algoVersion;
+                }
+                if (logicalDigestSchemaSig.equals(digest.schemaSig) && logicalDigestAlgo.equals(digest.algoVersion)) {
+                    if (logicalDigestRoots == null) {
+                        logicalDigestRoots = Maps.newHashMap();
+                    }
+                    logicalDigestRoots.put(tabletId, digest.root);
+                    return;
+                }
+                digest = LogicalDigestInfo.none(LogicalDigestInfo.REASON_MIXED_SCHEMA);
+            } else if (digest.hasDigest()) {
+                digest = LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR);
+            }
+            if (logicalDigestNone == null) {
+                logicalDigestNone = Maps.newHashMap();
+            }
+            logicalDigestNone.put(tabletId, digest.reason == null ? LogicalDigestInfo.REASON_ERROR : digest.reason);
+        }
+
+        private void clearLogicalDigests() {
+            logicalDigestRoots = null;
+            logicalDigestNone = null;
+            logicalDigestSchemaSig = null;
+            logicalDigestAlgo = null;
+            logicalDigests = null;
+        }
+
+        // Keep the logical digests of the given tablets only (in new maps: a hash map does not shrink).
+        private void retainLogicalDigests(Set<Long> tabletIds) {
+            logicalDigestRoots = retain(logicalDigestRoots, tabletIds);
+            if (logicalDigestRoots == null) {
+                logicalDigestSchemaSig = null;
+                logicalDigestAlgo = null;
+            }
+            logicalDigestNone = retain(logicalDigestNone, tabletIds);
+            logicalDigests = retain(logicalDigests, tabletIds);
+        }
+
+        private static <V> Map<Long, V> retain(Map<Long, V> map, Set<Long> tabletIds) {
+            if (map == null) {
+                return null;
+            }
+            Map<Long, V> kept = Maps.newHashMap();
+            for (Long id : tabletIds) {
+                V value = map.get(id);
+                if (value != null) {
+                    kept.put(id, value);
+                }
+            }
+            return kept.isEmpty() ? null : kept;
         }
 
         public String getPrefixDigestRoot(long tabletId) {
@@ -504,7 +595,7 @@ public class BackupJobInfo implements GsonPostProcessable {
         // Persisted in BackupIndexInfo.manifestRoots, this is a view of it.
         public String manifestRoot;
         // The logical digest of the tablet snapshot, null if the backup has none.
-        // Persisted in BackupIndexInfo.logicalDigests, this is a view of it.
+        // Persisted in BackupIndexInfo.logicalDigestRoots etc, this is a view of it.
         public LogicalDigestInfo logicalDigest;
         // The root of the decomposed digest file of the tablet snapshot, null if there is none.
         // Persisted in BackupIndexInfo.prefixDigestRoots, this is a view of it.
@@ -785,14 +876,15 @@ public class BackupJobInfo implements GsonPostProcessable {
         }
         manifestVersion = MANIFEST_VERSION;
         this.digestAlgorithm = digestAlgorithm;
-        manifestRootIndex = null;
         return true;
     }
 
     /**
-     * Record the logical digest of every tablet, see TLogicalDigest. Unlike the manifest, it is per tablet: a tablet
-     * without a digest (NOT_SUPPORTED, failed, or reported by an old backend) records the reason code and an
-     * empty root, the other tablets are not affected.
+     * Record the logical digest of every tablet that was asked for one, see TLogicalDigest. Unlike the manifest, it
+     * is per tablet: a tablet without a digest (NOT_SUPPORTED, failed, or reported by an old backend) records the
+     * reason code, the other tablets are not affected. A tablet which was not asked for a digest (the snapshot info
+     * has none, e.g. a unique table) records nothing. The schema signature and the algorithm version are recorded
+     * once for an index.
      *
      * @param snapshotInfos tablet id -> snapshot info
      * @return the number of tablets with a digest
@@ -806,19 +898,23 @@ public class BackupJobInfo implements GsonPostProcessable {
         for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
             for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
                 for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
-                    Map<Long, LogicalDigestInfo> digests = Maps.newHashMap();
                     for (Long tabletId : idxInfo.tablets.keySet()) {
                         SnapshotInfo info = snapshotInfos.get(tabletId);
-                        LogicalDigestInfo digest = info == null ? null : info.getLogicalDigest();
-                        if (digest == null) {
+                        LogicalDigestInfo digest;
+                        if (info == null) {
                             digest = LogicalDigestInfo.none(LogicalDigestInfo.REASON_NO_REPORT);
+                        } else {
+                            digest = info.getLogicalDigest();
+                            if (digest == null) {
+                                // not asked for a digest
+                                continue;
+                            }
                         }
-                        if (digest.hasDigest()) {
-                            withDigest++;
-                        }
-                        digests.put(tabletId, digest);
+                        idxInfo.putLogicalDigest(tabletId, digest);
                     }
-                    idxInfo.logicalDigests = digests;
+                    if (idxInfo.logicalDigestRoots != null) {
+                        withDigest += idxInfo.logicalDigestRoots.size();
+                    }
                 }
             }
         }
@@ -858,29 +954,51 @@ public class BackupJobInfo implements GsonPostProcessable {
         return count;
     }
 
-    // Returns the root of the decomposed digest file of a tablet in the backup, null if the tablet has none.
-    public String getPrefixDigestRoot(long tabletId) {
-        if (prefixDigestRootIndex == null) {
-            Map<Long, String> index = Maps.newHashMap();
+    /** The number of tablets of the backup. */
+    public long getTabletNum() {
+        long num = 0;
+        for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+            if (tblInfo == null) {
+                continue;
+            }
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    num += idxInfo.tablets.size();
+                }
+            }
+        }
+        return num;
+    }
+
+    // The index the tablet belongs to, null if it is not in the backup.
+    private BackupIndexInfo getIndexOfTablet(long tabletId) {
+        Map<Long, BackupIndexInfo> index = tabletIndex;
+        if (index == null) {
+            index = Maps.newHashMap();
             for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
                 if (tblInfo == null) {
                     continue;
                 }
                 for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
                     for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
-                        if (idxInfo.prefixDigestRoots != null) {
-                            index.putAll(idxInfo.prefixDigestRoots);
+                        for (Long id : idxInfo.tablets.keySet()) {
+                            index.put(id, idxInfo);
                         }
                     }
                 }
             }
-            prefixDigestRootIndex = index;
+            tabletIndex = index;
         }
-        return prefixDigestRootIndex.get(tabletId);
+        return index.get(tabletId);
+    }
+
+    // Returns the root of the decomposed digest file of a tablet in the backup, null if the tablet has none.
+    public String getPrefixDigestRoot(long tabletId) {
+        BackupIndexInfo idxInfo = getIndexOfTablet(tabletId);
+        return idxInfo == null ? null : idxInfo.getPrefixDigestRoot(tabletId);
     }
 
     private void clearPrefixDigests() {
-        prefixDigestRootIndex = null;
         for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
             for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
                 for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
@@ -890,33 +1008,19 @@ public class BackupJobInfo implements GsonPostProcessable {
         }
     }
 
-    // Returns the logical digest of a tablet in the backup, null if the backup has none for the tablet.
+    // Returns the logical digest of a tablet in the backup, put together from its index, null if the backup has none
+    // for the tablet.
     public LogicalDigestInfo getLogicalDigest(long tabletId) {
-        if (logicalDigestIndex == null) {
-            Map<Long, LogicalDigestInfo> index = Maps.newHashMap();
-            for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
-                if (tblInfo == null) {
-                    continue;
-                }
-                for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
-                    for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
-                        if (idxInfo.logicalDigests != null) {
-                            index.putAll(idxInfo.logicalDigests);
-                        }
-                    }
-                }
-            }
-            logicalDigestIndex = index;
-        }
-        return logicalDigestIndex.get(tabletId);
+        BackupIndexInfo idxInfo = getIndexOfTablet(tabletId);
+        return idxInfo == null ? null : idxInfo.getLogicalDigest(tabletId);
     }
 
     private void clearLogicalDigests() {
-        logicalDigestIndex = null;
+        logicalDigestSkipReason = null;
         for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
             for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
                 for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
-                    idxInfo.logicalDigests = null;
+                    idxInfo.clearLogicalDigests();
                 }
             }
         }
@@ -945,29 +1049,13 @@ public class BackupJobInfo implements GsonPostProcessable {
         if (!hasManifest()) {
             return null;
         }
-        if (manifestRootIndex == null) {
-            Map<Long, String> index = Maps.newHashMap();
-            for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
-                if (tblInfo == null) {
-                    continue;
-                }
-                for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
-                    for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
-                        if (idxInfo.manifestRoots != null) {
-                            index.putAll(idxInfo.manifestRoots);
-                        }
-                    }
-                }
-            }
-            manifestRootIndex = index;
-        }
-        return manifestRootIndex.get(tabletId);
+        BackupIndexInfo idxInfo = getIndexOfTablet(tabletId);
+        return idxInfo == null ? null : idxInfo.getManifestRoot(tabletId);
     }
 
     private void clearManifest() {
         manifestVersion = null;
         digestAlgorithm = null;
-        manifestRootIndex = null;
         for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
             for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
                 for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
@@ -1100,14 +1188,55 @@ public class BackupJobInfo implements GsonPostProcessable {
                     // The manifest roots are only needed for downloading. Keep manifest_version and
                     // digest_algorithm, they are shown in SHOW RESTORE.
                     indexInfo.manifestRoots = null;
-                    indexInfo.logicalDigests = null;
+                    indexInfo.clearLogicalDigests();
                     indexInfo.prefixDigestRoots = null;
                 }
             }
         }
-        manifestRootIndex = null;
-        logicalDigestIndex = null;
-        prefixDigestRootIndex = null;
+        tabletIndex = null;
+    }
+
+    /**
+     * Release the logical digests and the decomposed digest roots, which a restore only needs to decide the reuse of
+     * partitions, except the logical digests of the given tablets (those that are sent with the incremental append,
+     * see RestoreJob#getBackupLogicalDigest). The manifest roots are kept, the download needs them.
+     */
+    public void releaseDigests(Set<Long> keepLogicalDigestTablets) {
+        for (BackupOlapTableInfo tableInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tableInfo.partitions.values()) {
+                for (BackupIndexInfo indexInfo : partInfo.indexes.values()) {
+                    indexInfo.prefixDigestRoots = null;
+                    if (keepLogicalDigestTablets.isEmpty()) {
+                        indexInfo.clearLogicalDigests();
+                    } else {
+                        indexInfo.retainLogicalDigests(keepLogicalDigestTablets);
+                    }
+                    for (BackupTabletInfo tabletInfo : indexInfo.sortedTabletInfoList) {
+                        tabletInfo.prefixDigestRoot = null;
+                        if (!keepLogicalDigestTablets.contains(tabletInfo.id)) {
+                            tabletInfo.logicalDigest = null;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Release the manifest roots, which are only needed to download. manifest_version and digest_algorithm are kept,
+     * they are shown in SHOW RESTORE.
+     */
+    public void releaseManifestRoots() {
+        for (BackupOlapTableInfo tableInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tableInfo.partitions.values()) {
+                for (BackupIndexInfo indexInfo : partInfo.indexes.values()) {
+                    indexInfo.manifestRoots = null;
+                    for (BackupTabletInfo tabletInfo : indexInfo.sortedTabletInfoList) {
+                        tabletInfo.manifestRoot = null;
+                    }
+                }
+            }
+        }
     }
 
     @Override

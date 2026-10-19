@@ -23,9 +23,10 @@ import org.apache.doris.thrift.TLogicalDigest;
 import com.google.gson.annotations.SerializedName;
 
 /**
- * The logical digest of a tablet snapshot, see TLogicalDigest. Persisted in the job info of a backup (per tablet,
- * BackupIndexInfo.logicalDigests) and in the SnapshotInfo, so the gson names are short and must not change.
- * Without a digest (root is empty) the reason code says why.
+ * The logical digest of a tablet snapshot, see TLogicalDigest. Persisted in the SnapshotInfo, so the gson names are
+ * short and must not change. In the job info of a backup it is recorded as the root of each tablet, and the schema
+ * signature and the algorithm version of each index (BackupIndexInfo.logicalDigestRoots etc), and put together on
+ * reading. Without a digest (root is empty) the reason code says why.
  */
 public class LogicalDigestInfo {
     // the backend failed or did not report
@@ -34,6 +35,8 @@ public class LogicalDigestInfo {
     public static final String REASON_NOT_SUPPORTED = "NOT_SUPPORTED";
     // the backend is an old version and did not report a digest
     public static final String REASON_NO_REPORT = "NO_REPORT";
+    // the schema signature or the algorithm version differs from the other digests of the index of the backup
+    public static final String REASON_MIXED_SCHEMA = "MIXED_SCHEMA";
 
     @SerializedName("a")
     public Integer algoVersion;

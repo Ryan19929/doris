@@ -264,13 +264,19 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     public static final int RESTORE_REUSE_CAPABILITY = 1;
     // The reason of downloading all the data when a node does not have the capability.
     public static final String MIXED_VERSIONS = "MIXED_VERSIONS";
+    // The reason of downloading all the data when the backup has more tablets than restore_reuse_max_tablets.
+    public static final String TOO_MANY_TABLETS = "TOO_MANY_TABLETS";
     // The prefix of the error message of a downloaded snapshot which does not match the manifest of the backup.
     public static final String RESTORE_MANIFEST_MISMATCH = "[RESTORE_MANIFEST_MISMATCH]";
     // The working state of partition level reuse while PENDING..VERIFYING, never persisted: the job is redone
     // from PENDING after a restart or a master switch.
     private transient List<ReuseCandidate> reuseCandidates = Lists.newArrayList();
     // signature of a digest task -> the digest reported, or none() if the task failed
+    // Only the results of the partitions which are not decided yet: the partition is decided as soon as the results
+    // of all its replicas are in, and its results are dropped then.
     private transient Map<Long, LogicalDigestInfo> digestResults = Maps.newHashMap();
+    // signature of a digest task -> the candidate it belongs to, until the candidate is decided
+    private transient Map<Long, ReuseCandidate> digestSignatureToCandidate = Maps.newHashMap();
     private transient long verifyRoundStartMs = 0;
     // 1: the sampled partitions (or all, if there is no sampling), 2: the others, after the sample found a mismatch
     private transient int verifyRound = 0;
@@ -456,7 +462,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         } else {
             digest = LogicalDigestInfo.fromThrift(request.isSetLogicalDigest() ? request.getLogicalDigest() : null);
         }
+        ReuseCandidate candidate = digestSignatureToCandidate.get(task.getSignature());
+        if (candidate == null || candidate.decided) {
+            // the partition is decided (e.g. changed while verifying), nothing to keep
+            digestSignatureToCandidate.remove(task.getSignature());
+            return true;
+        }
         digestResults.put(task.getSignature(), digest);
+        judgeCandidate(candidate, false);
         return true;
     }
 
@@ -623,8 +636,19 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     private void resetManifestCheck() {
         manifestCheck = null;
-        manifestVerifiedReplicas.clear();
-        manifestDigestCheckedReplicas.clear();
+        releaseManifestCheckReplicas();
+    }
+
+    // The replicas checked are only needed to compute the result of the check, which is fixed (manifestCheck) when
+    // the download finishes or the job is cancelled. Do not hold them as long as the job is kept in the history.
+    private void releaseManifestCheckReplicas() {
+        manifestVerifiedReplicas = Sets.newHashSet();
+        manifestDigestCheckedReplicas = Sets.newHashSet();
+    }
+
+    @VisibleForTesting
+    int getManifestCheckReplicaNum() {
+        return manifestVerifiedReplicas.size() + manifestDigestCheckedReplicas.size();
     }
 
     public synchronized boolean finishDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
@@ -1541,6 +1565,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 startVerifying(db);
                 return;
             }
+            // nothing to verify, no digest is needed any more
+            releaseDigestsOfJobInfo();
             prepareAndSendSnapshotTaskForOlapTable(db);
         }
 
@@ -2552,7 +2578,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             // backupMeta is useless now
             backupMeta = null;
             manifestCheck = computeManifestCheck();
+            releaseManifestCheckReplicas();
             fixDownloadStats();
+            // The download is done, and the job never downloads again from COMMIT on: the manifest roots (and the
+            // job info in the edit log below) do not need to carry them.
+            jobInfo.releaseManifestRoots();
 
             env.getEditLog().logRestoreJob(this);
             LOG.info("finished to download, manifest check: {}. {}", manifestCheck, this);
@@ -2741,6 +2771,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             snapshotInfos.clear();
             fileMapping.clear();
             jobInfo.releaseSnapshotInfo();
+            releaseManifestCheckReplicas();
 
             finishedTime = commitTime;
             state = RestoreJobState.FINISHED;
@@ -2962,13 +2993,48 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 jobInfo.getSrcClusterIdOrUnknown());
     }
 
+    /**
+     * The number of tablets of the backup if it is more than restore_reuse_max_tablets, otherwise 0 (also if there
+     * is no limit).
+     */
+    @VisibleForTesting
+    long tabletNumOverReuseLimit() {
+        long limit = Config.restore_reuse_max_tablets;
+        if (limit <= 0 || jobInfo == null) {
+            return 0;
+        }
+        long num = jobInfo.getTabletNum();
+        return num > limit ? num : 0;
+    }
+
     public RestoreReuseResult getReuseResult() {
         return reuseResult;
     }
 
+    /**
+     * The logical digests and the decomposed digest roots of the job info are only needed to decide the reuse
+     * (VERIFYING), release them (and their share of the edit logs of the following states). The exception is the
+     * logical digest of the tablets of the partitions restored by the incremental append: it is sent with the move
+     * task in COMMIT, and the job may be redone from the edit log.
+     */
+    @VisibleForTesting
+    void releaseDigestsOfJobInfo() {
+        Set<Long> keep = Sets.newHashSet();
+        if (reuseResult != null && reuseResult.getIncrementalPartitions() > 0) {
+            for (Map.Entry<IdChain, IdChain> entry : fileMapping.getMapping().entrySet()) {
+                if (getIncrementalDecision(entry.getKey().getTblId(), entry.getKey().getPartId()) != null) {
+                    keep.add(entry.getValue().getTabletId());
+                }
+            }
+        }
+        jobInfo.releaseDigests(keep);
+    }
+
     private void clearReuseWorkingState() {
         reuseCandidates.clear();
-        digestResults.clear();
+        // new collections, the capacity of a cleared hash map is kept
+        digestResults = Maps.newHashMap();
+        digestSignatureToCandidate = Maps.newHashMap();
         verifyRound = 0;
     }
 
@@ -3055,6 +3121,21 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 Config.restore_reuse_default_check_level);
         if (jobLevel == CheckLevel.DISABLE) {
             LOG.info("partition level reuse is disabled by the property of the job {}", jobId);
+            return keys;
+        }
+        long tooManyTablets = tabletNumOverReuseLimit();
+        if (tooManyTablets > 0) {
+            // Too many tablets for the job to hold the digests and the results: the check level is disable.
+            RestoreReuseResult result = new RestoreReuseResult();
+            for (BackupOlapTableInfo tblInfo : jobInfo.backupOlapTableObjects.values()) {
+                for (int i = 0; i < tblInfo.partitions.size(); i++) {
+                    result.addRejected(TOO_MANY_TABLETS);
+                }
+            }
+            reuseResult = result;
+            jobInfo.releaseDigests(Collections.emptySet());
+            LOG.info("restore reuse: the backup has {} tablets, more than restore_reuse_max_tablets {}, download all. "
+                    + "job: {}", tooManyTablets, Config.restore_reuse_max_tablets, jobId);
             return keys;
         }
         CheckLevel effectiveJobLevel = RestoreReuseJudge.levelOfTable(jobLevel, KeysType.DUP_KEYS);
@@ -3239,6 +3320,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     private void startVerifying(Database db) {
         digestResults.clear();
+        digestSignatureToCandidate.clear();
         unfinishedSignatureToId.clear();
         taskProgress.clear();
         taskErrMsg.clear();
@@ -3283,6 +3365,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 LOG.warn("failed to prepare the digest tasks of partition {}.{}, download it. {}",
                         candidate.tableName, candidate.partitionName, this, e);
                 candidate.decide(false, RestoreReuseResult.DOWNLOAD_VERIFY_ERROR);
+            }
+            if (!candidate.decided && candidate.tablets != null) {
+                // all the replicas may be without a task already (e.g. the backends are down)
+                judgeCandidate(candidate, false);
             }
         }
         AgentTaskExecutor.submit(batchTask);
@@ -3354,6 +3440,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             tbl.readUnlock();
         }
         candidate.tablets = checks;
+        for (ReuseTabletCheck check : checks) {
+            for (long signature : check.signatures) {
+                digestSignatureToCandidate.put(signature, candidate);
+            }
+        }
         digestResults.putAll(immediateResults);
         for (RestoreDigestTask task : tasks) {
             batchTask.addTask(task);
@@ -3509,44 +3600,69 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         finishVerifying(db);
     }
 
-    // Judge the partitions of the round that are not decided: all digests of a partition are in, or the round timed
-    // out.
+    // Judge the partitions of the round that are not decided: the partitions whose results are all in are decided
+    // as they come (see judgeCandidate), those left timed out.
     private void judgeDigestRound() {
         for (ReuseCandidate candidate : reuseCandidates) {
             if (candidate.decided || candidate.tablets == null) {
                 continue;
             }
-            String reason = null;
-            boolean complete = true;
-            for (ReuseTabletCheck check : candidate.tablets) {
-                List<LogicalDigestInfo> actual = Lists.newArrayList();
-                for (long signature : check.signatures) {
-                    LogicalDigestInfo digest = digestResults.get(signature);
-                    if (digest == null) {
-                        complete = false;
-                        break;
-                    }
-                    actual.add(digest);
-                }
-                if (!complete) {
+            judgeCandidate(candidate, true);
+        }
+    }
+
+    /**
+     * Decide the partition if the results of all its replicas are in, and drop the results (and the tasks) of the
+     * partition, so that the results held are those of the partitions which are not decided, not of all the
+     * replicas of the job.
+     *
+     * @param roundEnded the round is over, the partition is decided as timed out if a result is missing
+     * @return whether the partition is decided
+     */
+    private boolean judgeCandidate(ReuseCandidate candidate, boolean roundEnded) {
+        if (candidate.decided || candidate.tablets == null) {
+            return candidate.decided;
+        }
+        String reason = null;
+        boolean complete = true;
+        for (ReuseTabletCheck check : candidate.tablets) {
+            List<LogicalDigestInfo> actual = Lists.newArrayList();
+            for (long signature : check.signatures) {
+                LogicalDigestInfo digest = digestResults.get(signature);
+                if (digest == null) {
+                    complete = false;
                     break;
                 }
-                reason = candidate.incrementalCandidate ? RestoreReuseJudge.compareIncrementalTablet(actual)
-                        : RestoreReuseJudge.compareTablet(check.expected, actual);
-                if (reason != null) {
-                    break;
-                }
+                actual.add(digest);
             }
             if (!complete) {
-                candidate.decide(false, RestoreReuseResult.DOWNLOAD_TIMEOUT);
-            } else if (reason == null && candidate.incrementalCandidate) {
-                candidate.decideIncremental();
-            } else if (reason == null) {
-                candidate.decide(true, RestoreReuseResult.KEPT_DIGEST_VERIFIED);
-            } else {
-                candidate.decide(false, reason);
+                break;
+            }
+            reason = candidate.incrementalCandidate ? RestoreReuseJudge.compareIncrementalTablet(actual)
+                    : RestoreReuseJudge.compareTablet(check.expected, actual);
+            if (reason != null) {
+                break;
             }
         }
+        if (!complete && !roundEnded) {
+            return false;
+        }
+        if (!complete) {
+            candidate.decide(false, RestoreReuseResult.DOWNLOAD_TIMEOUT);
+        } else if (reason == null && candidate.incrementalCandidate) {
+            candidate.decideIncremental();
+        } else if (reason == null) {
+            candidate.decide(true, RestoreReuseResult.KEPT_DIGEST_VERIFIED);
+        } else {
+            candidate.decide(false, reason);
+        }
+        for (ReuseTabletCheck check : candidate.tablets) {
+            for (long signature : check.signatures) {
+                digestResults.remove(signature);
+                digestSignatureToCandidate.remove(signature);
+            }
+        }
+        return true;
     }
 
     /**
@@ -3579,6 +3695,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         // The data of the partitions to download is about to change.
         invalidateRestoreLineageOfOverwrittenPartitions(db);
         clearReuseWorkingState();
+        releaseDigestsOfJobInfo();
         LOG.info("restore reuse: keep {} partitions ({} bytes of a single replica), append the increment to {}, "
                 + "download {} of the candidates, job: {}", result.getKeptPartitions(),
                 result.getKeptBytesSingleReplica(), result.getIncrementalPartitions(),
@@ -3886,6 +4003,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
             // only the reason is recorded, the estimate is of the data, not of the nodes
             boolean mixedVersions = findNodeWithoutReuseCapability(false) != null;
+            boolean tooManyTablets = tabletNumOverReuseLimit() > 0;
             for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
                 BackupOlapTableInfo tblInfo = tblEntry.getValue();
                 Table localTbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
@@ -3924,6 +4042,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             bytes = RestoreReuseShadowStats.getSingleReplicaLocalDataSize(localPart);
                             if (mixedVersions && unsupported == RestoreReuseShadowStats.Unsupported.NONE) {
                                 unsupported = RestoreReuseShadowStats.Unsupported.MIXED_VERSIONS;
+                            }
+                            if (tooManyTablets && unsupported == RestoreReuseShadowStats.Unsupported.NONE) {
+                                unsupported = RestoreReuseShadowStats.Unsupported.TOO_MANY_TABLETS;
                             }
                         }
                         stats.add(verdict, unsupported, bytes, l0Path);
@@ -4113,6 +4234,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 // keep the partial result of the manifest check for SHOW RESTORE
                 manifestCheck = computeManifestCheck();
             }
+            releaseManifestCheckReplicas();
             if (state == RestoreJobState.DOWNLOADING) {
                 fixDownloadStats();
             }

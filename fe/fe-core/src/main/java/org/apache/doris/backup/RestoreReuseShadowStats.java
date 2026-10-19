@@ -98,7 +98,10 @@ public class RestoreReuseShadowStats {
         HIDDEN_STATE_MOR,
         // A frontend or a backend of the cluster does not report the capability of partition level reuse (an old
         // version, a rolling upgrade or rollback), the job downloads all the data. Only the reason is counted.
-        MIXED_VERSIONS
+        MIXED_VERSIONS,
+        // The backup has more tablets than restore_reuse_max_tablets, the job downloads all the data. Only the reason
+        // is counted.
+        TOO_MANY_TABLETS
     }
 
     @SerializedName("partitions")
@@ -126,6 +129,9 @@ public class RestoreReuseShadowStats {
     private long l0PassedButHiddenStateMor = 0;
     @SerializedName("l0_passed_but_mixed_versions")
     private long l0PassedButMixedVersions = 0;
+
+    @SerializedName("l0_passed_but_too_many_tablets")
+    private long l0PassedButTooManyTablets = 0;
     @SerializedName("cluster_mismatch")
     private long clusterMismatch = 0;
     @SerializedName("no_local")
@@ -336,6 +342,9 @@ public class RestoreReuseShadowStats {
                     case MIXED_VERSIONS:
                         l0PassedButMixedVersions++;
                         break;
+                    case TOO_MANY_TABLETS:
+                        l0PassedButTooManyTablets++;
+                        break;
                     default:
                         reusable++;
                         reusableBytesSingleReplica += singleReplicaBytes;
@@ -423,6 +432,10 @@ public class RestoreReuseShadowStats {
         return l0PassedButMixedVersions;
     }
 
+    public long getL0PassedButTooManyTablets() {
+        return l0PassedButTooManyTablets;
+    }
+
     public long getClusterMismatch() {
         return clusterMismatch;
     }
@@ -481,6 +494,11 @@ public class RestoreReuseShadowStats {
         if (mixedVersions > 0) {
             // the job did not decide the reuse, a node does not have the capability of it
             json.addProperty("mixed_versions", mixedVersions);
+        }
+        long tooManyTablets = actual.getRejected().getOrDefault(RestoreJob.TOO_MANY_TABLETS, 0L);
+        if (tooManyTablets > 0) {
+            // the job did not reuse any partition, the backup has more tablets than restore_reuse_max_tablets
+            json.addProperty("too_many_tablets", tooManyTablets);
         }
         json.addProperty("download_digest_mismatch", actual.countReasons(
                 RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH));
