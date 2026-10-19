@@ -482,7 +482,11 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
             file.sha256 = std::string(item["d"].GetString(), item["d"].GetStringLength());
         }
         if (file.name == kPrefixDigestEntryName) {
-            // not a file of the tablet snapshot: keep it out of `files`
+            // not a file of the tablet snapshot: keep it out of `files`. Only a version 2 manifest has it, an old
+            // BE only knows version 1 and would take it for a data file.
+            if (doc["version"].GetInt() != kVersionWithPrefixDigest) {
+                return invalid("a version 1 manifest has the entry of the decomposed digest");
+            }
             if (file.sha256.size() != 64) {
                 return invalid("the entry of the decomposed digest has no SHA-256");
             }

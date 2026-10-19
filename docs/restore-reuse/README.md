@@ -69,6 +69,8 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 
 1. 先升级所有 BE，再升级所有 FE。升级期间保持复用开关关闭（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）。
 2. 全部节点升级完成后，确认心跳已经收到（`restore_reuse_require_capability` 为 true 时，作业会自己判断），再打开复用开关。
+3. 升级和回滚期间，不要用 `logical_digest=true` 做备份。新版本 BE 为这样的备份写出版本 2 的 manifest（多一条分解摘要），旧版本 BE 不认识版本 2，按 manifest 不符处理，连普通恢复也会失败。默认属性（`logical_digest=false`）的备份不受影响。如果已经有这样的备份、又必须在旧版本 BE 上恢复，可以临时把 BE 配置 `restore_manifest_check` 设为 false。
+4. 新 FE 加旧 BE 时，带 `logical_digest=true` 的备份会被 FE 当作 manifest 里有分解摘要，而旧 BE 并没有写进去；恢复时这类分区的增量补齐会报错并回退为整体下载，结果正确，只是少了复用。全部 BE 升级后不再出现。
 
 **回滚。**
 
