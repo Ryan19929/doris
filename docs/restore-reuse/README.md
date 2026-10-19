@@ -1,6 +1,6 @@
 # Restore / CCR 全量同步的本地数据复用
 
-目标是让 Restore 和 CCR 全量同步时，目标端已有且内容一致的数据不再重复下载。证明不了一致就照常下载，结果与完整下载相同；复用相关的能力默认关闭。注意"复用开关全关"不等于没有任何新行为：备份文件清单（Manifest）默认会生成，文件集合与大小校验默认开启，备份侧会多一次文件清单的计算和存储，开销见 [manifest-design.md](./manifest-design.md)。
+目标是让 Restore 和 CCR 全量同步时，目标端已有且内容一致的数据不再重复下载。证明不了一致就照常下载，结果与完整下载相同；复用相关的能力默认关闭。注意"三个复用开关全关"不等于没有任何新行为：备份文件清单（Manifest）默认会生成，文件集合与大小校验默认开启。只有三个复用开关（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）和 `enable_backup_manifest` 全部关闭，才回到旧行为（仅余常数字段和心跳能力位）。Manifest 默认开启的代价：BE 每个 tablet 多写一个小文件（数 KB），对象存储仓库每个 tablet 多一个对象，jobInfo 每个 tablet 多约 83 字节（`manifest_roots`），详见 [manifest-design.md](./manifest-design.md)。FE 配置 `enable_backup_manifest`（默认 true，可动态修改，仅 Master 生效）设为 false 后，BE 不写 Manifest，jobInfo 不写 `manifest_roots`，这样的备份在恢复时按"没有 Manifest"处理（不做文件集合校验，也不能增量补齐）。
 
 ## 代码位置
 
@@ -26,6 +26,15 @@
 - **默认每个复用的分区都有摘要证明。** `restore_reuse_default_check_level` 默认 `full`；`off`、`sample` 默认也按 `full` 执行，除非打开 `restore_reuse_allow_unverified_keep`（默认 false，仅供实验和观测，不提供一致性保证）。`SHOW RESTORE` 里同时显示请求的档位和实际生效的档位。
 - **谱系戳带来源集群 ID。** 备份记录源端集群 ID，谱系戳随之记录，两边都有且不相等时不作为候选。集群 ID 是初始化时生成的随机整数，不是全局唯一标识，只用来缩小候选范围，不当作证明；任何一边缺失（旧备份、旧谱系戳）时仍可作为候选，由摘要兜底。
 - **"查询结果相同"的含义。** 摘要证明的是在备份版本上的可见数据相同，不含隐藏列（如 `__DORIS_VERSION_COL__`，它随写入历史而不同，`show_hidden_columns=true` 时可见）。
+
+## 容量边界
+
+jobInfo 里逻辑摘要按"索引级 schema_sig 与算法版本 + 每 tablet 只记 root"紧凑存放：`ldr`（tablet→root）、`ldn`（tablet→无摘要原因）、`lds`、`lda`；仍能读取旧版本的 `ld` 字段。大规模下的控制项：
+
+- `backup_logical_digest_max_tablets`（默认 0，不限制）：备份涉及的 tablet 数超过它时，备份不要求 BE 计算逻辑摘要，jobInfo 不写摘要，备份照常成功；原因（`TOO_MANY_TABLETS:<n>><limit>`）显示在 `SHOW BACKUP` 末尾的 `LogicalDigest` 列。
+- `restore_reuse_max_tablets`（默认 0，不限制）：恢复所用备份的 tablet 数超过它时，本作业不复用任何分区，整体下载，`SHOW RESTORE` 的 `ReuseEstimate` 里记 `too_many_tablets`。
+- Unique 表默认不计算也不记录逻辑摘要（源端 FE 的 `restore_reuse_allow_hidden_state_models` 为 false 时）；只有该配置在备份前打开，Unique 表才会有摘要。
+- 恢复作业在摘要比对结束后释放摘要，下载完成后释放 Manifest 校验的中间集合与 Manifest root；分区的全部副本摘要到齐就立即判定并释放该分区的结果。
 
 ## 当前状态
 
