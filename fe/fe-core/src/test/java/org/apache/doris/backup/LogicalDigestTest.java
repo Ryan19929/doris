@@ -140,8 +140,8 @@ public class LogicalDigestTest {
         LogicalDigestInfo d2 = jobInfo.getLogicalDigest(TABLET_2);
         Assertions.assertFalse(d2.hasDigest());
         Assertions.assertEquals("NOT_SUPPORTED", d2.reason);
-        // an entry per tablet, the missing report is recorded as such
-        Assertions.assertEquals("NO_REPORT", jobInfo.getLogicalDigest(TABLET_3).reason);
+        // a tablet which was not asked for a digest records nothing
+        Assertions.assertNull(jobInfo.getLogicalDigest(TABLET_3));
         Assertions.assertNull(jobInfo.getLogicalDigest(999));
 
         // metadata only: no files, no digests
@@ -154,12 +154,14 @@ public class LogicalDigestTest {
     public void testGsonRoundTrip() {
         BackupJobInfo jobInfo = jobInfoWithDigests();
         String json = jobInfo.toJson(false);
-        // short and stable names
-        Assertions.assertTrue(json.contains("\"ld\":{"), json);
-        Assertions.assertTrue(json.contains("\"101\":{\"a\":1,\"s\":\"" + hex('5') + "\",\"r\":\"" + hex('a')
-                + "\"}"), json);
-        Assertions.assertTrue(json.contains("\"102\":{\"r\":\"\",\"e\":\"NOT_SUPPORTED\"}"), json);
-        Assertions.assertTrue(json.contains("\"103\":{\"r\":\"\",\"e\":\"NO_REPORT\"}"), json);
+        // short and stable names: the root of each tablet, the reason of the tablets without digest, and the schema
+        // signature and the algorithm of the index
+        Assertions.assertTrue(json.contains("\"ldr\":{\"101\":\"" + hex('a') + "\"}"), json);
+        Assertions.assertTrue(json.contains("\"ldn\":{\"102\":\"NOT_SUPPORTED\"}"), json);
+        Assertions.assertTrue(json.contains("\"lds\":\"" + hex('5') + "\""), json);
+        Assertions.assertTrue(json.contains("\"lda\":1"), json);
+        // the old name is not used for the new format
+        Assertions.assertFalse(json.contains("\"ld\""), json);
         // the index is a cache, not persisted
         Assertions.assertFalse(json.contains("logicalDigestIndex"), json);
 
@@ -179,7 +181,144 @@ public class LogicalDigestTest {
         read.releaseSnapshotInfo();
         Assertions.assertNull(read.getLogicalDigest(TABLET_1));
         Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).logicalDigest);
+        Assertions.assertFalse(read.toJson(false).contains("\"ldr\""));
+        Assertions.assertFalse(read.toJson(false).contains("\"lds\""));
+    }
+
+    private static int countOf(String text, String part) {
+        int count = 0;
+        for (int i = text.indexOf(part); i >= 0; i = text.indexOf(part, i + 1)) {
+            count++;
+        }
+        return count;
+    }
+
+    @Test
+    public void testNewFormatIsCompact() {
+        BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2, TABLET_3);
+        Map<Long, SnapshotInfo> infos = Maps.newHashMap();
+        for (long tabletId : new long[] {TABLET_1, TABLET_2, TABLET_3}) {
+            char c = (char) ('a' + tabletId % 10);
+            infos.put(tabletId, snapshotInfo(tabletId, LogicalDigestInfo.of(1, hex('5'), hex(c))));
+        }
+        Assertions.assertEquals(3, jobInfo.buildLogicalDigests(infos));
+        BackupIndexInfo idxInfo = index(jobInfo);
+        Assertions.assertEquals(hex('5'), idxInfo.logicalDigestSchemaSig);
+        Assertions.assertEquals(1, (int) idxInfo.logicalDigestAlgo);
+        Assertions.assertEquals(3, idxInfo.logicalDigestRoots.size());
+        Assertions.assertNull(idxInfo.logicalDigestNone);
+        Assertions.assertNull(idxInfo.logicalDigests);
+        // the schema signature is written once for the index, not once for each tablet
+        Assertions.assertEquals(1, countOf(jobInfo.toJson(false), hex('5')));
+        // and put together again for the callers
+        LogicalDigestInfo digest = jobInfo.getLogicalDigest(TABLET_2);
+        Assertions.assertEquals(hex('5'), digest.schemaSig);
+        Assertions.assertEquals(1, (int) digest.algoVersion);
+        Assertions.assertEquals(hex((char) ('a' + TABLET_2 % 10)), digest.root);
+        Assertions.assertNull(digest.reason);
+        Assertions.assertTrue(digest.hasDigest());
+    }
+
+    @Test
+    public void testReadLegacyLd() {
+        // a backup of the version which recorded the digest of each tablet under "ld"
+        BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2);
+        BackupIndexInfo idxInfo = index(jobInfo);
+        idxInfo.logicalDigests = Maps.newHashMap();
+        idxInfo.logicalDigests.put(TABLET_1, LogicalDigestInfo.of(1, hex('5'), hex('a')));
+        idxInfo.logicalDigests.put(TABLET_2, LogicalDigestInfo.none(LogicalDigestInfo.REASON_NOT_SUPPORTED));
+        String json = jobInfo.toJson(false);
+        Assertions.assertTrue(json.contains("\"ld\":{\"101\":{\"a\":1,\"s\":\"" + hex('5') + "\",\"r\":\""
+                + hex('a') + "\"}"), json);
+        Assertions.assertFalse(json.contains("\"ldr\""), json);
+
+        BackupJobInfo read = BackupJobInfo.genFromJson(json);
+        LogicalDigestInfo d1 = read.getLogicalDigest(TABLET_1);
+        Assertions.assertTrue(d1.hasDigest());
+        Assertions.assertEquals(hex('a'), d1.root);
+        Assertions.assertEquals(hex('5'), d1.schemaSig);
+        Assertions.assertEquals(1, (int) d1.algoVersion);
+        Assertions.assertEquals("NOT_SUPPORTED", read.getLogicalDigest(TABLET_2).reason);
+        Assertions.assertEquals(hex('a'), index(read).sortedTabletInfoList.get(0).logicalDigest.root);
+        // released, as the new format
+        read.releaseDigests(java.util.Collections.emptySet());
+        Assertions.assertNull(read.getLogicalDigest(TABLET_1));
         Assertions.assertFalse(read.toJson(false).contains("\"ld\""));
+    }
+
+    @Test
+    public void testMixedTabletsOfAnIndex() {
+        // digests, a reason, and a tablet which was not asked: written and read back
+        BackupJobInfo jobInfo = jobInfoWithDigests();
+        BackupJobInfo read = BackupJobInfo.genFromJson(jobInfo.toJson(false));
+        Assertions.assertTrue(read.getLogicalDigest(TABLET_1).hasDigest());
+        Assertions.assertEquals("NOT_SUPPORTED", read.getLogicalDigest(TABLET_2).reason);
+        Assertions.assertFalse(read.getLogicalDigest(TABLET_2).hasDigest());
+        Assertions.assertEquals("", read.getLogicalDigest(TABLET_2).root);
+        Assertions.assertNull(read.getLogicalDigest(TABLET_3));
+        Assertions.assertNull(index(read).sortedTabletInfoList.get(2).logicalDigest);
+
+        // an index of tablets without any digest has the reasons only
+        BackupJobInfo noDigest = newJobInfo(TABLET_1, TABLET_2);
+        Map<Long, SnapshotInfo> infos = Maps.newHashMap();
+        infos.put(TABLET_1, snapshotInfo(TABLET_1, LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR)));
+        infos.put(TABLET_2, snapshotInfo(TABLET_2, LogicalDigestInfo.none(LogicalDigestInfo.REASON_NO_REPORT)));
+        Assertions.assertEquals(0, noDigest.buildLogicalDigests(infos));
+        String json = noDigest.toJson(false);
+        Assertions.assertTrue(json.contains("\"ldn\":{"), json);
+        Assertions.assertFalse(json.contains("\"ldr\""), json);
+        Assertions.assertFalse(json.contains("\"lds\""), json);
+        Assertions.assertEquals("ERROR", BackupJobInfo.genFromJson(json).getLogicalDigest(TABLET_1).reason);
+    }
+
+    @Test
+    public void testDigestOfAnotherSchemaIsRecordedAsNone() {
+        BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2, TABLET_3);
+        Map<Long, SnapshotInfo> infos = Maps.newHashMap();
+        infos.put(TABLET_1, snapshotInfo(TABLET_1, LogicalDigestInfo.of(1, hex('5'), hex('a'))));
+        // another schema signature, and another algorithm version: can not be put together with the index
+        infos.put(TABLET_2, snapshotInfo(TABLET_2, LogicalDigestInfo.of(1, hex('6'), hex('b'))));
+        infos.put(TABLET_3, snapshotInfo(TABLET_3, LogicalDigestInfo.of(2, hex('5'), hex('c'))));
+        Assertions.assertEquals(1, jobInfo.buildLogicalDigests(infos));
+        Assertions.assertTrue(jobInfo.getLogicalDigest(TABLET_1).hasDigest());
+        Assertions.assertEquals(LogicalDigestInfo.REASON_MIXED_SCHEMA, jobInfo.getLogicalDigest(TABLET_2).reason);
+        Assertions.assertEquals(LogicalDigestInfo.REASON_MIXED_SCHEMA, jobInfo.getLogicalDigest(TABLET_3).reason);
+    }
+
+    @Test
+    public void testSkipReasonAndReleaseDigests() {
+        BackupJobInfo jobInfo = jobInfoWithDigests();
+        Assertions.assertFalse(jobInfo.toJson(false).contains("ldskip"));
+        jobInfo.logicalDigestSkipReason = "TOO_MANY_TABLETS:5>2";
+        String json = jobInfo.toJson(false);
+        Assertions.assertTrue(json.contains("\"ldskip\":\"TOO_MANY_TABLETS:5"), json);
+        Assertions.assertEquals("TOO_MANY_TABLETS:5>2", BackupJobInfo.genFromJson(json).logicalDigestSkipReason);
+
+        // release all the digests and the decomposed digests, keep the manifest
+        BackupJobInfo read = BackupJobInfo.genFromJson(json);
+        index(read).prefixDigestRoots = Maps.newHashMap();
+        index(read).prefixDigestRoots.put(TABLET_1, hex('b'));
+        index(read).manifestRoots = Maps.newHashMap();
+        index(read).manifestRoots.put(TABLET_1, hex('c'));
+        read.manifestVersion = BackupJobInfo.MANIFEST_VERSION;
+        read.releaseDigests(java.util.Collections.singleton(TABLET_1));
+        // the digest of the tablet kept is still there, with its schema signature, the others are gone
+        Assertions.assertEquals(hex('a'), read.getLogicalDigest(TABLET_1).root);
+        Assertions.assertEquals(hex('5'), read.getLogicalDigest(TABLET_1).schemaSig);
+        Assertions.assertNull(read.getLogicalDigest(TABLET_2));
+        Assertions.assertNotNull(index(read).sortedTabletInfoList.get(0).logicalDigest);
+        Assertions.assertNull(index(read).sortedTabletInfoList.get(1).logicalDigest);
+        Assertions.assertNull(read.getPrefixDigestRoot(TABLET_1));
+        Assertions.assertEquals(hex('c'), read.getManifestRoot(TABLET_1));
+        read.releaseDigests(java.util.Collections.emptySet());
+        Assertions.assertNull(read.getLogicalDigest(TABLET_1));
+        Assertions.assertNull(index(read).logicalDigestSchemaSig);
+        Assertions.assertNull(index(read).logicalDigestRoots);
+        Assertions.assertEquals(hex('c'), read.getManifestRoot(TABLET_1));
+        // manifest roots are released after the download
+        read.releaseManifestRoots();
+        Assertions.assertNull(read.getManifestRoot(TABLET_1));
+        Assertions.assertTrue(read.hasManifest());
     }
 
     @Test
@@ -254,6 +393,17 @@ public class LogicalDigestTest {
         Assertions.assertTrue(req.isComputeLogicalDigest());
         // independent of the manifest digest
         Assertions.assertFalse(req.isSetComputeDigest());
+    }
+
+    @Test
+    public void testSnapshotTaskSkipManifestFlag() {
+        SnapshotTask task = new SnapshotTask(null, 10001, 1, 55, 1, 2, 3, 4, TABLET_1, 10, 5, 1000, false);
+        Assertions.assertFalse(task.isSkipManifest());
+        Assertions.assertFalse(task.toThrift().isSetSkipManifest());
+        task.setSkipManifest(true);
+        Assertions.assertTrue(task.toThrift().isSkipManifest());
+        // the files are still listed
+        Assertions.assertTrue(task.toThrift().isListFiles());
     }
 
     @Test

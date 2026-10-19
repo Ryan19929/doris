@@ -289,6 +289,7 @@ public class RestoreReuseTest {
                 partInfo.indexes.put(tbl2.getIndexNameById(index.getId()), idxInfo);
                 for (Tablet tablet : index.getTablets()) {
                     idxInfo.sortedTabletInfoList.add(new BackupTabletInfo(tablet.getId(), Lists.newArrayList()));
+                    idxInfo.tablets.put(tablet.getId(), Lists.newArrayList());
                     idxInfo.logicalDigests.put(tablet.getId(), LogicalDigestInfo.of(1, SIG, rootOf(part)));
                 }
             }
@@ -3761,5 +3762,248 @@ public class RestoreReuseTest {
         Assertions.assertEquals(1, result.getKeptPartitions());
         Assertions.assertTrue(result.isKept(tbl2.getId(), p2().getId()));
         Assertions.assertFalse(result.isKept(tbl2.getId(), p1().getId()));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // capacity: results held, release of the digests, limits
+    // ---------------------------------------------------------------------------------------------
+
+    private static Map<Long, LogicalDigestInfo> digestResultsOf(RestoreJob job) {
+        return Deencapsulation.getField(job, "digestResults");
+    }
+
+    private static List<RestoreJob.ReuseCandidate> candidatesOf(RestoreJob job) {
+        return Deencapsulation.getField(job, "reuseCandidates");
+    }
+
+    private RestoreJob.ReuseCandidate candidateOf(RestoreJob job, Partition part) {
+        return candidatesOf(job).stream().filter(c -> c.partitionId == part.getId()).findFirst().get();
+    }
+
+    @Test
+    public void testPartitionIsDecidedWhenItsReplicasAreAllIn() {
+        RestoreJob job = prepareJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        List<RestoreDigestTask> p1Tasks = tasks.stream().filter(t -> t.getPartitionId() == p1().getId())
+                .collect(Collectors.toList());
+        List<RestoreDigestTask> p2Tasks = tasks.stream().filter(t -> t.getPartitionId() == p2().getId())
+                .collect(Collectors.toList());
+        Assertions.assertTrue(p1Tasks.size() > 1);
+        Assertions.assertEquals(tasks.size(), p1Tasks.size() + p2Tasks.size());
+
+        // all but the last replica of p1, and the first of p2: held, nothing is decided
+        for (int i = 0; i < p1Tasks.size() - 1; i++) {
+            Assertions.assertTrue(job.finishRestoreDigestTask(p1Tasks.get(i), okReport(ROOT_P1, SIG, 1)));
+        }
+        Assertions.assertTrue(job.finishRestoreDigestTask(p2Tasks.get(0), okReport(ROOT_P2, SIG, 1)));
+        Assertions.assertEquals(p1Tasks.size(), digestResultsOf(job).size());
+        Assertions.assertFalse(candidateOf(job, p1()).decided);
+        Assertions.assertFalse(candidateOf(job, p2()).decided);
+
+        // the last replica of p1: p1 is decided at once and its results are dropped
+        Assertions.assertTrue(job.finishRestoreDigestTask(p1Tasks.get(p1Tasks.size() - 1),
+                okReport(ROOT_P1, SIG, 1)));
+        Assertions.assertTrue(candidateOf(job, p1()).decided);
+        Assertions.assertTrue(candidateOf(job, p1()).kept);
+        Assertions.assertEquals(RestoreReuseResult.KEPT_DIGEST_VERIFIED, candidateOf(job, p1()).reason);
+        Assertions.assertEquals(1, digestResultsOf(job).size());
+        Assertions.assertFalse(candidateOf(job, p2()).decided);
+
+        // p2 is a mismatch, decided as soon as its replicas are in
+        for (int i = 1; i < p2Tasks.size(); i++) {
+            Assertions.assertTrue(job.finishRestoreDigestTask(p2Tasks.get(i), okReport("dead", SIG, 1)));
+        }
+        Assertions.assertTrue(candidateOf(job, p2()).decided);
+        Assertions.assertFalse(candidateOf(job, p2()).kept);
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, candidateOf(job, p2()).reason);
+        Assertions.assertTrue(digestResultsOf(job).isEmpty());
+
+        // a late report of a decided partition is not kept
+        Assertions.assertTrue(job.finishRestoreDigestTask(p1Tasks.get(0), okReport(ROOT_P1, SIG, 1)));
+        Assertions.assertTrue(digestResultsOf(job).isEmpty());
+
+        // the end of the round decides nothing more, the result is the one of the decisions
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertTrue(result.isKept(tbl2.getId(), p1().getId()));
+        Assertions.assertFalse(result.isKept(tbl2.getId(), p2().getId()));
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertTrue(digestResultsOf(job).isEmpty());
+    }
+
+    @Test
+    public void testResultsHeldAreBoundedByTheUndecidedPartitions() {
+        RestoreJob job = prepareJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        int maxHeld = 0;
+        // the replicas of the partitions come in an interleaved order
+        List<RestoreDigestTask> p1Tasks = tasks.stream().filter(t -> t.getPartitionId() == p1().getId())
+                .collect(Collectors.toList());
+        List<RestoreDigestTask> p2Tasks = tasks.stream().filter(t -> t.getPartitionId() == p2().getId())
+                .collect(Collectors.toList());
+        for (int i = 0; i < Math.max(p1Tasks.size(), p2Tasks.size()); i++) {
+            if (i < p1Tasks.size()) {
+                job.finishRestoreDigestTask(p1Tasks.get(i), okReport(ROOT_P1, SIG, 1));
+                maxHeld = Math.max(maxHeld, digestResultsOf(job).size());
+            }
+            if (i < p2Tasks.size()) {
+                job.finishRestoreDigestTask(p2Tasks.get(i), okReport(ROOT_P2, SIG, 1));
+                maxHeld = Math.max(maxHeld, digestResultsOf(job).size());
+            }
+        }
+        // never all the replicas of the job at once
+        Assertions.assertTrue(maxHeld < tasks.size(), maxHeld + " of " + tasks.size());
+        Assertions.assertTrue(digestResultsOf(job).isEmpty());
+        waitDigests(job);
+        Assertions.assertEquals(2, job.getReuseResult().getKeptPartitions());
+    }
+
+    @Test
+    public void testTimedOutPartitionIsDownloadedAndHoldsNothing() {
+        RestoreJob job = prepareJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        // p1 is complete, p2 lacks one replica
+        List<RestoreDigestTask> p2Tasks = Lists.newArrayList();
+        for (RestoreDigestTask task : tasks) {
+            if (task.getPartitionId() == p1().getId()) {
+                job.finishRestoreDigestTask(task, okReport(ROOT_P1, SIG, 1));
+            } else {
+                p2Tasks.add(task);
+            }
+        }
+        for (int i = 0; i < p2Tasks.size() - 1; i++) {
+            job.finishRestoreDigestTask(p2Tasks.get(i), okReport(ROOT_P2, SIG, 1));
+        }
+        Assertions.assertEquals(p2Tasks.size() - 1, digestResultsOf(job).size());
+        Config.restore_digest_timeout_s = 0;
+        Deencapsulation.setField(job, "verifyRoundStartMs", System.currentTimeMillis() - 10000);
+        waitDigests(job);
+        RestoreReuseResult result = job.getReuseResult();
+        Assertions.assertTrue(result.isKept(tbl2.getId(), p1().getId()));
+        Assertions.assertFalse(result.isKept(tbl2.getId(), p2().getId()));
+        Assertions.assertEquals(RestoreReuseResult.DOWNLOAD_TIMEOUT,
+                result.getDecisions().stream().filter(d -> d.partitionId == p2().getId()).findFirst().get().reason);
+        Assertions.assertTrue(digestResultsOf(job).isEmpty());
+    }
+
+    @Test
+    public void testDigestsOfTheJobInfoAreReleasedAfterVerifying() {
+        RestoreJob job = prepareJob("full");
+        long tablet = tabletOf(p1());
+        Assertions.assertNotNull(job.jobInfo.getLogicalDigest(tablet));
+        toVerifying(job);
+        // still needed while verifying
+        Assertions.assertNotNull(job.jobInfo.getLogicalDigest(tablet));
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertNull(job.jobInfo.getLogicalDigest(tablet));
+        Assertions.assertNull(job.jobInfo.getPrefixDigestRoot(tablet));
+        BackupJobInfo.BackupIndexInfo idxInfo = job.jobInfo.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME)
+                .getPartInfo(p1().getName()).getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()));
+        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).logicalDigest);
+        Assertions.assertNull(idxInfo.logicalDigests);
+        Assertions.assertNull(idxInfo.logicalDigestRoots);
+        // the decisions are what the job keeps
+        Assertions.assertEquals(2, job.getReuseResult().getKeptPartitions());
+    }
+
+    @Test
+    public void testDigestsAreReleasedWhenNothingIsVerified() {
+        Config.enable_restore_partition_reuse = false;
+        RestoreJob job = prepareJob("full");
+        // no candidates: straight to SNAPSHOTING, the digests are of no use
+        Deencapsulation.invoke(job, "allReplicasCreated");
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertNull(job.jobInfo.getLogicalDigest(tabletOf(p1())));
+    }
+
+    @Test
+    public void testIncrementalAppendKeepsTheDigestOfItsTablets() {
+        RestoreJob job = prepareIncrementalJob("full");
+        toVerifying(job);
+        reportPrefix(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(2, job.getReuseResult().getIncrementalPartitions());
+        // the digest sent with the move task survives, and so do the manifest roots to download
+        Assertions.assertNotNull(job.jobInfo.getLogicalDigest(tabletOf(p1())));
+        Assertions.assertEquals(SIG, job.jobInfo.getLogicalDigest(tabletOf(p1())).schemaSig);
+        Assertions.assertNull(job.jobInfo.getPrefixDigestRoot(tabletOf(p1())));
+        Assertions.assertEquals("m" + tabletOf(p1()), job.jobInfo.getManifestRoot(tabletOf(p1())));
+    }
+
+    @Test
+    public void testRestoreReuseMaxTabletsNotExceeded() {
+        long orig = Config.restore_reuse_max_tablets;
+        try {
+            long tablets = selfBackupJobInfo().getTabletNum();
+            Assertions.assertTrue(tablets >= 2, "tablets " + tablets);
+            // the limit is reached, not exceeded
+            Config.restore_reuse_max_tablets = tablets;
+            RestoreJob job = prepareJob("full");
+            Assertions.assertEquals(RestoreJobState.CREATING, job.getState());
+            Assertions.assertFalse(candidatesOf(job).isEmpty());
+            Assertions.assertTrue(job.getReuseResult().getRejected().isEmpty());
+            Assertions.assertEquals(0, job.getReuseShadowStats().getL0PassedButTooManyTablets());
+            Assertions.assertEquals(2, job.getReuseShadowStats().getReusable());
+        } finally {
+            Config.restore_reuse_max_tablets = orig;
+        }
+    }
+
+    @Test
+    public void testRestoreReuseMaxTabletsExceeded() {
+        long orig = Config.restore_reuse_max_tablets;
+        try {
+            long tablets = selfBackupJobInfo().getTabletNum();
+            // exceeded: no candidate, no digest task, everything is downloaded
+            Config.restore_reuse_max_tablets = tablets - 1;
+            RestoreJob job = prepareJob("full");
+            Assertions.assertTrue(candidatesOf(job).isEmpty());
+            Assertions.assertEquals(2L, (long) job.getReuseResult().getRejected().get(RestoreJob.TOO_MANY_TABLETS));
+            Assertions.assertEquals(0, job.getReuseResult().getKeptPartitions());
+            // counted in the estimate, not as reusable
+            RestoreReuseShadowStats stats = job.getReuseShadowStats();
+            Assertions.assertEquals(2, stats.getL0PassedButTooManyTablets());
+            Assertions.assertEquals(0, stats.getReusable());
+            Assertions.assertEquals(0, stats.getReusableForward());
+            Assertions.assertEquals(0, stats.getReusableReverse());
+            Assertions.assertEquals(0, stats.getReusableTable());
+            Assertions.assertEquals(0, stats.getL0PassedButMixedVersions());
+            List<String> info = job.getInfo(false);
+            com.google.gson.JsonObject estimate = com.google.gson.JsonParser.parseString(
+                    info.get(info.size() - 3)).getAsJsonObject();
+            Assertions.assertEquals(2, estimate.get("too_many_tablets").getAsLong());
+            Assertions.assertEquals(2, estimate.get("l0_passed_but_too_many_tablets").getAsLong());
+            // the digests are released at once
+            Assertions.assertNull(job.jobInfo.getLogicalDigest(tabletOf(p1())));
+            // and the job goes on to download
+            Deencapsulation.invoke(job, "allReplicasCreated");
+            Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+            Assertions.assertTrue(newDigestTasks().isEmpty());
+            Assertions.assertEquals(2, versionInfo(job).size());
+        } finally {
+            Config.restore_reuse_max_tablets = orig;
+        }
+    }
+
+    @Test
+    public void testBackupWithoutDigestBecauseOfTooManyTablets() {
+        RestoreReuseJudge.Input in = input(CheckLevel.FULL);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(in));
+        in.jobInfo.logicalDigestSkipReason = "TOO_MANY_TABLETS:3000000>500000";
+        for (BackupOlapTableInfo tblInfo : in.jobInfo.backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    idxInfo.logicalDigests = null;
+                }
+            }
+        }
+        Assertions.assertEquals("NO_DIGEST_TOO_MANY_TABLETS", RestoreReuseJudge.firstReject(in));
+        in.jobInfo.logicalDigestSkipReason = null;
+        Assertions.assertEquals("NO_DIGEST", RestoreReuseJudge.firstReject(in));
     }
 }

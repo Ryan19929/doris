@@ -241,7 +241,11 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     sql "INSERT INTO ${dbA}.${mowTable} VALUES ${mowValues.join(",")}"
     sql "sync"
     String snapMow1 = "${suiteName}_snap_mow1"
+    // The backup records the logical digest of a unique table only if the source cluster allows the hidden state
+    // models (the control group below restores it with the switch on).
+    setConfig("restore_reuse_allow_hidden_state_models", "true")
     String tsMow1 = backupAndWait(dbA, snapMow1, [mowTable])
+    setConfig("restore_reuse_allow_hidden_state_models", "false")
     // B is new: restored as a whole, and the table of B is stamped as a replica of the table of A
     restoreAndWait(dbB, snapMow1, tsMow1, [mowTable], null)
     assertEquals(rowsOf(dbA, mowTable), rowsOf(dbB, mowTable))
@@ -258,7 +262,11 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     assertEquals(0, (sql "SELECT COUNT(*) FROM ${dbB}.${mowTable} WHERE id = 5")[0][0])
 
     String snapMow2 = "${suiteName}_snap_mow2"
+    // The backup records the logical digest of a unique table only if the source cluster allows the hidden state
+    // models (the control group below restores it with the switch on).
+    setConfig("restore_reuse_allow_hidden_state_models", "true")
     String tsMow2 = backupAndWait(dbA, snapMow2, [mowTable])
+    setConfig("restore_reuse_allow_hidden_state_models", "false")
     // the default configs: the partition is a candidate (the versions are equal, the digests are equal because the
     // delete sign rows are skipped), but a unique table is not reused: rejected, downloaded as a whole
     def stats = restoreAndWait(dbB, snapMow2, tsMow2, [mowTable], null)

@@ -23,6 +23,7 @@ import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DynamicPartitionProperty;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.FsBroker;
+import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.TableProperty;
@@ -31,12 +32,14 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.UserException;
+import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.common.util.UnitTestUtil;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.datasource.storage.StorageAdapter;
 import org.apache.doris.fs.FileSystemDescriptor;
 import org.apache.doris.info.TableRefInfo;
 import org.apache.doris.nereids.trees.plans.commands.BackupCommand;
+import org.apache.doris.nereids.trees.plans.commands.ShowBackupCommand;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.task.AgentTask;
 import org.apache.doris.task.AgentTaskExecutor;
@@ -211,6 +214,7 @@ public class BackupJobTest {
 
     @AfterEach
     public void tearDown() {
+        AgentTaskQueue.clearAllTasks();
         if (mockedEnvStatic != null) {
             mockedEnvStatic.close();
         }
@@ -661,6 +665,10 @@ public class BackupJobTest {
 
     private static final String MD5 = "4f158689243a3d6030352fec3cfd3798";
 
+    // Whether the snapshot task asks the backend for the logical digest when the property is on, false for a unique
+    // table with the default config.
+    private boolean logicalDigestAsked = true;
+
     private static String sha(char c) {
         return String.valueOf(c).repeat(64).toLowerCase();
     }
@@ -686,8 +694,9 @@ public class BackupJobTest {
                 id.get() - 1);
         // a remote repository computes the digests when uploading, not in the snapshot.
         Assertions.assertFalse(snapshotTask.toThrift().isSetComputeDigest());
-        Assertions.assertEquals(logicalDigest, snapshotTask.isComputeLogicalDigest());
-        Assertions.assertEquals(logicalDigest, snapshotTask.toThrift().isSetComputeLogicalDigest());
+        boolean asked = logicalDigest && logicalDigestAsked;
+        Assertions.assertEquals(asked, snapshotTask.isComputeLogicalDigest());
+        Assertions.assertEquals(asked, snapshotTask.toThrift().isSetComputeLogicalDigest());
 
         TBackend tBackend = new TBackend("", 0, 1);
         TStatus ok = new TStatus(TStatusCode.OK);
@@ -786,12 +795,15 @@ public class BackupJobTest {
         Assertions.assertNull(digest.reason);
         BackupJobInfo.BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.values().iterator().next()
                 .partitions.values().iterator().next().indexes.values().iterator().next();
-        Assertions.assertSame(digest, idxInfo.sortedTabletInfoList.get(0).logicalDigest);
+        Assertions.assertEquals(digest.root, idxInfo.sortedTabletInfoList.get(0).logicalDigest.root);
         // the manifest is not affected
         Assertions.assertEquals(sha('a'), jobInfo.getManifestRoot(tabletId));
         String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
-        Assertions.assertTrue(json.contains("\"ld\":{\"" + tabletId + "\":{\"a\":1,\"s\":\"" + sha('5')
-                + "\",\"r\":\"" + sha('b') + "\"}}"), json);
+        // the schema signature and the algorithm once for the index, the root for each tablet; no old "ld"
+        Assertions.assertTrue(json.contains("\"ldr\":{\"" + tabletId + "\":\"" + sha('b') + "\"}"), json);
+        Assertions.assertTrue(json.contains("\"lds\":\"" + sha('5') + "\""), json);
+        Assertions.assertTrue(json.contains("\"lda\":1"), json);
+        Assertions.assertFalse(json.contains("\"ld\""), json);
     }
 
     private void checkNoLogicalDigest(TLogicalDigest reported, String reason) throws IOException {
@@ -829,6 +841,256 @@ public class BackupJobTest {
         Assertions.assertNull(jobInfo.getLogicalDigest(tabletId));
         String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
         Assertions.assertFalse(json.contains("\"ld\""), json);
+    }
+
+    private List<TableRefInfo> tableRefsOf(String... tableNames) {
+        List<TableRefInfo> tableRefs = Lists.newArrayList();
+        for (String name : tableNames) {
+            tableRefs.add(new TableRefInfo(
+                    new TableNameInfo(InternalCatalog.INTERNAL_CATALOG_NAME, UnitTestUtil.DB_NAME, name),
+                    null, null, null, new ArrayList<>(), null, null, new ArrayList<>()));
+        }
+        return tableRefs;
+    }
+
+    // Run the job until the snapshot tasks are sent, returns them.
+    private List<SnapshotTask> runToSnapshotTasks(BackupJob backupJob) {
+        AgentTaskQueue.clearAllTasks();
+        backupJob.run();
+        Assertions.assertEquals(BackupJobState.SNAPSHOTING, backupJob.getState());
+        List<SnapshotTask> tasks = Lists.newArrayList();
+        for (long signature = id.get() - 10; signature < id.get(); signature++) {
+            AgentTask task = AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT, signature);
+            if (task instanceof SnapshotTask) {
+                tasks.add((SnapshotTask) task);
+            }
+        }
+        return tasks;
+    }
+
+    @Test
+    public void testLogicalDigestOfUniqueTableIsNotAskedFor() {
+        boolean orig = Config.restore_reuse_allow_hidden_state_models;
+        OlapTable tbl = (OlapTable) db.getTableNullable(tblId);
+        try {
+            job.setLogicalDigest(true);
+            // a duplicate table is asked for it
+            Deencapsulation.setField(tbl, "keysType", KeysType.DUP_KEYS);
+            Config.restore_reuse_allow_hidden_state_models = false;
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            Assertions.assertEquals(1, tasks.size());
+            Assertions.assertTrue(tasks.get(0).isComputeLogicalDigest());
+
+            // a unique table is not, with the default config of the source cluster
+            Deencapsulation.setField(tbl, "keysType", KeysType.UNIQUE_KEYS);
+            job = new BackupJob("label2", dbId, UnitTestUtil.DB_NAME, tableRefsOf(UnitTestUtil.TABLE_NAME),
+                    13600 * 1000, BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            job.setLogicalDigest(true);
+            tasks = runToSnapshotTasks(job);
+            Assertions.assertEquals(1, tasks.size());
+            Assertions.assertFalse(tasks.get(0).isComputeLogicalDigest());
+            Assertions.assertFalse(tasks.get(0).toThrift().isSetComputeLogicalDigest());
+            // the manifest is not affected
+            Assertions.assertTrue(tasks.get(0).toThrift().isSetListFiles());
+
+            // unless the source cluster allows the hidden state models
+            Config.restore_reuse_allow_hidden_state_models = true;
+            job = new BackupJob("label3", dbId, UnitTestUtil.DB_NAME, tableRefsOf(UnitTestUtil.TABLE_NAME),
+                    13600 * 1000, BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            job.setLogicalDigest(true);
+            tasks = runToSnapshotTasks(job);
+            Assertions.assertTrue(tasks.get(0).isComputeLogicalDigest());
+        } finally {
+            Config.restore_reuse_allow_hidden_state_models = orig;
+            Deencapsulation.setField(tbl, "keysType", KeysType.DUP_KEYS);
+        }
+    }
+
+    @Test
+    public void testUniqueTableHasNoLogicalDigestInJobInfo() throws IOException {
+        boolean orig = Config.restore_reuse_allow_hidden_state_models;
+        OlapTable tbl = (OlapTable) db.getTableNullable(tblId);
+        try {
+            Config.restore_reuse_allow_hidden_state_models = false;
+            Deencapsulation.setField(tbl, "keysType", KeysType.UNIQUE_KEYS);
+            logicalDigestAsked = false;
+            // the backend reports none, as it was not asked
+            BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, true, null);
+            Assertions.assertNull(jobInfo.getLogicalDigest(tabletId));
+            String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
+            Assertions.assertFalse(json.contains("\"ldr\""), json);
+            Assertions.assertFalse(json.contains("\"ldn\""), json);
+            Assertions.assertTrue(jobInfo.hasManifest());
+        } finally {
+            Config.restore_reuse_allow_hidden_state_models = orig;
+            Deencapsulation.setField(tbl, "keysType", KeysType.DUP_KEYS);
+        }
+    }
+
+    @Test
+    public void testLogicalDigestMaxTablets() {
+        long orig = Config.backup_logical_digest_max_tablets;
+        try {
+            // two tablets
+            for (long limit : new long[] {0, 2, 1}) {
+                Config.backup_logical_digest_max_tablets = limit;
+                BackupJob twoTables = new BackupJob("label_" + limit, dbId, UnitTestUtil.DB_NAME,
+                        tableRefsOf(UnitTestUtil.TABLE_NAME, table2Name), 13600 * 1000,
+                        BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+                twoTables.setLogicalDigest(true);
+                List<SnapshotTask> tasks = runToSnapshotTasks(twoTables);
+                Assertions.assertEquals(2, tasks.size());
+                boolean exceeded = limit == 1;
+                for (SnapshotTask task : tasks) {
+                    // no limit (0) and not exceeded: asked for the digest; exceeded: not asked
+                    Assertions.assertEquals(!exceeded, task.isComputeLogicalDigest(), "limit " + limit);
+                }
+                if (exceeded) {
+                    Assertions.assertEquals("TOO_MANY_TABLETS:2>1", twoTables.getLogicalDigestSkipReason());
+                    List<String> info = twoTables.getInfo();
+                    Assertions.assertEquals("SKIPPED:TOO_MANY_TABLETS:2>1", info.get(info.size() - 1));
+                } else {
+                    Assertions.assertNull(twoTables.getLogicalDigestSkipReason());
+                    List<String> info = twoTables.getInfo();
+                    Assertions.assertEquals("ON", info.get(info.size() - 1));
+                }
+            }
+            // the limit does nothing if the digest is not asked for
+            Config.backup_logical_digest_max_tablets = 1;
+            BackupJob noDigest = new BackupJob("label_off", dbId, UnitTestUtil.DB_NAME,
+                    tableRefsOf(UnitTestUtil.TABLE_NAME, table2Name), 13600 * 1000,
+                    BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            runToSnapshotTasks(noDigest);
+            Assertions.assertNull(noDigest.getLogicalDigestSkipReason());
+            List<String> info = noDigest.getInfo();
+            Assertions.assertEquals("OFF", info.get(info.size() - 1));
+        } finally {
+            Config.backup_logical_digest_max_tablets = orig;
+        }
+    }
+
+    @Test
+    public void testBackupWithTooManyTabletsRecordsNoDigestAndSucceeds() throws IOException {
+        long orig = Config.backup_logical_digest_max_tablets;
+        try {
+            // one tablet, the limit is exceeded only by a limit below it: use the skip decided by the job directly
+            Config.backup_logical_digest_max_tablets = 1;
+            List<TableRefInfo> refs = tableRefsOf(UnitTestUtil.TABLE_NAME, table2Name);
+            job = new BackupJob("label", dbId, UnitTestUtil.DB_NAME, refs, 13600 * 1000,
+                    BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            job.setLogicalDigest(true);
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            Assertions.assertEquals(2, tasks.size());
+            TBackend tBackend = new TBackend("", 0, 1);
+            TStatus ok = new TStatus(TStatusCode.OK);
+            for (SnapshotTask task : tasks) {
+                Assertions.assertFalse(task.toThrift().isSetComputeLogicalDigest());
+                TFinishTaskRequest request = new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT,
+                        task.getSignature(), ok);
+                request.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+                request.setSnapshotPath("/path/to/snapshot");
+                request.setManifestRoot(sha('1'));
+                // even a backend which reports a digest anyway is not recorded
+                request.setLogicalDigest(reportedDigest("OK"));
+                Assertions.assertTrue(job.finishTabletSnapshotTask(task, request));
+            }
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+            // keep on local: no upload, go on to the job info
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+        } finally {
+            Config.backup_logical_digest_max_tablets = orig;
+        }
+    }
+
+    @Test
+    public void testShowBackupLogicalDigestColumn() throws IOException {
+        Assertions.assertEquals("LogicalDigest", ShowBackupCommand.TITLE_NAMES.get(
+                ShowBackupCommand.TITLE_NAMES.size() - 1));
+        // Status is not changed
+        Assertions.assertEquals("Status", ShowBackupCommand.TITLE_NAMES.get(
+                ShowBackupCommand.TITLE_NAMES.size() - 3));
+        List<String> info = job.getInfo();
+        Assertions.assertEquals(ShowBackupCommand.TITLE_NAMES.size(), info.size());
+        Assertions.assertEquals("OFF", info.get(info.size() - 1));
+        Assertions.assertEquals("[OK]", info.get(info.size() - 3));
+
+        runBackupToSavedJobInfo(true, true, true, reportedDigest("OK"));
+        info = job.getInfo();
+        Assertions.assertEquals(ShowBackupCommand.TITLE_NAMES.size(), info.size());
+        Assertions.assertEquals("RECORDED:digest=1,no_digest=0,not_asked=0", info.get(info.size() - 1));
+    }
+
+    @Test
+    public void testNoManifestIfDisabled() throws IOException {
+        boolean orig = Config.enable_backup_manifest;
+        try {
+            Config.enable_backup_manifest = false;
+            AgentTaskQueue.clearAllTasks();
+            job.setManifestDigest(true);
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            Assertions.assertTrue(tasks.get(0).isSkipManifest());
+            Assertions.assertTrue(tasks.get(0).toThrift().isSetSkipManifest());
+            Assertions.assertTrue(tasks.get(0).toThrift().isSkipManifest());
+            Assertions.assertTrue(tasks.get(0).toThrift().isSetListFiles());
+            Assertions.assertFalse(tasks.get(0).toThrift().isSetComputeDigest());
+        } finally {
+            Config.enable_backup_manifest = orig;
+        }
+    }
+
+    @Test
+    public void testJobInfoHasNoManifestIfDisabled() throws IOException {
+        boolean orig = Config.enable_backup_manifest;
+        try {
+            Config.enable_backup_manifest = false;
+            // even if the backend reports the roots (a backend which does not know the request field)
+            BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true);
+            Assertions.assertFalse(jobInfo.hasManifest());
+            Assertions.assertNull(jobInfo.manifestVersion);
+            Assertions.assertNull(jobInfo.getManifestRoot(tabletId));
+            String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
+            Assertions.assertFalse(json.contains("manifest"), json);
+            Assertions.assertFalse(json.contains("digest_algorithm"), json);
+        } finally {
+            Config.enable_backup_manifest = orig;
+        }
+    }
+
+    @Test
+    public void testUploadTaskSkipsManifestIfDisabled() {
+        UploadTask task = new UploadTask(null, backendId, 1, 2, dbId, Maps.newHashMap(),
+                new FsBroker("127.0.0.1", 8000), Maps.newHashMap(), StorageBackend.StorageType.BROKER, "loc");
+        Assertions.assertFalse(task.toThrift().isSetSkipManifest());
+        task.setSkipManifest(true);
+        Assertions.assertTrue(task.toThrift().isSetSkipManifest());
+        Assertions.assertTrue(task.toThrift().isSkipManifest());
+    }
+
+    @Test
+    public void testUploadTasksOfJobWithoutManifest() {
+        boolean orig = Config.enable_backup_manifest;
+        try {
+            Config.enable_backup_manifest = false;
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            TBackend tBackend = new TBackend("", 0, 1);
+            TFinishTaskRequest request = new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT,
+                    tasks.get(0).getSignature(), new TStatus(TStatusCode.OK));
+            request.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+            request.setSnapshotPath("/path/to/snapshot");
+            Assertions.assertTrue(job.finishTabletSnapshotTask(tasks.get(0), request));
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+            AgentTaskQueue.clearAllTasks();
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+            UploadTask upTask = (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+            Assertions.assertTrue(upTask.isSkipManifest());
+            Assertions.assertTrue(upTask.toThrift().isSkipManifest());
+        } finally {
+            Config.enable_backup_manifest = orig;
+        }
     }
 
     @Test

@@ -521,6 +521,7 @@ public class RestoreLineageTest {
                 + "\"l0_passed_but_atomic_restore\":0,\"l0_passed_but_aggregate_table\":0,"
                 + "\"l0_passed_but_remote_storage\":0,\"l0_passed_but_hidden_state_mow\":0,"
                 + "\"l0_passed_but_hidden_state_mor\":0,\"l0_passed_but_mixed_versions\":0,"
+                + "\"l0_passed_but_too_many_tablets\":0,"
                 + "\"cluster_mismatch\":0,\"no_local\":2,\"no_lineage\":0,"
                 + "\"lineage_mismatch\":0,"
                 + "\"local_version_changed\":1,\"source_version_changed\":0,\"commit_seq_mismatch\":0}", shown);
@@ -663,6 +664,7 @@ public class RestoreLineageTest {
                 partInfo.indexes.put(tbl2.getIndexNameById(index.getId()), idxInfo);
                 for (Tablet tablet : index.getTablets()) {
                     idxInfo.sortedTabletInfoList.add(new BackupTabletInfo(tablet.getId(), Lists.newArrayList()));
+                    idxInfo.tablets.put(tablet.getId(), Lists.newArrayList());
                 }
             }
             tblInfo.partitions.put(part.getName(), partInfo);

@@ -395,6 +395,69 @@ public class RestoreManifestTest {
         Assertions.assertEquals(shown, manifestCheckColumn(readJob));
     }
 
+    private RestoreJob downloadingJobWithCheckedReplicas() {
+        RestoreJob job = newRestoreJob(jobInfoWithManifest(TABLET_1, TABLET_2));
+        for (long beId : new long[] {1, 2}) {
+            for (long tabletId : new long[] {201, 202}) {
+                job.snapshotInfos.put(tabletId, beId, new SnapshotInfo(1, 2, 3, 4, tabletId, beId, 5, "/p",
+                        Lists.newArrayList()));
+            }
+        }
+        job.recordManifestCheck(1, downloadFinished(true, Lists.newArrayList(201L, 202L)));
+        job.recordManifestCheck(2, downloadFinished(false, Lists.newArrayList(201L)));
+        Assertions.assertEquals(5, job.getManifestCheckReplicaNum());
+        Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
+        return job;
+    }
+
+    @Test
+    public void testManifestCheckReplicasAreReleasedWhenTheDownloadFinishes() {
+        RestoreJob job = downloadingJobWithCheckedReplicas();
+        Assertions.assertEquals(root(TABLET_1), job.getExpectedManifestRoot(TABLET_1));
+        Deencapsulation.invoke(job, "waitingAllDownloadFinished");
+        Assertions.assertEquals(RestoreJob.RestoreJobState.COMMIT, job.getState());
+        // the result is fixed, and the sets it was computed from are gone
+        Assertions.assertEquals(0, job.getManifestCheckReplicaNum());
+        RestoreManifestCheck check = job.getManifestCheck();
+        Assertions.assertEquals(3, check.getVerifiedTablets());
+        Assertions.assertEquals(1, check.getUnverifiedTablets());
+        Assertions.assertFalse(check.isDigestChecked());
+        // the manifest roots are only needed to download, the version and the algorithm are still shown
+        Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
+        Assertions.assertTrue(job.jobInfo.hasManifest());
+        Assertions.assertEquals("{\"version\":1,\"algo\":\"sha256\",\"verified_tablets\":3,"
+                + "\"unverified_tablets\":1,\"digest_checked\":false}", manifestCheckColumn(job));
+        // the job info logged with the COMMIT state has no manifest root
+        String json = job.jobInfo.toJson(false);
+        Assertions.assertFalse(json.contains("manifest_roots"), json);
+        Assertions.assertTrue(json.contains("manifest_version"), json);
+    }
+
+    @Test
+    public void testManifestCheckReplicasAreReleasedWhenTheJobIsCancelled() {
+        RestoreJob job = downloadingJobWithCheckedReplicas();
+        Assertions.assertTrue(job.cancel().ok());
+        Assertions.assertEquals(RestoreJob.RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertEquals(0, job.getManifestCheckReplicaNum());
+        // the partial result is kept
+        Assertions.assertEquals(3, job.getManifestCheck().getVerifiedTablets());
+    }
+
+    @Test
+    public void testBackupWithoutManifestIsRestoredWithoutIt() {
+        // a backup taken with enable_backup_manifest = false: no manifest version, no root
+        BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2);
+        Assertions.assertFalse(jobInfo.hasManifest());
+        RestoreJob job = newRestoreJob(jobInfo);
+        Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
+        Assertions.assertNull(job.getManifestCheck());
+        Assertions.assertEquals(FeConstants.null_string, manifestCheckColumn(job));
+        Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
+        Deencapsulation.invoke(job, "waitingAllDownloadFinished");
+        Assertions.assertEquals(RestoreJob.RestoreJobState.COMMIT, job.getState());
+        Assertions.assertNull(job.getManifestCheck());
+    }
+
     @Test
     public void testManifestCheckOfRestoreJobWithoutManifest() throws Exception {
         // as persisted by an old version: no "mck", and the job info has no manifest.

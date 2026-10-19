@@ -1604,6 +1604,61 @@ public:
     void use_remote_fs(std::shared_ptr<io::RemoteFileSystem> fs) { _remote_fs = std::move(fs); }
 };
 
+// A remote file system over the local disk which also uploads (copies), to upload to.
+class LocalDirUploadFileSystem : public LocalDirRemoteFileSystem {
+protected:
+    Status create_directory_impl(const io::Path& path, bool failed_if_exists) override {
+        return io::global_local_filesystem()->create_directory(path, failed_if_exists);
+    }
+    Status upload_impl(const io::Path& local_file, const io::Path& remote_file) override {
+        RETURN_IF_ERROR(io::global_local_filesystem()->create_directory(remote_file.parent_path()));
+        return io::global_local_filesystem()->copy_path(local_file, remote_file);
+    }
+    Status rename_impl(const io::Path& orig, const io::Path& new_path) override {
+        return io::global_local_filesystem()->rename(orig, new_path);
+    }
+};
+
+// Whether any file named __manifest__* is in the dir.
+static bool has_uploaded_manifest(const std::string& dir) {
+    std::vector<io::FileInfo> files;
+    bool exists = false;
+    EXPECT_TRUE(io::global_local_filesystem()->list(dir, true, &files, &exists).ok());
+    for (const auto& file : files) {
+        if (file.file_name.starts_with("__manifest__")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+TEST_F(SnapshotLoaderTest, UploadWritesManifestUnlessSkipped) {
+    for (bool skip : {false, true}) {
+        int64_t tablet_id = skip ? 3501 : 3401;
+        TRemoteTabletSnapshot snapshot;
+        prepare_http_snapshots(tablet_id, tablet_id + 1, tablet_id + 2, tablet_id + 10,
+                               tablet_id + 11, &snapshot);
+        ASSERT_FALSE(HasFatalFailure());
+        std::string idx_dir = fmt::format("{}/repo_up_{}/__idx_1", storage_root_path, tablet_id);
+        std::string dest = fmt::format("{}/__{}", idx_dir, tablet_id);
+        ASSERT_TRUE(io::global_local_filesystem()->create_directory(dest).ok());
+
+        RepositoryTestLoader loader(*engine_ref, ExecEnv::GetInstance(), 77L, tablet_id);
+        loader.use_remote_fs(std::make_shared<LocalDirUploadFileSystem>());
+        loader.set_skip_manifest(skip);
+        std::map<int64_t, std::vector<std::string>> tablet_files;
+        Status st = loader.upload({{snapshot.local_snapshot_path, dest}}, &tablet_files);
+        ASSERT_TRUE(st.ok()) << st;
+        // the data files are uploaded either way
+        ASSERT_EQ(1, tablet_files.count(tablet_id));
+        EXPECT_FALSE(tablet_files[tablet_id].empty());
+        EXPECT_EQ(skip, loader.skip_manifest());
+        EXPECT_EQ(!skip, has_uploaded_manifest(idx_dir));
+        EXPECT_EQ(skip ? 0 : 1, loader.uploaded_manifest_roots().size());
+    }
+}
+
+
 TEST_F(SnapshotLoaderTest, RepositoryDownloadOfAnIncrementLeavesOnlyTheIncrementHdr) {
     ManifestConfigGuard guard(true, false);
     TRemoteTabletSnapshot remote_snapshot;
