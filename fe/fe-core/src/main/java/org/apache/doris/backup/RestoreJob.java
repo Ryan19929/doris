@@ -627,11 +627,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // The manifest root of a tablet in the backup for the backend to download by the manifest and check the
     // downloaded snapshot, null if the backup has no manifest.
     @VisibleForTesting
-    String getExpectedManifestRoot(long repoTabletId) {
+    String getExpectedManifestRoot(long repoPartitionId, long repoIndexId, long repoTabletId) {
         if (Config.isCloudMode() || jobInfo == null || !jobInfo.hasManifest()) {
             return null;
         }
-        return jobInfo.getManifestRoot(repoTabletId);
+        return jobInfo.getManifestRoot(repoPartitionId, repoIndexId, repoTabletId);
     }
 
     private void resetManifestCheck() {
@@ -2283,7 +2283,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 // download to previous exist snapshot dir
                                 String dest = snapshotInfo.getTabletPath();
                                 srcToDest.put(src, dest);
-                                String manifestRoot = getExpectedManifestRoot(result.second.getTabletId());
+                                String manifestRoot = getExpectedManifestRoot(result.second.getPartId(),
+                                        result.second.getIdxId(), result.second.getTabletId());
                                 if (manifestRoot != null) {
                                     manifestRoots.put(src, manifestRoot);
                                 }
@@ -2439,7 +2440,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                                 remoteTabletSnapshot.setRemoteBeAddr(remoteBeAddr);
                                 remoteTabletSnapshot.setRemoteSnapshotPath(remoteSnapshotPath);
                                 remoteTabletSnapshot.setRemoteToken(remoteToken);
-                                String manifestRoot = getExpectedManifestRoot(remoteTabletId);
+                                String manifestRoot = getExpectedManifestRoot(repoIds.getPartId(), repoIds.getIdxId(),
+                                        remoteTabletId);
                                 if (manifestRoot != null) {
                                     remoteTabletSnapshot.setManifestRoot(manifestRoot);
                                 }
@@ -2606,7 +2608,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         AgentBoundedBatchTask batchTask = new AgentBoundedBatchTask(
                 Config.backup_restore_batch_task_num_per_rpc, Config.restore_task_concurrency_per_be);
         // the tablet in the backup of each tablet of the restore, for the digest sent with an incremental append
-        Map<Long, Long> backupTabletIds = null;
+        Map<Long, IdChain> backupTabletIds = null;
         // tablet id->(be id -> download info)
         for (Cell<Long, Long, SnapshotInfo> cell : snapshotInfos.cellSet()) {
             SnapshotInfo info = cell.getValue();
@@ -2638,10 +2640,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     // The tablet of the backup for each tablet of the restore, by the file mapping.
-    private Map<Long, Long> buildBackupTabletIds() {
-        Map<Long, Long> ids = Maps.newHashMap();
+    private Map<Long, IdChain> buildBackupTabletIds() {
+        Map<Long, IdChain> ids = Maps.newHashMap();
         for (Map.Entry<IdChain, IdChain> entry : fileMapping.getMapping().entrySet()) {
-            ids.put(entry.getKey().getTabletId(), entry.getValue().getTabletId());
+            ids.put(entry.getKey().getTabletId(), entry.getValue());
         }
         return ids;
     }
@@ -2652,10 +2654,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      * backup, otherwise it fails the task.
      */
     @VisibleForTesting
-    TRestoreBackupDigest getBackupLogicalDigest(Map<Long, Long> backupTabletIds, long tabletId) {
-        Long backupTabletId = backupTabletIds.get(tabletId);
-        LogicalDigestInfo digest = backupTabletId == null || jobInfo == null ? null
-                : jobInfo.getLogicalDigest(backupTabletId);
+    TRestoreBackupDigest getBackupLogicalDigest(Map<Long, IdChain> backupTabletIds, long tabletId) {
+        IdChain backupIds = backupTabletIds.get(tabletId);
+        LogicalDigestInfo digest = backupIds == null || jobInfo == null ? null
+                : jobInfo.getLogicalDigest(backupIds.getPartId(), backupIds.getIdxId(), backupIds.getTabletId());
         if (digest == null || !digest.hasDigest() || digest.algoVersion == null || digest.schemaSig == null) {
             return null;
         }
@@ -3405,8 +3407,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 int schemaHash = tbl.getSchemaHashByIndexId(index.getId());
                 for (int i = 0; i < index.getTablets().size(); i++) {
                     Tablet tablet = index.getTablets().get(i);
-                    BackupTabletInfo backupTablet = backupIdx.sortedTabletInfoList.get(i);
-                    ReuseTabletCheck check = new ReuseTabletCheck(jobInfo.getLogicalDigest(backupTablet.id));
+                    ReuseTabletCheck check = new ReuseTabletCheck(backupIdx.getLogicalDigestAt(i));
                     for (Replica replica : tablet.getReplicas()) {
                         if (!RestoreReuseJudge.isReplicaHealthyAt(replica, candidate.digestVersion)) {
                             candidate.decide(false, RestoreReuseResult.DOWNLOAD_CHANGED);
@@ -3423,8 +3424,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         RestoreDigestTask task = new RestoreDigestTask(beId, signature, jobId, dbId, tbl.getId(),
                                 part.getId(), index.getId(), tablet.getId(), schemaHash, candidate.digestVersion, 0);
                         if (candidate.incrementalCandidate) {
-                            TRestoreDigestPrefixSource source = buildPrefixSource(candidate, backupIdx, backupTablet,
-                                    beId);
+                            TRestoreDigestPrefixSource source = buildPrefixSource(candidate, backupIdx, i, beId);
                             if (source == null) {
                                 immediateResults.put(signature, LogicalDigestInfo.none(LogicalDigestInfo.REASON_ERROR));
                                 continue;
@@ -3458,14 +3458,21 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      * partition is downloaded.
      */
     private TRestoreDigestPrefixSource buildPrefixSource(ReuseCandidate candidate, BackupIndexInfo backupIdx,
-            BackupTabletInfo backupTablet, long beId) {
+            int pos, long beId) {
+        BackupTabletInfo backupTablet = backupIdx.sortedTabletInfoList.get(pos);
         try {
-            String root = backupTablet.prefixDigestRoot;
-            if (root == null || root.isEmpty()) {
+            // A backup which has the decomposed digest in its manifest: the backend locates it by the manifest, and
+            // checks it by the SHA-256 there. Otherwise the job info has the SHA-256 of the file.
+            boolean inManifest = jobInfo.isPrefixDigestInManifest();
+            String root = inManifest ? backupIdx.getManifestRootAt(pos) : backupIdx.getPrefixDigestRootAt(pos);
+            if (root == null || root.isEmpty() || (inManifest && !backupIdx.hasPrefixDigestAt(pos))) {
                 return null;
             }
             TRestoreDigestPrefixSource source = new TRestoreDigestPrefixSource(backupTablet.id, root,
                     candidate.version);
+            if (inManifest) {
+                source.setRootIsManifest(true);
+            }
             if (isFromLocalSnapshot()) {
                 TRemoteTabletSnapshot remote = buildRemoteTabletSnapshot(backupTablet.id, candidate.backupTableId,
                         candidate.backupPartition.id, backupIdx.id);
@@ -3522,7 +3529,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         remote.setRemoteBeAddr(remoteBeAddr);
         remote.setRemoteSnapshotPath(String.format("%s/%d/%d", remoteSnapshotPath, remoteTabletId, schemaHash));
         remote.setRemoteToken(jobInfo.getToken());
-        String manifestRoot = getExpectedManifestRoot(remoteTabletId);
+        String manifestRoot = getExpectedManifestRoot(remotePartId, remoteIdxId, remoteTabletId);
         if (manifestRoot != null) {
             remote.setManifestRoot(manifestRoot);
         }

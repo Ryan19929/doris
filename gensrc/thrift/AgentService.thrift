@@ -521,10 +521,15 @@ struct TRestoreDigestPrefixSource {
     // the backup is kept on local: the remote tablet snapshot (the remote fields are used)
     6: optional TRemoteTabletSnapshot remote_tablet_snapshot
     7: required Types.TTabletId remote_tablet_id
-    // SHA-256 of the decomposed digest file, recorded in the job info
+    // SHA-256 of the decomposed digest file, recorded in the job info; or, if root_is_manifest, the manifest root
+    // of the tablet snapshot
     8: required string root
     // the version of the backup (V_b): the end version of the last rowset of the decomposed digest
     9: required Types.TVersion end_version
+    // root is the root of the manifest of the tablet snapshot, which has the decomposed digest file as one of its
+    // entries (manifest version 2): the backend gets the manifest, checks it against the root, and reads the file
+    // by the SHA-256 in it
+    10: optional bool root_is_manifest
 }
 
 // compute the logical digest (order independent digest of the visible rows) of a tablet at a version

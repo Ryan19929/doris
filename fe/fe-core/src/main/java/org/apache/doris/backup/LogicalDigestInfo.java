@@ -25,7 +25,7 @@ import com.google.gson.annotations.SerializedName;
 /**
  * The logical digest of a tablet snapshot, see TLogicalDigest. Persisted in the SnapshotInfo, so the gson names are
  * short and must not change. In the job info of a backup it is recorded as the root of each tablet, and the schema
- * signature and the algorithm version of each index (BackupIndexInfo.logicalDigestRoots etc), and put together on
+ * signature and the algorithm version of each index (BackupIndexInfo.logicalDigestRootArray etc), and put together on
  * reading. Without a digest (root is empty) the reason code says why.
  */
 public class LogicalDigestInfo {

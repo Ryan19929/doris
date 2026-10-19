@@ -20,7 +20,6 @@ package org.apache.doris.backup;
 import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
-import org.apache.doris.backup.BackupJobInfo.BackupTabletInfo;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
@@ -440,8 +439,8 @@ public final class RestoreReuseJudge {
             if (backupIdx == null || backupIdx.sortedTabletInfoList.size() != localIdx.getTablets().size()) {
                 return "INDEX_MISMATCH";
             }
-            for (BackupTabletInfo backupTablet : backupIdx.sortedTabletInfoList) {
-                LogicalDigestInfo digest = in.jobInfo.getLogicalDigest(backupTablet.id);
+            for (int i = 0; i < backupIdx.sortedTabletInfoList.size(); i++) {
+                LogicalDigestInfo digest = backupIdx.getLogicalDigestAt(i);
                 if (digest == null || !digest.hasDigest()) {
                     String skipReason = in.jobInfo.logicalDigestSkipReason;
                     if (digest == null && skipReason != null && skipReason.startsWith(RestoreJob.TOO_MANY_TABLETS)) {
@@ -578,11 +577,11 @@ public final class RestoreReuseJudge {
             if (backupIdx == null) {
                 return "INDEX_MISMATCH";
             }
-            for (BackupTabletInfo backupTablet : backupIdx.sortedTabletInfoList) {
-                if (backupTablet.manifestRoot == null || backupTablet.manifestRoot.isEmpty()) {
+            for (int i = 0; i < backupIdx.sortedTabletInfoList.size(); i++) {
+                if (backupIdx.getManifestRootAt(i) == null) {
                     return "NO_MANIFEST";
                 }
-                if (backupTablet.prefixDigestRoot == null || backupTablet.prefixDigestRoot.isEmpty()) {
+                if (!backupIdx.hasPrefixDigestAt(i)) {
                     return "NO_PREFIX_DIGEST";
                 }
             }

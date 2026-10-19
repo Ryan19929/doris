@@ -285,12 +285,15 @@ public class RestoreReuseTest {
                 BackupIndexInfo idxInfo = new BackupIndexInfo();
                 idxInfo.id = index.getId();
                 idxInfo.schemaHash = tbl2.getSchemaHashByIndexId(index.getId());
-                idxInfo.logicalDigests = Maps.newHashMap();
                 partInfo.indexes.put(tbl2.getIndexNameById(index.getId()), idxInfo);
                 for (Tablet tablet : index.getTablets()) {
                     idxInfo.sortedTabletInfoList.add(new BackupTabletInfo(tablet.getId(), Lists.newArrayList()));
                     idxInfo.tablets.put(tablet.getId(), Lists.newArrayList());
-                    idxInfo.logicalDigests.put(tablet.getId(), LogicalDigestInfo.of(1, SIG, rootOf(part)));
+                    idxInfo.tabletsOrder.add(tablet.getId());
+                }
+                // the digests are arrays aligned with the tablets
+                for (int pos = 0; pos < idxInfo.tabletsOrder.size(); pos++) {
+                    idxInfo.putLogicalDigestAt(pos, LogicalDigestInfo.of(1, SIG, rootOf(part)));
                 }
             }
             tblInfo.partitions.put(part.getName(), partInfo);
@@ -480,12 +483,15 @@ public class RestoreReuseTest {
         // a tablet of the backup has no digest, except for the check level off
         in = input(CheckLevel.FULL);
         BackupIndexInfo idx = in.backupPartition.indexes.values().iterator().next();
-        idx.logicalDigests.put(tabletOf(p1()), LogicalDigestInfo.none(LogicalDigestInfo.REASON_NOT_SUPPORTED));
+        int pos = idx.positionOf(tabletOf(p1()));
+        Assertions.assertTrue(pos >= 0);
+        idx.logicalDigestRootArray.set(pos, "");
+        idx.putLogicalDigestAt(pos, LogicalDigestInfo.none(LogicalDigestInfo.REASON_NOT_SUPPORTED));
         Assertions.assertEquals("NO_DIGEST", RestoreReuseJudge.firstReject(in));
         in.level = CheckLevel.OFF;
         Assertions.assertNull(RestoreReuseJudge.firstReject(in));
         in.level = CheckLevel.SAMPLE;
-        idx.logicalDigests = null;
+        idx.clearLogicalDigests();
         Assertions.assertEquals("NO_DIGEST", RestoreReuseJudge.firstReject(in));
 
         // too small
@@ -2116,16 +2122,16 @@ public class RestoreReuseTest {
         for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
             partInfo.version = V2;
             for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
-                idxInfo.manifestRoots = Maps.newHashMap();
-                idxInfo.prefixDigestRoots = Maps.newHashMap();
+                // the manifest root of each tablet, and every tablet has a decomposed digest in its manifest
+                idxInfo.manifestRootArray = Lists.newArrayList();
+                StringBuilder present = new StringBuilder();
                 for (BackupTabletInfo tablet : idxInfo.sortedTabletInfoList) {
-                    tablet.manifestRoot = "m" + tablet.id;
-                    tablet.prefixDigestRoot = "p" + tablet.id;
-                    idxInfo.manifestRoots.put(tablet.id, tablet.manifestRoot);
-                    idxInfo.prefixDigestRoots.put(tablet.id, tablet.prefixDigestRoot);
+                    idxInfo.manifestRootArray.add("m" + tablet.id);
+                    present.append('1');
                     info.tabletBeMap.put(tablet.id, 1L);
                     info.tabletSnapshotPathMap.put(tablet.id, "/snapshot/ss");
                 }
+                idxInfo.prefixDigestPresent = present.toString();
             }
         }
         return info;
@@ -2234,15 +2240,29 @@ public class RestoreReuseTest {
         in.jobInfo.manifestVersion = null;
         Assertions.assertEquals("NO_MANIFEST", RestoreReuseJudge.firstRejectIncremental(in));
         in = incrementalInput(CheckLevel.FULL);
-        in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()))
-                .sortedTabletInfoList.get(0).prefixDigestRoot = null;
+        BackupIndexInfo p1Idx = in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()));
+        // only some tablets have no decomposed digest in the manifest
+        p1Idx.prefixDigestPresent = "0" + p1Idx.prefixDigestPresent.substring(1);
+        Assertions.assertEquals("NO_PREFIX_DIGEST", RestoreReuseJudge.firstRejectIncremental(in));
+        // a backup of the manifest version 1 has the root of the file in the job info
+        in = incrementalInput(CheckLevel.FULL);
+        p1Idx = in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()));
+        in.jobInfo.manifestVersion = BackupJobInfo.MANIFEST_VERSION_V1;
+        p1Idx.prefixDigestPresent = null;
+        Assertions.assertEquals("NO_PREFIX_DIGEST", RestoreReuseJudge.firstRejectIncremental(in));
+        p1Idx.prefixDigestRootArray = Lists.newArrayList();
+        for (int i = 0; i < p1Idx.sortedTabletInfoList.size(); i++) {
+            p1Idx.prefixDigestRootArray.add("p" + p1Idx.sortedTabletInfoList.get(i).id);
+        }
+        Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(in));
+        p1Idx.prefixDigestRootArray.set(0, "");
         Assertions.assertEquals("NO_PREFIX_DIGEST", RestoreReuseJudge.firstRejectIncremental(in));
         in = incrementalInput(CheckLevel.FULL);
         in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()))
-                .sortedTabletInfoList.get(0).manifestRoot = null;
+                .manifestRootArray.set(0, "");
         Assertions.assertEquals("NO_MANIFEST", RestoreReuseJudge.firstRejectIncremental(in));
         in = incrementalInput(CheckLevel.FULL);
-        in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId())).logicalDigests.clear();
+        in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId())).clearLogicalDigests();
         Assertions.assertEquals("NO_DIGEST", RestoreReuseJudge.firstRejectIncremental(in));
 
         // small partition, unhealthy replica
@@ -2315,6 +2335,42 @@ public class RestoreReuseTest {
     }
 
     @Test
+    public void testPrefixSourceOfABackupOfManifestVersion1() throws Exception {
+        // the backup of the previous version: the decomposed digest is next to the manifest, not in it, and the job
+        // info has its SHA-256 for each tablet
+        Config.enable_restore_incremental_append = true;
+        BackupJobInfo info = incrementalJobInfo();
+        info.manifestVersion = BackupJobInfo.MANIFEST_VERSION_V1;
+        for (BackupOlapTableInfo tblInfo : info.backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    idxInfo.prefixDigestPresent = null;
+                    idxInfo.prefixDigestRootArray = Lists.newArrayList();
+                    for (BackupTabletInfo tablet : idxInfo.sortedTabletInfoList) {
+                        idxInfo.prefixDigestRootArray.add("p" + tablet.id);
+                    }
+                }
+            }
+        }
+        RestoreJob job = newJob(info, "full");
+        Deencapsulation.invoke(job, "checkAndPrepareMeta");
+        Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        for (RestoreDigestTask task : tasks) {
+            Assertions.assertNotNull(task.getPrefixSource());
+            // the root of the file, which is not the manifest root
+            Assertions.assertEquals("p" + task.getTabletId(), task.getPrefixSource().getRoot());
+            Assertions.assertFalse(task.getPrefixSource().isSetRootIsManifest());
+            Assertions.assertFalse(task.toThrift().getPrefixSource().isSetRootIsManifest());
+        }
+        reportPrefix(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(2, job.getReuseResult().getIncrementalPartitions());
+    }
+
+    @Test
     public void testIncrementalFlowToCommit() throws Exception {
         RestoreJob job = prepareIncrementalJob("full");
         toVerifying(job);
@@ -2325,7 +2381,9 @@ public class RestoreReuseTest {
             Assertions.assertEquals(V1, task.getVersion());
             Assertions.assertNotNull(task.getPrefixSource());
             Assertions.assertEquals(V2, task.getPrefixSource().getEndVersion());
-            Assertions.assertEquals("p" + task.getTabletId(), task.getPrefixSource().getRoot());
+            // the backup has the decomposed digest in its manifest, the backend locates it by the manifest root
+            Assertions.assertEquals("m" + task.getTabletId(), task.getPrefixSource().getRoot());
+            Assertions.assertTrue(task.getPrefixSource().isRootIsManifest());
             Assertions.assertTrue(task.getPrefixSource().isSetRemoteTabletSnapshot());
             Assertions.assertTrue(task.toThrift().isSetPrefixSource());
         }
@@ -3889,24 +3947,35 @@ public class RestoreReuseTest {
         Assertions.assertTrue(digestResultsOf(job).isEmpty());
     }
 
+    // the index of the backup of the partition (the self backup has the ids of the local partition)
+    private BackupJobInfo.BackupIndexInfo backupIndex(RestoreJob job, Partition part) {
+        return job.jobInfo.getIndexInfo(part.getId(), part.getBaseIndex().getId());
+    }
+
+    private LogicalDigestInfo backupDigest(RestoreJob job, long tablet) {
+        Partition part = tablet == tabletOf(p1()) ? p1() : p2();
+        return job.jobInfo.getLogicalDigest(part.getId(), part.getBaseIndex().getId(), tablet);
+    }
+
     @Test
     public void testDigestsOfTheJobInfoAreReleasedAfterVerifying() {
         RestoreJob job = prepareJob("full");
         long tablet = tabletOf(p1());
-        Assertions.assertNotNull(job.jobInfo.getLogicalDigest(tablet));
+        Assertions.assertNotNull(backupDigest(job, tablet));
         toVerifying(job);
         // still needed while verifying
-        Assertions.assertNotNull(job.jobInfo.getLogicalDigest(tablet));
+        Assertions.assertNotNull(backupDigest(job, tablet));
         reportAll(job, newDigestTasks(), Maps.newHashMap());
         waitDigests(job);
         Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
-        Assertions.assertNull(job.jobInfo.getLogicalDigest(tablet));
-        Assertions.assertNull(job.jobInfo.getPrefixDigestRoot(tablet));
+        Assertions.assertNull(backupDigest(job, tablet));
         BackupJobInfo.BackupIndexInfo idxInfo = job.jobInfo.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME)
                 .getPartInfo(p1().getName()).getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()));
-        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).logicalDigest);
+        Assertions.assertFalse(idxInfo.hasPrefixDigest(tablet));
+        Assertions.assertNull(idxInfo.getLogicalDigestAt(0));
         Assertions.assertNull(idxInfo.logicalDigests);
-        Assertions.assertNull(idxInfo.logicalDigestRoots);
+        Assertions.assertNull(idxInfo.logicalDigestRootArray);
+        Assertions.assertNull(idxInfo.logicalDigestNoneArray);
         // the decisions are what the job keeps
         Assertions.assertEquals(2, job.getReuseResult().getKeptPartitions());
     }
@@ -3918,7 +3987,7 @@ public class RestoreReuseTest {
         // no candidates: straight to SNAPSHOTING, the digests are of no use
         Deencapsulation.invoke(job, "allReplicasCreated");
         Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
-        Assertions.assertNull(job.jobInfo.getLogicalDigest(tabletOf(p1())));
+        Assertions.assertNull(backupDigest(job, tabletOf(p1())));
     }
 
     @Test
@@ -3929,10 +3998,11 @@ public class RestoreReuseTest {
         waitDigests(job);
         Assertions.assertEquals(2, job.getReuseResult().getIncrementalPartitions());
         // the digest sent with the move task survives, and so do the manifest roots to download
-        Assertions.assertNotNull(job.jobInfo.getLogicalDigest(tabletOf(p1())));
-        Assertions.assertEquals(SIG, job.jobInfo.getLogicalDigest(tabletOf(p1())).schemaSig);
-        Assertions.assertNull(job.jobInfo.getPrefixDigestRoot(tabletOf(p1())));
-        Assertions.assertEquals("m" + tabletOf(p1()), job.jobInfo.getManifestRoot(tabletOf(p1())));
+        Assertions.assertNotNull(backupDigest(job, tabletOf(p1())));
+        Assertions.assertEquals(SIG, backupDigest(job, tabletOf(p1())).schemaSig);
+        Assertions.assertFalse(backupIndex(job, p1()).hasPrefixDigest(tabletOf(p1())));
+        Assertions.assertEquals("m" + tabletOf(p1()), job.jobInfo.getManifestRoot(p1().getId(),
+                p1().getBaseIndex().getId(), tabletOf(p1())));
     }
 
     @Test
@@ -3979,7 +4049,7 @@ public class RestoreReuseTest {
             Assertions.assertEquals(2, estimate.get("too_many_tablets").getAsLong());
             Assertions.assertEquals(2, estimate.get("l0_passed_but_too_many_tablets").getAsLong());
             // the digests are released at once
-            Assertions.assertNull(job.jobInfo.getLogicalDigest(tabletOf(p1())));
+            Assertions.assertNull(backupDigest(job, tabletOf(p1())));
             // and the job goes on to download
             Deencapsulation.invoke(job, "allReplicasCreated");
             Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
@@ -3998,7 +4068,7 @@ public class RestoreReuseTest {
         for (BackupOlapTableInfo tblInfo : in.jobInfo.backupOlapTableObjects.values()) {
             for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
                 for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
-                    idxInfo.logicalDigests = null;
+                    idxInfo.clearLogicalDigests();
                 }
             }
         }

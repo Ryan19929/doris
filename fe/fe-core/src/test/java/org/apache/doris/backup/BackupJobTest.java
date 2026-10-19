@@ -743,13 +743,13 @@ public class BackupJobTest {
         Assertions.assertTrue(jobInfo.hasManifest());
 
         // the root of the manifest uploaded to the repository, not the one written with the snapshot
-        Assertions.assertEquals(sha('a'), jobInfo.getManifestRoot(tabletId));
+        Assertions.assertEquals(sha('a'), onlyIndex(jobInfo).getManifestRoot(tabletId));
 
-        // the BackupTabletInfo view of it
+        // read by position, there is no view object of the tablet
         BackupJobInfo.BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.values().iterator().next()
                 .partitions.values().iterator().next().indexes.values().iterator().next();
         BackupJobInfo.BackupTabletInfo tabletInfo = idxInfo.sortedTabletInfoList.get(0);
-        Assertions.assertEquals(sha('a'), tabletInfo.manifestRoot);
+        Assertions.assertEquals(sha('a'), idxInfo.getManifestRootAt(0));
         // the existing files are unchanged
         Assertions.assertEquals(Lists.newArrayList("1.dat." + MD5, "1.idx." + MD5, "1.hdr." + MD5),
                 tabletInfo.files);
@@ -762,11 +762,16 @@ public class BackupJobTest {
         Assertions.assertNull(jobInfo.manifestVersion);
         Assertions.assertNull(jobInfo.digestAlgorithm);
         Assertions.assertFalse(jobInfo.hasManifest());
-        Assertions.assertNull(jobInfo.getManifestRoot(tabletId));
+        Assertions.assertNull(onlyIndex(jobInfo).getManifestRoot(tabletId));
         // same as a backup of an old version: no new key in the job info file.
         String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
         Assertions.assertFalse(json.contains("manifest"), json);
         Assertions.assertFalse(json.contains("digest_algorithm"), json);
+    }
+
+    private static BackupJobInfo.BackupIndexInfo onlyIndex(BackupJobInfo jobInfo) {
+        return jobInfo.backupOlapTableObjects.values().iterator().next()
+                .partitions.values().iterator().next().indexes.values().iterator().next();
     }
 
     private static TLogicalDigest reportedDigest(String code) {
@@ -786,7 +791,7 @@ public class BackupJobTest {
     @Test
     public void testBackupRecordsLogicalDigest() throws IOException {
         BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, true, reportedDigest("OK"));
-        LogicalDigestInfo digest = jobInfo.getLogicalDigest(tabletId);
+        LogicalDigestInfo digest = onlyIndex(jobInfo).getLogicalDigest(tabletId);
         Assertions.assertNotNull(digest);
         Assertions.assertTrue(digest.hasDigest());
         Assertions.assertEquals(1, (int) digest.algoVersion);
@@ -795,12 +800,15 @@ public class BackupJobTest {
         Assertions.assertNull(digest.reason);
         BackupJobInfo.BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.values().iterator().next()
                 .partitions.values().iterator().next().indexes.values().iterator().next();
-        Assertions.assertEquals(digest.root, idxInfo.sortedTabletInfoList.get(0).logicalDigest.root);
+        Assertions.assertEquals(digest.root, idxInfo.getLogicalDigestAt(0).root);
         // the manifest is not affected
-        Assertions.assertEquals(sha('a'), jobInfo.getManifestRoot(tabletId));
+        Assertions.assertEquals(sha('a'), onlyIndex(jobInfo).getManifestRoot(tabletId));
         String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
         // the schema signature and the algorithm once for the index, the root for each tablet; no old "ld"
-        Assertions.assertTrue(json.contains("\"ldr\":{\"" + tabletId + "\":\"" + sha('b') + "\"}"), json);
+        Assertions.assertTrue(json.contains("\"lra\":[\"" + sha('b') + "\"]"), json);
+        Assertions.assertFalse(json.contains("\"ldr\""), json);
+        Assertions.assertFalse(json.contains("\"manifest_roots\""), json);
+        Assertions.assertTrue(json.contains("\"mra\":[\"" + sha('a') + "\"]"), json);
         Assertions.assertTrue(json.contains("\"lds\":\"" + sha('5') + "\""), json);
         Assertions.assertTrue(json.contains("\"lda\":1"), json);
         Assertions.assertFalse(json.contains("\"ld\""), json);
@@ -809,7 +817,7 @@ public class BackupJobTest {
     private void checkNoLogicalDigest(TLogicalDigest reported, String reason) throws IOException {
         // NOT_SUPPORTED, a failure and no report (an old backend) never fail the backup
         BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, true, reported);
-        LogicalDigestInfo digest = jobInfo.getLogicalDigest(tabletId);
+        LogicalDigestInfo digest = onlyIndex(jobInfo).getLogicalDigest(tabletId);
         Assertions.assertNotNull(digest);
         Assertions.assertFalse(digest.hasDigest());
         Assertions.assertEquals("", digest.root);
@@ -838,7 +846,7 @@ public class BackupJobTest {
     public void testBackupWithoutLogicalDigestPropertyHasNone() throws IOException {
         // the backend reports one anyway (it does not, but the job must not record it)
         BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, false, reportedDigest("OK"));
-        Assertions.assertNull(jobInfo.getLogicalDigest(tabletId));
+        Assertions.assertNull(onlyIndex(jobInfo).getLogicalDigest(tabletId));
         String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
         Assertions.assertFalse(json.contains("\"ld\""), json);
     }
@@ -916,10 +924,10 @@ public class BackupJobTest {
             logicalDigestAsked = false;
             // the backend reports none, as it was not asked
             BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true, true, null);
-            Assertions.assertNull(jobInfo.getLogicalDigest(tabletId));
+            Assertions.assertNull(onlyIndex(jobInfo).getLogicalDigest(tabletId));
             String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
-            Assertions.assertFalse(json.contains("\"ldr\""), json);
-            Assertions.assertFalse(json.contains("\"ldn\""), json);
+            Assertions.assertFalse(json.contains("\"lra\""), json);
+            Assertions.assertFalse(json.contains("\"lna\""), json);
             Assertions.assertTrue(jobInfo.hasManifest());
         } finally {
             Config.restore_reuse_allow_hidden_state_models = orig;
@@ -1049,7 +1057,7 @@ public class BackupJobTest {
             BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true);
             Assertions.assertFalse(jobInfo.hasManifest());
             Assertions.assertNull(jobInfo.manifestVersion);
-            Assertions.assertNull(jobInfo.getManifestRoot(tabletId));
+            Assertions.assertNull(onlyIndex(jobInfo).getManifestRoot(tabletId));
             String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
             Assertions.assertFalse(json.contains("manifest"), json);
             Assertions.assertFalse(json.contains("digest_algorithm"), json);
