@@ -29,7 +29,9 @@
 
 ## 容量边界
 
-jobInfo 里逻辑摘要按"索引级 schema_sig 与算法版本 + 每 tablet 只记 root"紧凑存放：`ldr`（tablet→root）、`ldn`（tablet→无摘要原因）、`lds`、`lda`；仍能读取旧版本的 `ld` 字段。大规模下的控制项：
+jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否有分解摘要）都存成与 `tablets_order` 对齐的数组，内存里也是数组，没有以 tablet id 为 key 的 map，也不为每个 tablet 常驻一个视图对象：`mra`（manifest root）、`lra`（逻辑摘要 root）、`lna`（无摘要原因）、`rdp`（每个 tablet 一个字符，`1` 表示它的 manifest 里有分解摘要），空串表示该 tablet 没有；schema_sig 与算法版本放在索引级的 `lds`、`lda`。分解摘要文件（rdigest）是 manifest 的一条记录（名字 `__rdigest__`，带大小和 SHA-256），BE 按 manifest 定位并校验它，jobInfo 不再记它的 root；`manifest_version` 由 1 升为 2，只认 1 的旧 FE 会把新备份当作没有 Manifest，自动不复用，不报错。新 FE 仍能读版本 1 的备份（`manifest_roots`、`ldr`、`ldn`、`rd`，以及更早的 `ld`），读入后转成数组；这类备份的分解摘要仍按 jobInfo 里的 root 取。没有 Manifest（`enable_backup_manifest=false`）时分解摘要无处记录，不计算，增量补齐不可用。
+
+大规模下的控制项：
 
 - `backup_logical_digest_max_tablets`（默认 0，不限制）：备份涉及的 tablet 数超过它时，备份不要求 BE 计算逻辑摘要，jobInfo 不写摘要，备份照常成功；原因（`TOO_MANY_TABLETS:<n>><limit>`）显示在 `SHOW BACKUP` 末尾的 `LogicalDigest` 列。
 - `restore_reuse_max_tablets`（默认 0，不限制）：恢复所用备份的 tablet 数超过它时，本作业不复用任何分区，整体下载，`SHOW RESTORE` 的 `ReuseEstimate` 里记 `too_many_tablets`。

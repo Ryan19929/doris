@@ -135,7 +135,7 @@ suite("test_backup_restore_manifest", "backup_restore") {
 
     // 1.1 default: the set of files and the sizes are checked for all tablets, the digests are not.
     def check = restoreFromRepo()
-    assertEquals(1, check.version)
+    assertEquals(2, check.version)
     assertEquals("sha256", check.algo)
     assertEquals(numTablets, check.verified_tablets)
     assertEquals(0, check.unverified_tablets)
@@ -242,7 +242,7 @@ suite("test_backup_restore_manifest", "backup_restore") {
 
     // 2.1 default: sizes only.
     check = restoreLocalSnapshot("${suiteName}_local_1", "")
-    assertEquals(1, check.version)
+    assertEquals(2, check.version)
     assertEquals("none", check.algo)
     assertEquals(numTablets, check.verified_tablets)
     assertEquals(0, check.unverified_tablets)
@@ -272,7 +272,12 @@ suite("test_backup_restore_manifest", "backup_restore") {
     jobInfo.backup_objects.each { tbl, tblInfo ->
         tblInfo.partitions.each { part, partInfo ->
             partInfo.indexes.each { idx, idxInfo ->
-                if (!replaced && idxInfo.manifest_roots) {
+                // the roots are an array aligned with tablets_order ("mra"); a job info of the previous version
+                // has a map from the tablet id ("manifest_roots")
+                if (!replaced && idxInfo.mra) {
+                    idxInfo.mra[0] = "0" * 64
+                    replaced = true
+                } else if (!replaced && idxInfo.manifest_roots) {
                     def tabletId = idxInfo.manifest_roots.keySet().iterator().next()
                     idxInfo.manifest_roots[tabletId] = "0" * 64
                     replaced = true
@@ -280,7 +285,7 @@ suite("test_backup_restore_manifest", "backup_restore") {
             }
         }
     }
-    assertTrue(replaced, "no manifest_roots in ${jobInfo}")
+    assertTrue(replaced, "no manifest roots (mra) in ${jobInfo}")
     syncer.context.getSnapshotResult.setJobInfo(gson.toJson(jobInfo).getBytes())
     assertTrue(syncer.restoreSnapshot())
     syncer.waitAllRestoreFinish(localDb)
