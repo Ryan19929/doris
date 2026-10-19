@@ -4790,8 +4790,18 @@ TEST(RestoreIncrementalTest, CutManifestKeepsTheFilesOfTheRowsets) {
     // one segment file expected, the manifest has two: mismatch
     EXPECT_TRUE(cut_manifest_to_increment(m, inc, ids, &cut).is<ErrorCode::RESTORE_MANIFEST_MISMATCH>());
     m.files.pop_back();
+    // the decomposed digest of the tablet is an entry of its manifest, outside of the files
+    m.prefix_digest_sha256 = std::string(64, 'e');
+    m.prefix_digest_size = 77;
     ASSERT_TRUE(cut_manifest_to_increment(m, inc, ids, &cut).ok());
     ASSERT_EQ(3U, cut.files.size()); // hdr, dat, idx
+    // the cut manifest still has the entry, and it is not one of the files to download
+    EXPECT_TRUE(cut.has_prefix_digest());
+    EXPECT_EQ(std::string(64, 'e'), cut.prefix_digest_sha256);
+    EXPECT_EQ(77, cut.prefix_digest_size);
+    for (const auto& file : cut.files) {
+        EXPECT_NE(SnapshotManifest::kPrefixDigestEntryName, file.name);
+    }
     EXPECT_TRUE(is_rowset_file(ids[0] + "_0.dat", ids[0]));
     EXPECT_FALSE(is_rowset_file(ids[0] + "x_0.dat", ids[0]));
     // a missing segment file
