@@ -382,16 +382,27 @@ Status parent_path_of(const std::string& path, std::string* parent) {
 std::string SnapshotManifest::serialize() {
     std::sort(files.begin(), files.end(),
               [](const auto& a, const auto& b) { return a.name < b.name; });
+    // The decomposed digest file is one more entry of the files, in the order of the names.
+    std::vector<SnapshotManifestFile> entries = files;
+    if (has_prefix_digest()) {
+        SnapshotManifestFile prefix_entry;
+        prefix_entry.name = std::string(kPrefixDigestEntryName);
+        prefix_entry.size = prefix_digest_size;
+        prefix_entry.sha256 = prefix_digest_sha256;
+        entries.push_back(std::move(prefix_entry));
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) { return a.name < b.name; });
+    }
     rapidjson::StringBuffer buffer;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     writer.StartObject();
     writer.Key("version");
-    writer.Int(kVersion);
+    writer.Int(has_prefix_digest() ? kVersionWithPrefixDigest : kVersion);
     writer.Key("tablet_id");
     writer.Int64(tablet_id);
     writer.Key("files");
     writer.StartArray();
-    for (const auto& file : files) {
+    for (const auto& file : entries) {
         writer.StartObject();
         writer.Key("n");
         writer.String(file.name.data(), static_cast<rapidjson::SizeType>(file.name.size()));
@@ -430,7 +441,8 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
         return invalid("not a json object");
     }
     if (!doc.HasMember("version") || !doc["version"].IsInt() ||
-        doc["version"].GetInt() != kVersion) {
+        (doc["version"].GetInt() != kVersion &&
+         doc["version"].GetInt() != kVersionWithPrefixDigest)) {
         return invalid("unknown version");
     }
     if (!doc.HasMember("tablet_id") || !doc["tablet_id"].IsInt64() ||
@@ -442,6 +454,8 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
     }
     manifest->tablet_id = expected_tablet_id;
     manifest->files.clear();
+    manifest->prefix_digest_sha256.clear();
+    manifest->prefix_digest_size = 0;
     std::set<std::string> names;
     for (const auto& item : doc["files"].GetArray()) {
         if (!item.IsObject() || !item.HasMember("n") || !item["n"].IsString() ||
@@ -466,6 +480,15 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
                 return invalid("bad digest");
             }
             file.sha256 = std::string(item["d"].GetString(), item["d"].GetStringLength());
+        }
+        if (file.name == kPrefixDigestEntryName) {
+            // not a file of the tablet snapshot: keep it out of `files`
+            if (file.sha256.size() != 64) {
+                return invalid("the entry of the decomposed digest has no SHA-256");
+            }
+            manifest->prefix_digest_sha256 = std::move(file.sha256);
+            manifest->prefix_digest_size = file.size;
+            continue;
         }
         manifest->files.push_back(std::move(file));
     }
@@ -536,6 +559,48 @@ Status fetch_prefix_digest_from_remote_be(const TRemoteTabletSnapshot& remote_ta
     RETURN_IF_ERROR(HttpClient::execute_with_retry(3, 1, fetch_cb));
     return RestoreDigestDecomposed::parse(content, root, remote_tablet_snapshot.remote_tablet_id,
                                           digest);
+}
+
+// Get a file of the snapshot kept on a remote BE over its http download.
+static Status fetch_file_from_remote_be(const TRemoteTabletSnapshot& remote_tablet_snapshot,
+                                        const std::string& remote_file, std::string* content) {
+    const auto& addr = remote_tablet_snapshot.remote_be_addr;
+    std::string url =
+            fmt::format("http://{}:{}/api/_tablet/_download?token={}&channel=ingest_binlog&file={}",
+                        addr.hostname, addr.port, remote_tablet_snapshot.remote_token, remote_file);
+    auto fetch_cb = [&url, content](HttpClient* client) {
+        content->clear();
+        RETURN_IF_ERROR(client->init(url));
+        client->set_timeout_ms(config::download_binlog_meta_timeout_ms);
+        return client->execute(content);
+    };
+    return HttpClient::execute_with_retry(3, 1, fetch_cb);
+}
+
+Status fetch_prefix_digest_from_remote_be_by_manifest(
+        const TRemoteTabletSnapshot& remote_tablet_snapshot, const std::string& manifest_root,
+        RestoreDigestDecomposed* digest) {
+    // <storage_root>/snapshot/<time>.<seq>.<timeout>/<tablet_id>/manifest, and rdigest next to it
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(remote_tablet_snapshot.remote_snapshot_path, &remote_parent));
+    std::string content;
+    RETURN_IF_ERROR(fetch_file_from_remote_be(
+            remote_tablet_snapshot,
+            fmt::format("{}/{}", remote_parent, SnapshotManifest::kLocalFileName), &content));
+    SnapshotManifest manifest;
+    RETURN_IF_ERROR(SnapshotManifest::parse(content, manifest_root,
+                                            remote_tablet_snapshot.remote_tablet_id, &manifest));
+    if (!manifest.has_prefix_digest()) {
+        return Status::InternalError("the manifest of remote tablet {} has no decomposed digest",
+                                     remote_tablet_snapshot.remote_tablet_id);
+    }
+    content.clear();
+    RETURN_IF_ERROR(fetch_file_from_remote_be(
+            remote_tablet_snapshot,
+            fmt::format("{}/{}", remote_parent, RestoreDigestDecomposed::kLocalFileName),
+            &content));
+    return RestoreDigestDecomposed::parse(content, manifest.prefix_digest_sha256,
+                                          remote_tablet_snapshot.remote_tablet_id, digest);
 }
 
 void SnapshotDownloadStats::classify_tablet() {
@@ -744,6 +809,10 @@ Status cut_manifest_to_increment(const SnapshotManifest& manifest, const TabletM
                                  SnapshotManifest* cut) {
     cut->tablet_id = manifest.tablet_id;
     cut->files.clear();
+    // the decomposed digest file is not a file of the increment, but the cut manifest is still the manifest of
+    // the tablet: keep its entry
+    cut->prefix_digest_sha256 = manifest.prefix_digest_sha256;
+    cut->prefix_digest_size = manifest.prefix_digest_size;
     std::map<std::string, int64_t> dat_files;
     for (const auto& id : rowset_ids) {
         dat_files[id] = 0;
@@ -1714,16 +1783,22 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
             RETURN_IF_ERROR(upload_with_checksum(*_remote_fs, local_path, remote_path, md5sum));
         } // end for each tablet's local files
 
-        // 2.4 upload the manifest after all the data files of the tablet, unless the frontend does not want it
+        // 2.4 upload the decomposed digest, if the snapshot has one. It is an entry of the manifest, so it
+        // goes first, and nowhere to be recorded if the frontend does not want the manifest.
+        std::string prefix_root;
+        int64_t prefix_size = 0;
+        if (!_skip_manifest) {
+            RETURN_IF_ERROR(_upload_prefix_digest(src_path, dest_path, tablet_id, &prefix_root,
+                                                  &prefix_size));
+        }
+
+        // 2.5 upload the manifest after all the files of the tablet, unless the frontend does not want it
         std::string manifest_root;
         if (!_skip_manifest) {
             RETURN_IF_ERROR(_upload_manifest(src_path, dest_path, tablet_id,
-                                             std::move(manifest_files), &manifest_root));
+                                             std::move(manifest_files), prefix_root, prefix_size,
+                                             &manifest_root));
         }
-
-        // 2.5 and the decomposed digest, if the snapshot has one
-        std::string prefix_root;
-        RETURN_IF_ERROR(_upload_prefix_digest(src_path, dest_path, tablet_id, &prefix_root));
 
         tablet_files->emplace(tablet_id, local_files_with_checksum);
         if (!_skip_manifest) {
@@ -2068,7 +2143,8 @@ Status SnapshotLoader::_download_tablet_incremental(
 
 Status SnapshotLoader::_upload_manifest(const std::string& src_path, const std::string& dest_path,
                                         int64_t tablet_id, std::vector<SnapshotManifestFile> files,
-                                        std::string* root) {
+                                        const std::string& prefix_digest_root,
+                                        int64_t prefix_digest_size, std::string* root) {
     // local: <snapshot>/<tablet_id>/<schema_hash> -> <snapshot>/<tablet_id>/manifest.upload
     // remote: .../__idx_<id>/__<tablet_id> -> .../__idx_<id>/__manifest__<tablet_id>.<root prefix>
     std::string local_parent;
@@ -2078,6 +2154,8 @@ Status SnapshotLoader::_upload_manifest(const std::string& src_path, const std::
     SnapshotManifest manifest;
     manifest.tablet_id = tablet_id;
     manifest.files = std::move(files);
+    manifest.prefix_digest_sha256 = prefix_digest_root;
+    manifest.prefix_digest_size = prefix_digest_size;
     std::string local_file = local_parent + "/manifest.upload";
     RETURN_IF_ERROR(write_snapshot_manifest(manifest, local_file, root));
     std::string remote_name = SnapshotManifest::remote_file_name(tablet_id, *root);
@@ -2094,7 +2172,7 @@ Status SnapshotLoader::_upload_manifest(const std::string& src_path, const std::
 
 Status SnapshotLoader::_upload_prefix_digest(const std::string& src_path,
                                              const std::string& dest_path, int64_t tablet_id,
-                                             std::string* root) {
+                                             std::string* root, int64_t* size) {
     // local: <snapshot>/<tablet_id>/<schema_hash> -> <snapshot>/<tablet_id>/rdigest
     // remote: .../__idx_<id>/__<tablet_id> -> .../__idx_<id>/__rdigest__<tablet_id>.<root prefix>
     std::string local_parent;
@@ -2107,11 +2185,13 @@ Status SnapshotLoader::_upload_prefix_digest(const std::string& src_path,
     RETURN_IF_ERROR(io::global_local_filesystem()->exists(local_file, &exists));
     if (!exists) {
         root->clear();
+        *size = 0;
         return Status::OK();
     }
     std::string content;
     RETURN_IF_ERROR(read_local_file(local_file, &content));
     *root = sha256_hex(content);
+    *size = static_cast<int64_t>(content.size());
     std::string remote_name = prefix_digest_remote_file_name(tablet_id, *root);
     size_t dot = remote_name.find_last_of('.');
     RETURN_IF_ERROR(upload_with_checksum(*_remote_fs, local_file,
@@ -2155,6 +2235,35 @@ Status SnapshotLoader::fetch_prefix_digest_to_dir(const std::string& remote_path
     static_cast<void>(io::global_local_filesystem()->delete_file(local_file));
     RETURN_IF_ERROR(st);
     return RestoreDigestDecomposed::parse(content, root, remote_tablet_id, digest);
+}
+
+Status SnapshotLoader::fetch_prefix_digest_by_manifest_to_dir(const std::string& remote_path,
+                                                              const std::string& tmp_dir,
+                                                              int64_t remote_tablet_id,
+                                                              const std::string& manifest_root,
+                                                              RestoreDigestDecomposed* digest) {
+    if (!_remote_fs) {
+        return Status::InternalError("Storage backend not initialized.");
+    }
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(remote_path, &remote_parent));
+    std::string remote_file = remote_parent + "/" +
+                              SnapshotManifest::remote_file_name(remote_tablet_id, manifest_root);
+    // download to a tmp file next to the local snapshot dir, never into it.
+    std::string local_file = fmt::format("{}/manifest.{}.download", tmp_dir, _task_id);
+    RETURN_IF_ERROR(_remote_fs->download(remote_file, local_file));
+    std::string content;
+    Status st = read_local_file(local_file, &content);
+    static_cast<void>(io::global_local_filesystem()->delete_file(local_file));
+    RETURN_IF_ERROR(st);
+    SnapshotManifest manifest;
+    RETURN_IF_ERROR(SnapshotManifest::parse(content, manifest_root, remote_tablet_id, &manifest));
+    if (!manifest.has_prefix_digest()) {
+        return Status::InternalError("the manifest of remote tablet {} has no decomposed digest",
+                                     remote_tablet_id);
+    }
+    return fetch_prefix_digest_to_dir(remote_path, tmp_dir, remote_tablet_id,
+                                      manifest.prefix_digest_sha256, digest);
 }
 
 Status SnapshotLoader::_fetch_remote_manifest(const std::string& remote_path,

@@ -1608,9 +1608,14 @@ void verify_prefix_digest(StorageEngine& engine, ExecEnv* env, const TAgentTaskR
     }
     RestoreDigestDecomposed decomposed;
     Status st;
+    // The root is the manifest root of the tablet if the decomposed digest is an entry of the
+    // manifest.
+    const bool root_is_manifest = source.__isset.root_is_manifest && source.root_is_manifest;
     if (source.__isset.remote_tablet_snapshot) {
-        st = fetch_prefix_digest_from_remote_be(source.remote_tablet_snapshot, source.root,
-                                                &decomposed);
+        st = root_is_manifest ? fetch_prefix_digest_from_remote_be_by_manifest(
+                                        source.remote_tablet_snapshot, source.root, &decomposed)
+                              : fetch_prefix_digest_from_remote_be(source.remote_tablet_snapshot,
+                                                                   source.root, &decomposed);
     } else if (source.__isset.remote_path && source.__isset.location) {
         TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(digest_req.tablet_id);
         if (tablet == nullptr) {
@@ -1628,9 +1633,12 @@ void verify_prefix_digest(StorageEngine& engine, ExecEnv* env, const TAgentTaskR
                                                             : TStorageBackendType::type::BROKER,
                              source.location);
             if (st.ok()) {
-                st = loader.fetch_prefix_digest_to_dir(source.remote_path, tmp_dir,
-                                                       source.remote_tablet_id, source.root,
-                                                       &decomposed);
+                st = root_is_manifest ? loader.fetch_prefix_digest_by_manifest_to_dir(
+                                                source.remote_path, tmp_dir,
+                                                source.remote_tablet_id, source.root, &decomposed)
+                                      : loader.fetch_prefix_digest_to_dir(
+                                                source.remote_path, tmp_dir,
+                                                source.remote_tablet_id, source.root, &decomposed);
             }
         }
     } else {
@@ -1725,6 +1733,32 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
                                                       &allow_incremental_clone,
                                                       local_source ? &local_source_stats : nullptr);
     }
+    // The digest never fails the snapshot task: NOT_SUPPORTED and errors are reported in it. It is
+    // computed before the manifest is written: the decomposed digest file (rdigest), which is
+    // written next to the manifest, is an entry of the manifest, with its size and SHA-256.
+    std::optional<TLogicalDigest> logical_digest;
+    if (status.ok() && snapshot_request.__isset.compute_logical_digest &&
+        snapshot_request.compute_logical_digest) {
+        if (snapshot_request.__isset.version) {
+            PrefixDigestOutput prefix;
+            // without a manifest the decomposed digest has nowhere to be recorded, do not compute it
+            const bool with_prefix = config::restore_digest_prefix_enabled &&
+                                     snapshot_request.__isset.list_files && !skip_manifest;
+            logical_digest = compute_logical_digest_for_task(engine, snapshot_request.tablet_id,
+                                                             snapshot_request.version, 0,
+                                                             with_prefix ? &prefix : nullptr);
+            if (with_prefix && logical_digest->status_code == "OK") {
+                write_snapshot_prefix_digest(snapshot_path, snapshot_request.tablet_id,
+                                             snapshot_request.schema_hash, prefix,
+                                             &*logical_digest);
+            }
+        } else {
+            TLogicalDigest digest;
+            digest.__set_status_code("ERROR");
+            digest.__set_status_msg("the snapshot request has no version");
+            logical_digest = digest;
+        }
+    }
     if (status.ok() && snapshot_request.__isset.list_files) {
         // list and save all snapshot files
         // snapshot_path like: data/snapshot/20180417205230.1.86400
@@ -1742,6 +1776,11 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
             // <snapshot_path>/<tablet_id>/manifest
             SnapshotManifest manifest;
             manifest.tablet_id = snapshot_request.tablet_id;
+            if (logical_digest.has_value() && logical_digest->__isset.prefix_root &&
+                logical_digest->__isset.prefix_bytes) {
+                manifest.prefix_digest_sha256 = logical_digest->prefix_root;
+                manifest.prefix_digest_size = logical_digest->prefix_bytes;
+            }
             for (auto& file : files) {
                 snapshot_files.push_back(file.file_name);
                 SnapshotManifestFile manifest_file;
@@ -1766,28 +1805,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
             }
         }
     }
-    // The digest never fails the snapshot task: NOT_SUPPORTED and errors are reported in it.
-    std::optional<TLogicalDigest> logical_digest;
-    if (status.ok() && snapshot_request.__isset.compute_logical_digest &&
-        snapshot_request.compute_logical_digest) {
-        if (snapshot_request.__isset.version) {
-            PrefixDigestOutput prefix;
-            const bool with_prefix = config::restore_digest_prefix_enabled;
-            logical_digest = compute_logical_digest_for_task(
-                    engine, snapshot_request.tablet_id, snapshot_request.version, 0,
-                    with_prefix ? &prefix : nullptr);
-            if (with_prefix && logical_digest->status_code == "OK") {
-                write_snapshot_prefix_digest(snapshot_path, snapshot_request.tablet_id,
-                                             snapshot_request.schema_hash, prefix, &*logical_digest);
-            }
-        } else {
-            TLogicalDigest digest;
-            digest.__set_status_code("ERROR");
-            digest.__set_status_msg("the snapshot request has no version");
-            logical_digest = digest;
-        }
-    }
     if (!status.ok()) {
+        // the digest is only reported for a snapshot which is complete
+        logical_digest.reset();
         LOG_WARNING("failed to make snapshot")
                 .tag("signature", req.signature)
                 .tag("tablet_id", snapshot_request.tablet_id)

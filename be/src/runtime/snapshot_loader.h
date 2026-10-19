@@ -75,18 +75,33 @@ struct SnapshotManifestFile {
 //   {"version":1,"tablet_id":<id>,"files":[{"n":<name>,"s":<size>,"m":<md5>,"d":<sha256>}, ...]}
 // The files are sorted by name, "m" and "d" are omitted if empty. The SHA-256 of the file content is the
 // manifest root, recorded by FE in the backup job info.
+//
+// The decomposed digest file (rdigest) of the tablet snapshot, which is not in the tablet snapshot dir, is one
+// more entry of "files", named kPrefixDigestEntryName, with its size and SHA-256 ("d"). The manifest is then
+// version 2, so that a BE which does not know the entry rejects the manifest instead of taking it for a data
+// file. parse() takes the entry out of `files` into prefix_digest_sha256, so that nothing which downloads,
+// links, checks or cuts the files ever sees it.
 struct SnapshotManifest {
     static constexpr int kVersion = 1;
+    static constexpr int kVersionWithPrefixDigest = 2;
     // the file name in a local snapshot: <storage_root>/snapshot/<time>.<seq>.<timeout>/<tablet_id>/manifest
     static constexpr std::string_view kLocalFileName = "manifest";
+    // the name of the entry of the decomposed digest file, never the name of a file of a tablet snapshot
+    static constexpr std::string_view kPrefixDigestEntryName = "__rdigest__";
 
     int64_t tablet_id = 0;
+    // The data files (and the tablet meta file), without the entry of the decomposed digest file.
     std::vector<SnapshotManifestFile> files;
+    // The lower case hex SHA-256 and the size of the decomposed digest file, empty if the manifest has none.
+    std::string prefix_digest_sha256;
+    int64_t prefix_digest_size = 0;
+
+    bool has_prefix_digest() const { return !prefix_digest_sha256.empty(); }
 
     // Serialize to the JSON content, the files are sorted by name first.
     std::string serialize();
 
-    // Parse the content of a manifest file, after checking its SHA-256 is the expected root. Returns a
+    // Parse the content of a manifest file (version 1 or 2), after checking its SHA-256 is the expected root. Returns a
     // RESTORE_MANIFEST_MISMATCH error if the root does not match, or the content is not a valid manifest of
     // the expected tablet.
     static Status parse(std::string_view content, std::string_view expected_root,
@@ -131,6 +146,13 @@ Status write_prefix_digest_file(const std::string& content, const std::string& p
 // remote_tablet_snapshot.remote_snapshot_path is the tablet snapshot dir, the file is next to it.
 Status fetch_prefix_digest_from_remote_be(const TRemoteTabletSnapshot& remote_tablet_snapshot,
                                           const std::string& root, RestoreDigestDecomposed* digest);
+
+// Same, for a backup which has the decomposed digest file in its manifest: fetch the manifest next to the
+// tablet snapshot dir, check it against `manifest_root`, then fetch the file by the SHA-256 in the manifest.
+// An error if the manifest does not have the file.
+Status fetch_prefix_digest_from_remote_be_by_manifest(
+        const TRemoteTabletSnapshot& remote_tablet_snapshot, const std::string& manifest_root,
+        RestoreDigestDecomposed* digest);
 
 // Returns the parent dir of a path (without the trailing '/'), or an error if it has none.
 Status parent_path_of(const std::string& path, std::string* parent);
@@ -394,6 +416,15 @@ public:
                                       int64_t remote_tablet_id, const std::string& root,
                                       RestoreDigestDecomposed* digest);
 
+    // Same as fetch_prefix_digest_to_dir, for a backup which has the decomposed digest file in its manifest:
+    // fetch the manifest by `manifest_root`, then the file by the SHA-256 in the manifest. An error if the
+    // manifest does not have the file.
+    Status fetch_prefix_digest_by_manifest_to_dir(const std::string& remote_path,
+                                                  const std::string& tmp_dir,
+                                                  int64_t remote_tablet_id,
+                                                  const std::string& manifest_root,
+                                                  RestoreDigestDecomposed* digest);
+
     // The data reused and downloaded by the tablets downloaded so far.
     const SnapshotDownloadStats& download_stats() const { return _download_stats; }
 
@@ -431,15 +462,18 @@ private:
                                         int finished_num, int total_num,
                                         SnapshotDownloadStats* stats);
 
-    // Upload the manifest of a tablet next to its dir in the repository, returns the root.
+    // Upload the manifest of a tablet next to its dir in the repository, returns the root. If
+    // prefix_digest_root is not empty the manifest has the decomposed digest file (of that size) as an entry.
     Status _upload_manifest(const std::string& src_path, const std::string& dest_path,
                             int64_t tablet_id, std::vector<SnapshotManifestFile> files,
+                            const std::string& prefix_digest_root, int64_t prefix_digest_size,
                             std::string* root);
 
     // Upload the decomposed digest file of a tablet next to its dir in the repository, if the
-    // snapshot has one (<snapshot>/<tablet_id>/rdigest), returns its root; empty if there is none.
+    // snapshot has one (<snapshot>/<tablet_id>/rdigest), returns its root and size; the root is
+    // empty if there is none.
     Status _upload_prefix_digest(const std::string& src_path, const std::string& dest_path,
-                                 int64_t tablet_id, std::string* root);
+                                 int64_t tablet_id, std::string* root, int64_t* size);
 
     // Download only the increment of the tablet, see select_incremental_rowsets.
     Status _download_tablet_incremental(const std::string& remote_path,
