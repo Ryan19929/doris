@@ -324,6 +324,7 @@ Status RestoreDigestDecomposed::compose(int64_t version, RestoreDigest* digest) 
                 version, tablet_id, base_version);
     }
     RestoreDigest total;
+    total.algo_version = algo_version;
     total.schema_sig = schema_sig;
     if (mor) {
         // the whole digest of that version

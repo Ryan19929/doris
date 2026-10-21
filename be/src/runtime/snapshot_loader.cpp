@@ -3042,7 +3042,11 @@ Status SnapshotLoader::_check_appended_tablet_equals_backup(
         const TabletSharedPtr& tablet, const TRestoreIncrementalRange& range,
         const TRestoreBackupDigest* backup_digest) {
     const int64_t tablet_id = tablet->tablet_id();
-    if (tablet->keys_type() == UNIQUE_KEYS) {
+    // The digest proves the hidden state of a unique MoW tablet (algo_version 2); MoR has no such
+    // digest.
+    const uint32_t algo_version = RestoreDigest::algo_version_for(
+            tablet->keys_type(), tablet->enable_unique_key_merge_on_write());
+    if (tablet->keys_type() == UNIQUE_KEYS && algo_version < RestoreDigest::kAlgoVersionMow) {
         return restore_not_retryable(fmt::format(
                 "tablet {} is at version {} with no evidence of the append, and the digest can not "
                 "prove the hidden state of a unique key tablet",
@@ -3056,10 +3060,10 @@ Status SnapshotLoader::_check_appended_tablet_equals_backup(
                 "usable digest of the backup to check it against",
                 tablet_id, range.end_version));
     }
-    if (backup_digest->algo_version != static_cast<int32_t>(RestoreDigest::kAlgoVersion)) {
+    if (backup_digest->algo_version != static_cast<int32_t>(algo_version)) {
         return restore_not_retryable(
                 fmt::format("the algorithm version {} of the digest of the backup is not {}",
-                            backup_digest->algo_version, RestoreDigest::kAlgoVersion));
+                            backup_digest->algo_version, algo_version));
     }
     LogicalDigestResult local;
     Status st = get_tablet_logical_digest(_engine, tablet_id, range.end_version, 1,

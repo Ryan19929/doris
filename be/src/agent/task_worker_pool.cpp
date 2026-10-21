@@ -1505,7 +1505,16 @@ TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t ta
         }
     }
     TLogicalDigest digest;
-    digest.__set_algo_version(static_cast<int32_t>(RestoreDigest::kAlgoVersion));
+    // the algorithm version is a property of the model of the tablet
+    uint32_t algo_version = RestoreDigest::kAlgoVersion;
+    if (st.ok()) {
+        algo_version = result.algo_version;
+    } else if (TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(tablet_id);
+               tablet != nullptr) {
+        algo_version = RestoreDigest::algo_version_for(tablet->keys_type(),
+                                                       tablet->enable_unique_key_merge_on_write());
+    }
+    digest.__set_algo_version(static_cast<int32_t>(algo_version));
     if (st.ok()) {
         digest.__set_schema_sig(result.schema_sig);
         digest.__set_root(result.root);

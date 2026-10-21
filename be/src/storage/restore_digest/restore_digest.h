@@ -70,21 +70,42 @@ class StorageEngine;
 //   * schema_sig = SHA-256 over the keys type and the (type, precision, scale) of every digest
 //     column. Two digests are comparable only if algo_version and schema_sig are equal.
 //
-// Hidden columns: the delete sign is only used to filter rows (MoW and MoR), the sequence column
-// takes part in the digest, version / commit TSO / skip bitmap / row store columns are excluded.
+// Hidden columns: the delete sign is only used to filter rows (MoR, and every model at algo_version
+// 1), the sequence column takes part in the digest, version / commit TSO / skip bitmap / row store
+// columns are excluded.
+//
+// algo_version = 2 (Unique MoW without a sequence column only, see restore_digest_algo()): the digest
+// is the set of the physical rows the delete bitmap snapshot at V leaves, delete sign rows included,
+// and the delete sign column is an ordinary digest column. The only thing a later write of a MoW
+// table sees of the existing data is those rows (the lookup of the key skips the rows the bitmap
+// marks and does not look at the delete sign), so equal digests mean equal behavior of every later
+// write. Everything else of algo_version 1 (encoding, hash, buckets, root) is unchanged, only the
+// seed and the header carry the algo version. A MoW tablet with a sequence column is not supported
+// (the rows the bitmap marks still decide the result of a later write there), nor is a MoW tablet
+// with a DELETE condition (light delete) in (0, V].
 //
 // Which rows are visible:
 //   * Duplicate: every row, minus the rows removed by DELETE conditions (delete predicates) of
 //     version <= V. A condition of version d removes matching rows of rowsets with end version < d,
 //     the same rule the query path uses, so the digest is the same before and after a compaction
 //     has physically dropped those rows.
-//   * Unique MoW: the rows the delete bitmap snapshot at V leaves, minus delete-sign rows, minus
-//     delete predicates. No merge is needed.
+//   * Unique MoW (algo_version 1, legacy): the rows the delete bitmap snapshot at V leaves, minus
+//     delete-sign rows, minus delete predicates. No merge is needed.
+//   * Unique MoW (algo_version 2): the rows the delete bitmap snapshot at V leaves, delete-sign rows
+//     included. No merge is needed.
 //   * Unique MoR: rows are merged across rowsets by key (highest version wins, sequence column
 //     first when the table has one) by the same BlockReader the checksum task uses, then
 //     delete-sign rows are dropped.
 struct RestoreDigest {
+    // Duplicate and unique MoR (and the default of the structs below).
     static constexpr uint32_t kAlgoVersion = 1;
+    // Unique MoW.
+    static constexpr uint32_t kAlgoVersionMow = 2;
+    // The algorithm version a digest of this model has. MoR is kept at 1, no version 2 digest
+    // exists for it.
+    static constexpr uint32_t algo_version_for(KeysType keys_type, bool enable_mow) {
+        return keys_type == UNIQUE_KEYS && enable_mow ? kAlgoVersionMow : kAlgoVersion;
+    }
     static constexpr size_t kNumBuckets = 256;
 
     struct Bucket {
@@ -92,6 +113,7 @@ struct RestoreDigest {
         uint64_t count = 0;
     };
 
+    uint32_t algo_version = kAlgoVersion;
     std::array<Bucket, kNumBuckets> buckets {};
     uint64_t rows = 0;
     // rows read from the segments, including rows removed by the delete sign
@@ -140,8 +162,8 @@ struct RestoreDigestInput {
 // sorted by (start_version, end_version, rowset_id), so independent of the order given.
 std::string restore_digest_rowsets_sig(const std::vector<RowsetSharedPtr>& rowsets);
 
-// Checks that the model and every column are supported by algo_version 1. Returns NotSupported
-// with the reason otherwise. Never computes anything.
+// Checks that the model and every column are supported by the algo_version of the model. Returns
+// NotSupported with the reason otherwise. Never computes anything.
 Status check_restore_digest_supported(const TabletSchema& schema, KeysType keys_type,
                                       bool enable_mow);
 

@@ -181,10 +181,13 @@ void append_type_sig(std::string& sig, const TabletColumn& col) {
 }
 
 // Classifies a schema column; returns NotSupported for columns the algorithm can not digest.
-Status classify_column(const TabletColumn& col, KeysType keys_type, ColRole* role,
-                       ColCodec* codec) {
+Status classify_column(const TabletColumn& col, KeysType keys_type, uint32_t algo_version,
+                       ColRole* role, ColCodec* codec) {
     const std::string& name = col.name();
-    if (name == DELETE_SIGN && keys_type == UNIQUE_KEYS) {
+    // algo_version 2 (unique MoW): the delete sign rows are part of the digest, the column is an
+    // ordinary digest column
+    if (name == DELETE_SIGN && keys_type == UNIQUE_KEYS &&
+        algo_version < RestoreDigest::kAlgoVersionMow) {
         *role = ColRole::DELETE_SIGN;
         return Status::OK();
     }
@@ -208,7 +211,10 @@ Status classify_column(const TabletColumn& col, KeysType keys_type, ColRole* rol
 struct ColumnPlan {
     std::vector<uint32_t> digest_ordinals; // ordinals in the schema, schema order
     std::vector<ColCodec> codecs;          // parallel to digest_ordinals
+    // only when the delete sign rows are dropped (algo_version 1); -1 at algo_version 2, where the
+    // delete sign column is one of digest_ordinals
     int32_t delete_sign_ordinal = -1;
+    uint32_t algo_version = RestoreDigest::kAlgoVersion;
     std::string schema_sig;
 };
 
@@ -236,16 +242,29 @@ Status build_plan(const TabletSchema& schema, KeysType keys_type, bool enable_mo
         return Status::NotSupported("restore digest: row binlog is not supported");
     }
 
+    plan->algo_version = RestoreDigest::algo_version_for(keys_type, enable_mow);
+    if (plan->algo_version >= RestoreDigest::kAlgoVersionMow && schema.has_sequence_col()) {
+        // A row the delete bitmap marks still decides the result of a later write when it has a
+        // larger sequence value than the new row (the segment lookup returns KEY_ALREADY_EXISTS
+        // before the bitmap is looked at), and that row is not in the digest.
+        return Status::NotSupported(
+                "restore digest: unique merge on write with a sequence column is not supported");
+    }
+
     SHA256Digest sig;
     std::string sig_data = fmt::format("restore-digest-schema|algo={}|keys_type={}|mow={}",
-                                       RestoreDigest::kAlgoVersion, static_cast<int>(keys_type),
+                                       plan->algo_version, static_cast<int>(keys_type),
                                        enable_mow ? 1 : 0);
     const auto& columns = schema.columns();
+    bool has_delete_sign_col = false;
     for (uint32_t i = 0; i < columns.size(); ++i) {
         const TabletColumn& col = *columns[i];
         ColRole role = ColRole::DIGEST;
         ColCodec codec;
-        RETURN_IF_ERROR(classify_column(col, keys_type, &role, &codec));
+        RETURN_IF_ERROR(classify_column(col, keys_type, plan->algo_version, &role, &codec));
+        if (col.name() == DELETE_SIGN) {
+            has_delete_sign_col = true;
+        }
         if (role == ColRole::DELETE_SIGN) {
             plan->delete_sign_ordinal = static_cast<int32_t>(i);
         } else if (role == ColRole::DIGEST) {
@@ -256,7 +275,7 @@ Status build_plan(const TabletSchema& schema, KeysType keys_type, bool enable_mo
             sig_data += fmt::format(":{}", col.is_key() ? 1 : 0);
         }
     }
-    if (keys_type == UNIQUE_KEYS && plan->delete_sign_ordinal < 0) {
+    if (keys_type == UNIQUE_KEYS && !has_delete_sign_col) {
         return Status::NotSupported("restore digest: unique table without delete sign column");
     }
     if (plan->digest_ordinals.empty()) {
@@ -325,8 +344,6 @@ inline void append_u32(std::string& buf, uint32_t v) {
 inline void append_u64(std::string& buf, uint64_t v) {
     buf.append(reinterpret_cast<const char*>(&v), sizeof(v));
 }
-
-constexpr XXH64_hash_t kHashSeed = RestoreDigest::kAlgoVersion;
 
 bool encode_slot(const IColumn& col, const ColCodec& codec, size_t row, std::string& buf);
 
@@ -515,7 +532,7 @@ public:
                 return Status::InternalError(
                         "restore digest: a column does not have the shape its schema type needs");
             }
-            XXH128_hash_t h = XXH3_128bits_withSeed(_row_buf.data(), _row_buf.size(), kHashSeed);
+            XXH128_hash_t h = XXH3_128bits_withSeed(_row_buf.data(), _row_buf.size(), _plan.algo_version);
             auto& bucket = acc->buckets[h.high64 >> 56];
             bucket.sum += (static_cast<unsigned __int128>(h.high64) << 64) | h.low64;
             bucket.count++;
@@ -724,6 +741,24 @@ Status run_tasks(const std::vector<DigestScanTask>& tasks, int threads, Fn&& fn,
     return Status::OK();
 }
 
+// algo_version 2 (unique MoW): a DELETE condition (light delete) is applied by the query path, but
+// the lookup of a write ignores it, and a compaction applies it physically afterwards. The digest
+// does not describe that, so a tablet with a condition in (0, V] is not supported until a base
+// compaction has merged the rowset which carries it.
+Status check_no_delete_condition_for_mow(const RestoreDigestInput& input, const ColumnPlan& plan) {
+    if (plan.algo_version < RestoreDigest::kAlgoVersionMow) {
+        return Status::OK();
+    }
+    for (const RowsetSharedPtr& rowset : input.rowsets) {
+        if (rowset->rowset_meta()->has_delete_predicate() &&
+            rowset->version().first <= input.version) {
+            return Status::NotSupported(
+                    "restore digest: unique mow with delete predicate (rowset {}, version {})",
+                    rowset->rowset_id().to_string(), rowset->version().first);
+        }
+    }
+    return Status::OK();
+}
 
 } // namespace restore_digest_detail
 Status check_restore_digest_supported(const TabletSchema& schema, KeysType keys_type,
@@ -736,7 +771,7 @@ Status check_restore_digest_supported(const TabletSchema& schema, KeysType keys_
 void RestoreDigest::finalize() {
     SHA256Digest sha;
     std::string header =
-            fmt::format("DORIS-RESTORE-DIGEST|algo={}|buckets={}|", kAlgoVersion, kNumBuckets);
+            fmt::format("DORIS-RESTORE-DIGEST|algo={}|buckets={}|", algo_version, kNumBuckets);
     sha.reset(header.data(), header.size());
     for (const Bucket& b : buckets) {
         uint64_t lo = static_cast<uint64_t>(b.sum);
@@ -756,7 +791,7 @@ std::string RestoreDigest::to_json() const {
             "\"schema_sig\":\"{}\",\"rowset_count\":{},\"segment_count\":{},\"bytes_read\":{},"
             "\"encoded_bytes\":{},\"elapsed_ms\":{},\"threads\":{},\"delete_predicates\":{},"
             "\"buckets\":[",
-            kAlgoVersion, rows, rows_scanned, root, schema_sig, rowset_count, segment_count,
+            algo_version, rows, rows_scanned, root, schema_sig, rowset_count, segment_count,
             bytes_read, encoded_bytes, elapsed_ms, threads, delete_predicates);
     for (size_t i = 0; i < buckets.size(); ++i) {
         const Bucket& b = buckets[i];
@@ -784,7 +819,10 @@ Status compute_restore_digest(const RestoreDigestInput& input, RestoreDigest* di
     }
     const bool is_mor = input.keys_type == UNIQUE_KEYS && !input.enable_mow;
 
+    RETURN_IF_ERROR(check_no_delete_condition_for_mow(input, plan));
+
     RestoreDigest total;
+    total.algo_version = plan.algo_version;
     total.schema_sig = plan.schema_sig;
 
     std::vector<RowsetMetaSharedPtr> delete_metas;
@@ -991,6 +1029,7 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
     if (input.enable_mow && input.delete_bitmap == nullptr) {
         return Status::InvalidArgument("restore digest: MoW needs a delete bitmap snapshot");
     }
+    RETURN_IF_ERROR(check_no_delete_condition_for_mow(input, plan));
     if (input.rowsets.empty()) {
         return Status::InvalidArgument("restore digest: no rowset");
     }
@@ -1024,9 +1063,6 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
         // (version, group) of the later scans, ascending: the delete conditions (duplicate), or the
         // death versions of rows (MoW)
         std::vector<std::pair<int64_t, size_t>> later;
-        // MoW with DELETE conditions above the rowset: (version of the condition, group) of the level
-        // scans, the rows alive after the condition. `later` then holds the bitmap deaths only.
-        std::vector<std::pair<int64_t, size_t>> levels;
     };
     std::vector<RowsetPlan> plans(input.rowsets.size());
     std::vector<PrefixScanJob> jobs;
@@ -1090,35 +1126,9 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
             continue;
         }
 
-        // Unique MoW. The DELETE conditions above the rowset kill rows at their own versions: the rows
-        // alive after each condition are read with a level scan, the rows killed by the bitmap
-        // before a condition are the ones the bitmap scans below read.
-        std::vector<int64_t> preds;
-        for (const auto& meta : delete_metas) {
-            if (meta->version().first > end) {
-                preds.push_back(meta->version().first);
-            }
-        }
-        std::sort(preds.begin(), preds.end());
-        for (const int64_t d : preds) {
-            if (++extra_scans > max_scans) {
-                return Status::NotSupported(
-                        "restore digest: the decomposed digest needs more than {} extra scans for "
-                        "the delete conditions",
-                        max_scans);
-            }
-            const size_t group = groups++;
-            plan_i.levels.emplace_back(d, group);
-            for (const auto& run : segment_runs(num_segments, threads)) {
-                ScanView view;
-                view.version = d;
-                view.delete_bitmap = input.delete_bitmap;
-                view.delete_metas = delete_metas;
-                add_job(i, std::move(view), run, group);
-            }
-        }
-
-        // Unique MoW: the rows of every segment by the first version above the end version at
+        // Unique MoW (no DELETE condition, checked above): a row dies only when the delete bitmap
+        // marks it. The delete sign rows are rows like any other.
+        // The rows of every segment by the first version above the end version at
         // which the delete bitmap marks them.
         std::map<int64_t, std::map<uint32_t, roaring::Roaring>> by_version;
         {
@@ -1154,10 +1164,6 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
         std::vector<uint32_t> segment_rows;
         rowset->rowset_meta()->get_num_segment_rows(&segment_rows);
         for (const auto& [k, per_segment] : by_version) {
-            // the rows killed by the bitmap at the version of a condition die there anyway
-            if (std::binary_search(preds.begin(), preds.end(), k)) {
-                continue;
-            }
             if (++extra_scans > max_scans) {
                 return Status::NotSupported(
                         "restore digest: the decomposed digest needs more than {} extra scans for "
@@ -1183,11 +1189,8 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
             const size_t group = groups++;
             plan_i.later.emplace_back(k, group);
             ScanView view;
-            // the rows which die at k, and are not hit by a condition up to k
-            view.version = preds.empty() ? std::max<int64_t>(1, input.version) : k;
-            if (!preds.empty()) {
-                view.delete_metas = delete_metas;
-            }
+            // the rows which die at k
+            view.version = std::max<int64_t>(1, input.version);
             view.delete_bitmap = std::move(bitmap);
             add_job(i, std::move(view),
                     lo == 0 && hi + 1 == num_segments ? std::pair<int64_t, int64_t> {0, 0}
@@ -1222,7 +1225,7 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
 
     // 3. Assemble the parts.
     RestoreDigestDecomposed result;
-    result.algo_version = RestoreDigest::kAlgoVersion;
+    result.algo_version = plan.algo_version;
     result.schema_sig = plan.schema_sig;
     result.mow = input.enable_mow;
     result.tablet_id = tablet_id;
@@ -1240,21 +1243,6 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
             if (input.enable_mow) {
                 for (const auto& [k, group] : plan_i.later) {
                     add_buckets(&marks[k], group_buckets[group]);
-                }
-                // The rows alive just before a condition d are the rows alive after the previous
-                // one, less the rows the bitmap kills in between (not hit by a condition, so they
-                // are the rows of the bitmap scans). Those that d kills die at d.
-                size_t next_later = 0;
-                DigestBuckets running = part.buckets;
-                for (const auto& [d, group] : plan_i.levels) {
-                    while (next_later < plan_i.later.size() && plan_i.later[next_later].first < d) {
-                        sub_buckets(&running, group_buckets[plan_i.later[next_later].second]);
-                        ++next_later;
-                    }
-                    DigestBuckets removed = running;
-                    sub_buckets(&removed, group_buckets[group]);
-                    add_buckets(&marks[d], removed);
-                    running = group_buckets[group];
                 }
             } else {
                 const DigestBuckets* previous = &part.buckets;
@@ -1582,7 +1570,7 @@ namespace {
 std::atomic<uint64_t> g_scan_count {0};
 
 void fill_result(const RestoreDigest& digest, LogicalDigestResult* result) {
-    result->algo_version = RestoreDigest::kAlgoVersion;
+    result->algo_version = digest.algo_version;
     result->schema_sig = digest.schema_sig;
     result->root = digest.root;
     result->rows = digest.rows;
@@ -1628,7 +1616,7 @@ Status get_tablet_logical_digest(StorageEngine& engine, int64_t tablet_id, int64
     RestoreDigestCache::Key key;
     key.tablet_id = tablet_id;
     key.version = version;
-    key.algo_version = RestoreDigest::kAlgoVersion;
+    key.algo_version = RestoreDigest::algo_version_for(input.keys_type, input.enable_mow);
     key.tablet_uid = input.tablet_uid;
     key.rowsets_sig = input.rowsets_sig;
     key.bitmap_keys = guard.bitmap_keys;

@@ -54,8 +54,9 @@ namespace doris {
 
 namespace {
 // The version of the restore reuse protocol this BE understands: the RESTORE_DIGEST task, the local source snapshot
-// and the incremental download. An old BE reports none.
-constexpr int32_t kRestoreReuseCapability = 1;
+// and the incremental download (1), the version 2 digest of the unique merge on write tables (2). An old BE
+// reports none.
+constexpr int32_t kRestoreReuseCapability = 2;
 } // namespace
 
 HeartbeatServer::HeartbeatServer(ClusterInfo* cluster_info)
