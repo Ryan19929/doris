@@ -239,7 +239,7 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
         assertEquals(outcomes[0], outcomes[1])
     }
     writeBoth { String db ->
-        sql "INSERT INTO ${db}.${mowTable} VALUES (11, 'upsert of an existing key', 11), (3001, 'upsert of a new key', 1)"
+        sql "INSERT INTO ${db}.${mowTable} VALUES (11, 'upsert of an existing key', 11), (2901, 'upsert of a new key', 1)"
         sql "DELETE FROM ${db}.${mowTable} WHERE id IN (12, 1012)"
         sql "INSERT INTO ${db}.${mowTable} VALUES (12, 'written again after the delete', 12)"
         sql "sync"
