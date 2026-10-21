@@ -74,7 +74,7 @@ class StorageEngine;
 // 1), the sequence column takes part in the digest, version / commit TSO / skip bitmap / row store
 // columns are excluded.
 //
-// algo_version = 2 (Unique MoW without a sequence column only, see restore_digest_algo()): the digest
+// algo_version = 2 (Unique MoW without a sequence column only, see algo_version_for()): the digest
 // is the set of the physical rows the delete bitmap snapshot at V leaves, delete sign rows included,
 // and the delete sign column is an ordinary digest column. The only thing a later write of a MoW
 // table sees of the existing data is those rows (the lookup of the key skips the rows the bitmap

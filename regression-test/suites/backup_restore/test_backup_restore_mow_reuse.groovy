@@ -246,7 +246,7 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
     // keys: an existing one (10), one that was deleted by the writes of A (7), one whose delete sign row is in the
     // data (700, 1700, written again at 700), the deleted ones of the writes above (1012), and new ones
     writeBoth { String db ->
-        return [10, 7, 700, 1700, 2700, 1012, 12, 778, 5000].collect { int id -> partialUpdate(db, mowTable, id) }
+        return [10, 7, 700, 1700, 2700, 1012, 12, 778, 2998].collect { int id -> partialUpdate(db, mowTable, id) }
     }
     writeBoth { String db ->
         sql "INSERT INTO ${db}.${mowTable} VALUES (7, 'upsert after the partial updates', 7), (1700, 'back', 2)"
