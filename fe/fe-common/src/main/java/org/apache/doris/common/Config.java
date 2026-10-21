@@ -2868,12 +2868,23 @@ public class Config extends ConfigBase {
             + "guarantee. For experiments and observation only.")
     public static boolean restore_reuse_allow_unverified_keep = false;
 
-    @ConfField(mutable = true, masterOnly = true, description = "Whether the tables with a hidden state that the "
-            + "digest does not cover (unique tables, merge-on-write and merge-on-read) are considered by partition "
-            + "level reuse. False by default: only duplicate tables are reused, the others are downloaded. If true, "
-            + "the behavior before the narrowing is restored, for experiments only, the data after the following "
-            + "writes is not guaranteed to be consistent with the backup.")
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the unique merge-on-read tables, which have "
+            + "a hidden state that the digest does not cover (the overwritten versions of a key), are considered by "
+            + "partition level reuse. False by default: they are downloaded. If true, the behavior before the "
+            + "narrowing is restored, for experiments only, the data after the following writes is not guaranteed "
+            + "to be consistent with the backup. It has no effect on the unique merge-on-write tables, see "
+            + "restore_reuse_mow.")
     public static boolean restore_reuse_allow_hidden_state_models = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the unique merge-on-write tables without a "
+            + "sequence column are considered by partition level reuse. Their digest (algorithm version 2) covers "
+            + "the rows that the delete bitmap leaves, the rows with a delete sign included, which is all that a "
+            + "later write reads of the existing data. False by default: they are downloaded; the backup computes "
+            + "and records the digest anyway. A table with a sequence column, or a tablet with a DELETE condition "
+            + "(light delete), is never reused. All the frontends and backends must report the capability 2. "
+            + "The digest of algorithm version 1 of a merge-on-write table is never trusted, whatever the value of "
+            + "restore_reuse_allow_hidden_state_models.")
+    public static boolean restore_reuse_mow = false;
 
     @ConfField(mutable = true, masterOnly = true, description = "The number of failures of an incremental append "
             + "task or a local source snapshot task of an atomic restore after which the restore job is cancelled. "

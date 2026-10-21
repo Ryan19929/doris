@@ -216,16 +216,24 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     }
 
     /**
-     * Whether the backend computes the logical digest of the tablets of the table in the snapshot task. A unique
-     * table (merge-on-write or merge-on-read) is not reused by a restore unless the source cluster allows the hidden
-     * state models (restore_reuse_allow_hidden_state_models), so its digest is neither computed nor recorded
-     * otherwise.
+     * Whether the backend computes the logical digest of the tablets of the table in the snapshot task. A duplicate
+     * table, and a unique merge-on-write table without a sequence column (the version 2 digest, whatever the value of
+     * restore_reuse_mow: the backup must have it when the switch is turned on later), are computed. A merge-on-write
+     * table with a sequence column has no digest. A unique merge-on-read table is not reused by a restore unless the
+     * source cluster allows the hidden state models (restore_reuse_allow_hidden_state_models), so its digest is
+     * neither computed nor recorded otherwise.
      */
     private boolean computeLogicalDigestInSnapshot(OlapTable table) {
         if (!isLogicalDigest() || Config.isCloudMode() || getLogicalDigestSkipReason() != null) {
             return false;
         }
-        return Config.restore_reuse_allow_hidden_state_models || table.getKeysType() != KeysType.UNIQUE_KEYS;
+        if (table.getKeysType() != KeysType.UNIQUE_KEYS) {
+            return true;
+        }
+        if (table.getEnableUniqueKeyMergeOnWrite()) {
+            return !table.hasSequenceCol() && table.getSequenceMapCol() == null;
+        }
+        return Config.restore_reuse_allow_hidden_state_models;
     }
 
     // Whether the job writes no manifest (enable_backup_manifest was false when the snapshot tasks were made).

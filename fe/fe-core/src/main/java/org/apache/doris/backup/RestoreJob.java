@@ -256,12 +256,21 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // before that and when the job is done, rebuilt from reuseResult when the job is replayed.
     private volatile Set<Long> localSourceStagingPartitions = Collections.emptySet();
 
+    // The first node which does not report the capability that the reuse of a MoW table needs, set when the candidates
+    // are selected, null if none. Not persisted.
+    private volatile String reuseMowIncapableNode = null;
+
     // The prefix of the error message of a backend which says that retrying the task cannot succeed.
     public static final String RESTORE_NOT_RETRYABLE = "[RESTORE_NOT_RETRYABLE]";
     // The version of the restore reuse protocol of this build, reported in the heartbeat of the frontend and the
-    // backend. A node of an old version reports none (0). Partition level reuse needs 1: the RESTORE_DIGEST task, the
-    // local source snapshot and the incremental download, which an old node does not understand.
-    public static final int RESTORE_REUSE_CAPABILITY = 1;
+    // backend. A node of an old version reports none (0).
+    public static final int RESTORE_REUSE_CAPABILITY_REPORTED = 2;
+    // What partition level reuse needs of every node: 1, the RESTORE_DIGEST task, the local source snapshot and the
+    // incremental download, which an old node does not understand.
+    public static final int RESTORE_REUSE_CAPABILITY_MIN_REQUIRED = 1;
+    // What the reuse of a unique merge-on-write table needs of every node: 2, the logical digest of algorithm version 2
+    // (a node of version 1 reports the digest of version 1, which does not cover the delete sign rows).
+    public static final int RESTORE_REUSE_CAPABILITY_MOW = 2;
     // The reason of downloading all the data when a node does not have the capability.
     public static final String MIXED_VERSIONS = "MIXED_VERSIONS";
     // The reason of downloading all the data when the backup has more tablets than restore_reuse_max_tablets.
@@ -3107,14 +3116,21 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     static String findNodeWithoutReuseCapability() {
-        return findNodeWithoutReuseCapability(true);
+        return findNodeWithoutReuseCapability(RESTORE_REUSE_CAPABILITY_MIN_REQUIRED, true);
+    }
+
+    /** Like {@link #findNodeWithoutReuseCapability()}, for the capability that the reuse of a MoW table needs. */
+    @VisibleForTesting
+    static String findNodeWithoutMowReuseCapability() {
+        return findNodeWithoutReuseCapability(RESTORE_REUSE_CAPABILITY_MOW, true);
     }
 
     /**
+     * @param required the capability that every node must report
      * @param unknownIsIncapable whether the failure to read the nodes is taken as a node without the capability (the
      *         decision of the job), or as none (the estimate, which only records the reason)
      */
-    private static String findNodeWithoutReuseCapability(boolean unknownIsIncapable) {
+    private static String findNodeWithoutReuseCapability(int required, boolean unknownIsIncapable) {
         if (!Config.restore_reuse_require_capability) {
             return null;
         }
@@ -3129,13 +3145,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 // the host and the port: several frontends may run on a host
                 boolean isSelf = self != null && fe.getHost().equals(self.getHost())
                         && fe.getEditLogPort() == self.getPort();
-                int capability = isSelf ? RESTORE_REUSE_CAPABILITY : fe.getRestoreReuseCapability();
-                if (capability < RESTORE_REUSE_CAPABILITY) {
+                int capability = isSelf ? RESTORE_REUSE_CAPABILITY_REPORTED : fe.getRestoreReuseCapability();
+                if (capability < required) {
                     return "frontend " + fe.getHost() + " (capability " + capability + ")";
                 }
             }
             for (Backend be : Env.getCurrentSystemInfo().getAllClusterBackends(true)) {
-                if (be.getRestoreReuseCapability() < RESTORE_REUSE_CAPABILITY) {
+                if (be.getRestoreReuseCapability() < required) {
                     return "backend " + be.getHost() + " (capability " + be.getRestoreReuseCapability() + ")";
                 }
             }
@@ -3211,6 +3227,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             LOG.info("restore reuse: {} does not have the capability of it, download all. job: {}", incapableNode,
                     jobId);
             return keys;
+        }
+        // the unique merge-on-write tables need more of the nodes than the others, see RESTORE_REUSE_CAPABILITY_MOW
+        reuseMowIncapableNode = findNodeWithoutMowReuseCapability();
+        if (reuseMowIncapableNode != null) {
+            LOG.info("restore reuse: {} does not have the capability of the reuse of a MoW table, download them. "
+                    + "job: {}", reuseMowIncapableNode, jobId);
         }
         try {
             RestoreReuseResult result = new RestoreReuseResult();
@@ -3921,6 +3943,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         in.atomicRestore = isAtomicRestore;
         in.allowLoad = allowLoad;
         in.cloudMode = Config.isCloudMode();
+        in.mowIncapableNode = reuseMowIncapableNode;
         in.minPartitionBytes = Config.restore_reuse_min_partition_bytes;
         in.incrementalEnabled = Config.enable_restore_incremental_append && Config.enable_restore_partition_reuse;
         in.level = level;
@@ -4066,7 +4089,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         try {
             RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
             // only the reason is recorded, the estimate is of the data, not of the nodes
-            boolean mixedVersions = findNodeWithoutReuseCapability(false) != null;
+            boolean mixedVersions =
+                    findNodeWithoutReuseCapability(RESTORE_REUSE_CAPABILITY_MIN_REQUIRED, false) != null;
+            boolean mowMixedVersions = findNodeWithoutReuseCapability(RESTORE_REUSE_CAPABILITY_MOW, false) != null;
             boolean tooManyTablets = tabletNumOverReuseLimit() > 0;
             for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
                 BackupOlapTableInfo tblInfo = tblEntry.getValue();
@@ -4086,6 +4111,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         Partition localPart = localOlapTbl.getPartition(partEntry.getKey(), false);
                         RestoreReuseShadowStats.L0Verdict verdict;
                         String l0Path = RestoreReuseJudge.L0_FORWARD;
+                        RestoreReuseJudge.Input verdictInput = null;
                         if (localPart == null) {
                             verdict = RestoreReuseShadowStats.L0Verdict.NO_LOCAL_PARTITION;
                         } else {
@@ -4097,6 +4123,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             String path = RestoreReuseJudge.passedL0(in, first);
                             verdict = path != null ? RestoreReuseShadowStats.L0Verdict.REUSABLE : first[0];
                             l0Path = path;
+                            verdictInput = in;
                         }
                         RestoreReuseShadowStats.Unsupported unsupported = RestoreReuseShadowStats.Unsupported.NONE;
                         long bytes = 0;
@@ -4104,7 +4131,12 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             unsupported = RestoreReuseShadowStats.checkUnsupported(isAtomicRestore, localOlapTbl,
                                     localPart);
                             bytes = RestoreReuseShadowStats.getSingleReplicaLocalDataSize(localPart);
-                            if (mixedVersions && unsupported == RestoreReuseShadowStats.Unsupported.NONE) {
+                            if (unsupported == RestoreReuseShadowStats.Unsupported.NONE && verdictInput != null
+                                    && RestoreReuseJudge.hasMowDigestV1(verdictInput)) {
+                                unsupported = RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW_DIGEST_V1;
+                            }
+                            if ((mixedVersions || (mowMixedVersions && RestoreReuseJudge.isMow(localOlapTbl)))
+                                    && unsupported == RestoreReuseShadowStats.Unsupported.NONE) {
                                 unsupported = RestoreReuseShadowStats.Unsupported.MIXED_VERSIONS;
                             }
                             if (tooManyTablets && unsupported == RestoreReuseShadowStats.Unsupported.NONE) {

@@ -440,7 +440,7 @@ public class HeartbeatMgr extends MasterDaemon {
                             Version.DORIS_BUILD_VERSION + "-" + Version.DORIS_BUILD_SHORT_HASH,
                             ExecuteEnv.getInstance().getStartupTime(), ExecuteEnv.getInstance().getDiskInfos(),
                             ExecuteEnv.getInstance().getProcessUUID(), Config.local_resource_group)
-                            .setRestoreReuseCapability(RestoreJob.RESTORE_REUSE_CAPABILITY);
+                            .setRestoreReuseCapability(RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
                 } else {
                     return new FrontendHbResponse(fe.getNodeName(), "not ready");
                 }

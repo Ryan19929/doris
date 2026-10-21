@@ -169,6 +169,9 @@ public final class RestoreReuseJudge {
         public String atomicReject;
         public boolean allowLoad;
         public boolean cloudMode;
+        // The first node which does not report the capability that the reuse of a unique merge-on-write table needs
+        // (RestoreJob#RESTORE_REUSE_CAPABILITY_MOW), null if every node does. Only read for such a table.
+        public String mowIncapableNode;
         public long minPartitionBytes;
         public CheckLevel level;
         public BackupJobInfo jobInfo;
@@ -222,6 +225,9 @@ public final class RestoreReuseJudge {
 
         abstract RestoreReuseShadowStats.L0Verdict check(Input in);
     }
+
+    // The algorithm version of the logical digest of a unique merge-on-write tablet (BE restore_digest.h).
+    public static final int MOW_DIGEST_ALGO_VERSION = 2;
 
     public static final String L0_FORWARD = "a";
     public static final String L0_REVERSE = "b";
@@ -425,7 +431,44 @@ public final class RestoreReuseJudge {
         }
         RestoreReuseShadowStats.Unsupported unsupported = RestoreReuseShadowStats.checkUnsupported(
                 in.atomicRestore, in.localTable, in.localPartition);
-        return unsupported == RestoreReuseShadowStats.Unsupported.NONE ? null : unsupported.name();
+        if (unsupported != RestoreReuseShadowStats.Unsupported.NONE) {
+            return unsupported.name();
+        }
+        // a node of version 1 would report the digest of algorithm version 1 for a merge-on-write table, which is not
+        // comparable: only that table is kept off, the duplicate tables are not affected
+        if (isMow(in.localTable) && in.mowIncapableNode != null) {
+            return RestoreJob.MIXED_VERSIONS;
+        }
+        return null;
+    }
+
+    static boolean isMow(OlapTable table) {
+        return table.getKeysType() == KeysType.UNIQUE_KEYS && table.getEnableUniqueKeyMergeOnWrite();
+    }
+
+    /**
+     * Whether the digest of a tablet of a unique merge-on-write table in the backup is of an algorithm version below
+     * 2. It skips the rows with a delete sign, so it does not prove the behavior of the later writes, and is never
+     * trusted. Whether a digest is there at all is checkDigestPresent.
+     */
+    static boolean hasMowDigestV1(Input in) {
+        if (!isMow(in.localTable)) {
+            return false;
+        }
+        for (MaterializedIndex localIdx : in.localPartition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            BackupIndexInfo backupIdx = in.backupPartition.getIdx(in.localTable.getIndexNameById(localIdx.getId()));
+            if (backupIdx == null) {
+                continue;
+            }
+            for (int i = 0; i < backupIdx.sortedTabletInfoList.size(); i++) {
+                LogicalDigestInfo digest = backupIdx.getLogicalDigestAt(i);
+                if (digest != null && digest.hasDigest()
+                        && (digest.algoVersion == null || digest.algoVersion < MOW_DIGEST_ALGO_VERSION)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // 4. every tablet of the backup partition has a digest, matching the local tablets one to one. Not needed
@@ -450,6 +493,9 @@ public final class RestoreReuseJudge {
                     return "NO_DIGEST";
                 }
             }
+        }
+        if (hasMowDigestV1(in)) {
+            return "HIDDEN_STATE_MOW_DIGEST_V1";
         }
         return null;
     }

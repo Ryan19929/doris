@@ -88,11 +88,18 @@ public class RestoreReuseShadowStats {
         AGGREGATE_TABLE,
         // Part of the data is cooled down to remote storage, reading it costs about the same as downloading.
         REMOTE_STORAGE,
-        // A unique merge-on-write table: the rows with a delete sign (and their sequence values) and the rows
-        // deleted by a delete predicate are hidden state. The digest skips them, but the partial column update and
-        // the sequence check of the later writes read them, so two replicas with the same digest may still behave
-        // differently. Not reused unless restore_reuse_allow_hidden_state_models.
+        // A unique merge-on-write table, and restore_reuse_mow is off (the default). With it on, the table without a
+        // sequence column is reused: its digest (algorithm version 2) covers the rows that the delete bitmap leaves,
+        // the rows with a delete sign included, which is all that the later writes read of the existing data.
+        // restore_reuse_allow_hidden_state_models does not lift it.
         HIDDEN_STATE_MOW,
+        // A unique merge-on-write table with a sequence column (or a sequence mapping): the rows that the delete
+        // bitmap marks still decide the result of a later write (a larger sequence value makes the new row a loser),
+        // and the digest does not cover them. Never reused.
+        HIDDEN_STATE_MOW_SEQUENCE,
+        // A unique merge-on-write table whose digest in the backup is of algorithm version 1, which skips the rows
+        // with a delete sign. Never trusted, whatever restore_reuse_allow_hidden_state_models says.
+        HIDDEN_STATE_MOW_DIGEST_V1,
         // A unique merge-on-read table: the overwritten versions of a key are hidden state, a later delete predicate
         // makes them visible again. Not reused unless restore_reuse_allow_hidden_state_models.
         HIDDEN_STATE_MOR,
@@ -125,6 +132,10 @@ public class RestoreReuseShadowStats {
     private long l0PassedButRemoteStorage = 0;
     @SerializedName("l0_passed_but_hidden_state_mow")
     private long l0PassedButHiddenStateMow = 0;
+    @SerializedName("l0_passed_but_hidden_state_mow_sequence")
+    private long l0PassedButHiddenStateMowSequence = 0;
+    @SerializedName("l0_passed_but_hidden_state_mow_digest_v1")
+    private long l0PassedButHiddenStateMowDigestV1 = 0;
     @SerializedName("l0_passed_but_hidden_state_mor")
     private long l0PassedButHiddenStateMor = 0;
     @SerializedName("l0_passed_but_mixed_versions")
@@ -257,15 +268,26 @@ public class RestoreReuseShadowStats {
 
     /**
      * Whether the table has a hidden state that the digest does not cover, so that the digest proves the visible rows
-     * only, not the behavior of the later writes. Only duplicate tables are free of it. The check is lifted by
-     * Config.restore_reuse_allow_hidden_state_models.
+     * only, not the behavior of the later writes. Duplicate tables are free of it. A unique merge-on-write table
+     * without a sequence column is covered by the digest of algorithm version 2, and is reused only when
+     * Config.restore_reuse_mow is on (it takes precedence over restore_reuse_allow_hidden_state_models, which does
+     * not apply to it); one with a sequence column never is. A unique merge-on-read table is reused only when
+     * Config.restore_reuse_allow_hidden_state_models is on.
      */
     public static Unsupported checkHiddenState(OlapTable localTbl) {
-        if (Config.restore_reuse_allow_hidden_state_models || localTbl.getKeysType() != KeysType.UNIQUE_KEYS) {
+        if (localTbl.getKeysType() != KeysType.UNIQUE_KEYS) {
             return Unsupported.NONE;
         }
-        return localTbl.getEnableUniqueKeyMergeOnWrite() ? Unsupported.HIDDEN_STATE_MOW
-                : Unsupported.HIDDEN_STATE_MOR;
+        if (!localTbl.getEnableUniqueKeyMergeOnWrite()) {
+            return Config.restore_reuse_allow_hidden_state_models ? Unsupported.NONE : Unsupported.HIDDEN_STATE_MOR;
+        }
+        if (!Config.restore_reuse_mow) {
+            return Unsupported.HIDDEN_STATE_MOW;
+        }
+        if (localTbl.hasSequenceCol() || localTbl.getSequenceMapCol() != null) {
+            return Unsupported.HIDDEN_STATE_MOW_SEQUENCE;
+        }
+        return Unsupported.NONE;
     }
 
     /**
@@ -335,6 +357,12 @@ public class RestoreReuseShadowStats {
                         break;
                     case HIDDEN_STATE_MOW:
                         l0PassedButHiddenStateMow++;
+                        break;
+                    case HIDDEN_STATE_MOW_SEQUENCE:
+                        l0PassedButHiddenStateMowSequence++;
+                        break;
+                    case HIDDEN_STATE_MOW_DIGEST_V1:
+                        l0PassedButHiddenStateMowDigestV1++;
                         break;
                     case HIDDEN_STATE_MOR:
                         l0PassedButHiddenStateMor++;
@@ -422,6 +450,14 @@ public class RestoreReuseShadowStats {
 
     public long getL0PassedButHiddenStateMow() {
         return l0PassedButHiddenStateMow;
+    }
+
+    public long getL0PassedButHiddenStateMowSequence() {
+        return l0PassedButHiddenStateMowSequence;
+    }
+
+    public long getL0PassedButHiddenStateMowDigestV1() {
+        return l0PassedButHiddenStateMowDigestV1;
     }
 
     public long getL0PassedButHiddenStateMor() {
