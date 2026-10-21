@@ -2748,6 +2748,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             }
         }
 
+        settleLocalSourceReplicaVersions(db);
+
         // Use the same time on replay, it is persisted as the finished time of the job.
         long commitTime = isReplay ? finishedTime : System.currentTimeMillis();
         stampRestoreLineage(db, commitTime);
@@ -2790,6 +2792,61 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         LOG.info("job is finished. is replay: {}. {}", isReplay, this);
         return Status.OK;
+    }
+
+    /**
+     * The tablets of the atomic local source partitions (kept or incremental) are loaded from the local source, and the
+     * backend may have reported a lower version than the visible version of the staging partition while the job ran, so
+     * the replica carries a last failed version. All their loads and move tasks succeeded when the job gets here, so
+     * the replicas are at the visible version: set them there and clear the failed version, or the tablet scheduler
+     * repairs them (a clone) as soon as the protection of the job is gone. Done on replay as well, to keep the
+     * followers the same. The staging tables are the formal tables now, they are found by the recorded ids.
+     * The partitions to download and the non-atomic restore are not touched.
+     */
+    @VisibleForTesting
+    int settleLocalSourceReplicaVersions(Database db) {
+        if (reuseResult == null) {
+            return 0;
+        }
+        Map<Long, Set<Long>> partitionsByTable = Maps.newHashMap();
+        for (RestoreReuseResult.Decision decision : reuseResult.getDecisions()) {
+            if (decision.atomic && (decision.kept || decision.incremental)) {
+                partitionsByTable.computeIfAbsent(decision.stagingTableId, k -> Sets.newHashSet())
+                        .add(decision.stagingPartitionId);
+            }
+        }
+        int fixed = 0;
+        for (Map.Entry<Long, Set<Long>> entry : partitionsByTable.entrySet()) {
+            Table tbl = db.getTableNullable(entry.getKey());
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                OlapTable olapTbl = (OlapTable) tbl;
+                for (long partId : entry.getValue()) {
+                    Partition part = olapTbl.getPartition(partId);
+                    if (part == null) {
+                        continue;
+                    }
+                    long visibleVersion = part.getVisibleVersion();
+                    for (MaterializedIndex idx : part.getMaterializedIndices(IndexExtState.VISIBLE)) {
+                        for (Tablet tablet : idx.getTablets()) {
+                            for (Replica replica : tablet.getReplicas()) {
+                                if (replica.getVersion() < visibleVersion || replica.getLastFailedVersion() > 0) {
+                                    replica.updateVersionWithFailed(visibleVersion, -1L, visibleVersion);
+                                    fixed++;
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+        LOG.info("restore reuse: settled the version of {} replicas of the local source partitions, job: {}",
+                fixed, jobId);
+        return fixed;
     }
 
     protected void updateOlapTablesVersion(Database db, boolean isReplay) {

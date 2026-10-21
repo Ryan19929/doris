@@ -3413,6 +3413,64 @@ public class RestoreReuseTest {
         Assertions.assertFalse(handler.hasJobsWithLocalSource());
     }
 
+    // the replicas of a staging partition as the BE reported them while the local source was loaded: lower than the
+    // visible version, with the failed version set
+    private void markReplicasBehind(OlapTable stagingTbl, Partition local, long behind, long failed) {
+        Partition staging = stagingTbl.getPartition(local.getName());
+        for (Tablet tablet : staging.getBaseIndex().getTablets()) {
+            for (Replica replica : tablet.getReplicas()) {
+                replica.adminUpdateVersionInfo(behind, failed, behind, System.currentTimeMillis());
+                Assertions.assertEquals(behind, replica.getVersion());
+                Assertions.assertEquals(failed, replica.getLastFailedVersion());
+            }
+        }
+    }
+
+    private void assertReplicasSettled(OlapTable tbl, Partition local, long version, boolean settled) {
+        Partition part = tbl.getPartition(local.getName());
+        for (Tablet tablet : part.getBaseIndex().getTablets()) {
+            for (Replica replica : tablet.getReplicas()) {
+                if (settled) {
+                    Assertions.assertEquals(version, replica.getVersion());
+                    Assertions.assertEquals(version, replica.getLastSuccessVersion());
+                    Assertions.assertEquals(-1L, replica.getLastFailedVersion());
+                } else {
+                    Assertions.assertEquals(version - 1, replica.getVersion());
+                    Assertions.assertEquals(version, replica.getLastFailedVersion());
+                }
+            }
+        }
+    }
+
+    private void settleOnCommit(boolean isReplay) {
+        // p2 is downloaded as a whole, p1 is appended from the local source
+        Map<Long, String> verdicts = Maps.newHashMap();
+        verdicts.put(p2().getId(), "NOT_BOUNDARY");
+        RestoreJob job = atomicIncrementalJob(verdicts);
+        OlapTable stagingTbl = staging(job);
+        toCommitting(job);
+        markReplicasBehind(stagingTbl, p1(), V2 - 1, V2);
+        markReplicasBehind(stagingTbl, p2(), V2 - 1, V2);
+        Status st = job.allTabletCommitted(isReplay);
+        Assertions.assertTrue(st.ok(), st.toString());
+        OlapTable replaced = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL2_NAME);
+        Assertions.assertEquals(stagingTbl.getId(), replaced.getId());
+        Assertions.assertEquals(V2, replaced.getPartition(p1().getName()).getVisibleVersion());
+        assertReplicasSettled(replaced, p1(), V2, true);
+        // the partition to download is not touched by the settle
+        assertReplicasSettled(replaced, p2(), V2, false);
+    }
+
+    @Test
+    public void testLocalSourceReplicasAreSettledAtCommit() {
+        settleOnCommit(false);
+    }
+
+    @Test
+    public void testLocalSourceReplicasAreSettledOnReplay() {
+        settleOnCommit(true);
+    }
+
     @Test
     public void testHandlerKeepsTheJobSetWhenTheObjectIsReplacedOrEvicted() throws Exception {
         BackupHandler handler = newHandler();
