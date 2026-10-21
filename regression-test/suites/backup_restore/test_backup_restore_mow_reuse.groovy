@@ -80,6 +80,8 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
         return timestamp
     }
     def lastEstimate = null
+    // a field the estimate leaves out (a level that judges nothing, e.g. disable) counts as 0
+    def est = { String name -> (lastEstimate?.get(name) ?: 0) as int }
     def lastStats = null
     def restoreAndWait = { String db, String snapshot, String timestamp, List<String> tables, String level ->
         String levelProp = level == null ? "" : ", \"reuse_check_level\" = \"${level}\""
@@ -193,16 +195,16 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
     waitDataSize(dbB, mowTable)
     def stats = restoreAndWait(dbB, snap2, ts2, [mowTable], null)
     // p2 and p3 are kept, p1 is appended with the rowsets after its version
-    assertEquals(numPartitions - 1, lastEstimate.kept_partitions as int)
-    assertEquals(1, lastEstimate.incremental_partitions as int)
-    assertEquals(0, lastEstimate.l0_passed_but_hidden_state_mow as int)
+    assertEquals(numPartitions - 1, est("kept_partitions"))
+    assertEquals(1, est("incremental_partitions"))
+    assertEquals(0, est("l0_passed_but_hidden_state_mow"))
     assertTrue((stats.incremental_bytes as long) > 0)
     assertTrue((stats.downloaded_bytes as long) * 3 < baselineBytes)
     assertEquals(rowsOf(dbA, mowTable), rowsOf(dbB, mowTable))
     assertEquals(versionsOf(dbA, mowTable), versionsOf(dbB, mowTable))
     // C: a whole download of the same backup, the control group
     restoreAndWait(dbC, snap2, ts2, [mowTable], "disable")
-    assertEquals(0, lastEstimate.kept_partitions as int)
+    assertEquals(0, est("kept_partitions"))
     assertEquals(rowsOf(dbC, mowTable), rowsOf(dbB, mowTable))
     assertEquals(versionsOf(dbC, mowTable), versionsOf(dbB, mowTable))
 
@@ -213,17 +215,17 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
     } finally {
         setConfig("restore_reuse_mow", "true")
     }
-    assertEquals(0, lastEstimate.kept_partitions as int)
+    assertEquals(0, est("kept_partitions"))
     assertEquals(0, (lastEstimate.incremental_partitions ?: 0) as int)
-    assertEquals(numPartitions, lastEstimate.l0_passed_but_hidden_state_mow as int)
-    assertEquals(0, lastEstimate.reusable as int)
+    assertEquals(numPartitions, est("l0_passed_but_hidden_state_mow"))
+    assertEquals(0, est("reusable"))
     assertEquals(0L, stats.kept_bytes as long)
     assertTrue((stats.downloaded_bytes as long) > 0)
     assertEquals(rowsOf(dbA, mowTable), rowsOf(dbB, mowTable))
     // and with the switch on again, the same restore keeps all the partitions
     waitDataSize(dbB, mowTable)
     stats = restoreAndWait(dbB, snap2, ts2, [mowTable], null)
-    assertEquals(numPartitions, lastEstimate.kept_partitions as int)
+    assertEquals(numPartitions, est("kept_partitions"))
     assertTrue((stats.kept_bytes as long) > 0)
     assertEquals(rowsOf(dbA, mowTable), rowsOf(dbB, mowTable))
 
@@ -305,10 +307,10 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
     waitDataSize(dbB, delTable)
     stats = restoreAndWait(dbB, snapDel2, tsDel2, [delTable], null)
     // the visible rows are the same, the digests of the version 2 are not: downloaded as a whole
-    assertEquals(0, lastEstimate.kept_partitions as int)
+    assertEquals(0, est("kept_partitions"))
     assertEquals(0, (lastEstimate.incremental_partitions ?: 0) as int)
-    assertEquals(1, lastEstimate.download_digest_mismatch as int)
-    assertEquals(0, lastEstimate.l0_passed_but_hidden_state_mow as int)
+    assertEquals(1, est("download_digest_mismatch"))
+    assertEquals(0, est("l0_passed_but_hidden_state_mow"))
     assertTrue((stats.downloaded_bytes as long) > 0)
     assertEquals(0L, stats.kept_bytes as long)
     assertEquals(rowsOf(dbA, delTable), rowsOf(dbB, delTable))
@@ -352,9 +354,9 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
     waitDataSize(dbB, seqTable)
     // B restores the same backup again: the partition is the same as the backup, but is not reused
     stats = restoreAndWait(dbB, snapSeq, tsSeq, [seqTable], null)
-    assertEquals(0, lastEstimate.kept_partitions as int)
-    assertEquals(1, lastEstimate.l0_passed_but_hidden_state_mow_sequence as int)
-    assertEquals(0, lastEstimate.reusable as int)
+    assertEquals(0, est("kept_partitions"))
+    assertEquals(1, est("l0_passed_but_hidden_state_mow_sequence"))
+    assertEquals(0, est("reusable"))
     assertEquals(0L, stats.kept_bytes as long)
     assertTrue((stats.downloaded_bytes as long) > 0)
     assertEquals(rowsOf(dbA, seqTable), rowsOf(dbB, seqTable))
