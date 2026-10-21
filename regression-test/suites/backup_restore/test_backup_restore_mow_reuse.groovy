@@ -50,8 +50,8 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
         def rows = sql_return_maparray """ADMIN SHOW FRONTEND CONFIG LIKE "${name}" """
         return rows.find { it.Key == name }.Value as String
     }
-    // the default under test, and the ones this case changes
-    assertEquals("false", getConfig("restore_reuse_mow"))
+    // the configs this case changes; a run that failed half way may have left them changed, so read them back
+    String origMow = getConfig("restore_reuse_mow")
     String origHidden = getConfig("restore_reuse_allow_hidden_state_models")
     setConfig("enable_restore_partition_reuse", "true")
     setConfig("enable_restore_incremental_append", "true")
@@ -370,7 +370,7 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
     // ------------------------------------------------------------------------------------------------
     // clean up, and restore the configs
     // ------------------------------------------------------------------------------------------------
-    setConfig("restore_reuse_mow", "false")
+    setConfig("restore_reuse_mow", origMow)
     setConfig("restore_reuse_allow_hidden_state_models", origHidden)
     setConfig("restore_reuse_min_partition_bytes", "0")
     setConfig("restore_reuse_default_check_level", "full")
