@@ -278,21 +278,28 @@ ccr-syncer 默认用原子恢复做全量同步（总体方案第 9 章风险）
 - `restore_reuse_allow_unverified_keep=true` 且档位为 `off` 时，如果集群 ID 没有在两边都比较过（缺失），不能免校验保留，该分区改为做摘要。
 - 局限：集群 ID 是初始化时生成的随机整数，不是全局唯一标识；运维可能把两套集群配成同一个值；用源端镜像冷备搭建的灾备集群，集群 ID 相同。所以它只用来缩小候选，不当作证明，这也是默认必须 `full` 的原因。
 
-### 16.3 只复用 Duplicate 表
+### 16.3 复用范围：Duplicate 表，以及无 sequence 列的 MoW 表
 
 | 表模型 | 结论 | 原因 |
 | --- | --- | --- |
-| Duplicate（含 DELETE 条件） | 复用 | 没有被覆盖的旧版本；DELETE 条件删掉的行永久删除，之后的写入不会让它们重现 |
-| Unique MoW（无论有无 sequence 列） | 拒绝：`HIDDEN_STATE_MOW` | 删除标记行是隐藏状态：部分列更新查找旧行时只看 delete bitmap、不看删除标记，"最新一行是删除标记"和"key 不存在"行为不同；摘要跳过删除标记行，两端摘要相同时，同一笔写入（如 `partial_update_new_key_behavior=ERROR` 的部分列更新）可能一边成功一边失败，两端 compaction 进度不同就会触发。带 sequence 列时，删除标记行的 sequence 值还影响之后的写入是否被接受 |
-| Unique MoR | 拒绝：`HIDDEN_STATE_MOR` | 被覆盖的旧版本是隐藏状态，之后的 DELETE 条件会让它们重现 |
+| Duplicate（含 DELETE 条件） | 复用 | 没有被覆盖的旧版本；DELETE 条件删掉的行永久删除，之后的写入不会让它们重现。摘要算法版本 1 |
+| Unique MoW，无 sequence 列 | `restore_reuse_mow=true` 时复用，否则 `HIDDEN_STATE_MOW` | 后续写入对已有数据只通过按 key 查找感知：查找跳过被 delete bitmap 标记的行，不看删除标记，也不看删除条件，找到的行（含删除标记行）是部分列更新读旧值的来源。所以"未被 bitmap 标记的全部物理行"是完整状态，版本 2 摘要对这个集合求和，删除标记列是普通摘要列。两端摘要相同，之后同一笔写入的结果相同 |
+| Unique MoW，有 sequence 列或 sequence mapping | 拒绝：`HIDDEN_STATE_MOW_SEQUENCE` | 段级查找发现已有行的 sequence 更大时直接判新行落败，不再看 bitmap；被标记的"输家"行仍是状态而不在摘要里。反例：upsert K seq20，DELETE K，乱序 upsert K seq15，只做 base compaction，两端摘要相等，之后 upsert K seq12 一端被拒一端成功 |
+| Unique MoW，tablet 内有带 DELETE 条件的 rowset（light delete） | BE 判 NOT_SUPPORTED，整体下载 | 查找不看删除条件，compaction 应用条件后行为改变。base compaction 合并掉该 rowset 后恢复 |
+| 备份里算法版本 1 的 MoW 摘要 | 拒绝：`HIDDEN_STATE_MOW_DIGEST_V1` | 版本 1 跳过删除标记行，不可信，不受 `restore_reuse_allow_hidden_state_models` 影响 |
+| Unique MoR | 拒绝：`HIDDEN_STATE_MOR` | 被覆盖的旧版本是隐藏状态，之后的 DELETE 条件会让它们重现。本期不做 |
 | Aggregate | 拒绝 | 逻辑等价无法证明 |
 
-- 整分区保留和增量补齐两条路径都拒绝。影子统计新增 `l0_passed_but_hidden_state_mow`、`l0_passed_but_hidden_state_mor` 两个计数，不把它们算作可复用。
-- FE 配置 `restore_reuse_allow_hidden_state_models`（mutable，masterOnly，默认 false）：为 true 时恢复收窄前的行为，仅供实验，不保证一致。
-- BE 和摘要算法不改，MoR 的前缀摘要等代码保留，默认用不到。
-- 以后放开 MoW 的方向：摘要算法 v2，对没被 delete bitmap 标记的全部物理行算摘要（包括删除标记行和被 light delete 删除条件命中的行），每行带标志位和 sequence 值，证明的是写入路径看到的状态；两端 compaction 进度不同时摘要会不同，退回整体下载（保守）。需要升级 `algo_version` 并重新审查。MoR 同理，代价更高。
+- 版本 2 摘要：编码、哈希、桶和根的结构同版本 1，只是行的范围不再跳过删除标记行，删除标记列进入摘要列和 `schema_sig`，哈希种子与根的头部带算法版本。Duplicate 与 MoR 保持版本 1，MoW 为版本 2；各处按表模型取算法版本（快照与 RESTORE_DIGEST 任务的回报、缓存键、追加后无证据时的比对）。
+- 分解摘要：去掉删除条件的 level 扫描，删除标记行按存活行处理，死亡贡献只来自 bitmap；rdigest 文件格式不变，靠 `algo_version` 区分。
+- 命中率：cumulative compaction 只清被标记的行，不影响摘要；base compaction 默认清掉删除标记行，所以"有删除标记行、且只有一端做过 base compaction"的分区摘要不同，整体下载（保守）。
+- FE 配置 `restore_reuse_mow`（mutable，masterOnly，首版默认 false）；备份侧不受它影响，始终为无 sequence 列的 MoW 表计算版本 2 摘要。`restore_reuse_allow_hidden_state_models` 只对 MoR 有效。
+- 心跳能力：上报值 2，最低要求 1。Duplicate 要求所有 FOLLOWER FE（含 Master）和存活 BE 的能力不小于 1，MoW 要求不小于 2；不满足的表记 `MIXED_VERSIONS`。
+- 备份 tablet 的摘要为 NOT_SUPPORTED（带 DELETE 条件、带 sequence 列等）时，FE 在决策时记 `NO_DIGEST`，整分区保留与增量补齐两条路径都排除，整体下载，不会让任务以不可重试错误失败。
+- 影子统计新增 `l0_passed_but_hidden_state_mow_sequence`、`l0_passed_but_hidden_state_mow_digest_v1`，与 `l0_passed_but_hidden_state_mow`、`l0_passed_but_hidden_state_mor` 一样不算作可复用。
+- 复用后本地值：每行提交 TSO、rowset ID、版本列、binlog 与 CCR 相关元数据在复用后是本地集群的值，整体下载则是来源端的值，Duplicate 表同样适用，摘要不包含它们（见 README）。
 
 ### 16.4 测试
 
 - FE 单测：默认档位；`allow_unverified_keep` 开关下 sample、off 的有效档位；集群 ID 在正向、反向、表级路径上相同、不同、缺失的组合；MoW、MoR 的拒绝原因与开关；影子统计；新字段缺失时可读。
-- 回归：`test_backup_restore_reuse_scope`：Duplicate 整分区保留后与整体下载逐行一致；MoW 一端有删除标记行、另一端该 key 不存在，可见结果相同时必须被拒绝并整体下载，之后部分列更新两端一致；MoR 被拒绝；默认生效档位为 `full`。涉及 Unique 表复用机制的既有用例显式打开 `restore_reuse_allow_hidden_state_models`，结束时恢复。
+- 回归：`test_backup_restore_reuse_scope`：Duplicate 整分区保留后与整体下载逐行一致；MoW 一端有删除标记行、另一端该 key 不存在，默认配置下 `HIDDEN_STATE_MOW`，打开 `restore_reuse_mow` 后版本 2 摘要不等，整体下载，之后部分列更新两端一致；MoR 被拒绝；默认生效档位为 `full`。`test_backup_restore_mow_reuse`：无 sequence 列的 MoW 表整分区保留与增量补齐，复用后与整体下载执行相同写入（upsert、DELETE、部分列更新）结果逐行一致；开关关闭时不复用；有 sequence 列的 MoW 表不复用。涉及 MoW 复用机制的既有用例显式打开 `restore_reuse_mow`，涉及 MoR 的打开 `restore_reuse_allow_hidden_state_models`，结束时恢复。

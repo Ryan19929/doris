@@ -22,7 +22,8 @@
 
 ## 复用范围（首版）
 
-- **只复用 Duplicate 表。** Unique 表（MoW、MoR）的删除标记行、被覆盖的旧版本等隐藏状态不在摘要里，摘要相同的两个分区，之后同一笔写入的结果可能不同，所以默认整体下载，原因记为 `HIDDEN_STATE_MOW`、`HIDDEN_STATE_MOR`。FE 配置 `restore_reuse_allow_hidden_state_models`（默认 false）可以恢复旧行为，仅供实验，不保证一致。
+- **复用 Duplicate 表；无 sequence 列的 MoW 表在 `restore_reuse_mow=true` 时也可复用。** MoW 表用算法版本 2 的摘要：对没有被 delete bitmap 标记的全部物理行求摘要，删除标记行也算（删除标记列按普通摘要列编码）。后续写入对已有数据只通过按 key 查找感知这些行，所以两端摘要相同，后续同一笔写入的结果（包括 `partial_update_new_key_behavior=ERROR` 的部分列更新是否报错）也相同。代价：两端 base compaction 进度不同、且分区里有删除标记行时，摘要不同，该分区整体下载。`restore_reuse_mow`（FE 配置，mutable，masterOnly）首版默认 false，原因记为 `HIDDEN_STATE_MOW`；备份侧不受它影响，始终为无 sequence 列的 MoW 表计算并记录版本 2 摘要。下面这些情况一律不复用：带 sequence 列（含 sequence mapping）的 MoW 表（`HIDDEN_STATE_MOW_SEQUENCE`，被 bitmap 标记但 sequence 值更大的行仍会让之后的写入落败，而它不在摘要里）；tablet 内存在带 DELETE 条件的 rowset（light delete，BE 判 NOT_SUPPORTED，base compaction 合并掉该 rowset 后恢复）；备份里算法版本 1 的 MoW 摘要（`HIDDEN_STATE_MOW_DIGEST_V1`，不受 `restore_reuse_allow_hidden_state_models` 影响，`restore_reuse_mow=false` 优先）。MoR 表仍整体下载（`HIDDEN_STATE_MOR`），`restore_reuse_allow_hidden_state_models`（默认 false）只对 MoR 有效，仅供实验，不保证一致。Duplicate 摘要保持版本 1，不变。
+- **复用后的元数据是本地值。** 复用保留的是本地的数据文件，不是备份里的字节，所以下面这些元数据在复用后是本地集群自己的值，整体下载则带来源端的值，Duplicate 表同样如此：每行提交 TSO（`__DORIS_COMMIT_TSO_COL__`，被视为各集群自己的提交时间，按 TSO 范围做流式读取的结果可能因此不同）、rowset ID、版本列（`__DORIS_VERSION_COL__`）、binlog 与 CCR 相关的元数据。摘要不包含这些列。
 - **默认每个复用的分区都有摘要证明。** `restore_reuse_default_check_level` 默认 `full`；`off`、`sample` 默认也按 `full` 执行，除非打开 `restore_reuse_allow_unverified_keep`（默认 false，仅供实验和观测，不提供一致性保证）。`SHOW RESTORE` 里同时显示请求的档位和实际生效的档位。
 - **谱系戳带来源集群 ID。** 备份记录源端集群 ID，谱系戳随之记录，两边都有且不相等时不作为候选。集群 ID 是初始化时生成的随机整数，不是全局唯一标识，只用来缩小候选范围，不当作证明；任何一边缺失（旧备份、旧谱系戳）时仍可作为候选，由摘要兜底。
 - **"查询结果相同"的含义。** 摘要证明的是在备份版本上的可见数据相同，不含隐藏列（如 `__DORIS_VERSION_COL__`，它随写入历史而不同，`show_hidden_columns=true` 时可见）。
@@ -35,7 +36,7 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 
 - `backup_logical_digest_max_tablets`（默认 0，不限制）：备份涉及的 tablet 数超过它时，备份不要求 BE 计算逻辑摘要，jobInfo 不写摘要，备份照常成功；原因（`TOO_MANY_TABLETS:<n>><limit>`）显示在 `SHOW BACKUP` 末尾的 `LogicalDigest` 列。
 - `restore_reuse_max_tablets`（默认 0，不限制）：恢复所用备份的 tablet 数超过它时，本作业不复用任何分区，整体下载，`SHOW RESTORE` 的 `ReuseEstimate` 里记 `too_many_tablets`。
-- Unique 表默认不计算也不记录逻辑摘要（源端 FE 的 `restore_reuse_allow_hidden_state_models` 为 false 时）；只有该配置在备份前打开，Unique 表才会有摘要。
+- 备份为 Duplicate 表和无 sequence 列的 MoW 表计算并记录逻辑摘要；带 sequence 列的 MoW 表没有摘要；MoR 表默认不计算（源端 FE 的 `restore_reuse_allow_hidden_state_models` 为 false 时），只有该配置在备份前打开才有。
 - 恢复作业在摘要比对结束后释放摘要，下载完成后释放 Manifest 校验的中间集合与 Manifest root；分区的全部副本摘要到齐就立即判定并释放该分区的结果。
 
 ## 当前状态
@@ -46,7 +47,7 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 - 备份完整性校验；
 - 复用观测；
 - 分区级复用（逻辑摘要）；
-- 增量补齐（实现上含 MoR、带 DELETE 条件的 MoW，但首版按上面的范围，默认只对 Duplicate 表生效）；
+- 增量补齐（实现上含 MoR，但首版按上面的范围，只对 Duplicate 表和无 sequence 列的 MoW 表生效，后者需要 `restore_reuse_mow=true`）；MoW 逻辑摘要版本 2；
 - 原子恢复路径；
 - 摘要缓存修复。
 
@@ -58,7 +59,7 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 
 先说明保护机制，再说步骤。
 
-**自动避开混跑。** FE 和 BE 在心跳里上报复用能力（`restore_reuse_capability`，本版本为 1，旧版本不带这个字段，按 0 处理）。恢复作业开始判定复用时，检查所有 FOLLOWER FE（Master 自己算，Observer 不会接管作业，不检查）和所有存活的 BE：任何一个能力小于 1，或者主节点还没收到它的心跳，本作业就不复用，整体下载，不下发摘要任务、本地来源快照和增量补齐，并在 `SHOW RESTORE` 的 `ReuseEstimate` 里记录原因 `MIXED_VERSIONS`。开关是 FE 配置 `restore_reuse_require_capability`（可动态修改，默认 true）；关掉它等于不检查，只用于实验。复用开关关闭时，`ReuseEstimate` 里也可能显示 `MIXED_VERSIONS`，那只是估算，作业本身没有走复用。FE 切主或重启后，首轮心跳（约 5 秒）之前开始的作业，因为还没收到各节点的能力，会整体下载。这个检查只在作业开始时做一次，作业进行中发生的升级、降级或切主，由下面的文件层保护和步骤兜底。
+**自动避开混跑。** FE 和 BE 在心跳里上报复用能力（`restore_reuse_capability`，本版本上报 2，旧版本不带这个字段，按 0 处理）。恢复作业开始判定复用时，检查所有 FOLLOWER FE（Master 自己算，Observer 不会接管作业，不检查）和所有存活的 BE：Duplicate 表要求能力至少为 1，MoW 表要求至少为 2（版本 2 摘要）。任何一个节点能力低于要求，或者主节点还没收到它的心跳，相应的表（能力低于 1 时是整个作业）就不复用，整体下载，不下发摘要任务、本地来源快照和增量补齐，并在 `SHOW RESTORE` 的 `ReuseEstimate` 里记录原因 `MIXED_VERSIONS`。开关是 FE 配置 `restore_reuse_require_capability`（可动态修改，默认 true）；关掉它等于不检查，只用于实验。复用开关关闭时，`ReuseEstimate` 里也可能显示 `MIXED_VERSIONS`，那只是估算，作业本身没有走复用。FE 切主或重启后，首轮心跳（约 5 秒）之前开始的作业，因为还没收到各节点的能力，会整体下载。这个检查只在作业开始时做一次，作业进行中发生的升级、降级或切主，由下面的文件层保护和步骤兜底。
 
 **文件层保护。**
 
@@ -67,7 +68,7 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 
 **升级。**
 
-1. 先升级所有 BE，再升级所有 FE。升级期间保持复用开关关闭（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）。
+1. 先升级所有 BE，再升级所有 FE。MoW 表的复用需要所有节点能力都不小于 2：升级期间有旧节点时，MoW 表整体下载，Duplicate 表照常复用。旧版本备份里没有 MoW 的版本 2 摘要，新版本恢复时同样整体下载，需要用新版本重新备份。升级期间保持复用开关关闭（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）。
 2. 全部节点升级完成后，确认心跳已经收到（`restore_reuse_require_capability` 为 true 时，作业会自己判断），再打开复用开关。
 3. 升级和回滚期间，不要用 `logical_digest=true` 做备份。新版本 BE 为这样的备份写出版本 2 的 manifest（多一条分解摘要），旧版本 BE 不认识版本 2，按 manifest 不符处理，连普通恢复也会失败。默认属性（`logical_digest=false`）的备份不受影响。如果已经有这样的备份、又必须在旧版本 BE 上恢复，可以临时把 BE 配置 `restore_manifest_check` 设为 false。
 4. 新 FE 加旧 BE 时，带 `logical_digest=true` 的备份会被 FE 当作 manifest 里有分解摘要，而旧 BE 并没有写进去；恢复时这类分区的增量补齐会报错并回退为整体下载，结果正确，只是少了复用。全部 BE 升级后不再出现。
