@@ -23,6 +23,7 @@ import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupTabletInfo;
 import org.apache.doris.backup.RestoreJob.RestoreJobState;
 import org.apache.doris.backup.RestoreReuseJudge.CheckLevel;
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.KeysType;
@@ -103,6 +104,9 @@ public class RestoreReuseTest {
     private static final String ROOT_P1 = "aa11";
     private static final String ROOT_P2 = "bb22";
     private static final String SIG = "sig-1";
+    // The algorithm version of the digests the tests make (the backup, the reports of the backends): 1 is the one of
+    // the duplicate and the merge-on-read tables, a merge-on-write table needs 2. Set back to 1 by setUp.
+    private static int digestAlgo = 1;
     // the cluster id of the source of the backup, and the one of this cluster
     private static final long SRC_CLUSTER = 777;
     private static final long LOCAL_CLUSTER = 555;
@@ -129,6 +133,7 @@ public class RestoreReuseTest {
     private int origTimeout;
     private boolean origUnverified;
     private boolean origHidden;
+    private boolean origMow;
 
     @BeforeEach
     public void setUp() throws Exception {
@@ -142,12 +147,15 @@ public class RestoreReuseTest {
         origForceFull = Config.restore_reuse_force_full_for_relation;
         origUnverified = Config.restore_reuse_allow_unverified_keep;
         origHidden = Config.restore_reuse_allow_hidden_state_models;
+        origMow = Config.restore_reuse_mow;
+        digestAlgo = 1;
         Config.enable_restore_partition_reuse = true;
         Config.restore_reuse_default_check_level = "full";
         // The tests of the mechanics (the sample, the level off, the unique tables) run with the narrowing lifted,
         // the tests of the narrowing set the configs back.
         Config.restore_reuse_allow_unverified_keep = true;
         Config.restore_reuse_allow_hidden_state_models = true;
+        Config.restore_reuse_mow = true;
         Config.restore_reuse_min_partition_bytes = 100;
 
         db = CatalogMocker.mockDb();
@@ -225,6 +233,8 @@ public class RestoreReuseTest {
         Config.restore_reuse_force_full_for_relation = origForceFull;
         Config.restore_reuse_allow_unverified_keep = origUnverified;
         Config.restore_reuse_allow_hidden_state_models = origHidden;
+        Config.restore_reuse_mow = origMow;
+        digestAlgo = 1;
         if (mockedExecutor != null) {
             mockedExecutor.close();
         }
@@ -293,7 +303,7 @@ public class RestoreReuseTest {
                 }
                 // the digests are arrays aligned with the tablets
                 for (int pos = 0; pos < idxInfo.tabletsOrder.size(); pos++) {
-                    idxInfo.putLogicalDigestAt(pos, LogicalDigestInfo.of(1, SIG, rootOf(part)));
+                    idxInfo.putLogicalDigestAt(pos, LogicalDigestInfo.of(digestAlgo, SIG, rootOf(part)));
                 }
             }
             tblInfo.partitions.put(part.getName(), partInfo);
@@ -351,7 +361,7 @@ public class RestoreReuseTest {
         request.setTaskStatus(new TStatus(TStatusCode.OK));
         TLogicalDigest digest = new TLogicalDigest();
         digest.setStatusCode("OK");
-        digest.setAlgoVersion(algo);
+        digest.setAlgoVersion(algo == 1 ? digestAlgo : algo);
         digest.setSchemaSig(sig);
         digest.setRoot(root);
         request.setLogicalDigest(digest);
@@ -1070,6 +1080,8 @@ public class RestoreReuseTest {
         Assertions.assertEquals("full", origLevel);
         Assertions.assertFalse(origUnverified);
         Assertions.assertFalse(origHidden);
+        // the reuse of the merge-on-write tables is off until it has been verified for a while
+        Assertions.assertFalse(origMow);
     }
 
     @Test
@@ -1434,33 +1446,47 @@ public class RestoreReuseTest {
     }
 
     @Test
-    public void testOnlyDuplicateTablesAreReused() {
+    public void testOnlyDuplicateAndMowWithoutSequenceTablesAreReused() {
         Config.restore_reuse_allow_hidden_state_models = false;
+        Config.restore_reuse_mow = false;
         Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
         Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
 
-        // unique merge-on-write
+        // unique merge-on-write, the switch of it is off (the default): downloaded
         Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
         tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        digestAlgo = 2;
         Assertions.assertEquals("HIDDEN_STATE_MOW", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
         Assertions.assertEquals("HIDDEN_STATE_MOW", RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
         Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW,
                 RestoreReuseShadowStats.checkUnsupported(false, tbl2, p1()));
-        // unique merge-on-read
+        // restore_reuse_mow takes precedence over the switch of the hidden state models
+        Config.restore_reuse_allow_hidden_state_models = true;
+        Assertions.assertEquals("HIDDEN_STATE_MOW", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Assertions.assertEquals("HIDDEN_STATE_MOW",
+                RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
+        Config.restore_reuse_allow_hidden_state_models = false;
+        // with the switch on, the version 2 digest is reused, by the whole partition and by the increment
+        Config.restore_reuse_mow = true;
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
+        Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
+        Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.NONE,
+                RestoreReuseShadowStats.checkUnsupported(false, tbl2, p1()));
+
+        // unique merge-on-read: still the hidden state, only the experiment switch lifts it
         tbl2.setEnableUniqueKeyMergeOnWrite(false);
+        digestAlgo = 1;
         Assertions.assertEquals("HIDDEN_STATE_MOR", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
         Assertions.assertEquals("HIDDEN_STATE_MOR", RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
         Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOR,
                 RestoreReuseShadowStats.checkUnsupported(false, tbl2, p1()));
-        // the incremental chain rejects them too
+        // the incremental chain rejects it too
         Assertions.assertEquals("HIDDEN_STATE_MOR",
                 RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
-        // the experiment switch restores the behavior before the narrowing
+        // the experiment switch restores the behavior before the narrowing, for the merge-on-read tables
         Config.restore_reuse_allow_hidden_state_models = true;
         Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
-        tbl2.setEnableUniqueKeyMergeOnWrite(true);
-        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
-        Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(input(CheckLevel.FULL)));
         // back to duplicate
         Config.restore_reuse_allow_hidden_state_models = false;
         Deencapsulation.setField(tbl2, "keysType", KeysType.DUP_KEYS);
@@ -1468,10 +1494,97 @@ public class RestoreReuseTest {
     }
 
     @Test
-    public void testHiddenStateTablesAreDownloadedByTheJob() {
-        Config.restore_reuse_allow_hidden_state_models = false;
+    public void testMowWithSequenceColumnIsNeverReused() {
         Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
         tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        digestAlgo = 2;
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        // a sequence column, or a sequence mapping column
+        tbl2.setSequenceMapCol("v1");
+        for (boolean allowHidden : new boolean[] {false, true}) {
+            Config.restore_reuse_allow_hidden_state_models = allowHidden;
+            Assertions.assertEquals("HIDDEN_STATE_MOW_SEQUENCE", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+            Assertions.assertEquals("HIDDEN_STATE_MOW_SEQUENCE",
+                    RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
+            Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW_SEQUENCE,
+                    RestoreReuseShadowStats.checkUnsupported(false, tbl2, p1()));
+        }
+        tbl2.setSequenceMapCol(null);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Column seq = new Column(Column.SEQUENCE_COL, org.apache.doris.catalog.Type.INT);
+        seq.setIsVisible(false);
+        seq.setAggregationType(org.apache.doris.catalog.AggregateType.NONE, false);
+        tbl2.getBaseSchema(true).add(seq);
+        try {
+            Assertions.assertTrue(tbl2.hasSequenceCol());
+            Assertions.assertEquals("HIDDEN_STATE_MOW_SEQUENCE", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        } finally {
+            tbl2.getBaseSchema(true).remove(seq);
+        }
+        // restore_reuse_mow off comes first
+        tbl2.setSequenceMapCol("v1");
+        Config.restore_reuse_mow = false;
+        Assertions.assertEquals("HIDDEN_STATE_MOW", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        tbl2.setSequenceMapCol(null);
+    }
+
+    // The digest of algorithm version 1 of a merge-on-write table skips the rows with a delete sign: never trusted,
+    // whatever the switches say. Merge-on-read and duplicate digests are of version 1 and fine.
+    @Test
+    public void testMowDigestOfAlgorithmVersion1IsNeverTrusted() {
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        for (boolean allowHidden : new boolean[] {false, true}) {
+            Config.restore_reuse_allow_hidden_state_models = allowHidden;
+            digestAlgo = 1;
+            Assertions.assertEquals("HIDDEN_STATE_MOW_DIGEST_V1", RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+            Assertions.assertEquals("HIDDEN_STATE_MOW_DIGEST_V1",
+                    RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
+            digestAlgo = 2;
+            Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+            Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(incrementalInput(CheckLevel.FULL)));
+        }
+        // no digest at all is the other reason, and takes precedence
+        digestAlgo = 1;
+        RestoreReuseJudge.Input in = input(CheckLevel.FULL);
+        in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId())).clearLogicalDigests();
+        Assertions.assertEquals("NO_DIGEST", RestoreReuseJudge.firstReject(in));
+        // the duplicate and the merge-on-read tables are of version 1
+        tbl2.setEnableUniqueKeyMergeOnWrite(false);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+        Deencapsulation.setField(tbl2, "keysType", KeysType.DUP_KEYS);
+        Assertions.assertNull(RestoreReuseJudge.firstReject(input(CheckLevel.FULL)));
+    }
+
+    // The backup digest of a tablet which the BE could not make (NOT_SUPPORTED: a DELETE condition, a sequence
+    // column) keeps the partition off the whole keep and off the incremental path: downloaded whole at the decision,
+    // no task fails with an error which can not be retried.
+    @Test
+    public void testNotSupportedBackupDigestKeepsThePartitionOutOfEveryPath() {
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        digestAlgo = 2;
+        for (boolean incremental : new boolean[] {false, true}) {
+            RestoreReuseJudge.Input in = incremental ? incrementalInput(CheckLevel.FULL) : input(CheckLevel.FULL);
+            BackupIndexInfo idx = in.backupPartition.getIdx(tbl2.getIndexNameById(p1().getBaseIndex().getId()));
+            // the BE reported NOT_SUPPORTED for the first tablet, the others have their digests
+            idx.clearLogicalDigests();
+            idx.putLogicalDigestAt(0, LogicalDigestInfo.none(LogicalDigestInfo.REASON_NOT_SUPPORTED));
+            for (int pos = 1; pos < idx.getTabletCount(); pos++) {
+                idx.putLogicalDigestAt(pos, LogicalDigestInfo.of(digestAlgo, SIG, ROOT_P1));
+            }
+            Assertions.assertEquals("NO_DIGEST", incremental ? RestoreReuseJudge.firstRejectIncremental(in)
+                    : RestoreReuseJudge.firstReject(in), "incremental " + incremental);
+        }
+    }
+
+    @Test
+    public void testMowTablesAreDownloadedByTheJobWhenTheSwitchIsOff() {
+        Config.restore_reuse_allow_hidden_state_models = false;
+        Config.restore_reuse_mow = false;
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        digestAlgo = 2;
         RestoreJob job = prepareJob("full");
         // no candidate, everything is downloaded
         Assertions.assertTrue(job.getReuseResult().getDecisions().isEmpty());
@@ -1485,6 +1598,41 @@ public class RestoreReuseTest {
     }
 
     @Test
+    public void testMowTablesAreReusedByTheJobWhenTheSwitchIsOn() {
+        Config.restore_reuse_allow_hidden_state_models = false;
+        Config.restore_reuse_mow = true;
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        digestAlgo = 2;
+        RestoreJob job = prepareJob("full");
+        toVerifying(job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        Assertions.assertEquals(replicasOf(p1()) + replicasOf(p2()), tasks.size());
+        reportAll(job, tasks, Maps.newHashMap());
+        waitDigests(job);
+        // proved by the digest of the version 2: both partitions are kept
+        Assertions.assertEquals(2, job.getReuseResult().getKeptPartitions());
+        RestoreReuseShadowStats estimate = job.getReuseShadowStats();
+        Assertions.assertEquals(2, estimate.getReusable());
+    }
+
+    // the backup of the version 1 digest of a merge-on-write table is downloaded and counted by its own reason,
+    // not as reusable
+    @Test
+    public void testMowDigestOfVersion1IsDownloadedByTheJob() {
+        Config.restore_reuse_allow_hidden_state_models = true;
+        Config.restore_reuse_mow = true;
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        digestAlgo = 1;
+        RestoreJob v1 = prepareJob("full");
+        Assertions.assertTrue(v1.getReuseResult().getDecisions().isEmpty());
+        Assertions.assertEquals(2L, (long) v1.getReuseResult().getRejected().get("HIDDEN_STATE_MOW_DIGEST_V1"));
+        Assertions.assertEquals(0, v1.getReuseShadowStats().getReusable());
+        Assertions.assertEquals(2, v1.getReuseShadowStats().getL0PassedButHiddenStateMowDigestV1());
+    }
+
+    @Test
     public void testShadowStatsDoNotCountHiddenStateAsReusable() {
         RestoreReuseShadowStats stats = new RestoreReuseShadowStats();
         stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW,
@@ -1493,7 +1641,13 @@ public class RestoreReuseTest {
                 100);
         stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE, RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOR,
                 100, RestoreReuseJudge.L0_REVERSE);
-        Assertions.assertEquals(3, stats.getPartitions());
+        stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE,
+                RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW_SEQUENCE, 100);
+        stats.add(RestoreReuseShadowStats.L0Verdict.REUSABLE,
+                RestoreReuseShadowStats.Unsupported.HIDDEN_STATE_MOW_DIGEST_V1, 100);
+        Assertions.assertEquals(5, stats.getPartitions());
+        Assertions.assertEquals(1, stats.getL0PassedButHiddenStateMowSequence());
+        Assertions.assertEquals(1, stats.getL0PassedButHiddenStateMowDigestV1());
         Assertions.assertEquals(0, stats.getReusable());
         Assertions.assertEquals(0, stats.getReusableBytesSingleReplica());
         Assertions.assertEquals(0, stats.getReusableForward() + stats.getReusableReverse() + stats.getReusableTable());
@@ -2223,6 +2377,9 @@ public class RestoreReuseTest {
         Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(in));
         Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(in));
         tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        // the digest of a merge-on-write table is of the version 2
+        digestAlgo = 2;
+        in = incrementalInput(CheckLevel.FULL);
         Assertions.assertNull(RestoreReuseJudge.firstRejectIncremental(in));
         Assertions.assertNull(RestoreReuseJudge.checkIncrementalModel(in));
         // the other conditions still apply to them
@@ -2524,6 +2681,7 @@ public class RestoreReuseTest {
     private void assertUniqueTableIsACandidate(boolean mow) {
         Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
         tbl2.setEnableUniqueKeyMergeOnWrite(mow);
+        digestAlgo = mow ? 2 : 1;
         RestoreJob job = prepareIncrementalJob("full");
         toVerifying(job);
         List<RestoreDigestTask> tasks = newDigestTasks();
@@ -3811,6 +3969,74 @@ public class RestoreReuseTest {
         aliveBackends.add(new Backend(3, "be3", 9050));
         Assertions.assertTrue(RestoreJob.findNodeWithoutReuseCapability().contains("be3"));
         assertNotReused(prepareJob("full"));
+    }
+
+    // The reuse of a merge-on-write table needs the capability 2 of every node (the digest of the version 2), the
+    // duplicate tables only 1: a cluster in a rolling upgrade keeps reusing the latter.
+    @Test
+    public void testConstantsOfTheCapability() {
+        Assertions.assertEquals(2, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
+        Assertions.assertEquals(1, RestoreJob.RESTORE_REUSE_CAPABILITY_MIN_REQUIRED);
+        Assertions.assertEquals(2, RestoreJob.RESTORE_REUSE_CAPABILITY_MOW);
+    }
+
+    private void mockMixedCluster() {
+        mockCluster();
+        // the master itself has not been heard from (0), it is this build
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 0);
+        frontend(FrontendNodeType.FOLLOWER, "fe2", 2);
+        backend(1, 2);
+        backend(2, 1);
+        Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+        Assertions.assertTrue(RestoreJob.findNodeWithoutMowReuseCapability().contains("be2"));
+    }
+
+    private void makeTableMow() {
+        Deencapsulation.setField(tbl2, "keysType", KeysType.UNIQUE_KEYS);
+        tbl2.setEnableUniqueKeyMergeOnWrite(true);
+        digestAlgo = 2;
+    }
+
+    @Test
+    public void testBackendOfCapability1StillReusesDuplicateTables() {
+        mockMixedCluster();
+        assertReused(prepareJob("full"));
+    }
+
+    @Test
+    public void testBackendOfCapability1DownloadsMowTables() {
+        mockMixedCluster();
+        makeTableMow();
+        assertNotReused(prepareJob("full"));
+        // the table level capability is not a case of the unsupported ones
+        Assertions.assertEquals(RestoreReuseShadowStats.Unsupported.NONE,
+                RestoreReuseShadowStats.checkUnsupported(false, tbl2, p1()));
+    }
+
+    @Test
+    public void testFollowerOfCapability1DownloadsMowTables() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 0);
+        frontend(FrontendNodeType.FOLLOWER, "fe2", 1);
+        backend(1, 2);
+        Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+        Assertions.assertTrue(RestoreJob.findNodeWithoutMowReuseCapability().contains("fe2"));
+        makeTableMow();
+        assertNotReused(prepareJob("full"));
+    }
+
+    @Test
+    public void testAllNodesOfCapability2ReuseMowTables() {
+        mockCluster();
+        frontend(FrontendNodeType.FOLLOWER, "fe1", 0);
+        frontend(FrontendNodeType.FOLLOWER, "fe2", 2);
+        // an observer does not take part
+        frontend(FrontendNodeType.OBSERVER, "fe3", 0);
+        backend(1, 2);
+        backend(2, 2);
+        Assertions.assertNull(RestoreJob.findNodeWithoutMowReuseCapability());
+        makeTableMow();
+        assertReused(prepareJob("full"));
     }
 
     @Test

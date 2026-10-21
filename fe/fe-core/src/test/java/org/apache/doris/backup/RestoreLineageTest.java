@@ -520,6 +520,8 @@ public class RestoreLineageTest {
                 + ",\"reusable_a\":1,\"reusable_b\":0,\"reusable_c\":0,"
                 + "\"l0_passed_but_atomic_restore\":0,\"l0_passed_but_aggregate_table\":0,"
                 + "\"l0_passed_but_remote_storage\":0,\"l0_passed_but_hidden_state_mow\":0,"
+                + "\"l0_passed_but_hidden_state_mow_sequence\":0,"
+                + "\"l0_passed_but_hidden_state_mow_digest_v1\":0,"
                 + "\"l0_passed_but_hidden_state_mor\":0,\"l0_passed_but_mixed_versions\":0,"
                 + "\"l0_passed_but_too_many_tablets\":0,"
                 + "\"cluster_mismatch\":0,\"no_local\":2,\"no_lineage\":0,"

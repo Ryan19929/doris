@@ -17,6 +17,7 @@
 
 package org.apache.doris.system;
 
+import org.apache.doris.backup.RestoreJob;
 import org.apache.doris.common.Config;
 import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.persist.gson.GsonUtils;
@@ -43,6 +44,26 @@ public class RestoreReuseCapabilityHeartbeatTest {
         Assertions.assertEquals(0, HeartbeatMgr.restoreReuseCapabilityOf(ping));
         ping.setRestoreReuseCapability(1);
         Assertions.assertEquals(1, HeartbeatMgr.restoreReuseCapabilityOf(ping));
+    }
+
+    // The version 2 of the capability (the logical digest of the merge-on-write tables) is reported as it is, and the
+    // frontend reports it, while the minimum that the reuse of the other tables needs stays 1.
+    @Test
+    public void testCapability2IsReportedAndKept() {
+        TBackendInfo backendInfo = new TBackendInfo();
+        backendInfo.setRestoreReuseCapability(2);
+        Assertions.assertEquals(2, HeartbeatMgr.restoreReuseCapabilityOf(backendInfo));
+        TFrontendPingFrontendResult ping = new TFrontendPingFrontendResult();
+        ping.setRestoreReuseCapability(RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
+        Assertions.assertEquals(2, HeartbeatMgr.restoreReuseCapabilityOf(ping));
+        Assertions.assertEquals(2, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
+        Assertions.assertEquals(1, RestoreJob.RESTORE_REUSE_CAPABILITY_MIN_REQUIRED);
+        Assertions.assertTrue(RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED >= RestoreJob.RESTORE_REUSE_CAPABILITY_MOW);
+
+        Backend be = new Backend(10001, "127.0.0.1", 9050);
+        be.handleHbResponse(new BackendHbResponse(10001, 9060, 8040, 8060, System.currentTimeMillis(), 1L,
+                "new", "mix", 0, 0, false, -1, 0).setRestoreReuseCapability(2), false);
+        Assertions.assertEquals(2, be.getRestoreReuseCapability());
     }
 
     @Test

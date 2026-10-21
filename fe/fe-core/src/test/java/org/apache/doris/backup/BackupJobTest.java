@@ -914,6 +914,57 @@ public class BackupJobTest {
         }
     }
 
+    // A unique merge-on-write table without a sequence column is asked for the digest (the version 2), whatever the
+    // value of restore_reuse_mow: the backup must have it when the switch is turned on later. One with a sequence
+    // column or a sequence mapping has none (the BE would say NOT_SUPPORTED), and a merge-on-read table only when the
+    // hidden state models are allowed.
+    @Test
+    public void testLogicalDigestOfMowTableIsAskedForWithoutSequenceColumn() {
+        boolean origHidden = Config.restore_reuse_allow_hidden_state_models;
+        boolean origMow = Config.restore_reuse_mow;
+        OlapTable tbl = (OlapTable) db.getTableNullable(tblId);
+        try {
+            Config.restore_reuse_allow_hidden_state_models = false;
+            Deencapsulation.setField(tbl, "keysType", KeysType.UNIQUE_KEYS);
+            tbl.setEnableUniqueKeyMergeOnWrite(true);
+            int n = 0;
+            for (boolean mowSwitch : new boolean[] {false, true}) {
+                Config.restore_reuse_mow = mowSwitch;
+                job = new BackupJob("mow" + n++, dbId, UnitTestUtil.DB_NAME, tableRefsOf(UnitTestUtil.TABLE_NAME),
+                        13600 * 1000, BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+                job.setLogicalDigest(true);
+                List<SnapshotTask> tasks = runToSnapshotTasks(job);
+                Assertions.assertEquals(1, tasks.size());
+                Assertions.assertTrue(tasks.get(0).isComputeLogicalDigest(), "restore_reuse_mow " + mowSwitch);
+            }
+            // a sequence mapping column
+            tbl.setSequenceMapCol("k1");
+            job = new BackupJob("mow" + n++, dbId, UnitTestUtil.DB_NAME, tableRefsOf(UnitTestUtil.TABLE_NAME),
+                    13600 * 1000, BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            job.setLogicalDigest(true);
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            Assertions.assertFalse(tasks.get(0).isComputeLogicalDigest());
+            tbl.setSequenceMapCol(null);
+            // merge-on-read: not, unless the hidden state models are allowed
+            tbl.setEnableUniqueKeyMergeOnWrite(false);
+            job = new BackupJob("mow" + n++, dbId, UnitTestUtil.DB_NAME, tableRefsOf(UnitTestUtil.TABLE_NAME),
+                    13600 * 1000, BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            job.setLogicalDigest(true);
+            Assertions.assertFalse(runToSnapshotTasks(job).get(0).isComputeLogicalDigest());
+            Config.restore_reuse_allow_hidden_state_models = true;
+            job = new BackupJob("mow" + n++, dbId, UnitTestUtil.DB_NAME, tableRefsOf(UnitTestUtil.TABLE_NAME),
+                    13600 * 1000, BackupCommand.BackupContent.ALL, env, repo.getId(), 0);
+            job.setLogicalDigest(true);
+            Assertions.assertTrue(runToSnapshotTasks(job).get(0).isComputeLogicalDigest());
+        } finally {
+            Config.restore_reuse_allow_hidden_state_models = origHidden;
+            Config.restore_reuse_mow = origMow;
+            tbl.setSequenceMapCol(null);
+            tbl.setEnableUniqueKeyMergeOnWrite(false);
+            Deencapsulation.setField(tbl, "keysType", KeysType.DUP_KEYS);
+        }
+    }
+
     @Test
     public void testUniqueTableHasNoLogicalDigestInJobInfo() throws IOException {
         boolean orig = Config.restore_reuse_allow_hidden_state_models;
