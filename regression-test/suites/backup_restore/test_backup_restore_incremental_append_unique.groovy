@@ -17,9 +17,11 @@
 
 import groovy.json.JsonSlurper
 
-// Incremental append for unique merge-on-read tables (with a sequence column) and merge-on-write tables with DELETE
-// conditions (R2 design section 15), by the non atomic and by the atomic restore. A is backed up and restored to B,
-// then A writes into p1 (updates, a stale update that loses by the sequence column, a DELETE condition) and is backed
+// Incremental append for unique merge-on-read tables (with a sequence column, which needs the experiment switch of the
+// hidden state models) and merge-on-write tables without a sequence column (the version 2 digest, with the switch
+// restore_reuse_mow), by the non atomic and by the atomic restore. A is backed up and restored to B,
+// then A writes into p1 (updates, a stale update that loses by the sequence column of the merge-on-read table, a
+// DELETE, which is a row with a delete sign in the merge-on-write table) and is backed
 // up again. Restoring that onto B keeps p2 and p3 and only appends the rowsets after the version of p1 to the local
 // tablets. For merge-on-read the backup holds whole digests at its most recent boundaries only: when B stands at an
 // older version, that partition is downloaded as a whole. The data of B equals the data of A row by row. Auto
@@ -42,10 +44,11 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
     setConfig("enable_restore_incremental_append", "true")
     setConfig("restore_reuse_min_partition_bytes", "0")
     setConfig("restore_reuse_default_check_level", "full")
-    // The tables of this case include unique tables (hidden state: delete sign rows, overwritten versions), which
-    // partition level reuse only reuses with the experiment switch below (default false: only duplicate tables are
-    // reused). Turn it on to cover the mechanics of the unique tables, and restore it at the end.
+    // The merge-on-read table has a hidden state (overwritten versions) which partition level reuse only reuses with
+    // the experiment switch below (default false), the merge-on-write table without a sequence column is reused
+    // with restore_reuse_mow (default false). Turn them on to cover the mechanics, and restore them at the end.
     setConfig("restore_reuse_allow_hidden_state_models", "true")
+    setConfig("restore_reuse_mow", "true")
 
     def runCase = { boolean atomic ->
         String tag = atomic ? "atomic" : "plain"
@@ -59,7 +62,7 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
         for (String tbl : [morTable, mowTable]) {
             String props = tbl == morTable
                     ? ", \"enable_unique_key_merge_on_write\" = \"false\", \"function_column.sequence_col\" = \"seq\""
-                    : ", \"enable_unique_key_merge_on_write\" = \"true\", \"enable_mow_light_delete\" = \"true\", \"function_column.sequence_col\" = \"seq\""
+                    : ", \"enable_unique_key_merge_on_write\" = \"true\""
             sql """
                 CREATE TABLE ${dbA}.${tbl} (
                     `id` INT NOT NULL,
@@ -156,7 +159,7 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
         def writeP1 = { int round ->
             for (String tbl : [morTable, mowTable]) {
                 sql "INSERT INTO ${dbA}.${tbl} VALUES (5, 'updated in p1 round ${round}', ${10 + round}), (${900 + round}, 'new row of p1 round ${round}', 1)"
-                // a stale update: the sequence column of both tables rejects it
+                // a stale update: the sequence column of the merge-on-read table rejects it
                 sql "INSERT INTO ${dbA}.${tbl} VALUES (6, 'stale update round ${round}', 0)"
                 sql "DELETE FROM ${dbA}.${tbl} WHERE id = ${7 + round}"
             }
@@ -174,7 +177,7 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
         // 2. A writes into p1 (3 versions, the version of B is a boundary of the backup): p2 and p3 are kept,
         // p1 of both tables downloads the rowsets after its version
         writeP1(1)
-        assertTrue((sql_return_maparray("SHOW DELETE FROM ${dbA}")).size() >= 2)
+        assertTrue((sql_return_maparray("SHOW DELETE FROM ${dbA}")).size() >= 1)
         String tsA2 = backupAndWait(dbA, "${suiteName}_${tag}_2")
         stats = restoreAndWait(dbB, "${suiteName}_${tag}_2", tsA2)
         assertEquals(2 * (numPartitions - 1), lastEstimate.kept_partitions as int)
@@ -191,9 +194,14 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
         assertSame(dbA, dbB)
         for (String tbl : [morTable, mowTable]) {
             assertEquals("updated in p1 round 1", (sql "SELECT value FROM ${dbB}.${tbl} WHERE id = 5")[0][0])
-            // the stale update lost by the sequence column
-            assertTrue(((sql "SELECT value FROM ${dbB}.${tbl} WHERE id = 6")[0][0] as String).startsWith("value of 6 "))
-            // the DELETE condition
+            // the stale update lost by the sequence column of the merge-on-read table, the merge-on-write table
+            // has none (its seq is an ordinary column)
+            if (tbl == morTable) {
+                assertTrue(((sql "SELECT value FROM ${dbB}.${tbl} WHERE id = 6")[0][0] as String).startsWith("value of 6 "))
+            } else {
+                assertEquals("stale update round 1", (sql "SELECT value FROM ${dbB}.${tbl} WHERE id = 6")[0][0])
+            }
+            // the DELETE
             assertEquals(0, (sql "SELECT COUNT(*) FROM ${dbB}.${tbl} WHERE id = 8")[0][0])
             assertEquals(1, (sql "SELECT COUNT(*) FROM ${dbB}.${tbl} WHERE id = 901")[0][0])
         }
@@ -250,6 +258,7 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
 
     setConfig("restore_reuse_min_partition_bytes", "0")
     setConfig("restore_reuse_allow_hidden_state_models", "false")
+    setConfig("restore_reuse_mow", "false")
     setConfig("restore_reuse_default_check_level", "full")
     setConfig("enable_restore_atomic_reuse", "false")
     sql "DROP REPOSITORY `${repoName}`"

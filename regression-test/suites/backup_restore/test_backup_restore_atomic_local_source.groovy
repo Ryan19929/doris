@@ -80,6 +80,7 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
     setConfig("restore_reuse_min_partition_bytes", "0")
     setConfig("restore_reuse_default_check_level", "full")
     setConfig("restore_reuse_allow_hidden_state_models", "false")
+    setConfig("restore_reuse_mow", "false")
     setConfig("restore_local_source_task_max_retry", "10")
 
     for (String db : [dbA, dbB, dbC]) {
@@ -410,8 +411,8 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         setConfig("restore_local_source_task_max_retry", "10")
     }
 
-    // ---- MoW with the experiment switch (hidden state models) ----
-    setConfig("restore_reuse_allow_hidden_state_models", "true")
+    // ---- MoW (no sequence column) with its switch ----
+    setConfig("restore_reuse_mow", "true")
     try {
         String snapM0 = "${suiteName}_m0"
         String tsM0 = backupAndWait(snapM0, mowTable)
@@ -430,21 +431,19 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         assertEquals("FINISHED", job.State)
         assertSameAsSource(dbB, mowTable)
 
-        // the append without its evidence: the digest does not prove the hidden state of a unique table, the job
-        // is cancelled at once instead of being retried, and B is not changed
+        // the append without its evidence: the digest of the version 2 proves the hidden state of a MoW table, so the
+        // retry of the append which finds the tablet already at the end version and equal to the backup finishes
         writeIntoP1(mowTable)
         String snapM2 = "${suiteName}_m2"
         String tsM2 = backupAndWait(snapM2, mowTable)
-        String mowRowsBefore = rowsOf(dbB, mowTable)
         enableDebug("SnapshotLoader.append_increment.fail_before_stage", [execute: 1])
         job = restoreAndWait(dbB, snapM2, tsM2, mowTable)
-        assertEquals("CANCELLED", job.State)
-        assertTrue(job.Status.toString().contains("RESTORE_NOT_RETRYABLE"), job.Status.toString())
-        assertEquals(mowRowsBefore, rowsOf(dbB, mowTable))
+        assertEquals("FINISHED", job.State)
+        assertSameAsSource(dbB, mowTable)
     } finally {
         disableDebug("SnapshotLoader.append_increment.delay")
         disableDebug("SnapshotLoader.append_increment.fail_before_stage")
-        setConfig("restore_reuse_allow_hidden_state_models", "false")
+        setConfig("restore_reuse_mow", "false")
     }
 
     for (String db : [dbA, dbB, dbC]) {

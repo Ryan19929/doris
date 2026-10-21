@@ -18,13 +18,16 @@
 import groovy.json.JsonSlurper
 
 // The scope of partition level reuse with the default configs: every reused partition is proved by the digest of each
-// replica (the check level is full), and only duplicate tables are reused.
+// replica (the check level is full), and only duplicate tables are reused (the merge-on-write tables without a
+// sequence column need restore_reuse_mow, which is off by default).
 //   1. A duplicate table is kept whole, and the same INSERT and DELETE on the kept table and on the table of a whole
 //      download leave the same rows (row count and row hash).
 //   2. The counterexample of the merge-on-write table: the latest row of a key is a delete sign row on one side, the
-//      key does not exist on the other side. The visible rows (and the digest) are the same, but the hidden state
-//      differs, so the reuse is rejected (HIDDEN_STATE_MOW) and the partition is downloaded; then a partial update
-//      with partial_update_new_key_behavior = ERROR behaves the same on both sides.
+//      key does not exist on the other side. The visible rows are the same, but the hidden state differs. With the
+//      default configs the reuse is rejected (HIDDEN_STATE_MOW) and the partition is downloaded; with
+//      restore_reuse_mow on, the digest of the version 2 covers the delete sign rows, so the two sides are told apart
+//      (DOWNLOAD_ROOT_MISMATCH) and the partition is downloaded as well. Then a partial update with
+//      partial_update_new_key_behavior = ERROR behaves the same on both sides.
 //   3. A merge-on-read table is rejected (HIDDEN_STATE_MOR) and downloaded.
 //   4. The effective check level is full, whatever level the job asks for.
 // Single replica, auto compaction is off, all the configs it changes are restored at the end.
@@ -56,6 +59,7 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     assertEquals("full", getConfig("restore_reuse_default_check_level"))
     assertEquals("false", getConfig("restore_reuse_allow_unverified_keep"))
     assertEquals("false", getConfig("restore_reuse_allow_hidden_state_models"))
+    assertEquals("false", getConfig("restore_reuse_mow"))
 
     setConfig("enable_restore_partition_reuse", "true")
     setConfig("restore_reuse_min_partition_bytes", "0")
@@ -241,11 +245,8 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     sql "INSERT INTO ${dbA}.${mowTable} VALUES ${mowValues.join(",")}"
     sql "sync"
     String snapMow1 = "${suiteName}_snap_mow1"
-    // The backup records the logical digest of a unique table only if the source cluster allows the hidden state
-    // models (the control group below restores it with the switch on).
-    setConfig("restore_reuse_allow_hidden_state_models", "true")
+    // The backup records the version 2 digest of a merge-on-write table, whatever restore_reuse_mow says.
     String tsMow1 = backupAndWait(dbA, snapMow1, [mowTable])
-    setConfig("restore_reuse_allow_hidden_state_models", "false")
     // B is new: restored as a whole, and the table of B is stamped as a replica of the table of A
     restoreAndWait(dbB, snapMow1, tsMow1, [mowTable], null)
     assertEquals(rowsOf(dbA, mowTable), rowsOf(dbB, mowTable))
@@ -262,14 +263,12 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     assertEquals(0, (sql "SELECT COUNT(*) FROM ${dbB}.${mowTable} WHERE id = 5")[0][0])
 
     String snapMow2 = "${suiteName}_snap_mow2"
-    // The backup records the logical digest of a unique table only if the source cluster allows the hidden state
-    // models (the control group below restores it with the switch on).
-    setConfig("restore_reuse_allow_hidden_state_models", "true")
     String tsMow2 = backupAndWait(dbA, snapMow2, [mowTable])
-    setConfig("restore_reuse_allow_hidden_state_models", "false")
-    // the default configs: the partition is a candidate (the versions are equal, the digests are equal because the
-    // delete sign rows are skipped), but a unique table is not reused: rejected, downloaded as a whole
+    // the default configs: the partition is a candidate (the versions are equal), but a merge-on-write table is not
+    // reused while restore_reuse_mow is off: rejected, downloaded as a whole, even with the hidden state models on
+    setConfig("restore_reuse_allow_hidden_state_models", "true")
     def stats = restoreAndWait(dbB, snapMow2, tsMow2, [mowTable], null)
+    setConfig("restore_reuse_allow_hidden_state_models", "false")
     assertEquals(0, keptPartitions())
     assertEquals(0, (lastEstimate?.incremental_partitions ?: 0) as int)
     assertEquals(1, lastEstimate.l0_passed_but_hidden_state_mow as int)
@@ -309,8 +308,9 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     assertEquals(rowsOf(dbA, mowTable), rowsOf(dbB, mowTable))
     assertEquals(versionsOf(dbA, mowTable), versionsOf(dbB, mowTable))
 
-    // The control group: with the experiment switch on, the same partition IS reused, and then the same partial update
-    // behaves differently on the two sides. This is why the reuse of a unique table is rejected by default.
+    // The switch of the merge-on-write tables on: the digest of the version 2 has the delete sign rows, so the delete
+    // sign row of key 5 in A (the backup) is told from the missing key in C. The partition is not kept, it is
+    // downloaded as a whole, and the same partial update behaves the same on both sides.
     // C is built as B was before the rejected restore: restored from the first backup, then a key that A does not have
     // is written and deleted, so it has the same version and the same visible rows as A at the second backup.
     // D is a whole download of the second backup, the pristine copy of A (A itself was changed by the updates above).
@@ -321,16 +321,21 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     restoreAndWait(dbD, snapMow2, tsMow2, [mowTable], "disable")
     assertEquals(rowsOf(dbD, mowTable), rowsOf(dbC, mowTable))
     assertEquals(versionsOf(dbD, mowTable), versionsOf(dbC, mowTable))
-    setConfig("restore_reuse_allow_hidden_state_models", "true")
-    restoreAndWait(dbC, snapMow2, tsMow2, [mowTable], null)
-    setConfig("restore_reuse_allow_hidden_state_models", "false")
-    assertEquals(1, keptPartitions())
+    setConfig("restore_reuse_mow", "true")
+    try {
+        restoreAndWait(dbC, snapMow2, tsMow2, [mowTable], null)
+    } finally {
+        setConfig("restore_reuse_mow", "false")
+    }
+    assertEquals(0, keptPartitions())
+    assertEquals(1, lastEstimate.download_digest_mismatch as int)
+    assertEquals(0, lastEstimate.l0_passed_but_hidden_state_mow as int)
     assertEquals(rowsOf(dbD, mowTable), rowsOf(dbC, mowTable))
-    // key 5: a delete sign row in D, no row in C
+    // key 5: a delete sign row on both sides
     String outcomeD = partialUpdate(dbD, 5)
     String outcomeC = partialUpdate(dbC, 5)
     assertEquals("OK", outcomeD)
-    assertEquals("ERROR", outcomeC)
+    assertEquals(outcomeD, outcomeC)
 
     // ------------------------------------------------------------------------------------------------
     // 3. merge-on-read: rejected, downloaded as a whole
@@ -374,6 +379,8 @@ suite("test_backup_restore_reuse_scope", "backup_restore") {
     // clean up, and restore the configs
     // ------------------------------------------------------------------------------------------------
     setConfig("restore_reuse_min_partition_bytes", "0")
+    setConfig("restore_reuse_allow_hidden_state_models", "false")
+    setConfig("restore_reuse_mow", "false")
     setConfig("enable_restore_partition_reuse", "false")
     for (String db : [dbA, dbB, dbC, dbD]) {
         sql "DROP DATABASE ${db} FORCE"

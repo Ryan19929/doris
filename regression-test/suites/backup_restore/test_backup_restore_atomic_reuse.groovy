@@ -48,6 +48,8 @@ suite("test_backup_restore_atomic_reuse", "backup_restore") {
     // partition level reuse only reuses with the experiment switch below (default false: only duplicate tables are
     // reused). Turn it on to cover the mechanics of the unique tables, and restore it at the end.
     setConfig("restore_reuse_allow_hidden_state_models", "true")
+    // the merge-on-write tables (no sequence column) are reused with their own switch
+    setConfig("restore_reuse_mow", "true")
 
     for (String db : [dbA, dbB]) {
         sql "DROP DATABASE IF EXISTS ${db} FORCE"
@@ -234,6 +236,7 @@ suite("test_backup_restore_atomic_reuse", "backup_restore") {
 
     setConfig("restore_reuse_min_partition_bytes", "0")
     setConfig("restore_reuse_allow_hidden_state_models", "false")
+    setConfig("restore_reuse_mow", "false")
     setConfig("restore_reuse_default_check_level", "full")
     setConfig("enable_restore_atomic_reuse", "false")
     for (String db : [dbA, dbB]) {
