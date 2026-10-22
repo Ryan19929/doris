@@ -2752,6 +2752,12 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
     // of the tablet are run anyway): the second one finds the evidence of the first and skips the load. The lock
     // of the snapshot path taken by the load is another key.
     auto tablet_guard = LocalSnapshotLock::instance().acquire(tablet->tablet_path());
+    // The load of the other task replaces the tablet object: judge the one the tablet manager has now.
+    tablet = _engine.tablet_manager()->get_tablet(request.tablet_id);
+    if (tablet == nullptr) {
+        return Status::Error<ErrorCode::TABLE_NOT_FOUND>("failed to get tablet. tablet={}",
+                                                         request.tablet_id);
+    }
     bool already_loaded = false;
     {
         // A resent task: judge the tablet by the evidence of this job, never by the shape of the tablet.
