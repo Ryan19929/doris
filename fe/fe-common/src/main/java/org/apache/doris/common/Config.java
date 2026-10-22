@@ -1704,6 +1704,14 @@ public class Config extends ConfigBase {
     @ConfField(mutable = false)
     public static long backup_handler_update_interval_millis = 3000;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether a backup or restore job goes on with the "
+            + "next state in the same round of the backup handler when the state it reached waits for nothing (for "
+            + "example the backup kept on local after its snapshots: UPLOAD_SNAPSHOT, UPLOADING, SAVE_META, "
+            + "UPLOAD_INFO; the restore after its snapshots or its download: DOWNLOAD, COMMIT), instead of one state "
+            + "per round of backup_handler_update_interval_millis. The edit logs are the same, in the same order. "
+            + "If false (the default) one state per round, as before.")
+    public static boolean backup_restore_merge_idle_ticks = false;
+
 
     /**
      * Whether to enable cloud restore job.
