@@ -2794,6 +2794,13 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
     if (already_loaded) {
         LOG(INFO) << "the local source of tablet " << request.tablet_id
                   << " is already loaded by job " << job_id << ", skip loading it";
+        // The task is sent again only when the report of the load was lost (or the BE died after the load): the
+        // tablet is made from the local source and loaded all the same, count it, so that the stats of the job add
+        // up to its tablets. What was linked or copied is not known any more.
+        if (stats != nullptr) {
+            stats->tablets++;
+            stats->loaded_tablets++;
+        }
     } else {
         TSnapshotRequest source_request = request;
         source_request.__set_restore_incremental(false);

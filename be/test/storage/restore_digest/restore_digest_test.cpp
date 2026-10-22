@@ -6004,10 +6004,13 @@ TEST_F(RestoreStageTest, LoadWritesTheEvidenceAndTheResentTaskIsSkipped) {
     EXPECT_NE(uid_before, loaded->tablet_uid());
     auto files = tablet_files(loaded);
     TabletUid uid_loaded = loaded->tablet_uid();
-    // branch 1: resent, the evidence of this job and the version: nothing is loaded again
+    // branch 1: resent, the evidence of this job and the version: nothing is loaded again, the tablet is counted
+    // (the report of the load was lost)
     LocalSourceStats again;
     ASSERT_TRUE(load(p, loader, 1, &again).ok());
-    EXPECT_EQ(0, again.tablets);
+    EXPECT_EQ(1, again.tablets);
+    EXPECT_EQ(1, again.loaded_tablets);
+    EXPECT_EQ(0, again.linked_files + again.copied_files);
     EXPECT_EQ(uid_loaded, current(p.target)->tablet_uid());
     EXPECT_EQ(files, tablet_files(current(p.target)));
     // and the empty dir for the increment is there for the download
@@ -6074,7 +6077,8 @@ TEST_F(RestoreStageTest, EmptyLoadedTabletIsNotTakenForACleanOneWithoutEvidence)
     // resent: skipped by the evidence
     LocalSourceStats again;
     ASSERT_TRUE(loader.make_local_source_snapshot_and_load(req, &path, &again).ok());
-    EXPECT_EQ(0, again.tablets);
+    EXPECT_EQ(1, again.tablets);
+    EXPECT_EQ(0, again.linked_files + again.copied_files);
     // after a compaction of the empty rowsets the evidence is still there
     // the evidence is lost: it is refused, not loaded over
     {
@@ -6136,7 +6140,8 @@ TEST_F(RestoreStageTest, AppendWritesTheEvidenceWithTheAppendAndTheResentTaskIsO
     // the snapshot task resent after the append: skipped, the tablet is not replaced
     LocalSourceStats again;
     ASSERT_TRUE(load(p, loader, 1, &again).ok());
-    EXPECT_EQ(0, again.tablets);
+    EXPECT_EQ(1, again.tablets);
+    EXPECT_EQ(0, again.linked_files + again.copied_files);
     EXPECT_EQ(6, current(p.target)->max_version_unlocked());
     // the append of another range or by another job is refused
     TRestoreIncrementalRange other = p.range;
@@ -6421,8 +6426,10 @@ TEST_F(RestoreKeptLoadTest, KeptLoadResentIsSkipped) {
     TabletUid uid = current(p.target)->tablet_uid();
     LocalSourceStats again;
     ASSERT_TRUE(load_kept(p, loader, 1, &again).ok());
-    EXPECT_EQ(0, again.tablets);
-    EXPECT_EQ(0, again.loaded_tablets);
+    // the tablet is counted (the report of the first task was lost), nothing is linked or copied again
+    EXPECT_EQ(1, again.tablets);
+    EXPECT_EQ(1, again.loaded_tablets);
+    EXPECT_EQ(0, again.linked_files + again.copied_files);
     EXPECT_EQ(files, tablet_files(current(p.target)));
     EXPECT_EQ(uid, current(p.target)->tablet_uid());
     EXPECT_TRUE(dir_is_empty(p.dir));
@@ -6432,6 +6439,7 @@ TEST_F(RestoreKeptLoadTest, KeptLoadIsSerializedPerTablet) {
     Prepared p = prepare(Kind::DUP, 7921);
     // two tasks of the same tablet at once: one loads, the other finds the evidence and skips
     std::atomic<int64_t> loaded_tablets {0};
+    std::atomic<int> loads {0};
     std::atomic<int> failures {0};
     auto run = [&]() {
         SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->orphan_mem_tracker());
@@ -6444,13 +6452,18 @@ TEST_F(RestoreKeptLoadTest, KeptLoadIsSerializedPerTablet) {
             ++failures;
         }
         loaded_tablets += stats.loaded_tablets;
+        if (stats.linked_files + stats.copied_files > 0) {
+            ++loads;
+        }
     };
     std::thread t1(run);
     std::thread t2(run);
     t1.join();
     t2.join();
     EXPECT_EQ(0, failures.load());
-    EXPECT_EQ(1, loaded_tablets.load());
+    // one task loads (links the files), the other finds the tablet loaded; both count the tablet
+    EXPECT_EQ(1, loads.load());
+    EXPECT_EQ(2, loaded_tablets.load());
     EXPECT_EQ(3, current(p.target)->max_version_unlocked());
     EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
     EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),

@@ -82,7 +82,8 @@ struct TDownloadStats {
     15: optional i64 incremental_files
     16: optional i64 incremental_bytes
     // snapshot task with restore_local_source (atomic restore keeps the data of the table being replaced): the
-    // tablets made from the local tablet, and their files hard linked / copied (the other disk) from it
+    // tablets made from the local tablet, and their files hard linked / copied (the other disk) from it (a task
+    // sent again after a lost report counts its tablet, not the files)
     17: optional i64 local_source_tablets
     18: optional i64 local_source_linked_files
     19: optional i64 local_source_linked_bytes
