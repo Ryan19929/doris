@@ -19,6 +19,7 @@
 | [timing-experiment.md](./timing-experiment.md) | 端到端耗时实验设计，以及测试环境下已完成的摸底与补充实验结果 |
 | [stuck-append-analysis.md](./stuck-append-analysis.md) | 原子恢复 + 增量补齐卡在 COMMITTING 的根因分析 |
 | [stuck-append-fix-plan.md](./stuck-append-fix-plan.md) | 上述问题的修复方案（已两轮审查） |
+| [speedup-design.md](./speedup-design.md) | 提速第一批：保留分区由快照任务装载到位（提交只做零 IO 确认）、状态机合并空拍、任务完成即运行 |
 
 ## 复用范围（首版）
 
@@ -40,6 +41,14 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 - 备份为 Duplicate 表和无 sequence 列的 MoW 表计算并记录逻辑摘要；带 sequence 列的 MoW 表没有摘要；MoR 表默认不计算（源端 FE 的 `restore_reuse_allow_hidden_state_models` 为 false 时），只有该配置在备份前打开才有。
 - 恢复作业在摘要比对结束后释放摘要，下载完成后释放 Manifest 校验的中间集合与 Manifest root；分区的全部副本摘要到齐就立即判定并释放该分区的结果。
 
+## 提速
+
+设计与收益估算见 [speedup-design.md](./speedup-design.md)。三项都有开关：
+
+- **保留分区由快照任务装载到位**（`restore_reuse_kept_load_at_snapshot`，FE，mutable，masterOnly，默认 true；只在 `enable_restore_atomic_reuse` 打开后有意义）。原子恢复里判为保留的分区，其暂存 tablet 原来由提交阶段的 MOVE 任务装载（改 rowset id、链接、重载），而 BE 的 MOVE 线程池每个 BE 只有一个线程。打开后，快照任务带 `restore_kept_load`，BE 像处理增量分区的本地底座一样，在快照阶段就把本地数据装进暂存 tablet（证据 `LOCAL_LOADED` 随 tablet meta 落盘），留下一个空的快照目录；提交阶段的 MOVE 请求不变，BE 看到空目录（没有 tablet meta、没有数据文件，普通恢复的快照目录一定有 tablet meta）就只核对本作业的装载证据，不做任何 IO；核对不过返回 `[RESTORE_NOT_RETRYABLE]`，FE 立即取消。旧版本 BE 忽略该字段，仍做带 tablet meta 的完整快照、由 MOVE 整体替换，结果正确只是慢；旧版本 FE 接管后发的普通 MOVE 在新 BE 上同样按目录内容处理。`SHOW RESTORE` 的 `DownloadStats.atomic_local.loaded_tablets` 是由快照任务装载的副本数。BE 配置 `restore_local_source_snapshot_timeout_s`（默认 3600）：本地来源快照目录的存活时间，BE 在装载后、释放前崩溃时由清扫线程按它清理。
+- **状态机合并空拍**（`backup_restore_merge_idle_ticks`，FE，mutable，masterOnly，默认 false）。备份恢复作业每一拍（`backup_handler_update_interval_millis`，默认 3 秒）只推进一个状态；打开后，到达一个不等待 BE 的状态时在同一拍继续：keep_on_local 备份从快照完成一拍走到 FINISHED（省 4 拍），恢复在快照完成的那一拍发下载任务、在下载完成的那一拍发 MOVE（没有要下载的东西时从快照完成一拍走到 COMMITTING）。状态函数和它们写的编辑日志不变，顺序不变，FOLLOWER 回放不受影响；一拍最多走 5（备份）/4（恢复）个状态；失败仍在当拍结束。改的是 Doris 原有路径，默认关闭时逐字节等价于原行为。
+- **任务完成即运行**（`backup_restore_run_on_task_finish`，FE，mutable，masterOnly，默认 false）。某个状态等待的最后一个 BE 任务回报时，作业请求 BackupHandler 立刻跑一次 `run()`（由 BackupHandler 的一个线程执行），省掉等下一拍的平均半拍。请求只记 (dbId, jobId)，执行前重新查找作业，只在本 FE 仍是 Master、该作业仍是库里当前作业且未结束时才运行。
+
 ## 当前状态
 
 已实现：
@@ -50,7 +59,8 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 - 分区级复用（逻辑摘要）；
 - 增量补齐（实现上含 MoR，但首版按上面的范围，只对 Duplicate 表和无 sequence 列的 MoW 表生效，后者需要 `restore_reuse_mow=true`）；MoW 逻辑摘要版本 2；
 - 原子恢复路径；
-- 摘要缓存修复。
+- 摘要缓存修复；
+- 提速第一批（见下文"提速"一节）：保留分区由快照任务装载到位、状态机合并空拍、任务完成即运行。
 
 **已知未修复**：原子恢复 + 增量补齐在多副本下，可能因副本修复竞争卡在 COMMITTING。根因和修复方案见 [stuck-append-analysis.md](./stuck-append-analysis.md) 和 [stuck-append-fix-plan.md](./stuck-append-fix-plan.md)，修复方案已审查、尚未实现。
 
@@ -60,7 +70,7 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 
 先说明保护机制，再说步骤。
 
-**自动避开混跑。** FE 和 BE 在心跳里上报复用能力（`restore_reuse_capability`，本版本上报 2，旧版本不带这个字段，按 0 处理）。恢复作业开始判定复用时，检查所有 FOLLOWER FE（Master 自己算，Observer 不会接管作业，不检查）和所有存活的 BE：Duplicate 表要求能力至少为 1，MoW 表要求至少为 2（版本 2 摘要）。任何一个节点能力低于要求，或者主节点还没收到它的心跳，相应的表（能力低于 1 时是整个作业）就不复用，整体下载，不下发摘要任务、本地来源快照和增量补齐，并在 `SHOW RESTORE` 的 `ReuseEstimate` 里记录原因 `MIXED_VERSIONS`。开关是 FE 配置 `restore_reuse_require_capability`（可动态修改，默认 true）；关掉它等于不检查，只用于实验。复用开关关闭时，`ReuseEstimate` 里也可能显示 `MIXED_VERSIONS`，那只是估算，作业本身没有走复用。FE 切主或重启后，首轮心跳（约 5 秒）之前开始的作业，因为还没收到各节点的能力，会整体下载。这个检查只在作业开始时做一次，作业进行中发生的升级、降级或切主，由下面的文件层保护和步骤兜底。
+**自动避开混跑。** FE 和 BE 在心跳里上报复用能力（`restore_reuse_capability`，本版本上报 3，旧版本不带这个字段，按 0 处理；3 只表示支持保留分区由快照任务装载，不被任何判定要求，能力为 2 的 BE 由 MOVE 装载，结果相同）。恢复作业开始判定复用时，检查所有 FOLLOWER FE（Master 自己算，Observer 不会接管作业，不检查）和所有存活的 BE：Duplicate 表要求能力至少为 1，MoW 表要求至少为 2（版本 2 摘要）。任何一个节点能力低于要求，或者主节点还没收到它的心跳，相应的表（能力低于 1 时是整个作业）就不复用，整体下载，不下发摘要任务、本地来源快照和增量补齐，并在 `SHOW RESTORE` 的 `ReuseEstimate` 里记录原因 `MIXED_VERSIONS`。开关是 FE 配置 `restore_reuse_require_capability`（可动态修改，默认 true）；关掉它等于不检查，只用于实验。复用开关关闭时，`ReuseEstimate` 里也可能显示 `MIXED_VERSIONS`，那只是估算，作业本身没有走复用。FE 切主或重启后，首轮心跳（约 5 秒）之前开始的作业，因为还没收到各节点的能力，会整体下载。这个检查只在作业开始时做一次，作业进行中发生的升级、降级或切主，由下面的文件层保护和步骤兜底。
 
 **文件层保护。**
 
@@ -73,6 +83,7 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 2. 全部节点升级完成后，确认心跳已经收到（`restore_reuse_require_capability` 为 true 时，作业会自己判断），再打开复用开关。
 3. 升级和回滚期间，不要用 `logical_digest=true` 做备份。新版本 BE 为这样的备份写出版本 2 的 manifest（多一条分解摘要），旧版本 BE 不认识版本 2，按 manifest 不符处理，连普通恢复也会失败。默认属性（`logical_digest=false`）的备份不受影响。如果已经有这样的备份、又必须在旧版本 BE 上恢复，可以临时把 BE 配置 `restore_manifest_check` 设为 false。
 4. 新 FE 加旧 BE 时，带 `logical_digest=true` 的备份会被 FE 当作 manifest 里有分解摘要，而旧 BE 并没有写进去；恢复时这类分区的增量补齐会报错并回退为整体下载，结果正确，只是少了复用。全部 BE 升级后不再出现。
+5. 保留分区的快照装载（`restore_reuse_kept_load_at_snapshot`）不需要等所有节点升级：能力低于 3 的 BE 忽略该字段，仍由 MOVE 装载。作业进行中降级 BE 的情况和其他本地来源任务一样：先按回滚步骤排空在途作业。`backup_restore_merge_idle_ticks` 与 `backup_restore_run_on_task_finish` 只影响 Master FE 的调度，随时可开关，不涉及持久化。
 
 **回滚。**
 
