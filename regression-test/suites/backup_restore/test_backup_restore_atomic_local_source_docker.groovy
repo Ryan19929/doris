@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import groovy.json.JsonSlurper
 import org.apache.doris.regression.suite.ClusterOptions
 
 // The restart of the FE and of a BE in the middle of the commit of an atomic restore with an incremental append:
@@ -25,6 +26,12 @@ import org.apache.doris.regression.suite.ClusterOptions
 //  - BE restart before the append: the evidence of the load (LOCAL_LOADED) is in the tablet meta, so it survives;
 //    the move is sent again and appends. After the job, all BEs restart again (after the appends): the data and the
 //    evidence are still right, restoring the same backup again keeps every partition.
+//  - FE restart while the snapshot tasks load the kept partitions (restore_reuse_kept_load_at_snapshot): nothing
+//    is in the edit log before DOWNLOAD, so the restarted FE runs the job from PENDING again with new staging
+//    tablets, the loads are done again, the job is FINISHED and the data equals the source; the first staging
+//    tablets are dropped by the tablet report, the backends stay alive.
+//  - BE restart in the middle of a load: after the tablet dir is emptied the load is redone, after the tablet is
+//    reloaded (before the snapshot of the local source is released) the resent load is skipped by the evidence.
 // The cluster needs the docker framework (docker image), and the S3 settings of the other backup_restore suites.
 suite("test_backup_restore_atomic_local_source_docker", "backup_restore,docker") {
     def options = new ClusterOptions()
@@ -183,5 +190,57 @@ suite("test_backup_restore_atomic_local_source_docker", "backup_restore,docker")
         job = waitRestoreDone(snap2, 900)
         assertEquals("FINISHED", job.State)
         assertEquals(rowsOf(dbA), rowsOf(dbB))
+        sleep(5000)
+
+        def waitState = { String snapshot, String state ->
+            for (long waited = 0; waited < 300 && jobState(snapshot) != state; waited += 1) {
+                sleep(1000)
+            }
+            assertEquals(state, jobState(snapshot))
+        }
+        def loadedTablets = { job ->
+            def stats = new JsonSlurper().parseText(job.DownloadStats as String)
+            return (stats.atomic_local?.loaded_tablets ?: 0) as int
+        }
+
+        // ---- 8. FE restart while the snapshot tasks load the kept partitions (every partition is kept now) ----
+        GetDebugPoint().enableDebugPointForAllBEs("SnapshotLoader.make_local_source.delay", [sleep_ms: "40000"])
+        startRestore(snap2, ts2)
+        waitState(snap2, "SNAPSHOTING")
+        sleep(5000)
+        cluster.restartFrontends()
+        sleep(15000)
+        context.reconnectFe()
+        // the job is run from PENDING again: the new staging tablets are loaded, with the delay once more
+        GetDebugPoint().disableDebugPointForAllBEs("SnapshotLoader.make_local_source.delay")
+        job = waitRestoreDone(snap2, 900)
+        assertEquals("FINISHED", job.State)
+        assertEquals(rowsOf(dbA), rowsOf(dbB))
+        assertTrue(loadedTablets(job) > 0)
+        // the first staging tablets are gone and the backends are alive
+        sleep(60000)
+        def alive = (sql_return_maparray "SHOW BACKENDS").count { it.Alive.toString() == "true" }
+        assertEquals(3, alive)
+        startRestore(snap2, ts2)
+        job = waitRestoreDone(snap2, 900)
+        assertEquals("FINISHED", job.State)
+        assertEquals(rowsOf(dbA), rowsOf(dbB))
+        sleep(5000)
+
+        // ---- 9. BE restart in the middle of a load: once after the tablet dir is emptied (the resent load does it
+        // again), once after the tablet is reloaded (the resent load is skipped by the evidence) ----
+        for (String point : ["SnapshotLoader.move.delay_after_remove", "SnapshotLoader.move.delay_after_load"]) {
+            GetDebugPoint().enableDebugPointForAllBEs(point, [sleep_ms: "60000", execute: "1"])
+            startRestore(snap2, ts2)
+            waitState(snap2, "SNAPSHOTING")
+            sleep(10000)
+            cluster.restartBackends(1)
+            GetDebugPoint().disableDebugPointForAllBEs(point)
+            job = waitRestoreDone(snap2, 900)
+            assertEquals("FINISHED", job.State)
+            assertEquals(rowsOf(dbA), rowsOf(dbB))
+            assertTrue(loadedTablets(job) > 0)
+            sleep(5000)
+        }
     }
 }
