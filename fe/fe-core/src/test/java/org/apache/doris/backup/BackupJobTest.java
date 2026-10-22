@@ -1173,4 +1173,154 @@ public class BackupJobTest {
             Assertions.assertEquals(manifestDigest, snapshotTask.isComputeDigest());
         }
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // backup_restore_merge_idle_ticks: the states which wait for nothing are run in the same round
+    // ---------------------------------------------------------------------------------------------
+
+    // the state of the job at every edit log written from now on
+    private List<BackupJobState> loggedStates() {
+        List<BackupJobState> states = new ArrayList<>();
+        Mockito.doAnswer(inv -> {
+            states.add(((BackupJob) inv.getArgument(0)).getState());
+            return null;
+        }).when(editLog).logBackupJob(ArgumentMatchers.any(BackupJob.class));
+        return states;
+    }
+
+    // runs the job to SNAPSHOTING and reports its snapshot task
+    private void finishTheSnapshot(BackupJob job) {
+        job.run();
+        Assertions.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+        SnapshotTask snapshotTask = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT,
+                id.get() - 1);
+        TFinishTaskRequest request = new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.MAKE_SNAPSHOT,
+                snapshotTask.getSignature(), new TStatus(TStatusCode.OK));
+        request.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+        request.setSnapshotPath("/path/to/snapshot");
+        Assertions.assertTrue(job.finishTabletSnapshotTask(snapshotTask, request));
+    }
+
+    private BackupJob keepOnLocalJob() {
+        List<TableRefInfo> tableRefs = Lists.newArrayList(new TableRefInfo(
+                new TableNameInfo(InternalCatalog.INTERNAL_CATALOG_NAME, UnitTestUtil.DB_NAME, UnitTestUtil.TABLE_NAME),
+                null, null, null, new ArrayList<>(), null, null, new ArrayList<>()));
+        return new BackupJob("label", dbId, UnitTestUtil.DB_NAME, tableRefs, 13600 * 1000,
+                BackupCommand.BackupContent.ALL, env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+    }
+
+    @Test
+    public void testMergedTicksKeepOnLocalBackupFinishesInOneRunAfterSnapshots() {
+        boolean orig = Config.backup_restore_merge_idle_ticks;
+        try {
+            // the switch off: one state per run, as before
+            Config.backup_restore_merge_idle_ticks = false;
+            job = keepOnLocalJob();
+            finishTheSnapshot(job);
+            List<BackupJobState> states = loggedStates();
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+            Assertions.assertEquals(Lists.newArrayList(BackupJobState.UPLOAD_SNAPSHOT), states);
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+            job.run();
+            Assertions.assertEquals(BackupJobState.SAVE_META, job.getState());
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOAD_INFO, job.getState());
+            job.run();
+            Assertions.assertEquals(BackupJobState.FINISHED, job.getState());
+            List<BackupJobState> oneByOne = Lists.newArrayList(states);
+
+            // the switch on: the same logs in the same order, in one run
+            Config.backup_restore_merge_idle_ticks = true;
+            AgentTaskQueue.clearAllTasks();
+            job = keepOnLocalJob();
+            finishTheSnapshot(job);
+            states = loggedStates();
+            job.run();
+            Assertions.assertEquals(Status.OK, job.getStatus());
+            Assertions.assertEquals(BackupJobState.FINISHED, job.getState());
+            Assertions.assertEquals(oneByOne, states);
+            Assertions.assertEquals(Lists.newArrayList(BackupJobState.UPLOAD_SNAPSHOT, BackupJobState.SAVE_META,
+                    BackupJobState.UPLOAD_INFO, BackupJobState.FINISHED), states);
+            Assertions.assertTrue(new File(job.getLocalJobInfoFilePath()).exists());
+            Mockito.verify(backupHandler).addSnapshot(ArgumentMatchers.eq("label"), ArgumentMatchers.same(job));
+        } finally {
+            Config.backup_restore_merge_idle_ticks = orig;
+        }
+    }
+
+    @Test
+    public void testMergedTicksStopAtUploadingWhenUploadTasksExist() {
+        boolean orig = Config.backup_restore_merge_idle_ticks;
+        try {
+            Config.backup_restore_merge_idle_ticks = true;
+            finishTheSnapshot(job);
+            List<BackupJobState> states = loggedStates();
+            AgentTaskQueue.clearAllTasks();
+            // the upload tasks are sent, then the job waits for them
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+            Assertions.assertEquals(Lists.newArrayList(BackupJobState.UPLOAD_SNAPSHOT), states);
+            Assertions.assertEquals(1, AgentTaskQueue.getTaskNum());
+            UploadTask upTask = (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+            Assertions.assertEquals(1, states.size());
+            // the upload is reported: the rest in one run
+            Map<Long, List<String>> tabletFileMap = Maps.newHashMap();
+            tabletFileMap.put(tabletId, Lists.newArrayList("1.dat.4f158689243a3d6030352fec3cfd3798",
+                    "1.idx.4f158689243a3d6030352fec3cfd3798", "1.hdr.4f158689243a3d6030352fec3cfd3798"));
+            TFinishTaskRequest request = new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.UPLOAD,
+                    upTask.getSignature(), new TStatus(TStatusCode.OK));
+            request.setTabletFiles(tabletFileMap);
+            Assertions.assertTrue(job.finishSnapshotUploadTask(upTask, request));
+            job.run();
+            Assertions.assertEquals(Status.OK, job.getStatus());
+            Assertions.assertEquals(BackupJobState.FINISHED, job.getState());
+            Assertions.assertEquals(Lists.newArrayList(BackupJobState.UPLOAD_SNAPSHOT, BackupJobState.SAVE_META,
+                    BackupJobState.UPLOAD_INFO, BackupJobState.FINISHED), states);
+        } finally {
+            Config.backup_restore_merge_idle_ticks = orig;
+        }
+    }
+
+    // a failure of UPLOAD_INFO ends the run after the logs of the states before it, the job is not cancelled and the
+    // next run retries it, as before (the status is not reset by the merged run)
+    @Test
+    public void testUploadInfoFailureStillRetriesNextRunWithMergedTicks() {
+        boolean orig = Config.backup_restore_merge_idle_ticks;
+        try {
+            Config.backup_restore_merge_idle_ticks = true;
+            finishTheSnapshot(job);
+            List<BackupJobState> states = loggedStates();
+            AgentTaskQueue.clearAllTasks();
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+            UploadTask upTask = (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+            Map<Long, List<String>> tabletFileMap = Maps.newHashMap();
+            tabletFileMap.put(tabletId, Lists.newArrayList("1.dat.4f158689243a3d6030352fec3cfd3798",
+                    "1.idx.4f158689243a3d6030352fec3cfd3798", "1.hdr.4f158689243a3d6030352fec3cfd3798"));
+            TFinishTaskRequest request = new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.UPLOAD,
+                    upTask.getSignature(), new TStatus(TStatusCode.OK));
+            request.setTabletFiles(tabletFileMap);
+            Assertions.assertTrue(job.finishSnapshotUploadTask(upTask, request));
+
+            Mockito.doReturn(new Status(Status.ErrCode.COMMON_ERROR, "upload failed")).when(repo)
+                    .upload(ArgumentMatchers.anyString(), ArgumentMatchers.anyString());
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOAD_INFO, job.getState());
+            Assertions.assertFalse(job.getStatus().ok());
+            Assertions.assertEquals(Lists.newArrayList(BackupJobState.UPLOAD_SNAPSHOT, BackupJobState.SAVE_META,
+                    BackupJobState.UPLOAD_INFO), states);
+
+            Mockito.doReturn(Status.OK).when(repo).upload(ArgumentMatchers.anyString(), ArgumentMatchers.anyString());
+            job.run();
+            Assertions.assertEquals(BackupJobState.FINISHED, job.getState());
+            Assertions.assertEquals(Status.OK, job.getStatus());
+            Assertions.assertEquals(BackupJobState.FINISHED, states.get(states.size() - 1));
+        } finally {
+            Config.backup_restore_merge_idle_ticks = orig;
+        }
+    }
 }
