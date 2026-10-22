@@ -88,6 +88,9 @@ struct TDownloadStats {
     19: optional i64 local_source_linked_bytes
     20: optional i64 local_source_copied_files
     21: optional i64 local_source_copied_bytes
+    // of local_source_tablets, those loaded into the tablet by the snapshot task itself (TSnapshotRequest.restore_kept_load
+    // or restore_incremental), the move of the restore then has nothing to load
+    22: optional i64 local_source_loaded_tablets
 }
 
 // Result of the logical digest computation of a tablet, see TSnapshotRequest.compute_logical_digest and

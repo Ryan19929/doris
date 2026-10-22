@@ -330,6 +330,9 @@ public:
     Status remote_http_download(const std::vector<TRemoteTabletSnapshot>& remote_tablets,
                                 std::vector<int64_t>* downloaded_tablet_ids);
 
+    // An empty snapshot dir (no tablet meta, no data file) is the one of a tablet which the snapshot task loaded
+    // from the local source itself (TSnapshotRequest.restore_kept_load): nothing is moved, the evidence of the load
+    // of this job in the tablet meta is checked instead, an error with kRestoreNotRetryable if it is not there.
     Status move(const std::string& snapshot_path, TabletSharedPtr tablet, bool overwrite);
 
     // move(), the tablet meta saved with the loaded tablet has restore_stage as the evidence of the restore job
@@ -337,12 +340,13 @@ public:
     Status move_with_restore_stage(const std::string& snapshot_path, TabletSharedPtr tablet,
                                    bool overwrite, const RestoreStagePB* restore_stage);
 
-    // Atomic restore with partition level reuse, a tablet whose increment is to be downloaded: the tablet being
-    // replaced (request.ref_tablet_id) is the source of the data up to request.version, the version the increment
-    // starts from. Make the snapshot of it (see TSnapshotRequest.restore_local_source), load it into the tablet of the
-    // restore at once as the move does, release it, and make an empty snapshot dir (snapshot_path) for the increment
-    // to be downloaded into. The tablet then looks like the local tablet of the incremental restore. On failure
-    // no snapshot is left, the tablet may have been loaded.
+    // Atomic restore with partition level reuse, a tablet whose increment is to be downloaded, or a kept tablet
+    // (request.restore_kept_load): the tablet being replaced (request.ref_tablet_id) is the source of the data up to
+    // request.version, the version the increment starts from (the version kept). Make the snapshot of it (see
+    // TSnapshotRequest.restore_local_source), load it into the tablet of the restore at once as the move does,
+    // release it, and make an empty snapshot dir (snapshot_path) for the increment to be downloaded into (nothing,
+    // for a kept tablet). The tablet then looks like the local tablet of the incremental restore. On failure no
+    // snapshot is left, the tablet may have been loaded.
     Status make_local_source_snapshot_and_load(const TSnapshotRequest& request,
                                                std::string* snapshot_path, LocalSourceStats* stats);
 
@@ -436,6 +440,10 @@ public:
 
 private:
     // OK if the digest of the tablet at range.end_version equals the one of the backup (algorithm, schema and
+    // The move of an empty snapshot: the tablet must have the evidence of the load of the local source by this job
+    // (LOCAL_LOADED) and be at the version loaded, else an error of kRestoreNotRetryable. Reads the tablet only.
+    Status _confirm_local_source_loaded(const TabletSharedPtr& tablet);
+
     // status checked), else an error of kRestoreNotRetryable. Not for a unique key tablet.
     Status _check_appended_tablet_equals_backup(const TabletSharedPtr& tablet,
                                                 const TRestoreIncrementalRange& range,

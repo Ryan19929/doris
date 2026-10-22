@@ -1729,8 +1729,14 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
             snapshot_request.__isset.skip_manifest && snapshot_request.skip_manifest;
     LocalSourceStats local_source_stats;
     Status status;
-    if (local_source && snapshot_request.__isset.restore_incremental &&
-        snapshot_request.restore_incremental) {
+    // The local source is loaded into the tablet by the snapshot task itself: the base of an incremental partition
+    // (restore_incremental) and, with restore_kept_load, a kept partition.
+    const bool load_local_source =
+            local_source && ((snapshot_request.__isset.restore_incremental &&
+                              snapshot_request.restore_incremental) ||
+                             (snapshot_request.__isset.restore_kept_load &&
+                              snapshot_request.restore_kept_load));
+    if (load_local_source) {
         SnapshotLoader loader(engine, ExecEnv::GetInstance(),
                               snapshot_request.__isset.job_id ? snapshot_request.job_id : 0,
                               snapshot_request.tablet_id);
@@ -1845,6 +1851,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     if (status.ok() && local_source) {
         TDownloadStats stats;
         stats.__set_local_source_tablets(local_source_stats.tablets);
+        stats.__set_local_source_loaded_tablets(local_source_stats.loaded_tablets);
         stats.__set_local_source_linked_files(local_source_stats.linked_files);
         stats.__set_local_source_linked_bytes(local_source_stats.linked_bytes);
         stats.__set_local_source_copied_files(local_source_stats.copied_files);

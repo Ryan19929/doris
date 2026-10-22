@@ -2570,6 +2570,8 @@ Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
     {
         std::vector<std::string> files;
         RETURN_IF_ERROR(_get_existing_files_from_local(snapshot_path, &files));
+        bool has_hdr = false;
+        bool has_data = false;
         for (const auto& file : files) {
             if (file.ends_with(kIncrementHdrSuffix)) {
                 return restore_not_retryable(
@@ -2577,6 +2579,22 @@ Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
                                     "replace tablet {}",
                                     snapshot_path, file, tablet_id));
             }
+            if (file.ends_with(".hdr")) {
+                has_hdr = true;
+            } else if (file.ends_with(".dat") || file.ends_with(".idx")) {
+                has_data = true;
+            }
+        }
+        // An empty snapshot (no tablet meta, no data): the snapshot task loaded the local source into the tablet
+        // itself (TSnapshotRequest.restore_kept_load) and left nothing to move. The move is then the check of the
+        // evidence of the load, nothing is converted, removed or linked. A snapshot of the usual restore always has
+        // the tablet meta file.
+        if (!has_hdr && !has_data) {
+            RETURN_IF_ERROR(_confirm_local_source_loaded(tablet));
+            RETURN_IF_ERROR(write_loaded_tag(snapshot_path, tablet_id));
+            LOG(INFO) << "the empty snapshot " << snapshot_path << " of tablet " << tablet_id
+                      << " confirms the local source loaded by job " << _job_id;
+            return Status::OK();
         }
     }
 
@@ -2631,6 +2649,7 @@ Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
         VLOG_CRITICAL << "remove dir: " << tablet_path;
         std::filesystem::create_directory(tablet_path);
         VLOG_CRITICAL << "re-create dir: " << tablet_path;
+        restore_debug_delay("SnapshotLoader.move.delay_after_remove", tablet_id);
     } catch (const std::filesystem::filesystem_error& e) {
         std::stringstream ss;
         ss << "failed to move tablet path: " << tablet_path << ". err: " << e.what();
@@ -2671,12 +2690,46 @@ Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
         return Status::InternalError(ss.str());
     }
 
+    restore_debug_delay("SnapshotLoader.move.delay_after_load", tablet_id);
+
     // mark the snapshot path as loaded
     RETURN_IF_ERROR(write_loaded_tag(snapshot_path, tablet_id));
 
     LOG(INFO) << "finished to reload header of tablet: " << tablet_id;
 
     return status;
+}
+
+Status SnapshotLoader::_confirm_local_source_loaded(const TabletSharedPtr& tablet) {
+    const int64_t tablet_id = tablet->tablet_id();
+    // Debug point: the evidence is dropped before the check, as a tablet overwritten by a clone looks (params:
+    // tablet_id, any if unset).
+    DBUG_EXECUTE_IF("SnapshotLoader.confirm_local_source.clear_stage", {
+        auto ptablet = dp->param<int64_t>("tablet_id", 0);
+        if (ptablet == 0 || ptablet == tablet_id) {
+            std::lock_guard wrlock(tablet->get_header_lock());
+            tablet->tablet_meta()->clear_restore_stage();
+            tablet->save_meta();
+        }
+    });
+    RestoreTabletState state = read_restore_tablet_state(tablet);
+    if (!state.has_stage || state.stage.job_id() != _job_id) {
+        return restore_not_retryable(fmt::format(
+                "tablet {} has no evidence that the restore job {} loaded it (evidence of job {}), "
+                "the empty snapshot can not confirm it",
+                tablet_id, _job_id, state.has_stage ? state.stage.job_id() : -1));
+    }
+    if (state.stage.stage() != RestoreStagePB::LOCAL_LOADED) {
+        return restore_not_retryable(
+                fmt::format("tablet {} has the evidence of job {} at stage {}, not of a load",
+                            tablet_id, _job_id, static_cast<int>(state.stage.stage())));
+    }
+    if (state.max_version != state.stage.base_version()) {
+        return restore_not_retryable(
+                fmt::format("tablet {} was loaded to version {} by job {} but its max version is {}",
+                            tablet_id, state.stage.base_version(), _job_id, state.max_version));
+    }
+    return Status::OK();
 }
 
 Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotRequest& request,
@@ -2695,6 +2748,10 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
                             request.tablet_id));
     }
     const int64_t base_version = request.version;
+    // One load of a tablet at a time (the BE does not run a task twice by its signature, this is in case two tasks
+    // of the tablet are run anyway): the second one finds the evidence of the first and skips the load. The lock
+    // of the snapshot path taken by the load is another key.
+    auto tablet_guard = LocalSnapshotLock::instance().acquire(tablet->tablet_path());
     bool already_loaded = false;
     {
         // A resent task: judge the tablet by the evidence of this job, never by the shape of the tablet.
@@ -2734,6 +2791,9 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
     } else {
         TSnapshotRequest source_request = request;
         source_request.__set_restore_incremental(false);
+        // The snapshot of the source lives for the load only: if the BE dies after the load and before the release
+        // below, the sweep removes it after this timeout (the one of the request is the timeout of the whole job).
+        source_request.__set_timeout(config::restore_local_source_snapshot_timeout_s);
         std::string source_path;
         bool allow_incremental_clone = false; // not used
         RETURN_IF_ERROR(_engine.snapshot_mgr()->make_snapshot(source_request, &source_path,
@@ -2753,9 +2813,15 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
         RETURN_IF_ERROR(move_with_restore_stage(
                 fmt::format("{}/{}/{}", source_path, request.tablet_id, request.schema_hash),
                 tablet, true, &stage));
+        if (stats != nullptr) {
+            stats->loaded_tablets++;
+        }
     }
+    // The empty snapshot dir: the increment is downloaded into it, nothing for a kept partition. Without
+    // restore_incremental the snapshot would hold the files of the tablet just loaded.
     TSnapshotRequest empty_request = request;
     empty_request.__set_restore_local_source(false);
+    empty_request.__set_restore_incremental(true);
     bool allow_incremental_clone = false; // not used
     return _engine.snapshot_mgr()->make_snapshot(empty_request, snapshot_path,
                                                  &allow_incremental_clone, nullptr);

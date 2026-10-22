@@ -90,6 +90,8 @@ private:
 // took from it: the files of its rowsets, hard linked if the two tablets are on the same disk, otherwise copied.
 struct LocalSourceStats {
     int64_t tablets = 0;
+    // of tablets, those loaded into the tablet of the restore by the snapshot task itself
+    int64_t loaded_tablets = 0;
     int64_t linked_files = 0;
     int64_t linked_bytes = 0;
     int64_t copied_files = 0;

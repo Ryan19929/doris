@@ -507,6 +507,11 @@ struct TSnapshotRequest {
     // backup only: do not write the manifest of the snapshot (the frontend config enable_backup_manifest is false),
     // list_files only lists the files
     20: optional bool skip_manifest
+    // restore only, with restore_local_source (atomic restore, a partition that keeps its local data): load the local
+    // source into the tablet at once as the move of the restore does (the evidence is saved with the tablet meta,
+    // see job_id) and make an empty snapshot dir, so that the move of the restore has nothing to move. Without it
+    // the snapshot holds the files of the local source and the move of the restore loads them into the tablet.
+    21: optional bool restore_kept_load
 }
 
 // Where to read the decomposed digest file (rdigest) of the tablet of a backup, for the incremental restore
