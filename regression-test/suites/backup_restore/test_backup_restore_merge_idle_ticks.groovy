@@ -183,22 +183,22 @@ suite("test_backup_restore_merge_idle_ticks", "backup_restore,nonConcurrent") {
 
     // ---- 3. the pause debug point still stops a merged round, set before the job is created ----
     if (debugPoints) {
-        String snap3 = "${suiteName}_3"
+        // the label of a restore is the name of the backup snapshot: the same backup is restored once more
         try {
-            GetDebugPoint().enableDebugPointForAllFEs("FE.PAUSE_NON_PENDING_RESTORE_JOB", [value: snap3])
-            startRestore(snap3, backup2.timestamp)
+            GetDebugPoint().enableDebugPointForAllFEs("FE.PAUSE_NON_PENDING_RESTORE_JOB", [value: snap2])
+            startRestore(snap2, backup2.timestamp)
             // the job is created and its replicas are made, then it is paused at the first state after that
             sleep(Math.max(3 * tickMs, 20000))
-            def paused = jobOf(snap3)
+            def paused = jobOf(snap2)
             assertTrue(paused != null && paused.State != "FINISHED" && paused.State != "CANCELLED"
                     && paused.State != "PENDING", "state: ${paused?.State}")
             String state = paused.State
             sleep(Math.max(3 * tickMs, 10000))
-            assertEquals(state, jobOf(snap3).State)
+            assertEquals(state, jobOf(snap2).State)
         } finally {
             GetDebugPoint().disableDebugPointForAllFEs("FE.PAUSE_NON_PENDING_RESTORE_JOB")
         }
-        job = waitRestoreDone(snap3, 600)
+        job = waitRestoreDone(snap2, 600)
         assertKeptAll(job)
     } else {
         logger.info("Config.enable_debug_points=true is required for the pause case, skip it")

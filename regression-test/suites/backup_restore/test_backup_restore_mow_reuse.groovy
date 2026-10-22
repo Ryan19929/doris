@@ -112,10 +112,13 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
         return parts.collectEntries { [(it.PartitionName): it.VisibleVersion as String] }
     }
     // the local data sizes are known by the report of the backends
+    // The kept bytes of SHOW RESTORE are the data sizes of the local replicas, which the tablet stat of the FE
+    // sets every tablet_stat_update_interval_second: wait until every tablet has one (the replicas made by a restore
+    // start with no size and no rows).
     def waitDataSize = { String db, String tbl ->
         for (int i = 0; i < 30; ++i) {
             def tablets = sql_return_maparray "SHOW TABLETS FROM ${db}.${tbl}"
-            if (!tablets.any { (it.LocalDataSize as long) == 0 && (it.RowCount as long) > 0 }) {
+            if (!tablets.any { (it.LocalDataSize as long) == 0 }) {
                 return
             }
             sleep(5000)

@@ -198,8 +198,8 @@ suite("test_backup_restore_atomic_local_source_docker", "backup_restore,docker")
             }
             assertEquals(state, jobState(snapshot))
         }
-        def loadedTablets = { job ->
-            def stats = new JsonSlurper().parseText(job.DownloadStats as String)
+        def loadedTablets = { row ->
+            def stats = new JsonSlurper().parseText(row.DownloadStats as String)
             return (stats.atomic_local?.loaded_tablets ?: 0) as int
         }
 

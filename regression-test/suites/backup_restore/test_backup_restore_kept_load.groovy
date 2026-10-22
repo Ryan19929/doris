@@ -266,9 +266,8 @@ suite("test_backup_restore_kept_load", "backup_restore,nonConcurrent") {
         enableDebug("WorkPool.finish_task.lost", [task_type: taskMakeSnapshot, times: 2])
         job = restoreAndWait(snap0, ts0, dupTable)
         stats = assertAllKept(job)
-        // the resent tasks report no load (the tablet is loaded already), the lost reports are not counted
-        int loaded = stats.atomic_local.loaded_tablets as int
-        assertTrue(loaded > 0 && loaded <= keptReplicas, "loaded tablets: ${loaded}")
+        // the resent tasks find the tablets loaded and count them, so the sums still add up to every replica
+        assertEquals(keptReplicas, stats.atomic_local.loaded_tablets as int)
         assertSameAsSource(dupTable)
     } finally {
         disableDebug("WorkPool.finish_task.lost")
