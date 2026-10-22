@@ -224,7 +224,12 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
         for (AbstractJob job : getAllCurrentJobs()) {
             job.setEnv(env);
-            job.run();
+            try {
+                job.run();
+            } catch (Throwable t) {
+                // the other jobs still run this round
+                LOG.warn("failed to run the backup or restore job {}", job, t);
+            }
         }
     }
 

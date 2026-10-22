@@ -263,8 +263,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // The prefix of the error message of a backend which says that retrying the task cannot succeed.
     public static final String RESTORE_NOT_RETRYABLE = "[RESTORE_NOT_RETRYABLE]";
     // The version of the restore reuse protocol of this build, reported in the heartbeat of the frontend and the
-    // backend. A node of an old version reports none (0).
-    public static final int RESTORE_REUSE_CAPABILITY_REPORTED = 2;
+    // backend. A node of an old version reports none (0). 3: the load of a kept partition by the snapshot task
+    // (TSnapshotRequest.restore_kept_load), which is not required of any node: a backend without it loads by the
+    // move as before, and the move request is the same.
+    public static final int RESTORE_REUSE_CAPABILITY_REPORTED = 3;
     // What partition level reuse needs of every node: 1, the RESTORE_DIGEST task, the local source snapshot and the
     // incremental download, which an old node does not understand.
     public static final int RESTORE_REUSE_CAPABILITY_MIN_REQUIRED = 1;
@@ -661,7 +663,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
-        if (task.getIncrementalRange() != null && task.isLocalSourceLoaded() && task.getJobId() == jobId
+        if ((task.getIncrementalRange() != null || task.isLocalSourceKept()) && task.isLocalSourceLoaded()
+                && task.getJobId() == jobId
                 && cancelOnLocalSourceTaskFailure(task, request, RestoreJobState.COMMITTING)) {
             return false;
         }
@@ -682,7 +685,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
     /**
      * The failure of a task of the local source (the snapshot task which loads the local source into a staging
-     * tablet, the move task which appends the increment): other tasks are resent without end, but these two cannot
+     * tablet, the move task which appends the increment or confirms a kept tablet): other tasks are resent without
+     * end, but these cannot
      * succeed forever if the tablet is not what the job expects, so the job is cancelled (an atomic restore leaves
      * the original table alone) when
      *  - the backend says that retrying is useless (the error has RESTORE_NOT_RETRYABLE), or
@@ -1714,6 +1718,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     }
                     if (atomicDecision != null) {
                         task.setRestoreLocalSource(true);
+                        if (atomicDecision.kept && Config.restore_reuse_kept_load_at_snapshot) {
+                            // loaded into the staging tablet by the snapshot task, the move only confirms it
+                            task.setRestoreKeptLoad(true);
+                        }
                     }
                     if (isIncrementalPartition(tbl.getId(), part.getId())) {
                         // an empty dir, only the increment is downloaded into it
@@ -2634,6 +2642,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     backupTabletIds = buildBackupTabletIds();
                 }
                 task.setBackupLogicalDigest(getBackupLogicalDigest(backupTabletIds, info.getTabletId()));
+            } else {
+                RestoreReuseResult.Decision kept = getAtomicLocalDecision(info.getTblId(), info.getPartitionId());
+                if (kept != null && kept.kept) {
+                    // The snapshot task may have loaded the tablet (restore_reuse_kept_load_at_snapshot), then the
+                    // backend judges the move by the evidence of the load: its failure is converged like the one of
+                    // an append. The request of the move is the same either way.
+                    task.setLocalSourceKept(true);
+                    task.setLocalSourceLoaded(true);
+                }
             }
             batchTask.addTask(task);
             unfinishedSignatureToId.put(signature, info.getTabletId());
