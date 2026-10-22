@@ -54,6 +54,7 @@
 #include "io/fs/local_file_system.h"
 #include "runtime/exec_env.h"
 #include "runtime/snapshot_loader.h"
+#include "runtime/thread_context.h"
 #include "service/backend_options.h"
 #include "storage/data_dir.h"
 #include "storage/delete/delete_handler.h"
@@ -6433,6 +6434,7 @@ TEST_F(RestoreKeptLoadTest, KeptLoadIsSerializedPerTablet) {
     std::atomic<int64_t> loaded_tablets {0};
     std::atomic<int> failures {0};
     auto run = [&]() {
+        SCOPED_ATTACH_TASK(ExecEnv::GetInstance()->orphan_mem_tracker());
         SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
         TSnapshotRequest req = kept_request(p, 1);
         std::string dir_path;

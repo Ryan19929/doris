@@ -43,10 +43,10 @@ import org.apache.doris.catalog.RestoreSource;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.TabletInvertedIndex;
 import org.apache.doris.common.Config;
-import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.ha.FrontendNodeType;
@@ -4006,6 +4006,7 @@ public class RestoreReuseTest {
     public void testKeptSnapshotTasksCarryTheKeptLoadFlag() {
         newHandler();
         boolean orig = Config.restore_reuse_kept_load_at_snapshot;
+        boolean origAtomic = Config.enable_restore_atomic_reuse;
         try {
             Config.restore_reuse_kept_load_at_snapshot = true;
             RestoreJob job = atomicKeptJob();
@@ -4032,6 +4033,7 @@ public class RestoreReuseTest {
             Assertions.assertTrue(job.cancel().ok());
             // the switch off: the plain local snapshot, the move loads it
             Config.restore_reuse_kept_load_at_snapshot = false;
+            submitted.clear();
             job = atomicKeptJob();
             for (SnapshotTask task : snapshotTasks(submitted)) {
                 Assertions.assertTrue(task.isRestoreLocalSource());
@@ -4041,6 +4043,7 @@ public class RestoreReuseTest {
             Assertions.assertTrue(job.cancel().ok());
             // a snapshot of the usual restore has none of it
             Config.enable_restore_atomic_reuse = false;
+            submitted.clear();
             RestoreJob plain = newAtomicJob(selfBackupJobInfo(), "full");
             Deencapsulation.invoke(plain, "checkAndPrepareMeta");
             Deencapsulation.invoke(plain, "allReplicasCreated");
@@ -4050,6 +4053,7 @@ public class RestoreReuseTest {
             }
         } finally {
             Config.restore_reuse_kept_load_at_snapshot = orig;
+            Config.enable_restore_atomic_reuse = origAtomic;
         }
     }
 
