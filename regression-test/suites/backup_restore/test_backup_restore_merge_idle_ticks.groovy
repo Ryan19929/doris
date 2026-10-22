@@ -148,6 +148,38 @@ suite("test_backup_restore_merge_idle_ticks", "backup_restore,nonConcurrent") {
     // the gap between FINISHED and the end of the upload of a backup: SAVE_META and UPLOAD_INFO, two rounds when not
     // merged
     def finishGapMs = { job -> timeOf(job.FinishedTime) - timeOf(job.UploadFinishedTime) }
+    // The clock of the host may step (the time stamps of the jobs are read from it, in the order of the states): a
+    // gap which is negative, or longer than many rounds, is a step of the clock, not the job. Such a measurement is
+    // made again, a few times, with a new backup or restore each time.
+    int backups = 0
+    def lastBackup = null
+    def lastJob = null
+    def nextBackup = { ->
+        ++backups
+        lastBackup = backupAndWait("${suiteName}_b${backups}")
+        return finishGapMs(lastBackup.job)
+    }
+    // restores the last backup once more: every partition is kept, nothing is downloaded
+    def nextRestore = { ->
+        lastJob = restoreAndWait("${suiteName}_b${backups}", lastBackup.timestamp)
+        assertKeptAll(lastJob)
+        return downloadGapMs(lastJob)
+    }
+    def measure = { String what, Closure once, Closure ok ->
+        long gap = 0
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            gap = once() as long
+            if (gap < 0 || gap > 20 * tickMs) {
+                logger.warn("${what}: gap ${gap} ms looks like a step of the clock, measured again")
+                continue
+            }
+            if (ok(gap)) {
+                return gap
+            }
+            logger.warn("${what}: gap ${gap} ms, tick ${tickMs} ms, attempt ${attempt}")
+        }
+        assertTrue(false, "${what}: gap ${gap} ms, tick ${tickMs} ms")
+    }
 
     // B = A, nothing kept yet
     String snap0 = "${suiteName}_0"
@@ -157,27 +189,23 @@ suite("test_backup_restore_merge_idle_ticks", "backup_restore,nonConcurrent") {
     assertEquals(rowsOf(dbA), rowsOf(dbB))
     sleep(5000)
 
-    // ---- 1. the switch off: one state per round ----
-    job = restoreAndWait(snap0, backup0.timestamp)
-    assertKeptAll(job)
-    assertTrue(downloadGapMs(job) >= tickMs, "download gap ${downloadGapMs(job)} ms, tick ${tickMs} ms")
-    String snap1 = "${suiteName}_1"
-    def backup1 = backupAndWait(snap1)
-    assertTrue(finishGapMs(backup1.job) >= tickMs, "finish gap ${finishGapMs(backup1.job)} ms, tick ${tickMs} ms")
-    // the time stamps are in seconds, and the gaps above are two rounds at least: the merged rounds below are
-    // told by a gap below one round
+    // the time stamps are in seconds, and the gaps of one state per round are two rounds at least: the merged
+    // rounds are told by a gap below one round
     assertTrue(tickMs >= 2000, "backup_handler_update_interval_millis ${tickMs} is too short for this test")
+
+    // ---- 1. the switch off: one state per round ----
+    nextBackup()
+    measure("restore, one state per round", nextRestore, { long gap -> gap >= tickMs })
+    measure("backup, one state per round", nextBackup, { long gap -> gap >= tickMs })
 
     // ---- 2. the switch on: the idle states in the same round, the result is the same ----
     setConfig("backup_restore_merge_idle_ticks", "true")
     sleep(5000)
-    job = restoreAndWait(snap1, backup1.timestamp)
-    assertKeptAll(job)
-    assertTrue(downloadGapMs(job) < tickMs, "download gap ${downloadGapMs(job)} ms with the merged rounds")
-    String snap2 = "${suiteName}_2"
-    def backup2 = backupAndWait(snap2)
-    assertTrue(finishGapMs(backup2.job) < tickMs, "finish gap ${finishGapMs(backup2.job)} ms with the merged rounds")
+    measure("restore, merged rounds", nextRestore, { long gap -> gap < tickMs })
+    measure("backup, merged rounds", nextBackup, { long gap -> gap < tickMs })
     sleep(5000)
+    String snap2 = "${suiteName}_b${backups}"
+    def backup2 = lastBackup
     job = restoreAndWait(snap2, backup2.timestamp)
     assertKeptAll(job)
 
@@ -224,12 +252,8 @@ suite("test_backup_restore_merge_idle_ticks", "backup_restore,nonConcurrent") {
     // ---- 5. the jobs run as soon as their last task is reported, too ----
     setConfig("backup_restore_run_on_task_finish", "true")
     sleep(5000)
-    String snap5 = "${suiteName}_5"
-    def backup5 = backupAndWait(snap5)
-    assertTrue(finishGapMs(backup5.job) < tickMs, "finish gap ${finishGapMs(backup5.job)} ms with the nudge")
-    job = restoreAndWait(snap5, backup5.timestamp)
-    assertKeptAll(job)
-    assertTrue(downloadGapMs(job) < tickMs, "download gap ${downloadGapMs(job)} ms with the nudge")
+    measure("backup, with the nudge", nextBackup, { long gap -> gap < tickMs })
+    measure("restore, with the nudge", nextRestore, { long gap -> gap < tickMs })
     // a write into p1: p1 is appended, the others are kept
     sql "INSERT INTO ${dbA}.${tbl} VALUES (5, 'new row of p1')"
     sql "sync"

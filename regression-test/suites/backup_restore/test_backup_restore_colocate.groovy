@@ -37,9 +37,19 @@ suite("test_backup_restore_colocate", "backup_restore,external") {
         }
     }
 
+    // A restore places a few replicas off the backend sequence of the group, which the colocate checker (every
+    // tablet_checker_interval_ms) marks and the balancer repairs; the group counts as stable until the checker
+    // looks at it. So the health is polled until the mismatches are gone, rather than read once.
     def checkColocateTabletHealth = { db_name ->
-        def result = showTabletHealth.call(db_name)
-        log.info(result as String)
+        def result = null
+        for (int i = 0; i < 24; ++i) {
+            result = showTabletHealth.call(db_name)
+            log.info(result as String)
+            if (result != null && (result.ColocateMismatchNum as int) == 0) {
+                return
+            }
+            sleep(5000)
+        }
         assertNotNull(result)
         assertTrue(result.ColocateMismatchNum as int == 0)
     }
@@ -376,9 +386,19 @@ suite("test_backup_restore_colocate_with_partition", "backup_restore") {
         }
     }
 
+    // A restore places a few replicas off the backend sequence of the group, which the colocate checker (every
+    // tablet_checker_interval_ms) marks and the balancer repairs; the group counts as stable until the checker
+    // looks at it. So the health is polled until the mismatches are gone, rather than read once.
     def checkColocateTabletHealth = { db_name ->
-        def result = showTabletHealth.call(db_name)
-        log.info(result as String)
+        def result = null
+        for (int i = 0; i < 24; ++i) {
+            result = showTabletHealth.call(db_name)
+            log.info(result as String)
+            if (result != null && (result.ColocateMismatchNum as int) == 0) {
+                return
+            }
+            sleep(5000)
+        }
         assertNotNull(result)
         assertTrue(result.ColocateMismatchNum as int == 0)
     }
