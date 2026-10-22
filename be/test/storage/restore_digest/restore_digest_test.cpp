@@ -40,6 +40,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -6351,6 +6352,213 @@ TEST_F(RestoreStageTest, DelayDebugPointsDelayTheTaskOfTheTabletOnly) {
                 ASSERT_TRUE(loader.append_increment(p.dir, loaded, p.range, &p.backup_digest).ok());
             }),
             400);
+}
+
+// The kept partition of an atomic restore loaded by the snapshot task (TSnapshotRequest.restore_kept_load), and the
+// move of the empty snapshot it leaves, which only checks the evidence of the load.
+class RestoreKeptLoadTest : public RestoreStageTest {
+protected:
+    TSnapshotRequest kept_request(const Prepared& p, int64_t job_id) {
+        TSnapshotRequest req = local_source_request(p.origin, p.target, 3);
+        req.__set_restore_kept_load(true);
+        req.__set_job_id(job_id);
+        return req;
+    }
+
+    // the snapshot task of a kept partition: loads the origin at 3 into the target, returns the empty dir
+    Status load_kept(Prepared& p, SnapshotLoader& loader, int64_t job_id, LocalSourceStats* stats) {
+        std::string dir_path;
+        Status st = loader.make_local_source_snapshot_and_load(kept_request(p, job_id), &dir_path,
+                                                               stats);
+        if (st.ok()) {
+            p.dir = fmt::format("{}/{}/{}", dir_path, p.target->tablet_id(),
+                                p.target->schema_hash());
+        }
+        return st;
+    }
+
+    bool dir_is_empty(const std::string& dir) {
+        std::vector<io::FileInfo> files;
+        bool exists = false;
+        EXPECT_TRUE(io::global_local_filesystem()->list(dir, true, &files, &exists).ok());
+        return exists && files.empty();
+    }
+};
+
+TEST_F(RestoreKeptLoadTest, KeptLoadWritesTheEvidenceAndReturnsAnEmptyDir) {
+    Prepared p = prepare(Kind::DUP, 7901);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    size_t dirs = snapshot_dirs(p.target);
+    auto origin_files = tablet_files(p.origin);
+    LocalSourceStats stats;
+    ASSERT_TRUE(load_kept(p, loader, 1, &stats).ok());
+    EXPECT_EQ(1, stats.tablets);
+    EXPECT_EQ(1, stats.loaded_tablets);
+    EXPECT_GT(stats.linked_files + stats.copied_files, 0);
+    // the tablet is the origin at the kept version, with the evidence of the load
+    auto loaded = current(p.target);
+    EXPECT_EQ(3, loaded->max_version_unlocked());
+    RestoreStagePB stage = stage_of(p.target);
+    EXPECT_EQ(1, stage.job_id());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage.stage());
+    EXPECT_EQ(3, stage.base_version());
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
+    // the snapshot of the local source is released, the snapshot dir is empty: nothing to move
+    EXPECT_EQ(dirs + 1, snapshot_dirs(p.target));
+    EXPECT_TRUE(dir_is_empty(p.dir));
+    // the origin is not changed
+    EXPECT_EQ(origin_files, tablet_files(p.origin));
+    EXPECT_EQ(3, p.origin->max_version_unlocked());
+}
+
+TEST_F(RestoreKeptLoadTest, KeptLoadResentIsSkipped) {
+    Prepared p = prepare(Kind::DUP, 7911);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load_kept(p, loader, 1, nullptr).ok());
+    auto files = tablet_files(current(p.target));
+    TabletUid uid = current(p.target)->tablet_uid();
+    LocalSourceStats again;
+    ASSERT_TRUE(load_kept(p, loader, 1, &again).ok());
+    EXPECT_EQ(0, again.tablets);
+    EXPECT_EQ(0, again.loaded_tablets);
+    EXPECT_EQ(files, tablet_files(current(p.target)));
+    EXPECT_EQ(uid, current(p.target)->tablet_uid());
+    EXPECT_TRUE(dir_is_empty(p.dir));
+}
+
+TEST_F(RestoreKeptLoadTest, KeptLoadIsSerializedPerTablet) {
+    Prepared p = prepare(Kind::DUP, 7921);
+    // two tasks of the same tablet at once: one loads, the other finds the evidence and skips
+    std::atomic<int64_t> loaded_tablets {0};
+    std::atomic<int> failures {0};
+    auto run = [&]() {
+        SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+        TSnapshotRequest req = kept_request(p, 1);
+        std::string dir_path;
+        LocalSourceStats stats;
+        Status st = loader.make_local_source_snapshot_and_load(req, &dir_path, &stats);
+        if (!st.ok()) {
+            ++failures;
+        }
+        loaded_tablets += stats.loaded_tablets;
+    };
+    std::thread t1(run);
+    std::thread t2(run);
+    t1.join();
+    t2.join();
+    EXPECT_EQ(0, failures.load());
+    EXPECT_EQ(1, loaded_tablets.load());
+    EXPECT_EQ(3, current(p.target)->max_version_unlocked());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
+}
+
+TEST_F(RestoreKeptLoadTest, MoveOnAnEmptyDirConfirmsTheLoadedTablet) {
+    Prepared p = prepare(Kind::DUP, 7931);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load_kept(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    auto files = tablet_files(loaded);
+    TabletUid uid = loaded->tablet_uid();
+    // the move of the restore, the plain request: nothing is moved, the evidence is checked
+    Status st = loader.move(p.dir, loaded, true);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(files, tablet_files(current(p.target)));
+    EXPECT_EQ(uid, current(p.target)->tablet_uid());
+    EXPECT_EQ(3, current(p.target)->max_version_unlocked());
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
+    // resent: ok again
+    st = loader.move(p.dir, current(p.target), true);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
+}
+
+TEST_F(RestoreKeptLoadTest, MoveOnAnEmptyDirRefusesWithoutTheRightEvidence) {
+    Prepared p = prepare(Kind::DUP, 7941);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load_kept(p, loader, 1, nullptr).ok());
+    auto files = tablet_files(current(p.target));
+    // the evidence of another job
+    SnapshotLoader other(*_engine, ExecEnv::GetInstance(), 2L, 2L);
+    Status st = other.move(p.dir, current(p.target), true);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    // appended, not loaded
+    mark_loaded(current(p.target), 1, 3, RestoreStagePB::APPENDED, 6);
+    st = loader.move(p.dir, current(p.target), true);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    // loaded to another version than the tablet is at
+    mark_loaded(current(p.target), 1, 2);
+    st = loader.move(p.dir, current(p.target), true);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    // the evidence dropped, as a tablet overwritten by a clone (the debug point)
+    mark_loaded(current(p.target), 1, 3);
+    debug_on();
+    Defer defer([this]() { debug_off(); });
+    DebugPoints::instance()->add_with_params(
+            "SnapshotLoader.confirm_local_source.clear_stage",
+            {{"tablet_id", std::to_string(p.target->tablet_id())}});
+    st = loader.move(p.dir, current(p.target), true);
+    EXPECT_TRUE(not_retryable(st)) << st;
+    EXPECT_FALSE(current(p.target)->tablet_meta()->has_restore_stage());
+    DebugPoints::instance()->clear();
+    // nothing was moved by the refused tasks
+    EXPECT_EQ(files, tablet_files(current(p.target)));
+    EXPECT_EQ(3, current(p.target)->max_version_unlocked());
+    EXPECT_TRUE(dir_is_empty(p.dir));
+}
+
+// a snapshot with the tablet meta (the one a backend without restore_kept_load makes) replaces the tablet as before,
+// whether the tablet has the evidence of a load or not
+TEST_F(RestoreKeptLoadTest, MoveOnAFullSnapshotDirReplacesEvenWithoutEvidence) {
+    Prepared p = prepare(Kind::DUP, 7951);
+    // no evidence: the plain local snapshot and move of the kept partition
+    LocalSourceStats stats = keep(p.origin, p.target, 3);
+    EXPECT_EQ(1, stats.tablets);
+    EXPECT_EQ(0, stats.loaded_tablets);
+    EXPECT_EQ(3, current(p.target)->max_version_unlocked());
+    EXPECT_FALSE(current(p.target)->tablet_meta()->has_restore_stage());
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
+    // with the evidence of a load: replaced as well, the evidence of the source is dropped by the move
+    mark_loaded(current(p.target), 1, 3);
+    stats = keep(p.origin, current(p.target), 3);
+    EXPECT_EQ(1, stats.tablets);
+    EXPECT_EQ(3, current(p.target)->max_version_unlocked());
+    EXPECT_FALSE(current(p.target)->tablet_meta()->has_restore_stage());
+}
+
+TEST_F(RestoreKeptLoadTest, KeptConfirmAfterCompactionIsOk) {
+    Prepared p = prepare(Kind::DUP, 7961);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    ASSERT_TRUE(load_kept(p, loader, 1, nullptr).ok());
+    auto loaded = current(p.target);
+    compact(loaded, loaded->tablet_schema(), 2, 3);
+    EXPECT_EQ(3, loaded->max_version_unlocked());
+    Status st = loader.move(p.dir, loaded, true);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(RestoreStagePB::LOCAL_LOADED, stage_of(p.target).stage());
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
+}
+
+TEST_F(RestoreKeptLoadTest, MergeOnWriteKeptLoadThenCompactionThenConfirmEqualsSource) {
+    Prepared p = prepare(Kind::MOW, 7971);
+    SnapshotLoader loader(*_engine, ExecEnv::GetInstance(), 1L, 2L);
+    LocalSourceStats stats;
+    ASSERT_TRUE(load_kept(p, loader, 1, &stats).ok());
+    EXPECT_EQ(1, stats.loaded_tablets);
+    auto loaded = current(p.target);
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
+    compact(loaded, loaded->tablet_schema(), 2, 3);
+    Status st = loader.move(p.dir, loaded, true);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(3, current(p.target)->max_version_unlocked());
+    EXPECT_TRUE(digests_equal(tablet_digest(p.origin->tablet_id(), 3),
+                              tablet_digest(p.target->tablet_id(), 3)));
 }
 
 } // namespace doris
