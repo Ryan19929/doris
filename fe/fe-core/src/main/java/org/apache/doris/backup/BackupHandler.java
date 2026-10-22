@@ -77,6 +77,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -114,6 +117,16 @@ public class BackupHandler extends MasterDaemon implements Writable {
     private boolean isInit = false;
 
     private Env env;
+
+    // Config.backup_restore_run_on_task_finish: the jobs nudged by the report of their last task are run by this
+    // one thread, once per nudge (nudgePending dedupes the nudges of a job until it is run). The thread is started
+    // on the first nudge only.
+    private final ExecutorService nudgeExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "backup-restore-nudge");
+        t.setDaemon(true);
+        return t;
+    });
+    private final Set<Long> nudgePending = ConcurrentHashMap.newKeySet();
 
     // map to store backup info, key is label name, value is the BackupJob
     // this map not present in persist && only in fe memory
@@ -190,6 +203,41 @@ public class BackupHandler extends MasterDaemon implements Writable {
     @VisibleForTesting
     Set<Long> getJobsWithLocalSource() {
         return Collections.unmodifiableSet(jobsWithLocalSource);
+    }
+
+    /**
+     * A job says that the last task its state waits for is reported: run it now (on the nudge thread), if
+     * Config.backup_restore_run_on_task_finish. Only the id of the job is kept: when the nudge is run the job is
+     * looked up again, and it is run only if this frontend is still the master and the job is still the current one
+     * of its database, not done (the object may have been replaced by a replay, or evicted, meanwhile).
+     */
+    public void nudge(long dbId, long jobId) {
+        if (!Config.backup_restore_run_on_task_finish || !nudgePending.add(jobId)) {
+            return;
+        }
+        try {
+            nudgeExecutor.execute(() -> runNudgedJob(dbId, jobId));
+        } catch (RejectedExecutionException e) {
+            nudgePending.remove(jobId);
+            LOG.warn("failed to submit the nudge of job {}, it runs at the next round", jobId, e);
+        }
+    }
+
+    private void runNudgedJob(long dbId, long jobId) {
+        nudgePending.remove(jobId);
+        if (!isInit || env == null || !env.isMaster()) {
+            return;
+        }
+        AbstractJob job = getCurrentJob(dbId);
+        if (job == null || job.getJobId() != jobId || job.isDone()) {
+            return;
+        }
+        job.setEnv(env);
+        try {
+            job.run();
+        } catch (Throwable t) {
+            LOG.warn("failed to run the nudged backup or restore job {}", job, t);
+        }
     }
 
     /** Brings the entry of the job in jobsWithLocalSource in line with the state of the job object. */

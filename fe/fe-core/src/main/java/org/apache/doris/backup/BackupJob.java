@@ -432,6 +432,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     info, unfinishedTaskIds.size(), (oldValue != null), this);
         }
 
+        nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
         return oldValue != null;
     }
 
@@ -498,6 +499,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             LOG.debug("get finished upload snapshot task, unfinished tasks num: {}, remove result: {}. {}",
                     unfinishedTaskIds.size(), (oldValue != null), this);
         }
+        nudgeIfIdle(oldValue != null && unfinishedTaskIds.isEmpty());
         return oldValue != null;
     }
 

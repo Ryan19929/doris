@@ -447,6 +447,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 LOG.debug("get finished snapshot info: {}, unfinished tasks num: {}, remove result: {}. {}",
                           info, unfinishedSignatureToId.size(), this, removedTabletId);
             }
+            nudgeIfIdle(unfinishedSignatureToId.isEmpty());
             return true;
         }
         return false;
@@ -481,6 +482,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         digestResults.put(task.getSignature(), digest);
         judgeCandidate(candidate, false);
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 
@@ -526,6 +528,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         taskErrMsg.remove(task.getSignature());
         recordManifestCheck(task.getBackendId(), request);
         recordDownloadStats(task.getBackendId(), request);
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 
@@ -680,6 +683,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
 
         taskErrMsg.remove(task.getSignature());
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 

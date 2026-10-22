@@ -1712,6 +1712,13 @@ public class Config extends ConfigBase {
             + "If false (the default) one state per round, as before.")
     public static boolean backup_restore_merge_idle_ticks = false;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether a backup or restore job is run once more "
+            + "as soon as the last task the state waits for is reported by a backend, instead of at the next round "
+            + "of the backup handler (backup_handler_update_interval_millis later on average half of it). The run is "
+            + "done by one thread of the backup handler, on the master, for the current job of the database only. "
+            + "If false (the default) the job is run by the rounds only, as before.")
+    public static boolean backup_restore_run_on_task_finish = false;
+
 
     /**
      * Whether to enable cloud restore job.
