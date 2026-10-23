@@ -2948,9 +2948,10 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true, masterOnly = true, description = "Atomic restore with partition level reuse "
             + "(enable_restore_atomic_reuse): whether the snapshot task loads the local data of a kept partition into "
             + "the staging tablet at once (on the snapshot worker pool of the backend), so that the move task of the "
-            + "commit only checks it. If false the move task loads it, on the pool of one thread per backend, as "
-            + "before. A backend of an old version ignores it and loads by the move. Read when the snapshot tasks "
-            + "are sent, a running job is not affected by a change.")
+            + "commit only checks it. If false the move task loads it, on the pool of one thread per backend; a failed "
+            + "move of a kept partition is retried up to restore_local_source_task_max_retry times either way. A "
+            + "backend of an old version ignores it and loads by the move. Read when the snapshot tasks are sent, a "
+            + "running job is not affected by a change.")
     public static boolean restore_reuse_kept_load_at_snapshot = true;
 
     @ConfField(mutable = true, masterOnly = true, description = "Whether a restore job uses partition level reuse "

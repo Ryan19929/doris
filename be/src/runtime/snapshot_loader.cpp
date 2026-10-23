@@ -2570,8 +2570,6 @@ Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
     {
         std::vector<std::string> files;
         RETURN_IF_ERROR(_get_existing_files_from_local(snapshot_path, &files));
-        bool has_hdr = false;
-        bool has_data = false;
         for (const auto& file : files) {
             if (file.ends_with(kIncrementHdrSuffix)) {
                 return restore_not_retryable(
@@ -2579,17 +2577,12 @@ Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
                                     "replace tablet {}",
                                     snapshot_path, file, tablet_id));
             }
-            if (file.ends_with(".hdr")) {
-                has_hdr = true;
-            } else if (file.ends_with(".dat") || file.ends_with(".idx")) {
-                has_data = true;
-            }
         }
-        // An empty snapshot (no tablet meta, no data): the snapshot task loaded the local source into the tablet
+        // An empty snapshot (no file at all): the snapshot task loaded the local source into the tablet
         // itself (TSnapshotRequest.restore_kept_load) and left nothing to move. The move is then the check of the
         // evidence of the load, nothing is converted, removed or linked. A snapshot of the usual restore always has
         // the tablet meta file.
-        if (!has_hdr && !has_data) {
+        if (files.empty()) {
             RETURN_IF_ERROR(_confirm_local_source_loaded(tablet));
             RETURN_IF_ERROR(write_loaded_tag(snapshot_path, tablet_id));
             LOG(INFO) << "the empty snapshot " << snapshot_path << " of tablet " << tablet_id
@@ -2805,8 +2798,14 @@ Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotReques
         TSnapshotRequest source_request = request;
         source_request.__set_restore_incremental(false);
         // The snapshot of the source lives for the load only: if the BE dies after the load and before the release
-        // below, the sweep removes it after this timeout (the one of the request is the timeout of the whole job).
-        source_request.__set_timeout(config::restore_local_source_snapshot_timeout_s);
+        // below, the sweep removes it after this timeout. The sweep does not know the load is running, so it is
+        // never shorter than the timeout of the job (the one of the request): a slow load (a copy across the disks)
+        // is not removed under it.
+        int64_t source_timeout = config::restore_local_source_snapshot_timeout_s;
+        if (request.__isset.timeout) {
+            source_timeout = std::max<int64_t>(source_timeout, request.timeout);
+        }
+        source_request.__set_timeout(source_timeout);
         std::string source_path;
         bool allow_incremental_clone = false; // not used
         RETURN_IF_ERROR(_engine.snapshot_mgr()->make_snapshot(source_request, &source_path,

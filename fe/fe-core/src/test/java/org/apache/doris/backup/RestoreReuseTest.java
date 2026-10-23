@@ -4276,6 +4276,7 @@ public class RestoreReuseTest {
         boolean orig = Config.backup_restore_run_on_task_finish;
         try {
             Deencapsulation.setField(handler, "isInit", true);
+            Mockito.when(env.isReady()).thenReturn(true);
             Mockito.when(env.isMaster()).thenReturn(true);
             AbstractJob job = mockJob(7);
             Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, job);
@@ -4322,6 +4323,7 @@ public class RestoreReuseTest {
         try {
             Config.backup_restore_run_on_task_finish = true;
             Deencapsulation.setField(handler, "isInit", true);
+            Mockito.when(env.isReady()).thenReturn(true);
             Mockito.when(env.isMaster()).thenReturn(false);
             AbstractJob job = mockJob(7);
             Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, job);
@@ -4329,6 +4331,7 @@ public class RestoreReuseTest {
             drainNudges(handler);
             Mockito.verify(job, Mockito.never()).run();
             // the master, but the handler not initialized yet
+            Mockito.when(env.isReady()).thenReturn(true);
             Mockito.when(env.isMaster()).thenReturn(true);
             Deencapsulation.setField(handler, "isInit", false);
             handler.nudge(5, 7);
@@ -4346,6 +4349,7 @@ public class RestoreReuseTest {
         try {
             Config.backup_restore_run_on_task_finish = true;
             Deencapsulation.setField(handler, "isInit", true);
+            Mockito.when(env.isReady()).thenReturn(true);
             Mockito.when(env.isMaster()).thenReturn(true);
             AbstractJob old = mockJob(7);
             Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, old);

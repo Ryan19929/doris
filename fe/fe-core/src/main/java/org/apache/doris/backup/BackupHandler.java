@@ -225,7 +225,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     private void runNudgedJob(long dbId, long jobId) {
         nudgePending.remove(jobId);
-        if (!isInit || env == null || !env.isMaster()) {
+        // as the daemon: only a ready master runs the jobs
+        if (!isInit || env == null || !env.isReady() || !env.isMaster()) {
             return;
         }
         AbstractJob job = getCurrentJob(dbId);
