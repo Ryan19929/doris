@@ -138,8 +138,16 @@ public class BackupJobTest {
         }
     }
 
+    private boolean origMergeIdleTicks;
+    private boolean origRunOnTaskFinish;
+
     @BeforeEach
     public void setUp() {
+        // the tests step the job one state per run(); the merged rounds are tested with the switch set explicitly
+        origMergeIdleTicks = Config.backup_restore_merge_idle_ticks;
+        origRunOnTaskFinish = Config.backup_restore_run_on_task_finish;
+        Config.backup_restore_merge_idle_ticks = false;
+        Config.backup_restore_run_on_task_finish = false;
         repoMgr = Mockito.mock(RepositoryMgr.class);
         backupHandler = Mockito.mock(BackupHandler.class);
 
@@ -214,6 +222,8 @@ public class BackupJobTest {
 
     @AfterEach
     public void tearDown() {
+        Config.backup_restore_merge_idle_ticks = origMergeIdleTicks;
+        Config.backup_restore_run_on_task_finish = origRunOnTaskFinish;
         AgentTaskQueue.clearAllTasks();
         if (mockedEnvStatic != null) {
             mockedEnvStatic.close();
