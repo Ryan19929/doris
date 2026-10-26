@@ -1709,15 +1709,15 @@ public class Config extends ConfigBase {
             + "example the backup kept on local after its snapshots: UPLOAD_SNAPSHOT, UPLOADING, SAVE_META, "
             + "UPLOAD_INFO; the restore after its snapshots or its download: DOWNLOAD, COMMIT), instead of one state "
             + "per round of backup_handler_update_interval_millis. The edit logs are the same, in the same order. "
-            + "If false (the default) one state per round, as before.")
-    public static boolean backup_restore_merge_idle_ticks = false;
+            + "Enabled by default; if false one state per round, as before.")
+    public static boolean backup_restore_merge_idle_ticks = true;
 
     @ConfField(mutable = true, masterOnly = true, description = "Whether a backup or restore job is run once more "
             + "as soon as the last task the state waits for is reported by a backend, instead of at the next round "
             + "of the backup handler (backup_handler_update_interval_millis later on average half of it). The run is "
             + "done by one thread of the backup handler, on the master, for the current job of the database only. "
-            + "If false (the default) the job is run by the rounds only, as before.")
-    public static boolean backup_restore_run_on_task_finish = false;
+            + "Enabled by default; if false the job is run by the rounds only, as before.")
+    public static boolean backup_restore_run_on_task_finish = true;
 
 
     /**

@@ -24,9 +24,9 @@
 
 `BackupHandler` 每拍（`backup_handler_update_interval_millis`，默认 3 秒）对每个作业调一次 `run()`，`run()` 每拍只执行一个状态函数。keep_on_local 备份在快照完成后还要 4 拍（UPLOAD_SNAPSHOT、UPLOADING、SAVE_META、UPLOAD_INFO 各一拍，都不等 BE）；恢复在快照完成后要 1 拍发下载任务、下载完成后要 1 拍发 MOVE，没有要下载的东西时 DOWNLOADING 还白等 1 拍。每张表 6～7 拍，三表串行就是 18～21 拍。
 
-`backup_restore_merge_idle_ticks`（默认 false）打开后，`run()` 的 switch 外包一层循环：状态函数执行后，若 `status` 正常、状态变了、新状态不需要等 BE（或等待集合已空），就在同一拍继续；备份一拍最多 5 个状态，恢复 4 个。状态函数本身和它们写的编辑日志一处不改，所以日志条目与顺序逐条相同，`replayRun` 零改动；恢复在每个合并步之前都重做 `checkIfNeedCancel` 和暂停调试点的检查；`status` 不复位，UPLOAD_INFO 失败仍靠下一拍重试。关闭时循环只跑一次，逐字节等价于原行为。
+`backup_restore_merge_idle_ticks`（默认 true）打开后，`run()` 的 switch 外包一层循环：状态函数执行后，若 `status` 正常、状态变了、新状态不需要等 BE（或等待集合已空），就在同一拍继续；备份一拍最多 5 个状态，恢复 4 个。状态函数本身和它们写的编辑日志一处不改，所以日志条目与顺序逐条相同，`replayRun` 零改动；恢复在每个合并步之前都重做 `checkIfNeedCancel` 和暂停调试点的检查；`status` 不复位，UPLOAD_INFO 失败仍靠下一拍重试。关闭时循环只跑一次，逐字节等价于原行为。
 
-`backup_restore_run_on_task_finish`（默认 false）：某状态等待的最后一个 BE 任务回报时，作业调用 `BackupHandler.nudge(dbId, jobId)`，由 handler 的一个线程立刻跑一次 `run()`，省掉等下一拍的平均半拍。只记 id，执行前重新查找作业，只在本 FE 仍是 Master、作业仍是库里当前作业且未结束时才运行，所以回放替换或淘汰的作业对象不会被运行。
+`backup_restore_run_on_task_finish`（默认 true）：某状态等待的最后一个 BE 任务回报时，作业调用 `BackupHandler.nudge(dbId, jobId)`，由 handler 的一个线程立刻跑一次 `run()`，省掉等下一拍的平均半拍。只记 id，执行前重新查找作业，只在本 FE 仍是 Master、作业仍是库里当前作业且未结束时才运行，所以回放替换或淘汰的作业对象不会被运行。
 
 ## 3. 测试
 
