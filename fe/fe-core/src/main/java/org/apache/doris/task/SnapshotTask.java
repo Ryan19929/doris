@@ -42,8 +42,9 @@ public class SnapshotTask extends AgentTask {
     private boolean computeDigest = false;
     // Whether the backend computes the logical digest of the tablet over (0, version] after the snapshot is made.
     private boolean computeLogicalDigest = false;
-    // Whether the backend does not write the manifest of the snapshot (enable_backup_manifest is false).
-    private boolean skipManifest = false;
+    // Whether the backend writes the manifest of the snapshot (enable_backup_manifest). Without the field the
+    // backend does not, as for an older frontend.
+    private boolean writeManifest = false;
     // Restore only: the backend makes an empty snapshot dir, for the increment of the incremental restore.
     private boolean restoreIncremental = false;
     // Restore only (atomic restore): the data of the snapshot is the local tablet refTabletId at the version, see
@@ -121,12 +122,12 @@ public class SnapshotTask extends AgentTask {
         return computeDigest;
     }
 
-    public void setSkipManifest(boolean skipManifest) {
-        this.skipManifest = skipManifest;
+    public void setWriteManifest(boolean writeManifest) {
+        this.writeManifest = writeManifest;
     }
 
-    public boolean isSkipManifest() {
-        return skipManifest;
+    public boolean isWriteManifest() {
+        return writeManifest;
     }
 
     public void setComputeLogicalDigest(boolean computeLogicalDigest) {
@@ -184,8 +185,8 @@ public class SnapshotTask extends AgentTask {
         if (computeLogicalDigest) {
             request.setComputeLogicalDigest(true);
         }
-        if (skipManifest) {
-            request.setSkipManifest(true);
+        if (writeManifest) {
+            request.setWriteManifest(true);
         }
         if (restoreIncremental) {
             request.setRestoreIncremental(true);

@@ -141,20 +141,20 @@ struct TFinishTaskRequest {
     // for Cloud mow table only, used by FE to check if the response is for the latest request
     20: optional list<AgentService.TCalcDeleteBitmapPartitionInfo> resp_partitions;
     // upload task: SHA-256 of the manifest file uploaded next to the files of each tablet
-    21: optional map<Types.TTabletId, string> manifest_roots
+    7601: optional map<Types.TTabletId, string> manifest_roots
     // snapshot task: SHA-256 of the manifest file written next to the snapshot files
-    22: optional string manifest_root
+    7602: optional string manifest_root
     // download task: the tablets whose downloaded snapshot has been checked against the manifest
-    23: optional list<Types.TTabletId> manifest_verified_tablets
+    7603: optional list<Types.TTabletId> manifest_verified_tablets
     // download task: whether the digests of the files of all manifest_verified_tablets are checked
-    24: optional bool manifest_digest_checked
+    7604: optional bool manifest_digest_checked
     // download task: how much of the data was reused locally instead of downloaded
-    25: optional TDownloadStats download_stats
+    7605: optional TDownloadStats download_stats
     // snapshot task (compute_logical_digest) and restore digest task: the logical digest of the tablet
-    26: optional TLogicalDigest logical_digest
+    7606: optional TLogicalDigest logical_digest
     // upload task: SHA-256 of the decomposed digest file (rdigest) uploaded next to the files of each tablet,
     // only the tablets which have one
-    27: optional map<Types.TTabletId, string> prefix_digest_roots
+    7607: optional map<Types.TTabletId, string> prefix_digest_roots
 }
 
 struct TTablet {

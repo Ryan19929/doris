@@ -1745,21 +1745,26 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
             RETURN_IF_ERROR(_report_every(10, &report_counter, finished_num, total_num,
                                           TTaskType::type::UPLOAD));
 
-            // calc md5sum of localfile, and the size and sha256 for the manifest in the same read
+            // calc md5sum of localfile; with the manifest, the size and sha256 for it in the same read
             std::string md5sum;
-            std::string sha256;
-            int64_t file_size = 0;
-            RETURN_IF_ERROR(compute_file_digests(src_path + "/" + local_file, &md5sum, &sha256,
-                                                 &file_size));
+            if (_write_manifest) {
+                std::string sha256;
+                int64_t file_size = 0;
+                RETURN_IF_ERROR(compute_file_digests(src_path + "/" + local_file, &md5sum,
+                                                     &sha256, &file_size));
+                // the tablet meta file is rewritten in restore, only its name and size are recorded,
+                // and the md5 to locate it.
+                manifest_files.push_back(SnapshotManifestFile {
+                        .name = local_file,
+                        .size = file_size,
+                        .md5 = md5sum,
+                        .sha256 = _end_with(local_file, ".hdr") ? std::string() : sha256});
+            } else {
+                RETURN_IF_ERROR(io::global_local_filesystem()->md5sum(src_path + "/" + local_file,
+                                                                      &md5sum));
+            }
             VLOG_CRITICAL << "get file checksum: " << local_file << ": " << md5sum;
             local_files_with_checksum.push_back(local_file + "." + md5sum);
-            // the tablet meta file is rewritten in restore, only its name and size are recorded,
-            // and the md5 to locate it.
-            manifest_files.push_back(SnapshotManifestFile {
-                    .name = local_file,
-                    .size = file_size,
-                    .md5 = md5sum,
-                    .sha256 = _end_with(local_file, ".hdr") ? std::string() : sha256});
 
             // check if this local file need upload
             bool need_upload = false;
@@ -1788,24 +1793,24 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
         } // end for each tablet's local files
 
         // 2.4 upload the decomposed digest, if the snapshot has one. It is an entry of the manifest, so it
-        // goes first, and nowhere to be recorded if the frontend does not want the manifest.
+        // goes first, and nowhere to be recorded unless the frontend asks for the manifest.
         std::string prefix_root;
         int64_t prefix_size = 0;
-        if (!_skip_manifest) {
+        if (_write_manifest) {
             RETURN_IF_ERROR(_upload_prefix_digest(src_path, dest_path, tablet_id, &prefix_root,
                                                   &prefix_size));
         }
 
-        // 2.5 upload the manifest after all the files of the tablet, unless the frontend does not want it
+        // 2.5 upload the manifest after all the files of the tablet, if the frontend asks for it
         std::string manifest_root;
-        if (!_skip_manifest) {
+        if (_write_manifest) {
             RETURN_IF_ERROR(_upload_manifest(src_path, dest_path, tablet_id,
                                              std::move(manifest_files), prefix_root, prefix_size,
                                              &manifest_root));
         }
 
         tablet_files->emplace(tablet_id, local_files_with_checksum);
-        if (!_skip_manifest) {
+        if (_write_manifest) {
             _uploaded_manifest_roots.emplace(tablet_id, std::move(manifest_root));
         }
         if (!prefix_root.empty()) {

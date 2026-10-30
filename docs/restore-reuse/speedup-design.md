@@ -11,7 +11,7 @@
 - FE 的快照任务多一个 optional 字段 `TSnapshotRequest.restore_kept_load`（配置 `restore_reuse_kept_load_at_snapshot`，默认 true）；BE 入口条件改为 `restore_local_source && (restore_incremental || restore_kept_load)`，装载后返回一个空的快照目录（`restore_incremental=true` 的空目录请求）。
 - 提交阶段的 MOVE 请求**不变**。BE 的 `move_with_restore_stage` 在 `.hdr.increment` 检查之后、`convert_rowset_ids` 之前多一个分支：目录里没有 `<tablet_id>.hdr`、没有 `.hdr.increment`、没有数据文件 → 读 tablet meta 里的证据，`job_id` 相同、stage 为 `LOCAL_LOADED`、`max_version == base_version` 则返回 OK（零 IO），否则 `[RESTORE_NOT_RETRYABLE]`。普通恢复的快照目录一定有 tablet meta，这个分支对原有路径是死代码。
 - FE 在 `commit()` 给保留分区的 DirMoveTask 打一个只在内存里的标记，`finishDirMoveTask` 据此把它的失败按本地来源任务处理（不可重试错误立即取消，其他错误 `restore_local_source_task_max_retry` 次后取消）；普通 MOVE 的失败仍无限重发。
-- 纵深防御：装载入口按 tablet 路径互斥（`LocalSnapshotLock`），两个任务同时装载同一个 tablet 时第二个看到证据后跳过；本地来源快照的超时取 `restore_local_source_snapshot_timeout_s`（默认 6 小时）与作业超时中的较大者：清扫线程不看装载是否在进行，短于作业超时会在跨盘慢装载时中途删掉源快照（代码审查 P1-1）。
+- 纵深防御：装载入口按 tablet 路径互斥（`LocalSnapshotLock`），两个任务同时装载同一个 tablet 时第二个看到证据后跳过；本地来源快照的超时取 `restore_local_source_snapshot_timeout_s`（默认 1 天，与恢复作业的默认超时相同）与作业超时中的较大者：清扫线程不看装载是否在进行，短于作业超时会在跨盘慢装载时中途删掉源快照（代码审查 P1-1）。
 - 可观测：`TDownloadStats.local_source_loaded_tablets` → `SHOW RESTORE` 的 `atomic_local.loaded_tablets`；心跳能力值升为 3（不被要求）。
 
 **为什么 BE 按目录内容自描述，而不是 FE 加字段。** 同一个副本的快照和 MOVE 总在同一个 BE 上，所以无论 FE 是哪个版本、BE 在作业中途升级与否，BE 自己做过什么就知道怎么收尾：能力 2 的 FOLLOWER FE 接管后发的普通 MOVE 在新 BE 上同样变成确认，不会卡到超时；快照时是旧 BE（做了带 tablet meta 的完整快照）、提交时是新 BE，照旧整体替换，不会取消。FE 不需要持久化任何新字段，回滚没有兼容问题。

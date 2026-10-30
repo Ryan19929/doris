@@ -1,6 +1,6 @@
 # Restore / CCR 全量同步的本地数据复用
 
-目标是让 Restore 和 CCR 全量同步时，目标端已有且内容一致的数据不再重复下载。证明不了一致就照常下载，结果与完整下载相同；复用相关的能力默认关闭。注意"三个复用开关全关"不等于没有任何新行为：备份文件清单（Manifest）默认会生成，文件集合与大小校验默认开启。只有三个复用开关（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）和 `enable_backup_manifest` 全部关闭，才回到旧行为（仅余常数字段和心跳能力位）。Manifest 默认开启的代价：BE 每个 tablet 多写一个小文件（数 KB），对象存储仓库每个 tablet 多一个对象，jobInfo 每个 tablet 多约 83 字节（`manifest_roots`），详见 [manifest-design.md](./manifest-design.md)。FE 配置 `enable_backup_manifest`（默认 true，可动态修改，仅 Master 生效）设为 false 后，BE 不写 Manifest，jobInfo 不写 `manifest_roots`，这样的备份在恢复时按"没有 Manifest"处理（不做文件集合校验，也不能增量补齐）。
+目标是让 Restore 和 CCR 全量同步时，目标端已有且内容一致的数据不再重复下载。证明不了一致就照常下载，结果与完整下载相同；复用相关的能力默认关闭。注意"三个复用开关全关"不等于没有任何新行为：备份文件清单（Manifest）默认会生成，文件集合与大小校验默认开启。只有三个复用开关（`enable_restore_partition_reuse`、`enable_restore_incremental_append`、`enable_restore_atomic_reuse`）和 `enable_backup_manifest` 全部关闭，才回到旧行为（仅余常数字段和心跳能力位）。Manifest 默认开启的代价：BE 每个 tablet 多写一个小文件（数 KB），对象存储仓库每个 tablet 多一个对象，jobInfo 每个 tablet 多约 83 字节（`manifest_roots`），详见 [manifest-design.md](./manifest-design.md)。FE 配置 `enable_backup_manifest`（默认 true，可动态修改，仅 Master 生效）设为 false 后，BE 不写 Manifest，jobInfo 不写 `manifest_roots`，这样的备份在恢复时按"没有 Manifest"处理（不做文件集合校验，也不能增量补齐）。BE 只在 FE 明确要求时（快照与上传任务带 `write_manifest`）才写 Manifest、才算文件的 SHA-256；旧版本 FE 不带这个字段，新版本 BE 在它下面和原来完全一样，只列文件、只算 md5。新增的 thrift/proto 字段都用私有号段 7601 起，见 [field-numbers.md](./field-numbers.md)。
 
 ## 代码位置
 
@@ -20,6 +20,7 @@
 | [stuck-append-analysis.md](./stuck-append-analysis.md) | 原子恢复 + 增量补齐卡在 COMMITTING 的根因分析 |
 | [stuck-append-fix-plan.md](./stuck-append-fix-plan.md) | 上述问题的修复方案（已两轮审查） |
 | [speedup-design.md](./speedup-design.md) | 提速第一批：保留分区由快照任务装载到位（提交只做零 IO 确认）、状态机合并空拍、任务完成即运行 |
+| [field-numbers.md](./field-numbers.md) | 新增 thrift/proto 字段的私有号段（7601 起）登记表 |
 
 ## 复用范围（首版）
 
@@ -45,7 +46,7 @@ jobInfo 里每个 tablet 的数据（manifest root、逻辑摘要 root、是否�
 
 设计与收益估算见 [speedup-design.md](./speedup-design.md)。三项都有开关：
 
-- **保留分区由快照任务装载到位**（`restore_reuse_kept_load_at_snapshot`，FE，mutable，masterOnly，默认 true；只在 `enable_restore_atomic_reuse` 打开后有意义）。原子恢复里判为保留的分区，其暂存 tablet 原来由提交阶段的 MOVE 任务装载（改 rowset id、链接、重载），而 BE 的 MOVE 线程池每个 BE 只有一个线程。打开后，快照任务带 `restore_kept_load`，BE 像处理增量分区的本地底座一样，在快照阶段就把本地数据装进暂存 tablet（证据 `LOCAL_LOADED` 随 tablet meta 落盘），留下一个空的快照目录；提交阶段的 MOVE 请求不变，BE 看到空目录（目录里没有任何文件，普通恢复的快照目录一定有 tablet meta）就只核对本作业的装载证据，不做任何 IO；核对不过返回 `[RESTORE_NOT_RETRYABLE]`，FE 立即取消。旧版本 BE 忽略该字段，仍做带 tablet meta 的完整快照、由 MOVE 整体替换，结果正确只是慢；旧版本 FE 接管后发的普通 MOVE 在新 BE 上同样按目录内容处理。`SHOW RESTORE` 的 `DownloadStats.atomic_local.loaded_tablets` 是由快照任务装载的副本数。BE 配置 `restore_local_source_snapshot_timeout_s`（默认 21600）：本地来源快照目录的存活时间，BE 在装载后、释放前崩溃时由清扫线程按它清理；实际取它与作业超时中的较大者，清扫线程不知道装载是否在进行，这样跨盘的慢装载不会被中途清掉。保留分区的 MOVE 失败无论开关取值都按 `restore_local_source_task_max_retry` 收敛（超过次数取消作业），不再像原路径那样重发到作业超时。
+- **保留分区由快照任务装载到位**（`restore_reuse_kept_load_at_snapshot`，FE，mutable，masterOnly，默认 true；只在 `enable_restore_atomic_reuse` 打开后有意义）。原子恢复里判为保留的分区，其暂存 tablet 原来由提交阶段的 MOVE 任务装载（改 rowset id、链接、重载），而 BE 的 MOVE 线程池每个 BE 只有一个线程。打开后，快照任务带 `restore_kept_load`，BE 像处理增量分区的本地底座一样，在快照阶段就把本地数据装进暂存 tablet（证据 `LOCAL_LOADED` 随 tablet meta 落盘），留下一个空的快照目录；提交阶段的 MOVE 请求不变，BE 看到空目录（目录里没有任何文件，普通恢复的快照目录一定有 tablet meta）就只核对本作业的装载证据，不做任何 IO；核对不过返回 `[RESTORE_NOT_RETRYABLE]`，FE 立即取消。旧版本 BE 忽略该字段，仍做带 tablet meta 的完整快照、由 MOVE 整体替换，结果正确只是慢；旧版本 FE 接管后发的普通 MOVE 在新 BE 上同样按目录内容处理。`SHOW RESTORE` 的 `DownloadStats.atomic_local.loaded_tablets` 是由快照任务装载的副本数。BE 配置 `restore_local_source_snapshot_timeout_s`（默认 86400，与恢复作业的默认超时相同）：本地来源快照目录的存活时间，BE 在装载后、释放前崩溃时由清扫线程按它清理；实际取它与作业超时中的较大者，清扫线程不知道装载是否在进行，这样跨盘的慢装载不会被中途清掉。保留分区的 MOVE 失败无论开关取值都按 `restore_local_source_task_max_retry` 收敛（超过次数取消作业），不再像原路径那样重发到作业超时。
 - **状态机合并空拍**（`backup_restore_merge_idle_ticks`，FE，mutable，masterOnly，默认 true）。备份恢复作业每一拍（`backup_handler_update_interval_millis`，默认 3 秒）只推进一个状态；打开后，到达一个不等待 BE 的状态时在同一拍继续：keep_on_local 备份从快照完成一拍走到 FINISHED（省 4 拍），恢复在快照完成的那一拍发下载任务、在下载完成的那一拍发 MOVE（没有要下载的东西时从快照完成一拍走到 COMMITTING）。状态函数和它们写的编辑日志不变，顺序不变，FOLLOWER 回放不受影响；一拍最多走 5（备份）/4（恢复）个状态；失败仍在当拍结束。改的是 Doris 原有路径，默认关闭时逐字节等价于原行为。
 - **任务完成即运行**（`backup_restore_run_on_task_finish`，FE，mutable，masterOnly，默认 true）。某个状态等待的最后一个 BE 任务回报时，作业请求 BackupHandler 立刻跑一次 `run()`（由 BackupHandler 的一个线程执行），省掉等下一拍的平均半拍。请求只记 (dbId, jobId)，执行前重新查找作业，只在本 FE 仍是 Master、该作业仍是库里当前作业且未结束时才运行。
 

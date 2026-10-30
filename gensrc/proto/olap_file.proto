@@ -779,7 +779,7 @@ message TabletMetaPB {
     // Used by a base tablet to find its paired row-binlog tablet.
     optional int64 binlog_tablet_id = 37;
     // The completion evidence of the restore job which loaded the data of this tablet.
-    optional RestoreStagePB restore_stage = 38;
+    optional RestoreStagePB restore_stage = 7601;
 
     // For cloud
     optional int64 index_id = 1000;
@@ -845,7 +845,7 @@ message TabletMetaCloudPB {
     // Used by a base tablet to find its paired row-binlog tablet.
     optional int64 binlog_tablet_id = 42;
     // The completion evidence of the restore job which loaded the data of this tablet.
-    optional RestoreStagePB restore_stage = 43;
+    optional RestoreStagePB restore_stage = 7601;
 
     // Use for selectdb-cloud
     optional string table_name = 101;

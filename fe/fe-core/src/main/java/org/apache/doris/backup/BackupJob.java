@@ -308,7 +308,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
             newTask.setComputeDigest(computeDigestInSnapshot());
             // the same as the task it replaces
             newTask.setComputeLogicalDigest(task.isComputeLogicalDigest());
-            newTask.setSkipManifest(task.isSkipManifest());
+            newTask.setWriteManifest(task.isWriteManifest());
             unfinishedTaskIds.put(signature, beId);
 
             //send task
@@ -858,7 +858,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                             schemaHash, timeoutMs, false /* not restore task */);
                     task.setComputeDigest(computeDigestInSnapshot());
                     task.setComputeLogicalDigest(computeLogicalDigestInSnapshot(olapTable));
-                    task.setSkipManifest(isManifestDisabled());
+                    task.setWriteManifest(!isManifestDisabled());
                     batchTask.addTask(task);
                     unfinishedTaskIds.put(signature, beId);
                 }
@@ -976,7 +976,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                         brokers.get(0),
                         repo.getFileSystemDescriptor().getBackendConfigProperties(),
                         repo.getFileSystemDescriptor().getThriftStorageType(), repo.getLocation());
-                task.setSkipManifest(isManifestDisabled());
+                task.setWriteManifest(!isManifestDisabled());
                 batchTask.addTask(task);
                 unfinishedTaskIds.put(signature, beId);
             }

@@ -36,8 +36,9 @@ public class UploadTask extends AgentTask {
     private Map<String, String> brokerProperties;
     private StorageBackend.StorageType storageType;
     private String location;
-    // Whether the backend does not upload the manifest of the tablet snapshots (enable_backup_manifest is false).
-    private boolean skipManifest = false;
+    // Whether the backend uploads the manifest of the tablet snapshots (enable_backup_manifest). Without the field
+    // the backend does not, as for an older frontend.
+    private boolean writeManifest = false;
 
     public UploadTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, Long dbId,
             Map<String, String> srcToDestPath, FsBroker broker, Map<String, String> brokerProperties,
@@ -71,12 +72,12 @@ public class UploadTask extends AgentTask {
         this.brokerProperties = new HashMap<>(brokerProperties);
     }
 
-    public void setSkipManifest(boolean skipManifest) {
-        this.skipManifest = skipManifest;
+    public void setWriteManifest(boolean writeManifest) {
+        this.writeManifest = writeManifest;
     }
 
-    public boolean isSkipManifest() {
-        return skipManifest;
+    public boolean isWriteManifest() {
+        return writeManifest;
     }
 
     public TUploadReq toThrift() {
@@ -85,8 +86,8 @@ public class UploadTask extends AgentTask {
         request.setBrokerProp(brokerProperties);
         request.setStorageBackend(storageType.toThrift());
         request.setLocation(location);
-        if (skipManifest) {
-            request.setSkipManifest(true);
+        if (writeManifest) {
+            request.setWriteManifest(true);
         }
         return request;
     }

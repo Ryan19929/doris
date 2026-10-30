@@ -1314,7 +1314,7 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
             engine, env, upload_request.job_id, req.signature, upload_request.broker_addr,
             upload_request.broker_prop);
     SCOPED_ATTACH_TASK(loader->resource_ctx());
-    loader->set_skip_manifest(upload_request.__isset.skip_manifest && upload_request.skip_manifest);
+    loader->set_write_manifest(upload_request.__isset.write_manifest && upload_request.write_manifest);
     Status status =
             loader->init(upload_request.__isset.storage_backend ? upload_request.storage_backend
                                                                 : TStorageBackendType::type::BROKER,
@@ -1341,7 +1341,7 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_tablet_files(tablet_files);
     if (status.ok()) {
-        if (!loader->skip_manifest()) {
+        if (loader->write_manifest()) {
             finish_task_request.__set_manifest_roots(loader->uploaded_manifest_roots());
         }
         if (!loader->uploaded_prefix_digest_roots().empty()) {
@@ -1724,9 +1724,10 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     std::string manifest_root;
     const bool local_source =
             snapshot_request.__isset.restore_local_source && snapshot_request.restore_local_source;
-    // The frontend does not want the manifest (enable_backup_manifest is false): list the files only.
-    const bool skip_manifest =
-            snapshot_request.__isset.skip_manifest && snapshot_request.skip_manifest;
+    // The manifest is written only if the frontend asks for it (enable_backup_manifest): an older frontend
+    // does not know the manifest, the files are only listed for it, as before.
+    const bool write_manifest =
+            snapshot_request.__isset.write_manifest && snapshot_request.write_manifest;
     LocalSourceStats local_source_stats;
     Status status;
     // The local source is loaded into the tablet by the snapshot task itself: the base of an incremental partition
@@ -1758,7 +1759,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
             PrefixDigestOutput prefix;
             // without a manifest the decomposed digest has nowhere to be recorded, do not compute it
             const bool with_prefix = config::restore_digest_prefix_enabled &&
-                                     snapshot_request.__isset.list_files && !skip_manifest;
+                                     snapshot_request.__isset.list_files && write_manifest;
             logical_digest = compute_logical_digest_for_task(engine, snapshot_request.tablet_id,
                                                              snapshot_request.version, 0,
                                                              with_prefix ? &prefix : nullptr);
@@ -1784,8 +1785,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
                                     snapshot_request.schema_hash);
         status = io::global_local_filesystem()->list(path, true, &files, &exists);
         if (status.ok()) {
-            bool compute_digest =
-                    snapshot_request.__isset.compute_digest && snapshot_request.compute_digest;
+            // the sha256 of the files only goes into the manifest
+            bool compute_digest = write_manifest && snapshot_request.__isset.compute_digest &&
+                                  snapshot_request.compute_digest;
             // The manifest of the snapshot: the name and size (and the sha256 if required) of each
             // file, written next to the snapshot dir, one level up:
             // <snapshot_path>/<tablet_id>/manifest
@@ -1811,7 +1813,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
                 }
                 manifest.files.push_back(std::move(manifest_file));
             }
-            if (status.ok() && !skip_manifest) {
+            if (status.ok() && write_manifest) {
                 status = write_snapshot_manifest(
                         manifest,
                         fmt::format("{}/{}/{}", snapshot_path, snapshot_request.tablet_id,
@@ -1842,7 +1844,7 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_snapshot_path(snapshot_path);
     finish_task_request.__set_snapshot_files(snapshot_files);
-    if (status.ok() && snapshot_request.__isset.list_files && !skip_manifest) {
+    if (status.ok() && snapshot_request.__isset.list_files && write_manifest) {
         finish_task_request.__set_manifest_root(manifest_root);
     }
     if (logical_digest.has_value()) {

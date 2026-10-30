@@ -308,8 +308,9 @@ DEFINE_mInt32(restore_digest_prefix_max_scans, "4096");
 DEFINE_mInt32(restore_digest_mor_prefix_boundaries, "3");
 // how long (seconds) the snapshot of the local source of a tablet lives in the snapshot dir, if the BE dies
 // after the snapshot is loaded into the tablet and before it is released; the sweep removes it after that.
-// Never shorter than the timeout of the restore job, so a slow load is not removed under it.
-DEFINE_mInt32(restore_local_source_snapshot_timeout_s, "21600");
+// The larger of it and the timeout of the job is taken, so a slow load is not removed under it; the default is
+// the default timeout of a restore job (one day).
+DEFINE_mInt32(restore_local_source_snapshot_timeout_s, "86400");
 // download binlog meta timeout, default 30s
 DEFINE_mInt32(download_binlog_meta_timeout_ms, "30000");
 // the interval time(seconds) for agent report index policy to FE

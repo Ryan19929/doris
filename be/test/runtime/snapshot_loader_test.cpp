@@ -1827,7 +1827,7 @@ static bool has_uploaded_manifest(const std::string& dir) {
     return false;
 }
 
-TEST_F(SnapshotLoaderTest, UploadWritesManifestUnlessSkipped) {
+TEST_F(SnapshotLoaderTest, UploadWritesManifestOnlyIfAsked) {
     for (bool skip : {false, true}) {
         int64_t tablet_id = skip ? 3501 : 3401;
         TRemoteTabletSnapshot snapshot;
@@ -1840,14 +1840,14 @@ TEST_F(SnapshotLoaderTest, UploadWritesManifestUnlessSkipped) {
 
         RepositoryTestLoader loader(*engine_ref, ExecEnv::GetInstance(), 77L, tablet_id);
         loader.use_remote_fs(std::make_shared<LocalDirUploadFileSystem>());
-        loader.set_skip_manifest(skip);
+        loader.set_write_manifest(!skip);
         std::map<int64_t, std::vector<std::string>> tablet_files;
         Status st = loader.upload({{snapshot.local_snapshot_path, dest}}, &tablet_files);
         ASSERT_TRUE(st.ok()) << st;
         // the data files are uploaded either way
         ASSERT_EQ(1, tablet_files.count(tablet_id));
         EXPECT_FALSE(tablet_files[tablet_id].empty());
-        EXPECT_EQ(skip, loader.skip_manifest());
+        EXPECT_EQ(!skip, loader.write_manifest());
         EXPECT_EQ(!skip, has_uploaded_manifest(idx_dir));
         EXPECT_EQ(skip ? 0 : 1, loader.uploaded_manifest_roots().size());
     }
@@ -1876,7 +1876,7 @@ TEST_F(SnapshotLoaderTest, UploadRecordsPrefixDigestInManifest) {
 
         RepositoryTestLoader loader(*engine_ref, ExecEnv::GetInstance(), 78L, tablet_id);
         loader.use_remote_fs(std::make_shared<LocalDirUploadFileSystem>());
-        loader.set_skip_manifest(skip);
+        loader.set_write_manifest(!skip);
         std::map<int64_t, std::vector<std::string>> tablet_files;
         Status st = loader.upload({{snapshot.local_snapshot_path, dest}}, &tablet_files);
         ASSERT_TRUE(st.ok()) << st;

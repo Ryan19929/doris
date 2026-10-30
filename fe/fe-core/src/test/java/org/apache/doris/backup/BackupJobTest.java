@@ -1099,9 +1099,9 @@ public class BackupJobTest {
             AgentTaskQueue.clearAllTasks();
             job.setManifestDigest(true);
             List<SnapshotTask> tasks = runToSnapshotTasks(job);
-            Assertions.assertTrue(tasks.get(0).isSkipManifest());
-            Assertions.assertTrue(tasks.get(0).toThrift().isSetSkipManifest());
-            Assertions.assertTrue(tasks.get(0).toThrift().isSkipManifest());
+            // the field is not set at all, as by a frontend which does not know the manifest
+            Assertions.assertFalse(tasks.get(0).isWriteManifest());
+            Assertions.assertFalse(tasks.get(0).toThrift().isSetWriteManifest());
             Assertions.assertTrue(tasks.get(0).toThrift().isSetListFiles());
             Assertions.assertFalse(tasks.get(0).toThrift().isSetComputeDigest());
         } finally {
@@ -1128,13 +1128,13 @@ public class BackupJobTest {
     }
 
     @Test
-    public void testUploadTaskSkipsManifestIfDisabled() {
+    public void testUploadTaskWritesManifestOnlyIfAsked() {
         UploadTask task = new UploadTask(null, backendId, 1, 2, dbId, Maps.newHashMap(),
                 new FsBroker("127.0.0.1", 8000), Maps.newHashMap(), StorageBackend.StorageType.BROKER, "loc");
-        Assertions.assertFalse(task.toThrift().isSetSkipManifest());
-        task.setSkipManifest(true);
-        Assertions.assertTrue(task.toThrift().isSetSkipManifest());
-        Assertions.assertTrue(task.toThrift().isSkipManifest());
+        Assertions.assertFalse(task.toThrift().isSetWriteManifest());
+        task.setWriteManifest(true);
+        Assertions.assertTrue(task.toThrift().isSetWriteManifest());
+        Assertions.assertTrue(task.toThrift().isWriteManifest());
     }
 
     @Test
@@ -1155,8 +1155,34 @@ public class BackupJobTest {
             job.run();
             Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
             UploadTask upTask = (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
-            Assertions.assertTrue(upTask.isSkipManifest());
-            Assertions.assertTrue(upTask.toThrift().isSkipManifest());
+            Assertions.assertFalse(upTask.isWriteManifest());
+            Assertions.assertFalse(upTask.toThrift().isSetWriteManifest());
+        } finally {
+            Config.enable_backup_manifest = orig;
+        }
+    }
+
+    @Test
+    public void testUploadTasksOfJobWithManifest() {
+        boolean orig = Config.enable_backup_manifest;
+        try {
+            Config.enable_backup_manifest = true;
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            Assertions.assertTrue(tasks.get(0).toThrift().isWriteManifest());
+            TBackend tBackend = new TBackend("", 0, 1);
+            TFinishTaskRequest request = new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT,
+                    tasks.get(0).getSignature(), new TStatus(TStatusCode.OK));
+            request.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+            request.setSnapshotPath("/path/to/snapshot");
+            Assertions.assertTrue(job.finishTabletSnapshotTask(tasks.get(0), request));
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+            AgentTaskQueue.clearAllTasks();
+            job.run();
+            Assertions.assertEquals(BackupJobState.UPLOADING, job.getState());
+            UploadTask upTask = (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+            Assertions.assertTrue(upTask.isWriteManifest());
+            Assertions.assertTrue(upTask.toThrift().isWriteManifest());
         } finally {
             Config.enable_backup_manifest = orig;
         }

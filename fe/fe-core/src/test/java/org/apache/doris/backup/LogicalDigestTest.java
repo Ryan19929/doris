@@ -403,12 +403,12 @@ public class LogicalDigestTest {
     }
 
     @Test
-    public void testSnapshotTaskSkipManifestFlag() {
+    public void testSnapshotTaskWriteManifestFlag() {
         SnapshotTask task = new SnapshotTask(null, 10001, 1, 55, 1, 2, 3, 4, TABLET_1, 10, 5, 1000, false);
-        Assertions.assertFalse(task.isSkipManifest());
-        Assertions.assertFalse(task.toThrift().isSetSkipManifest());
-        task.setSkipManifest(true);
-        Assertions.assertTrue(task.toThrift().isSkipManifest());
+        Assertions.assertFalse(task.isWriteManifest());
+        Assertions.assertFalse(task.toThrift().isSetWriteManifest());
+        task.setWriteManifest(true);
+        Assertions.assertTrue(task.toThrift().isWriteManifest());
         // the files are still listed
         Assertions.assertTrue(task.toThrift().isListFiles());
     }

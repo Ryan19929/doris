@@ -424,8 +424,9 @@ struct TUploadReq {
     4: optional map<string, string> broker_prop
     5: optional Types.TStorageBackendType storage_backend = Types.TStorageBackendType.BROKER
     6: optional string location // root path
-    // do not upload the manifest of the tablet snapshots (the frontend config enable_backup_manifest is false)
-    7: optional bool skip_manifest
+    // upload the manifest of the tablet snapshots (the frontend config enable_backup_manifest). An older frontend
+    // does not set it, and the backend uploads no manifest, as before.
+    7601: optional bool write_manifest
 }
 
 // The versions (base_version, end_version] of a remote tablet snapshot to append to a local tablet whose
@@ -447,9 +448,9 @@ struct TRemoteTabletSnapshot {
     // SHA-256 of the manifest file of the remote tablet snapshot, recorded at backup time. If set, the
     // manifest is fetched from "<parent of remote_snapshot_path>/manifest", the files are downloaded by it
     // and the downloaded tablet snapshot is checked against it.
-    8: optional string manifest_root
+    7601: optional string manifest_root
     // download only this range of the remote tablet snapshot, see TRestoreIncrementalRange
-    9: optional TRestoreIncrementalRange incremental
+    7602: optional TRestoreIncrementalRange incremental
 }
 
 struct TDownloadReq {
@@ -465,10 +466,10 @@ struct TDownloadReq {
     // time. If set, the manifest is fetched from "<parent of src path>/__manifest__<tablet id>.<first 32 hex
     // chars of the SHA-256>", the files are downloaded by it and the downloaded tablet snapshot is checked
     // against it.
-    9: optional map<string, string> manifest_roots
+    7601: optional map<string, string> manifest_roots
     // src path (same key as src_dest_map) -> the range to download, see TRestoreIncrementalRange. Only for
     // a repository, the range of a http path is in remote_tablet_snapshots.
-    10: optional map<string, TRestoreIncrementalRange> incremental_ranges
+    7602: optional map<string, TRestoreIncrementalRange> incremental_ranges
 }
 
 struct TSnapshotRequest {
@@ -489,29 +490,29 @@ struct TSnapshotRequest {
     13: optional bool is_copy_binlog
     14: optional Types.TTabletId ref_tablet_id
     // record the SHA-256 of each snapshot file in the manifest file of the snapshot
-    15: optional bool compute_digest
+    7601: optional bool compute_digest
     // after the snapshot is made, compute the logical digest of the tablet over (0, version] and report it
-    16: optional bool compute_logical_digest
+    7602: optional bool compute_logical_digest
     // restore only: make an empty snapshot dir, to download the increment of the incremental restore into
-    17: optional bool restore_incremental
+    7603: optional bool restore_incremental
     // restore only (atomic restore, partition level reuse): the data source of the snapshot is the local tablet
     // ref_tablet_id (the tablet of the table being replaced) at `version`, instead of the tablet itself. Its files are
     // hard linked into the snapshot dir of the tablet, or copied if the two tablets are not on the same disk. With
     // restore_incremental the snapshot is loaded into the tablet at once (as the move of the restore does), and an
     // empty snapshot dir is made for the increment to be downloaded into.
-    18: optional bool restore_local_source
+    7604: optional bool restore_local_source
     // restore only: the id of the restore job. With restore_local_source, the evidence that the local source is
     // loaded into the tablet by this job is saved with the tablet meta, to tell a resent task from a tablet
     // which was changed.
-    19: optional i64 job_id
-    // backup only: do not write the manifest of the snapshot (the frontend config enable_backup_manifest is false),
-    // list_files only lists the files
-    20: optional bool skip_manifest
+    7605: optional i64 job_id
+    // backup only: write the manifest of the snapshot (the frontend config enable_backup_manifest). Without it,
+    // as from an older frontend, list_files only lists the files.
+    7606: optional bool write_manifest
     // restore only, with restore_local_source (atomic restore, a partition that keeps its local data): load the local
     // source into the tablet at once as the move of the restore does (the evidence is saved with the tablet meta,
     // see job_id) and make an empty snapshot dir, so that the move of the restore has nothing to move. Without it
     // the snapshot holds the files of the local source and the move of the restore loads them into the tablet.
-    21: optional bool restore_kept_load
+    7607: optional bool restore_kept_load
 }
 
 // Where to read the decomposed digest file (rdigest) of the tablet of a backup, for the incremental restore
@@ -585,13 +586,13 @@ struct TMoveDirReq {
     4: required i64 job_id
     5: required bool overwrite
     // append the downloaded rowsets of this range to the tablet, instead of replacing the tablet
-    6: optional TRestoreIncrementalRange incremental
+    7601: optional TRestoreIncrementalRange incremental
     // with incremental: the logical digest of the backup of the tablet at incremental.end_version, to tell whether
     // the data of the tablet is already the backup when the evidence of the append is missing
-    7: optional TRestoreBackupDigest backup_logical_digest
+    7602: optional TRestoreBackupDigest backup_logical_digest
     // with incremental: the tablet was loaded from a local source by this (atomic) restore job, the backend judges
     // the task by the evidence in the tablet meta. Unset / false (non atomic incremental restore): as without it.
-    8: optional bool local_source_loaded
+    7603: optional bool local_source_loaded
 }
 
 enum TAgentServiceVersion {
@@ -740,7 +741,7 @@ struct TAgentTaskRequest {
     35: optional TVisibleVersionReq visible_version_req
     36: optional TCleanUDFCacheReq clean_udf_cache_req
     37: optional TPushIndexPolicyReq push_index_policy_req
-    38: optional TRestoreDigestReq restore_digest_req
+    7601: optional TRestoreDigestReq restore_digest_req
 
     // For cloud
     1000: optional TCalcDeleteBitmapRequest calc_delete_bitmap_req
