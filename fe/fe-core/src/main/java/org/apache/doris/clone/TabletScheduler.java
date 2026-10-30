@@ -649,9 +649,10 @@ public class TabletScheduler extends MasterDaemon {
 
             // The replicas of a staging partition which an atomic restore loads from a local source are not to be
             // repaired by clone while the job runs: the clone would replace the data the job loaded. Nothing is
-            // looked up unless a running restore job has such partitions (a lock free check), and then only for a
-            // table in the state RESTORE.
-            if (tableState == OlapTableState.RESTORE && isLocalSourceStagingPartition(
+            // looked up unless a running restore job has such partitions (a lock free check). The state of the table
+            // is not looked at: the atomic replace sets the table NORMAL before the job settles the versions of these
+            // replicas, and the job clears the partitions only after that.
+            if (isLocalSourceStagingPartition(
                     Env.getCurrentEnv().getBackupHandler(), db.getId(), partition.getId())) {
                 throw new SchedException(Status.UNRECOVERABLE, SubCode.DIAGNOSE_IGNORE,
                         "partition is loaded from a local source by the restore job");
