@@ -306,6 +306,9 @@ DEFINE_mInt32(restore_digest_prefix_max_scans, "4096");
 // the local data when it stands at one of them; every one is a full merge scan of the tablet. 0 disables
 // the decomposed digest of merge on read tablets.
 DEFINE_mInt32(restore_digest_mor_prefix_boundaries, "3");
+// whether the debug HTTP API /api/_restore_digest answers. It reads a whole tablet for a digest and is not
+// authenticated unless enable_all_http_auth is set, so it is off unless turned on for a check.
+DEFINE_mBool(enable_restore_digest_http_api, "false");
 // how long (seconds) the snapshot of the local source of a tablet lives in the snapshot dir, if the BE dies
 // after the snapshot is loaded into the tablet and before it is released; the sweep removes it after that.
 // The larger of it and the timeout of the job is taken, so a slow load is not removed under it; the default is

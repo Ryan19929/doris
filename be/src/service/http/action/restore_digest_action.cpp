@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <string>
 
+#include "common/config.h"
 #include "common/logging.h"
 #include "common/status.h"
 #include "io/fs/file_reader.h"
@@ -107,6 +108,11 @@ void RestoreDigestAction::handle_prefix_file(HttpRequest* req, int64_t tablet_id
 }
 
 void RestoreDigestAction::handle(HttpRequest* req) {
+    if (!config::enable_restore_digest_http_api) {
+        HttpChannel::send_reply(req, HttpStatus::FORBIDDEN,
+                                "the restore digest API is off, see enable_restore_digest_http_api");
+        return;
+    }
     const std::string& tablet_id_str = req->param(TABLET_ID);
     const std::string& version_str = req->param("version");
     int64_t tablet_id = 0;

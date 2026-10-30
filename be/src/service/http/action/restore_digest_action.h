@@ -27,6 +27,7 @@ class StorageEngine;
 // Debug-only, read-only endpoint of the restore reuse prototype:
 //   GET /api/_restore_digest?tablet_id=<id>&version=<v>
 // returns the order-independent logical digest of the tablet at (0, v] as JSON.
+// Debug only, off unless the BE config enable_restore_digest_http_api is true.
 class RestoreDigestAction final : public HttpHandlerWithAuth {
 public:
     RestoreDigestAction(ExecEnv* exec_env, StorageEngine& engine, TPrivilegeHier::type hier,
