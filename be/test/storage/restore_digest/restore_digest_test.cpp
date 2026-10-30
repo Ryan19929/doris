@@ -581,7 +581,7 @@ TEST_F(RestoreDigestTest, LayoutIndependence) {
     RestoreDigest base = digest_of(schema, {write_rowset(schema, rows, 2, 100000, false)});
     ASSERT_EQ(rows.size(), base.rows);
     ASSERT_EQ(rows.size(), base.rows_scanned);
-    expect_golden(base, "GOLDEN_WIDE_ROOT", "GOLDEN_WIDE_SIG");
+    expect_golden(base, "b55a6b67bc9ffa99ed236fe4c75bc3d2b398a5b684cad125327d7696236e1290", "1d06b8cc8b8b80abfbd1f6c27c49de60a28297fdda15a902ea2a67190d0ec53f");
 
     std::mt19937 rng(42);
     // layout B: three rowsets, shuffled arrival, overlapping segments of different sizes
@@ -1051,7 +1051,7 @@ TEST_F(RestoreDigestMowTest, SameVisibleRowsSameDigest) {
                        std::make_shared<DeleteBitmap>(990005), 5);
     EXPECT_NE(del_0.root, del_1.root);
     EXPECT_EQ(2U, del_0.algo_version);
-    expect_golden(full, "GOLDEN_MOW_ROOT", "GOLDEN_MOW_SIG");
+    expect_golden(full, "eb48dac722552742966d29fa9b748a1edae503a6d40fba01b225a80d6a77cecb", "d67b27f4857f7133189326c91e53af14daa0ba63aae6b98bb27a5bab2407f0cd");
 }
 
 // A unique MoW table with a sequence column is not supported: a row which the delete bitmap marks
@@ -1252,7 +1252,7 @@ TEST_F(RestoreDigestDeleteTest, AppliedByVersionAndStableAcrossCompaction) {
     RestoreDigest after = digest_of(schema, {m27}, DUP_KEYS, false, nullptr, 7);
     EXPECT_TRUE(same_digest(with_pred, after));
     EXPECT_EQ(0U, after.delete_predicates);
-    expect_golden(with_pred, "GOLDEN_DELETE_ROOT", "GOLDEN_DELETE_SIG");
+    expect_golden(with_pred, "476b1fe04c43fa25bc371b4a912e00992c738c7d6b798adea59099a1257e04d2", "5115a9a767d305ad2c8bbaf30f52fb47de96325e0493aca2912e9aa84d09590f");
 }
 
 TEST_F(RestoreDigestDeleteTest, Operators) {
@@ -1611,7 +1611,7 @@ TEST_F(RestoreDigestTypesTest, LayoutIndependenceAndCompaction) {
     }
     RestoreDigest base = digest_of(schema, {write_rowset(schema, rows, 2, 100000, false)});
     ASSERT_EQ(rows.size(), base.rows);
-    expect_golden(base, "GOLDEN_TYPES_ROOT", "GOLDEN_TYPES_SIG");
+    expect_golden(base, "1825741206db0b6f92705361b4ff39e1d890c2b1448dbdb75bfb1ebcd04e280c", "dcf11a30c669ec837554019752ea843e4e9624d89d5ad45ba589a6afb177b460");
 
     std::mt19937 rng(11);
     auto shuffled = rows;
