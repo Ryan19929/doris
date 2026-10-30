@@ -559,6 +559,15 @@ protected:
 
 // ===== 1. layout independence ===============================================================
 
+// Fixed expected digests: the same data must give the same root and schema signature on every branch the
+// algorithm is carried to (a backport rewrites the read path), or the digests of the two never agree. A change
+// of these values is a change of the algorithm, it needs a new algo_version.
+static void expect_golden(const RestoreDigest& d, const std::string& root,
+                          const std::string& schema_sig) {
+    EXPECT_EQ(root, d.root) << "root";
+    EXPECT_EQ(schema_sig, d.schema_sig) << "schema_sig";
+}
+
 TEST_F(RestoreDigestTest, LayoutIndependence) {
     auto schema = make_schema(DUP_KEYS, wide_cols());
     std::vector<Row> rows;
@@ -572,6 +581,7 @@ TEST_F(RestoreDigestTest, LayoutIndependence) {
     RestoreDigest base = digest_of(schema, {write_rowset(schema, rows, 2, 100000, false)});
     ASSERT_EQ(rows.size(), base.rows);
     ASSERT_EQ(rows.size(), base.rows_scanned);
+    expect_golden(base, "GOLDEN_WIDE_ROOT", "GOLDEN_WIDE_SIG");
 
     std::mt19937 rng(42);
     // layout B: three rowsets, shuffled arrival, overlapping segments of different sizes
@@ -1041,6 +1051,7 @@ TEST_F(RestoreDigestMowTest, SameVisibleRowsSameDigest) {
                        std::make_shared<DeleteBitmap>(990005), 5);
     EXPECT_NE(del_0.root, del_1.root);
     EXPECT_EQ(2U, del_0.algo_version);
+    expect_golden(full, "GOLDEN_MOW_ROOT", "GOLDEN_MOW_SIG");
 }
 
 // A unique MoW table with a sequence column is not supported: a row which the delete bitmap marks
@@ -1241,6 +1252,7 @@ TEST_F(RestoreDigestDeleteTest, AppliedByVersionAndStableAcrossCompaction) {
     RestoreDigest after = digest_of(schema, {m27}, DUP_KEYS, false, nullptr, 7);
     EXPECT_TRUE(same_digest(with_pred, after));
     EXPECT_EQ(0U, after.delete_predicates);
+    expect_golden(with_pred, "GOLDEN_DELETE_ROOT", "GOLDEN_DELETE_SIG");
 }
 
 TEST_F(RestoreDigestDeleteTest, Operators) {
@@ -1599,6 +1611,7 @@ TEST_F(RestoreDigestTypesTest, LayoutIndependenceAndCompaction) {
     }
     RestoreDigest base = digest_of(schema, {write_rowset(schema, rows, 2, 100000, false)});
     ASSERT_EQ(rows.size(), base.rows);
+    expect_golden(base, "GOLDEN_TYPES_ROOT", "GOLDEN_TYPES_SIG");
 
     std::mt19937 rng(11);
     auto shuffled = rows;
