@@ -18,6 +18,7 @@
 package org.apache.doris.backup;
 
 import org.apache.doris.analysis.BackupStmt;
+import org.apache.doris.analysis.StorageBackend;
 import org.apache.doris.analysis.TableName;
 import org.apache.doris.analysis.TableRef;
 import org.apache.doris.backup.BackupJob.BackupJobState;
@@ -52,6 +53,7 @@ import org.apache.doris.thrift.TStatus;
 import org.apache.doris.thrift.TStatusCode;
 import org.apache.doris.thrift.TTaskType;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import mockit.Delegate;
@@ -169,6 +171,8 @@ public class BackupJobTest {
 
     @Before
     public void setUp() {
+        // the task queue is static, other cases leave their tasks in it
+        AgentTaskQueue.clearAllTasks();
 
         repoMgr = new MockRepositoryMgr();
         backupHandler = new MockBackupHandler(env);
@@ -1407,5 +1411,213 @@ public class BackupJobTest {
         try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
             raf.setLength(logicalSize);
         }
+    }
+
+    private static final String MD5 = "4f158689243a3d6030352fec3cfd3798";
+
+    private static String sha(char c) {
+        return Strings.repeat(String.valueOf(c), 64).toLowerCase();
+    }
+
+    // Run the job until the snapshot tasks are sent, returns them.
+    private List<SnapshotTask> runToSnapshotTasks(BackupJob backupJob) {
+        AgentTaskQueue.clearAllTasks();
+        backupJob.run();
+        Assert.assertEquals(BackupJobState.SNAPSHOTING, backupJob.getState());
+        List<SnapshotTask> tasks = Lists.newArrayList();
+        for (long signature = id.get() - 10; signature < id.get(); signature++) {
+            AgentTask task = AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT, signature);
+            if (task instanceof SnapshotTask) {
+                tasks.add((SnapshotTask) task);
+            }
+        }
+        return tasks;
+    }
+
+    // Finish the snapshot task of the job, as a backend which writes the manifest root if snapshotRoot.
+    private void finishSnapshotTask(SnapshotTask snapshotTask, boolean snapshotRoot) {
+        TBackend tBackend = new TBackend("", 0, 1);
+        TStatus ok = new TStatus(TStatusCode.OK);
+        TFinishTaskRequest request = new TFinishTaskRequest(tBackend, TTaskType.MAKE_SNAPSHOT,
+                snapshotTask.getSignature(), ok);
+        request.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+        request.setSnapshotPath("/path/to/snapshot");
+        if (snapshotRoot) {
+            request.setManifestRoot(sha('1'));
+        }
+        Assert.assertTrue(job.finishTabletSnapshotTask(snapshotTask, request));
+    }
+
+    // Run the backup to a remote repository until the job info file is saved, returns the job info read from it.
+    // The snapshot task reports the root of the manifest written with the snapshot if snapshotRoot, the upload task
+    // reports the root of the manifest uploaded to the repository if uploadRoot, as a new backend does.
+    private BackupJobInfo runBackupToSavedJobInfo(boolean snapshotRoot, boolean uploadRoot) throws IOException {
+        AgentTaskQueue.clearAllTasks();
+        job.run();
+        Assert.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+        SnapshotTask snapshotTask = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT,
+                id.get() - 1);
+        // a remote repository computes the digests when uploading, not in the snapshot.
+        Assert.assertFalse(snapshotTask.toThrift().isSetComputeDigest());
+
+        finishSnapshotTask(snapshotTask, snapshotRoot);
+        job.run();
+        Assert.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+
+        AgentTaskQueue.clearAllTasks();
+        job.run();
+        Assert.assertEquals(BackupJobState.UPLOADING, job.getState());
+        UploadTask upTask = (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+        TFinishTaskRequest request = new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.UPLOAD,
+                upTask.getSignature(), new TStatus(TStatusCode.OK));
+        Map<Long, List<String>> tabletFileMap = Maps.newHashMap();
+        tabletFileMap.put(tabletId, Lists.newArrayList("1.dat." + MD5, "1.idx." + MD5, "1.hdr." + MD5));
+        request.setTabletFiles(tabletFileMap);
+        if (uploadRoot) {
+            Map<Long, String> roots = Maps.newHashMap();
+            roots.put(tabletId, sha('A'));
+            request.setManifestRoots(roots);
+        }
+        Assert.assertTrue(job.finishSnapshotUploadTask(upTask, request));
+        job.run();
+        Assert.assertEquals(BackupJobState.SAVE_META, job.getState());
+        job.run();
+        Assert.assertEquals(BackupJobState.UPLOAD_INFO, job.getState());
+        return BackupJobInfo.fromFile(job.getLocalJobInfoFilePath());
+    }
+
+    @Test
+    public void testBackupWritesManifest() throws IOException {
+        BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true);
+        Assert.assertEquals(BackupJobInfo.MANIFEST_VERSION, (int) jobInfo.manifestVersion);
+        Assert.assertEquals(BackupJobInfo.DIGEST_SHA256, jobInfo.digestAlgorithm);
+        Assert.assertTrue(jobInfo.hasManifest());
+
+        // the root of the manifest uploaded to the repository, not the one written with the snapshot
+        Assert.assertEquals(sha('a'), jobInfo.getManifestRoot(tabletId));
+
+        // the BackupTabletInfo view of it
+        BackupJobInfo.BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.values().iterator().next()
+                .partitions.values().iterator().next().indexes.values().iterator().next();
+        BackupJobInfo.BackupTabletInfo tabletInfo = idxInfo.sortedTabletInfoList.get(0);
+        Assert.assertEquals(sha('a'), tabletInfo.manifestRoot);
+        // the existing files are unchanged
+        Assert.assertEquals(Lists.newArrayList("1.dat." + MD5, "1.idx." + MD5, "1.hdr." + MD5),
+                tabletInfo.files);
+    }
+
+    @Test
+    public void testBackupWithoutManifestIfUploadHasNoManifestRoot() throws IOException {
+        // the snapshot wrote a manifest, but the upload reports no root (e.g. the backend is downgraded).
+        BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, false);
+        Assert.assertNull(jobInfo.manifestVersion);
+        Assert.assertNull(jobInfo.digestAlgorithm);
+        Assert.assertFalse(jobInfo.hasManifest());
+        Assert.assertNull(jobInfo.getManifestRoot(tabletId));
+        // same as a backup of an old version: no new key in the job info file.
+        String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
+        Assert.assertFalse(json, json.contains("manifest"));
+        Assert.assertFalse(json, json.contains("digest_algorithm"));
+    }
+
+    @Test
+    public void testLocalSnapshotManifestDigest() {
+        List<TableRef> tableRefs = Lists.newArrayList(new TableRef(
+                new TableName(InternalCatalog.INTERNAL_CATALOG_NAME, UnitTestUtil.DB_NAME, UnitTestUtil.TABLE_NAME),
+                null));
+        for (boolean manifestDigest : new boolean[] {false, true}) {
+            AgentTaskQueue.clearAllTasks();
+            job = new BackupJob("label", dbId, UnitTestUtil.DB_NAME, tableRefs, 13600 * 1000,
+                    BackupStmt.BackupContent.ALL, env, Repository.KEEP_ON_LOCAL_REPO_ID, 0);
+            if (manifestDigest) {
+                job.setManifestDigest(true);
+            }
+            Assert.assertEquals(manifestDigest, job.isManifestDigest());
+            job.run();
+            Assert.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+            SnapshotTask snapshotTask = (SnapshotTask) AgentTaskQueue.getTask(backendId, TTaskType.MAKE_SNAPSHOT,
+                    id.get() - 1);
+            Assert.assertEquals(manifestDigest, snapshotTask.toThrift().isSetComputeDigest());
+            Assert.assertEquals(manifestDigest, snapshotTask.isComputeDigest());
+            // the manifest is asked for by every snapshot task of a job (enable_backup_manifest is true)
+            Assert.assertTrue(snapshotTask.toThrift().isWriteManifest());
+        }
+    }
+
+    @Test
+    public void testNoManifestIfDisabled() {
+        boolean orig = Config.enable_backup_manifest;
+        try {
+            Config.enable_backup_manifest = false;
+            job.setManifestDigest(true);
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            // the field is not set at all, as by a frontend which does not know the manifest
+            Assert.assertFalse(tasks.get(0).isWriteManifest());
+            Assert.assertFalse(tasks.get(0).toThrift().isSetWriteManifest());
+            Assert.assertTrue(tasks.get(0).toThrift().isSetListFiles());
+            Assert.assertFalse(tasks.get(0).toThrift().isSetComputeDigest());
+        } finally {
+            Config.enable_backup_manifest = orig;
+        }
+    }
+
+    @Test
+    public void testJobInfoHasNoManifestIfDisabled() throws IOException {
+        boolean orig = Config.enable_backup_manifest;
+        try {
+            Config.enable_backup_manifest = false;
+            // even if the backend reports the roots (a backend which does not know the request field)
+            BackupJobInfo jobInfo = runBackupToSavedJobInfo(true, true);
+            Assert.assertFalse(jobInfo.hasManifest());
+            Assert.assertNull(jobInfo.manifestVersion);
+            Assert.assertNull(jobInfo.getManifestRoot(tabletId));
+            String json = new String(Files.readAllBytes(new File(job.getLocalJobInfoFilePath()).toPath()));
+            Assert.assertFalse(json, json.contains("manifest"));
+            Assert.assertFalse(json, json.contains("digest_algorithm"));
+        } finally {
+            Config.enable_backup_manifest = orig;
+        }
+    }
+
+    @Test
+    public void testUploadTaskWritesManifestOnlyIfAsked() {
+        UploadTask task = new UploadTask(null, backendId, 1, 2, dbId, Maps.newHashMap(),
+                new FsBroker("127.0.0.1", 8000), Maps.newHashMap(), StorageBackend.StorageType.BROKER, "loc");
+        Assert.assertFalse(task.toThrift().isSetWriteManifest());
+        task.setWriteManifest(true);
+        Assert.assertTrue(task.toThrift().isSetWriteManifest());
+        Assert.assertTrue(task.toThrift().isWriteManifest());
+    }
+
+    private UploadTask runToUploadTask(boolean enableManifest) {
+        boolean orig = Config.enable_backup_manifest;
+        try {
+            Config.enable_backup_manifest = enableManifest;
+            List<SnapshotTask> tasks = runToSnapshotTasks(job);
+            Assert.assertEquals(enableManifest, tasks.get(0).toThrift().isSetWriteManifest());
+            finishSnapshotTask(tasks.get(0), false);
+            job.run();
+            Assert.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+            AgentTaskQueue.clearAllTasks();
+            job.run();
+            Assert.assertEquals(BackupJobState.UPLOADING, job.getState());
+            return (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+        } finally {
+            Config.enable_backup_manifest = orig;
+        }
+    }
+
+    @Test
+    public void testUploadTasksOfJobWithoutManifest() {
+        UploadTask upTask = runToUploadTask(false);
+        Assert.assertFalse(upTask.isWriteManifest());
+        Assert.assertFalse(upTask.toThrift().isSetWriteManifest());
+    }
+
+    @Test
+    public void testUploadTasksOfJobWithManifest() {
+        UploadTask upTask = runToUploadTask(true);
+        Assert.assertTrue(upTask.isWriteManifest());
+        Assert.assertTrue(upTask.toThrift().isWriteManifest());
     }
 }

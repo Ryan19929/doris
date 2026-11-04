@@ -38,6 +38,11 @@ public class SnapshotTask extends AgentTask {
     // Only for copy tablet task.
     // Save the snapshot path.
     private String resultSnapshotPath;
+    // Whether the backend computes the SHA-256 of the snapshot files, for the manifest of a backup.
+    private boolean computeDigest = false;
+    // Whether the backend writes the manifest of the snapshot (enable_backup_manifest). Without the field the
+    // backend does not, as for an older frontend.
+    private boolean writeManifest = false;
 
     public SnapshotTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId, long tableId,
             long partitionId, long indexId, long tabletId, long version, int schemaHash, long timeoutMs,
@@ -99,6 +104,22 @@ public class SnapshotTask extends AgentTask {
         return resultSnapshotPath;
     }
 
+    public void setComputeDigest(boolean computeDigest) {
+        this.computeDigest = computeDigest;
+    }
+
+    public boolean isComputeDigest() {
+        return computeDigest;
+    }
+
+    public void setWriteManifest(boolean writeManifest) {
+        this.writeManifest = writeManifest;
+    }
+
+    public boolean isWriteManifest() {
+        return writeManifest;
+    }
+
     public void setRefTabletId(long refTabletId) {
         assert refTabletId > 0;
         this.refTabletId = refTabletId;
@@ -115,6 +136,12 @@ public class SnapshotTask extends AgentTask {
         }
         if (version > 0L) {
             request.setVersion(version);
+        }
+        if (computeDigest) {
+            request.setComputeDigest(true);
+        }
+        if (writeManifest) {
+            request.setWriteManifest(true);
         }
         return request;
     }

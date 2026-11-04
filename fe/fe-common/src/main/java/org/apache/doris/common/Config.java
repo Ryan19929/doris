@@ -1694,6 +1694,17 @@ public class Config extends ConfigBase {
     @ConfField(mutable = true, masterOnly = true)
     public static boolean restore_reset_index_id = false;
 
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "备份时是否为每个 tablet 快照写 manifest（它的完整文件清单，每个 tablet 一个小文件），并把它的根记录在 "
+                    + "job info 里（每个 tablet 约 83 字节）。恢复时用 manifest 校验下载的文件。设为 false 时不写 manifest，"
+                    + "job info 里也没有 manifest 根，恢复这个备份时不做 manifest 校验，与旧版本的备份相同。",
+            "Whether a backup writes the manifest of each tablet snapshot (the complete list of its files, one small "
+                    + "file per tablet) and records its root in the job info (about 83 bytes per tablet). The manifest "
+                    + "lets a restore check the downloaded files. If false, no manifest is written and the job info "
+                    + "has no manifest roots, a restore of the backup downloads without the manifest check, as a "
+                    + "backup of an old version does."})
+    public static boolean enable_backup_manifest = true;
+
     /**
      * Control the max num of tablets per backup job involved.
      */
