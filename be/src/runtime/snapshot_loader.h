@@ -17,12 +17,16 @@
 
 #pragma once
 
+#include <gen_cpp/AgentService_types.h>
+#include <gen_cpp/MasterService_types.h>
 #include <gen_cpp/Types_types.h>
+#include <gen_cpp/olap_file.pb.h>
 
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/status.h"
@@ -43,6 +47,117 @@ struct FileStat {
     int64_t size;
 };
 class ExecEnv;
+
+// Compute the md5 and the SHA-256 of a local file by reading it once. Both are lower case hex strings.
+// Pass nullptr to skip one of them. If size is not nullptr, it is set to the number of bytes read.
+Status compute_file_digests(const std::string& path, std::string* md5, std::string* sha256,
+                            int64_t* size = nullptr);
+
+// Lower case hex SHA-256 of the data.
+std::string sha256_hex(std::string_view data);
+
+// A file in the manifest of a tablet snapshot.
+struct SnapshotManifestFile {
+    // file name in the source tablet snapshot dir
+    std::string name;
+    int64_t size = 0;
+    // the md5 suffix of the object name in a repository ("<name>.<md5>"), empty in local mode
+    std::string md5;
+    // lower case hex SHA-256 of the content, empty if not computed; never set for the tablet meta file
+    std::string sha256;
+};
+
+// The manifest of a tablet snapshot: the complete list of its files. It is written as a JSON file next to
+// the tablet snapshot dir, one level up, so that an old BE never sees it:
+//   {"version":1,"tablet_id":<id>,"files":[{"n":<name>,"s":<size>,"m":<md5>,"d":<sha256>}, ...]}
+// The files are sorted by name, "m" and "d" are omitted if empty. The SHA-256 of the file content is the
+// manifest root, recorded by FE in the backup job info.
+struct SnapshotManifest {
+    static constexpr int kVersion = 1;
+    // the file name in a local snapshot: <storage_root>/snapshot/<time>.<seq>.<timeout>/<tablet_id>/manifest
+    static constexpr std::string_view kLocalFileName = "manifest";
+
+    int64_t tablet_id = 0;
+    std::vector<SnapshotManifestFile> files;
+
+    // Serialize to the JSON content, the files are sorted by name first.
+    std::string serialize();
+
+    // Parse the content of a manifest file, after checking its SHA-256 is the expected root. Returns a
+    // RESTORE_MANIFEST_MISMATCH error if the root does not match, or the content is not a valid manifest of
+    // the expected tablet.
+    static Status parse(std::string_view content, std::string_view expected_root,
+                        int64_t expected_tablet_id, SnapshotManifest* manifest);
+
+    // The object name of the manifest in a repository, in the parent dir of the tablet dir. The suffix is the
+    // first 32 hex chars of the root instead of the md5 used by the data files, so that it can be located by
+    // the root alone: listing the parent dir on an object storage would list all the tablets under it.
+    static std::string remote_file_name(int64_t tablet_id, std::string_view root);
+};
+
+// Write a manifest to a local file, returns the root (SHA-256 of the content).
+Status write_snapshot_manifest(SnapshotManifest& manifest, const std::string& path,
+                               std::string* root);
+
+// Returns the parent dir of a path (without the trailing '/'), or an error if it has none.
+Status parent_path_of(const std::string& path, std::string* parent);
+
+struct ManifestCheckResult {
+    // The local tablet snapshot matches the manifest.
+    bool checked = false;
+    // The SHA-256 of all the files except the tablet meta file are checked.
+    bool digest_checked = false;
+};
+
+// Check the files of a downloaded local tablet snapshot against the manifest of the source tablet
+// snapshot:
+//  - the set of files must be the same, no more and no less;
+//  - the size of each file must be the same;
+//  - if check_digest is true, the SHA-256 of each file must be the same, if the manifest has it. The
+//    tablet meta file is excluded, it is rewritten in restore.
+// The names in the manifest are those of the source tablet, the tablet meta file "<source tablet id>.hdr"
+// is expected as "<local_tablet_id>.hdr", as it is renamed when downloading.
+//
+// Returns a RESTORE_MANIFEST_MISMATCH error with the first mismatched file, the expected and the actual
+// value, if the local tablet snapshot does not match.
+Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t local_tablet_id,
+                                      const SnapshotManifest& manifest, bool check_digest,
+                                      ManifestCheckResult* result);
+
+// Statistics of the data reused locally and downloaded by a download task, the tablet meta files excluded.
+struct SnapshotDownloadStats {
+    int64_t linked_files = 0;
+    int64_t linked_bytes = 0;
+    int64_t skipped_files = 0;
+    int64_t skipped_bytes = 0;
+    int64_t downloaded_files = 0;
+    int64_t downloaded_bytes = 0;
+    int64_t tablets_full_reuse = 0;
+    int64_t tablets_partial_reuse = 0;
+    int64_t tablets_no_reuse = 0;
+    int64_t unmatched_rowsets = 0;
+    int64_t unmatched_no_source_rowset_id = 0;
+    int64_t unmatched_source_not_in_snapshot = 0;
+    int64_t unmatched_version_mismatch = 0;
+
+    // Count the stats of one tablet as full / partial / no reuse by its files, nothing if it has no file.
+    void classify_tablet();
+    void merge(const SnapshotDownloadStats& other);
+    std::string to_string() const;
+    TDownloadStats to_thrift() const;
+};
+
+// Count the rowsets of the remote tablet which have no lineage match in the local tablet, with the reason.
+// A remote rowset matches if a local rowset has it as source_rowset_id, or it has a local rowset as
+// source_rowset_id, with the same version range. Rowsets without segments and remote storage rowsets
+// have nothing to reuse and are not counted. The reason of a remote rowset without match is:
+//  - version_mismatch: a local rowset has the lineage with it, but a different version range;
+//  - source_not_in_snapshot: the local rowsets overlapping its version range all have a source, but not
+//    this rowset (e.g. the source rowset was compacted in the snapshot);
+//  - no_source_rowset_id: otherwise, a local rowset overlapping its version range has no source, or no
+//    local rowset overlaps it.
+void count_unmatched_rowsets(const TabletMetaPB& local_meta, const TabletMetaPB& remote_meta,
+                             SnapshotDownloadStats* stats);
 
 class BaseSnapshotLoader {
 public:
@@ -119,7 +234,74 @@ public:
 
     int64_t get_http_download_files_num() const { return _http_download_files_num; }
 
+    // The manifest root of each tablet to download, the key is the remote path, the same as the key
+    // of src_to_dest_path of download().
+    void set_manifest_roots(std::map<std::string, std::string> manifest_roots) {
+        _manifest_roots = std::move(manifest_roots);
+    }
+
+    // Upload the manifest of the tablet snapshots in upload() (enable_backup_manifest of the frontend). Without it,
+    // as for an older frontend, upload() computes the md5 only and uploads no manifest, no manifest root is
+    // reported then.
+    void set_write_manifest(bool write_manifest) { _write_manifest = write_manifest; }
+    bool write_manifest() const { return _write_manifest; }
+
+    // The manifest root of each tablet uploaded by upload().
+    const std::map<int64_t, std::string>& uploaded_manifest_roots() const {
+        return _uploaded_manifest_roots;
+    }
+
+    // The local tablets whose downloaded snapshot has been checked against the manifest.
+    const std::vector<int64_t>& manifest_verified_tablets() const {
+        return _manifest_verified_tablets;
+    }
+
+    // The data reused and downloaded by the tablets downloaded so far.
+    const SnapshotDownloadStats& download_stats() const { return _download_stats; }
+
+    // Whether the digests are checked for all the tablets in manifest_verified_tablets().
+    bool manifest_digest_checked() const {
+        return !_manifest_verified_tablets.empty() &&
+               _manifest_digest_checked_num == _manifest_verified_tablets.size();
+    }
+
 private:
+    // Download the files of a tablet from the remote path to the local path, see download().
+    Status _download_tablet_from_remote(const std::string& remote_path,
+                                        const std::string& local_path, int64_t local_tablet_id,
+                                        int64_t remote_tablet_id, int* report_counter,
+                                        int finished_num, int total_num,
+                                        SnapshotDownloadStats* stats);
+
+    // Fetch the manifest of a tablet from the repository and check it against the root.
+    Status _fetch_remote_manifest(const std::string& remote_path, const std::string& local_path,
+                                  int64_t remote_tablet_id, const std::string& root,
+                                  SnapshotManifest* manifest);
+
+    // Download the files in the manifest of a tablet from the remote path to the local path, then
+    // delete the local files not in the manifest. Files not in the manifest in the remote path are
+    // ignored.
+    Status _download_tablet_by_manifest(const std::string& remote_path,
+                                        const std::string& local_path, int64_t local_tablet_id,
+                                        const SnapshotManifest& manifest, int* report_counter,
+                                        int finished_num, int total_num,
+                                        SnapshotDownloadStats* stats);
+
+    // Upload the manifest of a tablet next to its dir in the repository, returns the root.
+    Status _upload_manifest(const std::string& src_path, const std::string& dest_path,
+                            int64_t tablet_id, std::vector<SnapshotManifestFile> files,
+                            std::string* root);
+
+    // Delete all the files in a local tablet snapshot dir, so that it can be downloaded again
+    // without reusing any local file.
+    Status _clear_local_snapshot_files(const std::string& local_path);
+
+    void _add_manifest_verified_tablet(int64_t tablet_id, bool digest_checked);
+
+    // Add the stats of a finished tablet to the total and log them.
+    void _add_tablet_download_stats(int64_t local_tablet_id, int64_t remote_tablet_id,
+                                    SnapshotDownloadStats stats);
+
     Status _replace_tablet_id(const std::string& file_name, int64_t tablet_id,
                               std::string* new_file_name);
 
@@ -138,6 +320,13 @@ private:
     StorageEngine& _engine;
     // for test remote_http_download
     size_t _http_download_files_num;
+
+    std::map<std::string, std::string> _manifest_roots;
+    bool _write_manifest = false;
+    std::map<int64_t, std::string> _uploaded_manifest_roots;
+    std::vector<int64_t> _manifest_verified_tablets;
+    size_t _manifest_digest_checked_num = 0;
+    SnapshotDownloadStats _download_stats;
 };
 
 } // end namespace doris

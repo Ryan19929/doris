@@ -1241,6 +1241,8 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     std::unique_ptr<SnapshotLoader> loader = std::make_unique<SnapshotLoader>(
             engine, env, upload_request.job_id, req.signature, upload_request.broker_addr,
             upload_request.broker_prop);
+    loader->set_write_manifest(upload_request.__isset.write_manifest &&
+                               upload_request.write_manifest);
     Status status =
             loader->init(upload_request.__isset.storage_backend ? upload_request.storage_backend
                                                                 : TStorageBackendType::type::BROKER,
@@ -1266,6 +1268,9 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_tablet_files(tablet_files);
+    if (status.ok() && loader->write_manifest()) {
+        finish_task_request.__set_manifest_roots(loader->uploaded_manifest_roots());
+    }
 
     finish_task(finish_task_request);
     remove_task_info(req.task_type, req.signature);
@@ -1279,6 +1284,10 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
 
     // TODO: download
     std::vector<int64_t> downloaded_tablet_ids;
+    std::vector<int64_t> manifest_verified_tablets;
+    bool manifest_digest_checked = false;
+
+    SnapshotDownloadStats download_stats;
 
     auto status = Status::OK();
     if (download_request.__isset.remote_tablet_snapshots) {
@@ -1286,6 +1295,9 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
                 engine, env, download_request.job_id, req.signature);
         status = loader->remote_http_download(download_request.remote_tablet_snapshots,
                                               &downloaded_tablet_ids);
+        manifest_verified_tablets = loader->manifest_verified_tablets();
+        manifest_digest_checked = loader->manifest_digest_checked();
+        download_stats = loader->download_stats();
     } else {
         std::unique_ptr<SnapshotLoader> loader = std::make_unique<SnapshotLoader>(
                 engine, env, download_request.job_id, req.signature, download_request.broker_addr,
@@ -1295,8 +1307,14 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
                                       : TStorageBackendType::type::BROKER,
                               download_request.__isset.location ? download_request.location : "");
         if (status.ok()) {
+            if (download_request.__isset.manifest_roots) {
+                loader->set_manifest_roots(download_request.manifest_roots);
+            }
             status = loader->download(download_request.src_dest_map, &downloaded_tablet_ids);
         }
+        manifest_verified_tablets = loader->manifest_verified_tablets();
+        manifest_digest_checked = loader->manifest_digest_checked();
+        download_stats = loader->download_stats();
     }
 
     if (!status.ok()) {
@@ -1316,6 +1334,12 @@ void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequ
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_task_status(status.to_thrift());
     finish_task_request.__set_downloaded_tablet_ids(downloaded_tablet_ids);
+    if (status.ok()) {
+        // Always set, so that FE knows the manifest is supported even if no tablet is verified.
+        finish_task_request.__set_manifest_verified_tablets(manifest_verified_tablets);
+        finish_task_request.__set_manifest_digest_checked(manifest_digest_checked);
+        finish_task_request.__set_download_stats(download_stats.to_thrift());
+    }
 
     finish_task(finish_task_request);
     remove_task_info(req.task_type, req.signature);
@@ -1369,6 +1393,49 @@ void download_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTas
     }
 }
 
+Status list_snapshot_files_and_write_manifest(const TSnapshotRequest& snapshot_request,
+                                              const std::string& snapshot_path,
+                                              bool write_manifest,
+                                              std::vector<std::string>* snapshot_files,
+                                              std::string* manifest_root) {
+    // list and save all snapshot files
+    // snapshot_path like: data/snapshot/20180417205230.1.86400
+    // we need to add subdir: tablet_id/schema_hash/
+    std::vector<io::FileInfo> files;
+    bool exists = true;
+    io::Path path = fmt::format("{}/{}/{}/", snapshot_path, snapshot_request.tablet_id,
+                                snapshot_request.schema_hash);
+    RETURN_IF_ERROR(io::global_local_filesystem()->list(path, true, &files, &exists));
+    // the sha256 of the files only goes into the manifest
+    bool compute_digest = write_manifest && snapshot_request.__isset.compute_digest &&
+                          snapshot_request.compute_digest;
+    // The manifest of the snapshot: the name and size (and the sha256 if required) of each
+    // file, written next to the snapshot dir, one level up:
+    // <snapshot_path>/<tablet_id>/manifest
+    SnapshotManifest manifest;
+    manifest.tablet_id = snapshot_request.tablet_id;
+    for (auto& file : files) {
+        snapshot_files->push_back(file.file_name);
+        SnapshotManifestFile manifest_file;
+        manifest_file.name = file.file_name;
+        manifest_file.size = file.file_size;
+        // the tablet meta file is rewritten in restore, it has no digest.
+        if (compute_digest && !file.file_name.ends_with(".hdr")) {
+            RETURN_IF_ERROR(compute_file_digests((path / file.file_name).native(), nullptr,
+                                                 &manifest_file.sha256, &manifest_file.size));
+        }
+        manifest.files.push_back(std::move(manifest_file));
+    }
+    if (write_manifest) {
+        RETURN_IF_ERROR(write_snapshot_manifest(
+                manifest,
+                fmt::format("{}/{}/{}", snapshot_path, snapshot_request.tablet_id,
+                            SnapshotManifest::kLocalFileName),
+                manifest_root));
+    }
+    return Status::OK();
+}
+
 void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req) {
     const auto& snapshot_request = req.snapshot_req;
 
@@ -1376,23 +1443,18 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
 
     string snapshot_path;
     bool allow_incremental_clone = false; // not used
-    std::vector<string> snapshot_files;
+    std::vector<std::string> snapshot_files;
+    std::string manifest_root;
+    // The manifest is written only if the frontend asks for it (enable_backup_manifest): an older frontend
+    // does not know the manifest, the files are only listed for it, as before.
+    const bool write_manifest =
+            snapshot_request.__isset.write_manifest && snapshot_request.write_manifest;
     Status status = engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
                                                          &allow_incremental_clone);
     if (status.ok() && snapshot_request.__isset.list_files) {
-        // list and save all snapshot files
-        // snapshot_path like: data/snapshot/20180417205230.1.86400
-        // we need to add subdir: tablet_id/schema_hash/
-        std::vector<io::FileInfo> files;
-        bool exists = true;
-        io::Path path = fmt::format("{}/{}/{}/", snapshot_path, snapshot_request.tablet_id,
-                                    snapshot_request.schema_hash);
-        status = io::global_local_filesystem()->list(path, true, &files, &exists);
-        if (status.ok()) {
-            for (auto& file : files) {
-                snapshot_files.push_back(file.file_name);
-            }
-        }
+        status = list_snapshot_files_and_write_manifest(snapshot_request, snapshot_path,
+                                                        write_manifest, &snapshot_files,
+                                                        &manifest_root);
     }
     if (!status.ok()) {
         LOG_WARNING("failed to make snapshot")
@@ -1414,6 +1476,9 @@ void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req)
     finish_task_request.__set_signature(req.signature);
     finish_task_request.__set_snapshot_path(snapshot_path);
     finish_task_request.__set_snapshot_files(snapshot_files);
+    if (status.ok() && snapshot_request.__isset.list_files && write_manifest) {
+        finish_task_request.__set_manifest_root(manifest_root);
+    }
     finish_task_request.__set_task_status(status.to_thrift());
 
     finish_task(finish_task_request);
