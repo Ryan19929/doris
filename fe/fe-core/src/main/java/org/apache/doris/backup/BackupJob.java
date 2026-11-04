@@ -91,6 +91,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(BackupJob.class);
     private static final String TABLE_COMMIT_SEQ_PREFIX = "table_commit_seq:";
     private static final String SNAPSHOT_COMMIT_SEQ = "commit_seq";
+    // internal property of the job (not set by the user), decided when the snapshot tasks are made
+    private static final String PROP_NO_MANIFEST = "no_manifest";
 
     public enum BackupJobState {
         PENDING, // Job is newly created. Send snapshot tasks and save copied meta info, then transfer to SNAPSHOTING
@@ -194,6 +196,25 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         return localMetaInfoFilePath;
     }
 
+    // Whether to compute the SHA-256 of the snapshot files when making snapshots, for the manifest of a backup
+    // kept on local (the http download path). The files uploaded to a remote repository always have it.
+    public void setManifestDigest(boolean manifestDigest) {
+        properties.put(BackupStmt.PROP_MANIFEST_DIGEST, String.valueOf(manifestDigest));
+    }
+
+    public boolean isManifestDigest() {
+        return Boolean.parseBoolean(properties.get(BackupStmt.PROP_MANIFEST_DIGEST));
+    }
+
+    // Whether the job writes no manifest (enable_backup_manifest was false when the snapshot tasks were made).
+    private boolean isManifestDisabled() {
+        return Boolean.parseBoolean(properties.get(PROP_NO_MANIFEST));
+    }
+
+    private boolean computeDigestInSnapshot() {
+        return repoId == Repository.KEEP_ON_LOCAL_REPO_ID && isManifestDigest() && !isManifestDisabled();
+    }
+
     public BackupContent getContent() {
         if (properties.containsKey(BackupStmt.PROP_CONTENT)) {
             return BackupStmt.BackupContent.valueOf(properties.get(BackupStmt.PROP_CONTENT).toUpperCase());
@@ -242,6 +263,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                     task.getIndexId(), task.getTabletId(),
                     task.getVersion(),
                     task.getSchemaHash(), timeoutMs, false /* not restore task */);
+            newTask.setComputeDigest(computeDigestInSnapshot());
+            // the same as the task it replaces
+            newTask.setWriteManifest(task.isWriteManifest());
             unfinishedTaskIds.put(signature, beId);
 
             //send task
@@ -340,6 +364,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                 task.getIndexId(), task.getTabletId(), task.getBackendId(),
                 task.getSchemaHash(), request.getSnapshotPath(),
                 request.getSnapshotFiles());
+        // the root of the manifest written with the snapshot. For a remote repository, it is replaced by the root
+        // of the manifest uploaded by the upload task.
+        if (request.isSetManifestRoot()) {
+            info.setManifestRoot(request.getManifestRoot());
+        }
 
         snapshotInfos.put(task.getTabletId(), info);
         taskProgress.remove(task.getSignature());
@@ -399,6 +428,9 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             // reset files in snapshot info with checksum filename
             info.setFiles(tabletFileMap.get(tabletId));
+            // the root of the manifest uploaded next to the files. Absent if the backend is an old version, then the
+            // job has no manifest.
+            info.setManifestRoot(request.isSetManifestRoots() ? request.getManifestRoots().get(tabletId) : null);
         }
 
         taskProgress.remove(task.getSignature());
@@ -560,6 +592,11 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
         unfinishedTaskIds.clear();
         taskProgress.clear();
         taskErrMsg.clear();
+        // decided again whenever the tasks are made again (e.g. after a restart)
+        properties.remove(PROP_NO_MANIFEST);
+        if (!Config.enable_backup_manifest) {
+            properties.put(PROP_NO_MANIFEST, "true");
+        }
         // copy all related schema at this moment
         List<Table> copiedTables = Lists.newArrayList();
         List<Resource> copiedResources = Lists.newArrayList();
@@ -722,6 +759,8 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                             index.getId(), tablet.getId(),
                             visibleVersion,
                             schemaHash, timeoutMs, false /* not restore task */);
+                    task.setComputeDigest(computeDigestInSnapshot());
+                    task.setWriteManifest(!isManifestDisabled());
                     batchTask.addTask(task);
                     unfinishedTaskIds.put(signature, beId);
                 }
@@ -867,6 +906,7 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
                         brokers.get(0),
                         repo.getRemoteFileSystem().getStorageProperties().getBackendConfigProperties(),
                         repo.getRemoteFileSystem().getStorageType(), repo.getLocation());
+                task.setWriteManifest(!isManifestDisabled());
                 batchTask.addTask(task);
                 unfinishedTaskIds.put(signature, beId);
             }
@@ -1021,6 +1061,17 @@ public class BackupJob extends AbstractJob implements GsonPostProcessable {
 
             jobInfo = BackupJobInfo.fromCatalog(createTime, label, dbName, dbId,
                     getContent(), backupMeta, filteredSnapshotInfos, tableCommitSeqMap);
+            // the files uploaded to a repository always have the digests, a backup kept on local has them only if
+            // required by the manifest_digest property.
+            String digestAlgorithm = repoId != Repository.KEEP_ON_LOCAL_REPO_ID || isManifestDigest()
+                    ? BackupJobInfo.DIGEST_SHA256 : BackupJobInfo.DIGEST_NONE;
+            if (isManifestDisabled()) {
+                LOG.info("backup manifest: disabled by enable_backup_manifest. {}", this);
+            } else {
+                boolean hasManifest = jobInfo.buildManifest(filteredSnapshotInfos, digestAlgorithm);
+                LOG.info("backup manifest: {}, digest algorithm: {}. {}", hasManifest, jobInfo.digestAlgorithm,
+                        this);
+            }
             if (LOG.isDebugEnabled()) {
                 LOG.debug("job info: {}. {}", jobInfo, this);
             }

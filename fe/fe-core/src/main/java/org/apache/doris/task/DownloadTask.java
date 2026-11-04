@@ -38,6 +38,9 @@ public class DownloadTask extends AgentTask {
     private String location;
     private List<TRemoteTabletSnapshot> remoteTabletSnapshots;
     private boolean isFromLocalSnapshot = false;
+    // src path (the key of srcToDestPath) -> the manifest root of the tablet snapshot, for the manifest check.
+    // Only for downloading from a repository, the manifest root of the http path is in remoteTabletSnapshots.
+    private Map<String, String> manifestRoots;
 
     // for cloud mode
     private String storageVaultId;
@@ -82,6 +85,18 @@ public class DownloadTask extends AgentTask {
         return brokerProperties;
     }
 
+    public List<TRemoteTabletSnapshot> getRemoteTabletSnapshots() {
+        return remoteTabletSnapshots;
+    }
+
+    public Map<String, String> getManifestRoots() {
+        return manifestRoots;
+    }
+
+    public void setManifestRoots(Map<String, String> manifestRoots) {
+        this.manifestRoots = manifestRoots;
+    }
+
     public void updateBrokerProperties(Map<String, String> brokerProperties) {
         this.brokerProperties = new java.util.HashMap<>(brokerProperties);
     }
@@ -103,6 +118,9 @@ public class DownloadTask extends AgentTask {
             req.setStorageBackend(storageType.toThrift());
             req.setLocation(location);
             req.setVaultId(storageVaultId);
+            if (manifestRoots != null && !manifestRoots.isEmpty()) {
+                req.setManifestRoots(manifestRoots);
+            }
         }
         return req;
     }

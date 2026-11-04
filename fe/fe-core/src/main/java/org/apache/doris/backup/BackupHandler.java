@@ -622,6 +622,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
         BackupJob backupJob = new BackupJob(stmt.getLabel(), db.getId(),
                 ClusterNamespace.getNameFromFullName(db.getFullName()),
                 tblRefs, stmt.getTimeoutMs(), stmt.getContent(), env, repoId, commitSeq);
+        if (stmt.isManifestDigest()) {
+            backupJob.setManifestDigest(true);
+        }
         // write log
         env.getEditLog().logBackupJob(backupJob);
 

@@ -79,6 +79,10 @@ import java.util.Set;
 public class BackupJobInfo implements Writable, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(BackupJobInfo.class);
 
+    public static final int MANIFEST_VERSION = 1;
+    public static final String DIGEST_SHA256 = "sha256";
+    public static final String DIGEST_NONE = "none";
+
     @SerializedName("name")
     public String name;
     @SerializedName("database")
@@ -118,6 +122,20 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
 
     @SerializedName("table_commit_seq_map")
     public Map<Long, Long> tableCommitSeqMap;
+
+    // The version of the manifest. The manifest of each tablet snapshot (the complete list of its files) is a file
+    // next to the tablet data, one level up; the job info only records its SHA-256, the manifest root, see
+    // BackupIndexInfo.manifestRoots. Null (absent in the json) means there is no manifest, e.g. a backup by an old
+    // version, or some backend did not report the root. Not written if null, so a job info without manifest is
+    // the same as before.
+    @SerializedName("manifest_version")
+    public Integer manifestVersion;
+    // The digest algorithm of the files in the manifest, DIGEST_SHA256 or DIGEST_NONE.
+    @SerializedName("digest_algorithm")
+    public String digestAlgorithm;
+
+    // tablet id -> manifest root, built from the manifest roots of all indexes on demand, not persisted.
+    private Map<Long, String> manifestRootIndex;
 
     public static class ExtraInfo {
         public static class NetworkAddrss {
@@ -172,6 +190,7 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
                             continue;
                         }
                         BackupTabletInfo backupTabletInfo = new BackupTabletInfo(tabletId, files);
+                        backupTabletInfo.manifestRoot = backupIndexInfo.getManifestRoot(tabletId);
                         backupIndexInfo.sortedTabletInfoList.add(backupTabletInfo);
                     }
                 }
@@ -426,10 +445,18 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
         public Map<Long, List<String>> tablets = Maps.newHashMap();
         @SerializedName("tablets_order")
         public List<Long> tabletsOrder = Lists.newArrayList();
+        // tablet id -> the manifest root of the tablet snapshot: the SHA-256 (lower case hex) of its manifest file.
+        // Null if the backup has no manifest.
+        @SerializedName("manifest_roots")
+        public Map<Long, String> manifestRoots;
         public List<BackupTabletInfo> sortedTabletInfoList = Lists.newArrayList();
 
         public List<String> getTabletFiles(long tabletId) {
             return tablets.get(tabletId);
+        }
+
+        public String getManifestRoot(long tabletId) {
+            return manifestRoots == null ? null : manifestRoots.get(tabletId);
         }
 
         private List<Long> getSortedTabletIds() {
@@ -450,6 +477,9 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
         public long id;
         @SerializedName("files")
         public List<String> files;
+        // The manifest root of the tablet snapshot, null if the backup has no manifest.
+        // Persisted in BackupIndexInfo.manifestRoots, this is a view of it.
+        public String manifestRoot;
 
         public BackupTabletInfo(long id, List<String> files) {
             this.id = id;
@@ -696,6 +726,99 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
         return jobInfo;
     }
 
+    /**
+     * Record the manifest roots of all the tablets reported by the backends, see SnapshotInfo.getManifestRoot().
+     * All or nothing: if any tablet has no manifest root (e.g. an old backend), no manifest is written for the whole
+     * job, the same as a backup of an old version.
+     *
+     * @param snapshotInfos tablet id -> snapshot info
+     * @param digestAlgorithm the digest algorithm of the files in the manifests, DIGEST_SHA256 or DIGEST_NONE
+     * @return true if the manifest is written
+     */
+    public boolean buildManifest(Map<Long, SnapshotInfo> snapshotInfos, String digestAlgorithm) {
+        clearManifest();
+        if (content == BackupContent.METADATA_ONLY) {
+            return false;
+        }
+
+        Map<BackupIndexInfo, Map<Long, String>> built = Maps.newHashMap();
+        for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    Map<Long, String> roots = Maps.newHashMap();
+                    built.put(idxInfo, roots);
+                    for (Long tabletId : idxInfo.tablets.keySet()) {
+                        SnapshotInfo info = snapshotInfos.get(tabletId);
+                        String root = info == null ? null : info.getManifestRoot();
+                        if (!isValidManifestRoot(root)) {
+                            LOG.info("no manifest for backup {}, tablet {} has no valid manifest root: {}",
+                                    name, tabletId, root);
+                            return false;
+                        }
+                        roots.put(tabletId, root.toLowerCase());
+                    }
+                }
+            }
+        }
+        for (Map.Entry<BackupIndexInfo, Map<Long, String>> entry : built.entrySet()) {
+            entry.getKey().manifestRoots = entry.getValue();
+        }
+        manifestVersion = MANIFEST_VERSION;
+        this.digestAlgorithm = digestAlgorithm;
+        manifestRootIndex = null;
+        return true;
+    }
+
+    // a lower or upper case hex SHA-256
+    private static boolean isValidManifestRoot(String root) {
+        return root != null && root.length() == 64 && root.chars().allMatch(c -> Character.digit(c, 16) >= 0);
+    }
+
+    /**
+     * Whether this backup has a manifest that this version can check. A manifest of an unknown (newer) version
+     * is not checked, never fails a restore.
+     */
+    public boolean hasManifest() {
+        return manifestVersion != null && manifestVersion == MANIFEST_VERSION;
+    }
+
+    // Returns the manifest root of a tablet in the backup, null if absent.
+    public String getManifestRoot(long tabletId) {
+        if (!hasManifest()) {
+            return null;
+        }
+        if (manifestRootIndex == null) {
+            Map<Long, String> index = Maps.newHashMap();
+            for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+                if (tblInfo == null) {
+                    continue;
+                }
+                for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                    for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                        if (idxInfo.manifestRoots != null) {
+                            index.putAll(idxInfo.manifestRoots);
+                        }
+                    }
+                }
+            }
+            manifestRootIndex = index;
+        }
+        return manifestRootIndex.get(tabletId);
+    }
+
+    private void clearManifest() {
+        manifestVersion = null;
+        digestAlgorithm = null;
+        manifestRootIndex = null;
+        for (BackupOlapTableInfo tblInfo : backupOlapTableObjects.values()) {
+            for (BackupPartitionInfo partInfo : tblInfo.partitions.values()) {
+                for (BackupIndexInfo idxInfo : partInfo.indexes.values()) {
+                    idxInfo.manifestRoots = null;
+                }
+            }
+        }
+    }
+
     public static BackupJobInfo fromFile(String path) throws IOException {
         try (InputStream inputStream = Files.newInputStream(Paths.get(path))) {
             return fromInputStream(inputStream);
@@ -813,10 +936,15 @@ public class BackupJobInfo implements Writable, GsonPostProcessable {
                 for (BackupIndexInfo indexInfo : partInfo.indexes.values()) {
                     for (BackupTabletInfo tabletInfo : indexInfo.sortedTabletInfoList) {
                         tabletInfo.files.clear();
+                        tabletInfo.manifestRoot = null;
                     }
+                    // The manifest roots are only needed for downloading. Keep manifest_version and
+                    // digest_algorithm, they are shown in SHOW RESTORE.
+                    indexInfo.manifestRoots = null;
                 }
             }
         }
+        manifestRootIndex = null;
     }
 
     public static BackupJobInfo read(DataInput in) throws IOException {

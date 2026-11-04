@@ -57,6 +57,11 @@ public class SnapshotInfo implements Writable {
     // 10006.hdr
     @SerializedName("f")
     private List<String> files = Lists.newArrayList();
+    // The SHA-256 of the manifest file of the tablet snapshot, reported by the backend: the manifest written
+    // when making the snapshot (kept on local), or the one uploaded next to the files (repository).
+    // Null if not reported (e.g. an old backend).
+    @SerializedName("mr")
+    private String manifestRoot;
 
     // for cloud
     @SerializedName("storageVaultId")
@@ -128,6 +133,14 @@ public class SnapshotInfo implements Writable {
 
     public void setFiles(List<String> files) {
         this.files = files;
+    }
+
+    public String getManifestRoot() {
+        return manifestRoot;
+    }
+
+    public void setManifestRoot(String manifestRoot) {
+        this.manifestRoot = manifestRoot;
     }
 
     public String getTabletPath() {
