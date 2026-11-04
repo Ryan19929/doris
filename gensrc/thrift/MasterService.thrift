@@ -56,6 +56,28 @@ struct TTabletInfo {
     1000: optional bool is_persistent
 }
 
+// Statistics of a download task, summed over all the tablets (replicas) of the task. The bytes and files
+// exclude the tablet meta files.
+struct TDownloadStats {
+    // reused by hard linking the local files of the rowsets with the same lineage (http snapshot only)
+    1: optional i64 linked_files
+    2: optional i64 linked_bytes
+    // already exist locally with the same name and size (and md5), not downloaded
+    3: optional i64 skipped_files
+    4: optional i64 skipped_bytes
+    5: optional i64 downloaded_files
+    6: optional i64 downloaded_bytes
+    // tablets whose data files are all / partially / not reused
+    7: optional i64 tablets_full_reuse
+    8: optional i64 tablets_partial_reuse
+    9: optional i64 tablets_no_reuse
+    // rowsets of the remote tablets which have no lineage match in the local tablets, and why
+    10: optional i64 unmatched_rowsets
+    11: optional i64 unmatched_no_source_rowset_id
+    12: optional i64 unmatched_source_not_in_snapshot
+    13: optional i64 unmatched_version_mismatch
+}
+
 struct TFinishTaskRequest {
     1: required Types.TBackend backend
     2: required Types.TTaskType task_type
@@ -78,6 +100,16 @@ struct TFinishTaskRequest {
     19: optional map<i64, map<i64, i64>> table_id_to_tablet_id_to_delta_num_rows
     // for Cloud mow table only, used by FE to check if the response is for the latest request
     20: optional list<AgentService.TCalcDeleteBitmapPartitionInfo> resp_partitions;
+    // upload task: SHA-256 of the manifest file uploaded next to the files of each tablet
+    7601: optional map<Types.TTabletId, string> manifest_roots
+    // snapshot task: SHA-256 of the manifest file written next to the snapshot files
+    7602: optional string manifest_root
+    // download task: the tablets whose downloaded snapshot has been checked against the manifest
+    7603: optional list<Types.TTabletId> manifest_verified_tablets
+    // download task: whether the digests of the files of all manifest_verified_tablets are checked
+    7604: optional bool manifest_digest_checked
+    // download task: how much of the data was reused locally instead of downloaded
+    7605: optional TDownloadStats download_stats
 }
 
 struct TTablet {

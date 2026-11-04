@@ -391,6 +391,9 @@ struct TUploadReq {
     4: optional map<string, string> broker_prop
     5: optional Types.TStorageBackendType storage_backend = Types.TStorageBackendType.BROKER
     6: optional string location // root path
+    // upload the manifest of the tablet snapshots (the frontend config enable_backup_manifest). An older frontend
+    // does not set it, and the backend uploads no manifest, as before.
+    7601: optional bool write_manifest
 }
 
 struct TRemoteTabletSnapshot {
@@ -401,6 +404,10 @@ struct TRemoteTabletSnapshot {
     5: optional Types.TNetworkAddress remote_be_addr
     6: optional string remote_snapshot_path
     7: optional string remote_token
+    // SHA-256 of the manifest file of the remote tablet snapshot, recorded at backup time. If set, the
+    // manifest is fetched from "<parent of remote_snapshot_path>/manifest", the files are downloaded by it
+    // and the downloaded tablet snapshot is checked against it.
+    7601: optional string manifest_root
 }
 
 struct TDownloadReq {
@@ -412,6 +419,11 @@ struct TDownloadReq {
     6: optional string location // root path
     7: optional list<TRemoteTabletSnapshot> remote_tablet_snapshots
     8: optional string vault_id // for cloud restore
+    // src path (same key as src_dest_map) -> SHA-256 of the manifest file of the tablet, recorded at backup
+    // time. If set, the manifest is fetched from "<parent of src path>/__manifest__<tablet id>.<first 32 hex
+    // chars of the SHA-256>", the files are downloaded by it and the downloaded tablet snapshot is checked
+    // against it.
+    7601: optional map<string, string> manifest_roots
 }
 
 struct TSnapshotRequest {
@@ -431,6 +443,11 @@ struct TSnapshotRequest {
     12: optional Types.TVersion end_version
     13: optional bool is_copy_binlog
     14: optional Types.TTabletId ref_tablet_id
+    // record the SHA-256 of each snapshot file in the manifest file of the snapshot
+    7601: optional bool compute_digest
+    // backup only: write the manifest of the snapshot (the frontend config enable_backup_manifest). Without it,
+    // as from an older frontend, list_files only lists the files.
+    7606: optional bool write_manifest
 }
 
 struct TReleaseSnapshotRequest {

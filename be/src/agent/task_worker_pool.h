@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/status.h"
 #include "gutil/ref_counted.h"
@@ -37,6 +38,7 @@ class CloudStorageEngine;
 class Thread;
 class ThreadPool;
 class TReportRequest;
+class TSnapshotRequest;
 class TTabletInfo;
 class TAgentTaskRequest;
 class ClusterInfo;
@@ -142,6 +144,15 @@ void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskReques
 void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 
 void download_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
+// Lists the files of the snapshot (the tablet_id/schema_hash dir of snapshot_path) into snapshot_files, and if
+// write_manifest, writes the manifest of the snapshot next to it and returns its root in manifest_root. Without
+// write_manifest (an older frontend) the files are only listed: no manifest, no SHA-256, an empty manifest_root.
+Status list_snapshot_files_and_write_manifest(const TSnapshotRequest& snapshot_request,
+                                              const std::string& snapshot_path,
+                                              bool write_manifest,
+                                              std::vector<std::string>* snapshot_files,
+                                              std::string* manifest_root);
 
 void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req);
 
