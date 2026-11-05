@@ -997,6 +997,8 @@ struct TFrontendPingFrontendResult {
     8: optional list<TDiskInfo> diskInfos
     9: optional i64 processUUID
     10: optional i32 arrowFlightSqlPort
+    // The version of the restore reuse protocol the FE understands, 0 or not set for a FE without it.
+    7601: optional i32 restoreReuseCapability
 }
 
 struct TPropertyVal {
