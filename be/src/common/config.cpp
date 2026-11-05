@@ -263,6 +263,24 @@ DEFINE_mBool(enable_batch_download, "false");
 DEFINE_mBool(enable_download_md5sum_check, "false");
 DEFINE_mBool(restore_manifest_check, "true");
 DEFINE_mBool(restore_manifest_digest_check, "false");
+// worker threads of one logical digest computation of a tablet, used when the request does not carry
+// a value
+DEFINE_mInt32(restore_digest_threads, "4");
+// max number of entries of the in-memory logical digest cache, 0 disables the cache
+DEFINE_mInt64(restore_digest_cache_capacity, "100000");
+// max memory (MB) of the decomposed digests (the per rowset parts) kept in the logical digest cache, so
+// that a repeated backup of the same version does not scan the tablet again; when exceeded the decomposed
+// digest of the least recently used entries is dropped (their whole digest stays). 0 does not cache
+// them. A digest larger than the limit is not cached.
+DEFINE_mInt64(restore_digest_cache_decomposed_mb, "256");
+// max number of extra scans (delete bitmap versions of a rowset for unique MoW, delete conditions for
+// duplicate) a decomposed digest may need; a tablet that needs more has no decomposed digest
+DEFINE_mInt32(restore_digest_prefix_max_scans, "4096");
+// unique merge on read: the number of most recent rowset boundary versions (below the backup version) on
+// which a snapshot task computes a whole digest, so that a restore can append an increment on top of
+// the local data when it stands at one of them; every one is a full merge scan of the tablet. 0 disables
+// the decomposed digest of merge on read tablets.
+DEFINE_mInt32(restore_digest_mor_prefix_boundaries, "3");
 // download binlog meta timeout, default 30s
 DEFINE_mInt32(download_binlog_meta_timeout_ms, "30000");
 // the interval time(seconds) for agent report index policy to FE

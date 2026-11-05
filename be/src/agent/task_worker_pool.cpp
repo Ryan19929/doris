@@ -66,6 +66,7 @@
 #include "olap/cumulative_compaction_time_series_policy.h"
 #include "olap/data_dir.h"
 #include "olap/olap_common.h"
+#include "olap/restore_digest/restore_digest.h"
 #include "olap/rowset/rowset_meta.h"
 #include "olap/snapshot_manager.h"
 #include "olap/storage_engine.h"
@@ -86,7 +87,9 @@
 #include "runtime/fragment_mgr.h"
 #include "runtime/index_policy/index_policy_mgr.h"
 #include "runtime/memory/global_memory_arbitrator.h"
+#include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/snapshot_loader.h"
+#include "runtime/thread_context.h"
 #include "service/backend_options.h"
 #include "util/brpc_client_cache.h"
 #include "util/debug_points.h"
@@ -1434,6 +1437,72 @@ Status list_snapshot_files_and_write_manifest(const TSnapshotRequest& snapshot_r
                 manifest_root));
     }
     return Status::OK();
+}
+
+// Computes the logical digest of a tablet for a snapshot / RESTORE_DIGEST task and converts the
+// outcome to the thrift struct. NOT_SUPPORTED and failures are reported through status_code and
+// status_msg (root is left empty), the caller decides whether they fail the task. If `prefix` is
+// not null, the decomposed digest is produced as well (prefix->produced tells), from the same pass.
+TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,
+                                               int64_t version, int threads,
+                                               PrefixDigestOutput* prefix) {
+    LogicalDigestResult result;
+    Status st;
+    Status prefix_status = Status::OK();
+    const auto start = std::chrono::steady_clock::now();
+    {
+        auto mem_tracker = MemTrackerLimiter::create_shared(
+                MemTrackerLimiter::Type::OTHER,
+                "RestoreDigest#tabletId=" + std::to_string(tablet_id));
+        SCOPED_ATTACH_TASK(mem_tracker);
+        st = get_tablet_logical_digest(engine, tablet_id, version, threads,
+                                       RestoreDigestCache::instance(), &result,
+                                       prefix != nullptr ? &prefix->digest : nullptr,
+                                       &prefix_status,
+                                       prefix != nullptr ? &prefix->from_cache : nullptr);
+    }
+    if (prefix != nullptr) {
+        prefix->produced = st.ok() && prefix_status.ok() && prefix->digest != nullptr;
+        if (!prefix->produced) {
+            prefix->reason = st.ok() ? prefix_status.to_string() : st.to_string();
+        }
+    }
+    TLogicalDigest digest;
+    // the algorithm version is a property of the model of the tablet
+    uint32_t algo_version = RestoreDigest::kAlgoVersion;
+    if (st.ok()) {
+        algo_version = result.algo_version;
+    } else if (TabletSharedPtr tablet = engine.tablet_manager()->get_tablet(tablet_id);
+               tablet != nullptr) {
+        algo_version = RestoreDigest::algo_version_for(tablet->keys_type(),
+                                                       tablet->enable_unique_key_merge_on_write());
+    }
+    digest.__set_algo_version(static_cast<int32_t>(algo_version));
+    if (st.ok()) {
+        digest.__set_schema_sig(result.schema_sig);
+        digest.__set_root(result.root);
+        digest.__set_rows(static_cast<int64_t>(result.rows));
+        digest.__set_status_code("OK");
+        LOG(INFO) << "logical digest done, tablet_id=" << tablet_id << ", version=" << version
+                  << ", rows=" << result.rows << ", root=" << result.root
+                  << ", from_cache=" << result.from_cache
+                  << ", rowsets_sig=" << result.rowsets_sig.substr(0, 8)
+                  << ", decomposed_from_cache=" << (prefix != nullptr && prefix->from_cache)
+                  << ", cache_decomposed_entries="
+                  << RestoreDigestCache::instance()->decomposed_count()
+                  << ", cache_decomposed_bytes="
+                  << RestoreDigestCache::instance()->decomposed_bytes() << ", elapsed_ms="
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+    } else {
+        digest.__set_status_code(st.is<ErrorCode::NOT_IMPLEMENTED_ERROR>() ? "NOT_SUPPORTED"
+                                                                           : "ERROR");
+        digest.__set_status_msg(st.to_string());
+        LOG(WARNING) << "logical digest not available, tablet_id=" << tablet_id
+                     << ", version=" << version << ", status=" << st;
+    }
+    return digest;
 }
 
 void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req) {

@@ -313,6 +313,18 @@ DECLARE_mBool(restore_manifest_check);
 // whether to also check the SHA-256 of each file against the manifest, if the manifest has it.
 // It reads all the files once, including the files reused locally instead of downloading.
 DECLARE_mBool(restore_manifest_digest_check);
+// worker threads of one logical digest computation of a tablet (see olap/restore_digest), used when
+// the request does not carry a value
+DECLARE_mInt32(restore_digest_threads);
+// max number of entries of the in-memory logical digest cache, 0 disables the cache
+DECLARE_mInt64(restore_digest_cache_capacity);
+// max memory (MB) of the decomposed digests kept in the logical digest cache, 0 does not cache them
+DECLARE_mInt64(restore_digest_cache_decomposed_mb);
+// max number of extra scans a decomposed digest may need, a tablet that needs more has none
+DECLARE_mInt32(restore_digest_prefix_max_scans);
+// unique merge on read: the number of most recent rowset boundary versions for which a whole digest
+// is computed, 0 disables the decomposed digest of merge on read tablets
+DECLARE_mInt32(restore_digest_mor_prefix_boundaries);
 // download binlog meta timeout
 DECLARE_mInt32(download_binlog_meta_timeout_ms);
 // the interval time(seconds) for agent report index policy to FE
