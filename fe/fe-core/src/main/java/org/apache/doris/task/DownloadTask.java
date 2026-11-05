@@ -23,6 +23,7 @@ import org.apache.doris.thrift.TDownloadReq;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TRemoteTabletSnapshot;
 import org.apache.doris.thrift.TResourceInfo;
+import org.apache.doris.thrift.TRestoreIncrementalRange;
 import org.apache.doris.thrift.TTaskType;
 
 import java.util.List;
@@ -41,6 +42,9 @@ public class DownloadTask extends AgentTask {
     // src path (the key of srcToDestPath) -> the manifest root of the tablet snapshot, for the manifest check.
     // Only for downloading from a repository, the manifest root of the http path is in remoteTabletSnapshots.
     private Map<String, String> manifestRoots;
+    // src path -> the range of the increment to download, for the incremental restore. Only for downloading from a
+    // repository, the range of a http path is in remoteTabletSnapshots.
+    private Map<String, TRestoreIncrementalRange> incrementalRanges;
 
     // for cloud mode
     private String storageVaultId;
@@ -97,6 +101,14 @@ public class DownloadTask extends AgentTask {
         this.manifestRoots = manifestRoots;
     }
 
+    public Map<String, TRestoreIncrementalRange> getIncrementalRanges() {
+        return incrementalRanges;
+    }
+
+    public void setIncrementalRanges(Map<String, TRestoreIncrementalRange> incrementalRanges) {
+        this.incrementalRanges = incrementalRanges;
+    }
+
     public void updateBrokerProperties(Map<String, String> brokerProperties) {
         this.brokerProperties = new java.util.HashMap<>(brokerProperties);
     }
@@ -120,6 +132,9 @@ public class DownloadTask extends AgentTask {
             req.setVaultId(storageVaultId);
             if (manifestRoots != null && !manifestRoots.isEmpty()) {
                 req.setManifestRoots(manifestRoots);
+            }
+            if (incrementalRanges != null && !incrementalRanges.isEmpty()) {
+                req.setIncrementalRanges(incrementalRanges);
             }
         }
         return req;

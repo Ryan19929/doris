@@ -2935,6 +2935,111 @@ public class Config extends ConfigBase {
             "The number of concurrent restore tasks per be"})
     public static int restore_task_concurrency_per_be = 5000;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether to enable partition level reuse of restore: "
+            + "for a non-atomic restore, a local partition that is proved logically equal to the partition in the "
+            + "backup keeps its local data, and its snapshot, download and move are skipped. Disabled by default, "
+            + "the restore behaves as before if disabled.")
+    public static boolean enable_restore_partition_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The default check level of partition level reuse, "
+            + "overridden by the restore property reuse_check_level: off|sample|full|disable. The default is full: "
+            + "every reused partition is proved by the digest of each replica. Unless "
+            + "restore_reuse_allow_unverified_keep is true, off and sample are taken as full.")
+    public static String restore_reuse_default_check_level = "full";
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the check levels off and sample take effect "
+            + "as they are. If false (the default), they are taken as full, so a partition is kept or appended "
+            + "only if the digest of every replica proves it. If true, a partition may be kept without a digest "
+            + "(off: by the lineage stamp only, sample: the partitions not sampled), which gives no consistency "
+            + "guarantee. For experiments and observation only.")
+    public static boolean restore_reuse_allow_unverified_keep = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the unique merge-on-read tables, which have "
+            + "a hidden state that the digest does not cover (the overwritten versions of a key), are considered by "
+            + "partition level reuse. False by default: they are downloaded. If true, the behavior before the "
+            + "narrowing is restored, for experiments only, the data after the following writes is not guaranteed "
+            + "to be consistent with the backup. It has no effect on the unique merge-on-write tables, see "
+            + "restore_reuse_mow.")
+    public static boolean restore_reuse_allow_hidden_state_models = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the unique merge-on-write tables without a "
+            + "sequence column are considered by partition level reuse. Their digest (algorithm version 2) covers "
+            + "the rows that the delete bitmap leaves, the rows with a delete sign included, which is all that a "
+            + "later write reads of the existing data. False by default: they are downloaded; the backup computes "
+            + "and records the digest anyway. A table with a sequence column, or a tablet with a DELETE condition "
+            + "(light delete), is never reused. All the frontends and backends must report the capability 2. "
+            + "The digest of algorithm version 1 of a merge-on-write table is never trusted, whatever the value of "
+            + "restore_reuse_allow_hidden_state_models.")
+    public static boolean restore_reuse_mow = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The number of failures of an incremental append "
+            + "task or a local source snapshot task of an atomic restore after which the restore job is cancelled. "
+            + "An error which the backend says can not be retried (with the prefix [RESTORE_NOT_RETRYABLE]) cancels "
+            + "the job at once, a failure to obtain the tablet locks is not counted. The other tasks of the "
+            + "restore are resent without a limit as before.")
+    public static int restore_local_source_task_max_retry = 10;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The ratio of the candidate partitions to compute "
+            + "the digest for in the sample check level, at least one partition.")
+    public static double restore_reuse_sample_ratio = 0.1;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the candidate partitions that come in by the "
+            + "reverse or the table level relation (not by the lineage stamp of the local partition) are always "
+            + "verified by the digest, whatever the check level is. They are neither sampled nor kept because the "
+            + "sample passed. If false, they are sampled as the others in the check level sample.")
+    public static boolean restore_reuse_force_full_for_relation = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The minimum size (local data size of a single "
+            + "replica, in bytes) of a partition to be considered for partition level reuse, smaller partitions are "
+            + "downloaded. 0 by default, every partition is considered: the digest check of a small partition costs "
+            + "little, and the partitions of a table partitioned by day are often smaller than 1 GB.")
+    public static long restore_reuse_min_partition_bytes = 0;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The timeout (in seconds) of waiting for the digest "
+            + "tasks of partition level reuse, the partitions timed out are downloaded.")
+    public static int restore_digest_timeout_s = 3600;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether to enable the incremental append of restore "
+            + "(needs enable_restore_partition_reuse too): a local partition that is behind the partition in the "
+            + "backup, and whose data up to its version is proved logically equal to the backup at that version, "
+            + "downloads only the rowsets of the versions after it and appends them to the local tablets, instead of "
+            + "being downloaded as a whole. Disabled by default, the restore behaves as before if disabled.")
+    public static boolean enable_restore_incremental_append = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether partition level reuse (and the incremental "
+            + "append, if enabled) also works for an atomic restore (needs enable_restore_partition_reuse too): the "
+            + "partitions of the table being replaced that are proved logically equal to the backup are made into "
+            + "the staging table by a local snapshot (hard links, or a copy on another disk) of the tablets of the "
+            + "table being replaced instead of a download. Only for a table whose schema is not changed and whose "
+            + "staging replicas are bound to the replicas of the table being replaced. If the version of such a "
+            + "partition changed before the tables are replaced, the restore fails (the table being replaced is "
+            + "not touched). Disabled by default, the atomic restore behaves as before if disabled.")
+    public static boolean enable_restore_atomic_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether a restore job uses partition level reuse "
+            + "(the digest tasks, the local source snapshot and the incremental append) only if every follower "
+            + "frontend (the master included, the observers excluded) and every alive backend reports the capability "
+            + "of it in the heartbeat. A node of an old version does not report it, then the job downloads all the "
+            + "data as before and the reason MIXED_VERSIONS is recorded. It is checked once, when the job starts to "
+            + "decide the reuse. If false, the check is skipped: a restore job may then send tasks that an old "
+            + "backend does not know, and be taken over by an old frontend, which fails the job or makes it "
+            + "wait. For experiments only.")
+    public static boolean restore_reuse_require_capability = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The maximum number of tablets of a backup job for "
+            + "which the logical digest is recorded. If a backup involves more tablets, the backup does not ask the "
+            + "backends to compute the logical digest and does not write it (nor the decomposed digest) into the job "
+            + "info, the reason (TOO_MANY_TABLETS) is shown in the column LogicalDigest of SHOW BACKUP, and the backup "
+            + "still succeeds. A restore of such a backup does not reuse partitions. 0 (the default) means no limit.")
+    public static long backup_logical_digest_max_tablets = 0;
+
+    @ConfField(mutable = true, masterOnly = true, description = "The maximum number of tablets of the backup that a "
+            + "restore job may consider for partition level reuse. If the backup involves more tablets, the job does "
+            + "not reuse any partition (the check level is forced to disable), all the data is downloaded as before "
+            + "and the reason TOO_MANY_TABLETS is counted in the ReuseEstimate of SHOW RESTORE. 0 (the default) "
+            + "means no limit.")
+    public static long restore_reuse_max_tablets = 0;
+
     @ConfField(mutable = true, description = {"执行 agent task 时，BE心跳超过多长时间，认为BE不可用",
             "The time after which BE is considered unavailable if the heartbeat is not received"})
     public static int agent_task_be_unavailable_heartbeat_timeout_second = 300;

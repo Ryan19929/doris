@@ -56,11 +56,13 @@ import org.apache.doris.fs.remote.RemoteFileSystem;
 import org.apache.doris.persist.BarrierLog;
 import org.apache.doris.task.DirMoveTask;
 import org.apache.doris.task.DownloadTask;
+import org.apache.doris.task.RestoreDigestTask;
 import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.task.UploadTask;
 import org.apache.doris.thrift.TFinishTaskRequest;
 import org.apache.doris.thrift.TTaskType;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
@@ -77,6 +79,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedList;
@@ -148,6 +151,13 @@ public class BackupHandler extends MasterDaemon implements Writable {
     // once the job is published (or the replay fails), so the map size is bounded by the number of
     // replays in flight.
     private static final Map<Path, Integer> UNPUBLISHED_STAGING_DIRS = new ConcurrentHashMap<>();
+
+    // The ids of the restore jobs, not done, that load staging partitions from a local source (see
+    // RestoreJob.localSourceStagingPartitions). The tablet scheduler asks isEmpty() first, to skip everything for the
+    // common case, so it has to be cheap and lock free. Kept up to date when a job builds or clears its set, when a
+    // job is added (also on replay and image load, where the job object is replaced by a new one) and when a job is
+    // evicted.
+    private final Set<Long> jobsWithLocalSource = ConcurrentHashMap.newKeySet();
 
     // this lock is used for handling one backup or restore request at a time.
     private ReentrantLock seqlock = new ReentrantLock();
@@ -221,6 +231,26 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     public AbstractJob getJob(long dbId) {
         return getCurrentJob(dbId);
+    }
+
+    /** Whether some running restore job loads staging partitions from a local source. Lock free. */
+    public boolean hasJobsWithLocalSource() {
+        return !jobsWithLocalSource.isEmpty();
+    }
+
+    @VisibleForTesting
+    Set<Long> getJobsWithLocalSource() {
+        return Collections.unmodifiableSet(jobsWithLocalSource);
+    }
+
+    /** Brings the entry of the job in jobsWithLocalSource in line with the state of the job object. */
+    void syncLocalSourceJob(AbstractJob job) {
+        if (job instanceof RestoreJob && !job.isDone()
+                && !((RestoreJob) job).getLocalSourceStagingPartitions().isEmpty()) {
+            jobsWithLocalSource.add(job.getJobId());
+        } else {
+            jobsWithLocalSource.remove(job.getJobId());
+        }
     }
 
     public List<AbstractJob> getJobs(long dbId, Predicate<String> predicate) {
@@ -625,6 +655,9 @@ public class BackupHandler extends MasterDaemon implements Writable {
         if (stmt.isManifestDigest()) {
             backupJob.setManifestDigest(true);
         }
+        if (stmt.isLogicalDigest()) {
+            backupJob.setLogicalDigest(true);
+        }
         // write log
         env.getEditLog().logBackupJob(backupJob);
 
@@ -705,6 +738,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             }
         }
 
+        restoreJob.setReuseCheckLevel(stmt.getReuseCheckLevel());
         env.getEditLog().logRestoreJob(restoreJob);
 
         // must put to dbIdToBackupOrRestoreJob after edit log, otherwise the state of job may be changed.
@@ -726,6 +760,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             Deque<AbstractJob> jobs = dbIdToBackupOrRestoreJobs.computeIfAbsent(dbId, k -> Lists.newLinkedList());
             while (jobs.size() >= Config.max_backup_restore_job_num_per_db) {
                 AbstractJob removedJob = jobs.removeFirst();
+                jobsWithLocalSource.remove(removedJob.getJobId());
                 if (removedJob instanceof BackupJob) {
                     removedBackupJobs.add((BackupJob) removedJob);
                 }
@@ -736,6 +771,7 @@ public class BackupHandler extends MasterDaemon implements Writable {
             // Otherwise, the tasks that have been successfully executed will be repeated when replaying edit log.
             if (lastJob != null && (lastJob.isPending() || lastJob.getJobId() == job.getJobId())) {
                 jobs.removeLast();
+                jobsWithLocalSource.remove(lastJob.getJobId());
             }
             jobs.addLast(job);
 
@@ -746,6 +782,8 @@ public class BackupHandler extends MasterDaemon implements Writable {
                     }
                 }
             }
+            // the state of the new object decides, whatever the replaced one was
+            syncLocalSourceJob(job);
         } finally {
             jobLock.unlock();
         }
@@ -1269,6 +1307,24 @@ public class BackupHandler extends MasterDaemon implements Writable {
         }
 
         return ((RestoreJob) job).finishTabletDownloadTask(task, request);
+    }
+
+    public boolean handleFinishedRestoreDigestTask(RestoreDigestTask task, TFinishTaskRequest request) {
+        AbstractJob job = getCurrentJob(task.getDbId());
+        if (!(job instanceof RestoreJob)) {
+            LOG.warn("failed to find restore job for task: {}", task);
+            // return true to remove this task from AgentTaskQueue
+            return true;
+        }
+
+        if (job.getJobId() != task.getJobId()) {
+            LOG.warn("invalid restore digest task: {}, job id: {}, task job id: {}", task, job.getJobId(),
+                    task.getJobId());
+            // return true to remove this task from AgentTaskQueue
+            return true;
+        }
+
+        return ((RestoreJob) job).finishRestoreDigestTask(task, request);
     }
 
     public boolean handleDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {

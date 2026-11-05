@@ -103,4 +103,27 @@ public class BackupTest {
         BackupStmt invalidStmt = createStmt(false, invalid);
         Assert.assertThrows(AnalysisException.class, () -> invalidStmt.analyze(analyzer));
     }
+
+    @Test
+    public void testLogicalDigestProperty() throws Exception {
+        // default false
+        BackupStmt stmt = createStmt(false);
+        stmt.analyze(analyzer);
+        Assert.assertFalse(stmt.isLogicalDigest());
+
+        for (String value : new String[] {"true", "TRUE", "false"}) {
+            Map<String, String> properties = Maps.newHashMap();
+            properties.put(BackupStmt.PROP_LOGICAL_DIGEST, value);
+            BackupStmt digestStmt = createStmt(false, properties);
+            digestStmt.analyze(analyzer);
+            Assert.assertEquals(Boolean.parseBoolean(value), digestStmt.isLogicalDigest());
+            // independent of manifest_digest
+            Assert.assertFalse(digestStmt.isManifestDigest());
+        }
+
+        Map<String, String> invalid = Maps.newHashMap();
+        invalid.put(BackupStmt.PROP_LOGICAL_DIGEST, "yes");
+        BackupStmt invalidStmt = createStmt(false, invalid);
+        Assert.assertThrows(AnalysisException.class, () -> invalidStmt.analyze(analyzer));
+    }
 }
