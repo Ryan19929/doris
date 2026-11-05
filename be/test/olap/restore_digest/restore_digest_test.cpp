@@ -436,6 +436,23 @@ protected:
     }
 
     // ---------------------------------------------------------------- helpers P2
+    // The schema without the column `name`; the other columns keep their unique ids, the way a
+    // schema change DROP COLUMN leaves them.
+    static TabletSchemaSPtr schema_without_column(const TabletSchemaSPtr& schema,
+                                                  const std::string& name) {
+        TabletSchemaPB pb;
+        schema->to_schema_pb(&pb);
+        for (int i = 0; i < pb.column_size(); ++i) {
+            if (pb.column(i).name() == name) {
+                pb.mutable_column()->DeleteSubrange(i, 1);
+                break;
+            }
+        }
+        auto out = std::make_shared<TabletSchema>();
+        out->init_from_pb(pb);
+        return out;
+    }
+
     static ColSpec with_children(ColSpec c, std::vector<ColSpec> children) {
         c.children = std::move(children);
         return c;
@@ -1146,6 +1163,49 @@ protected:
     }
 };
 
+// A DELETE condition on a column which was dropped afterwards still applies to the rows written
+// before: the scan schema gets the dropped column back for the delete handler.
+TEST_F(RestoreDigestDeleteTest, ConditionOnDroppedColumnStillApplies) {
+    // the aggregation is set explicitly: the dropped column is rebuilt from the schema pb, and a
+    // column pb without one leaves the aggregation of the column undefined
+    auto specs = cols();
+    for (auto& spec : specs) {
+        spec.aggregation = "NONE";
+    }
+    auto old_schema = make_schema(DUP_KEYS, specs);
+    std::vector<Rec> a;
+    std::vector<Rec> b;
+    for (int k = 0; k < 120; ++k) {
+        a.push_back({k, k % 7 == 0 ? std::nullopt : std::optional<int>(k % 10),
+                     "a" + std::to_string(k)});
+    }
+    for (int k = 200; k < 260; ++k) {
+        b.push_back({k, k % 4, "b" + std::to_string(k)});
+    }
+    auto rs2 = write_rowset(old_schema, rows_of(a), 2, 40, false);
+    auto rs3 = write_delete_rowset(old_schema, 3, {cond("v", "=", {"3"})});
+    auto rs4 = write_rowset(old_schema, rows_of(b), 4, 25, true);
+    ASSERT_TRUE(rs3->rowset_meta()->has_delete_predicate());
+
+    auto new_schema = schema_without_column(old_schema, "v");
+    ASSERT_EQ(2U, new_schema->num_columns());
+    // the condition applies to the rows before it (version 3), not to the rows after it
+    std::vector<Row> visible;
+    for (const Rec& r : a) {
+        if (!(r.v.has_value() && *r.v == 3)) {
+            visible.push_back({V<int32_t>(r.k), S(r.s)});
+        }
+    }
+    for (const Rec& r : b) {
+        visible.push_back({V<int32_t>(r.k), S(r.s)});
+    }
+    RestoreDigest d = digest_of(new_schema, {rs2, rs3, rs4}, DUP_KEYS, false, nullptr, 4);
+    RestoreDigest ref = digest_rows(new_schema, visible);
+    EXPECT_TRUE(same_digest(ref, d));
+    EXPECT_EQ(visible.size(), d.rows);
+    EXPECT_EQ(1U, d.delete_predicates);
+}
+
 TEST_F(RestoreDigestDeleteTest, AppliedByVersionAndStableAcrossCompaction) {
     auto schema = make_schema(DUP_KEYS, cols());
     std::vector<Rec> a;
@@ -1545,6 +1605,51 @@ protected:
         EXPECT_GE(roots.size(), 5U);
     }
 };
+
+// Unique merge on read: a DELETE condition (on a key column, the only kind a unique table takes)
+// written while a value column still existed, which is dropped afterwards. The scan schema of the
+// merge reader gets the dropped column appended through the schema of the delete condition, and
+// the digest columns must still be the right ones.
+TEST_F(RestoreDigestMorTest, DeleteConditionAfterColumnDropped) {
+    // see the duplicate test: the aggregation is set explicitly
+    auto specs = mor_cols(false);
+    for (auto& spec : specs) {
+        spec.aggregation = "NONE";
+    }
+    auto old_schema = make_schema(UNIQUE_KEYS, specs);
+    std::vector<MRow> v1;
+    for (int k = 1; k <= 30; ++k) {
+        v1.push_back({k, k % 5, "a" + std::to_string(k), 1, 0});
+    }
+    std::vector<MRow> v3 = {{3, 7, "c3", 3, 0}, {40, 2, "c40", 3, 0}, {41, 4, "c41", 3, 0}};
+    auto rs2 = write_rowset(old_schema, rows_of(false, v1), 2, 8, true);
+    auto rs3 = write_delete_rowset(old_schema, 3, {cond("k", "<", {"5"})});
+    auto rs4 = write_rowset(old_schema, rows_of(false, v3), 4, 8, false);
+    ASSERT_TRUE(rs3->rowset_meta()->has_delete_predicate());
+
+    auto new_schema = schema_without_column(old_schema, "v1");
+    ASSERT_EQ(3U, new_schema->num_columns());
+    auto tablet = make_meta_tablet(UNIQUE_KEYS, new_schema);
+    // keys 1..4 written before the condition are gone; key 3 is written again after it
+    std::map<int, MRow> state;
+    for (const MRow& r : v1) {
+        if (r.k >= 5) {
+            state[r.k] = r;
+        }
+    }
+    for (const MRow& r : v3) {
+        state[r.k] = r;
+    }
+    std::vector<Row> visible;
+    for (const auto& [k, r] : state) {
+        visible.push_back({V<int32_t>(r.k), S(r.v2), V<int8_t>(0)});
+    }
+    RestoreDigest d = mor_digest(new_schema, {rs2, rs3, rs4}, tablet, 4);
+    RestoreDigest ref =
+            mor_digest(new_schema, {write_rowset(new_schema, visible, 2, 1000, false)}, tablet, 4);
+    EXPECT_TRUE(same_digest(ref, d));
+    EXPECT_EQ(visible.size(), d.rows);
+}
 
 TEST_F(RestoreDigestMorTest, MultipleUpdatesEqualFinalRowsWithSequenceColumn) {
     run(true);
