@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <gen_cpp/MasterService_types.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -157,6 +159,17 @@ struct PrefixDigestOutput {
 TLogicalDigest compute_logical_digest_for_task(StorageEngine& engine, int64_t tablet_id,
                                                int64_t version, int threads,
                                                PrefixDigestOutput* prefix = nullptr);
+
+// Lists the files of a snapshot and, if write_manifest, writes its manifest and returns the root; without
+// write_manifest (an older frontend) only lists them. logical_digest (may be nullptr) puts the decomposed digest
+// file into the manifest.
+Status list_snapshot_files_and_write_manifest(const TSnapshotRequest& snapshot_request,
+                                              const std::string& snapshot_path, bool write_manifest,
+                                              const TLogicalDigest* logical_digest,
+                                              std::vector<std::string>* snapshot_files,
+                                              std::string* manifest_root);
+
+void restore_digest_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 
 void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
 

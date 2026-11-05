@@ -76,6 +76,22 @@ struct TDownloadStats {
     11: optional i64 unmatched_no_source_rowset_id
     12: optional i64 unmatched_source_not_in_snapshot
     13: optional i64 unmatched_version_mismatch
+    // tablets restored incrementally (only the rowsets of the increment are downloaded), and the files and bytes
+    // downloaded for them, which are also counted in downloaded_files / downloaded_bytes
+    14: optional i64 tablets_incremental
+    15: optional i64 incremental_files
+    16: optional i64 incremental_bytes
+    // snapshot task with restore_local_source (atomic restore keeps the data of the table being replaced): the
+    // tablets made from the local tablet, and their files hard linked / copied (the other disk) from it (a task
+    // sent again after a lost report counts its tablet, not the files)
+    17: optional i64 local_source_tablets
+    18: optional i64 local_source_linked_files
+    19: optional i64 local_source_linked_bytes
+    20: optional i64 local_source_copied_files
+    21: optional i64 local_source_copied_bytes
+    // of local_source_tablets, those loaded into the tablet by the snapshot task itself (TSnapshotRequest.restore_kept_load
+    // or restore_incremental), the move of the restore then has nothing to load
+    22: optional i64 local_source_loaded_tablets
 }
 
 // Result of the logical digest computation of a tablet, see TSnapshotRequest.compute_logical_digest and
@@ -134,6 +150,11 @@ struct TFinishTaskRequest {
     7604: optional bool manifest_digest_checked
     // download task: how much of the data was reused locally instead of downloaded
     7605: optional TDownloadStats download_stats
+    // snapshot task (compute_logical_digest) and restore digest task: the logical digest of the tablet
+    7606: optional TLogicalDigest logical_digest
+    // upload task: SHA-256 of the decomposed digest file (rdigest) uploaded next to the files of each tablet,
+    // only the tablets which have one
+    7607: optional map<Types.TTabletId, string> prefix_digest_roots
 }
 
 struct TTablet {

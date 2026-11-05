@@ -50,6 +50,7 @@
 #include "io/fs/file_reader.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
+#include "io/fs/remote_file_system.h"
 #include "olap/data_dir.h"
 #include "olap/delta_writer.h"
 #include "olap/iterators.h"
@@ -592,6 +593,110 @@ TEST_F(SnapshotLoaderTest, SnapshotManifestSerializeAndParse) {
     EXPECT_FALSE(parent_path_of("noslash", &parent).ok());
 }
 
+// The decomposed digest file (rdigest) is an entry of the manifest, in the order of the names. The manifest
+// is version 2 then, and parse() keeps the entry out of the files.
+TEST_F(SnapshotLoaderTest, SnapshotManifestWithPrefixDigest) {
+    SnapshotManifest manifest;
+    manifest.tablet_id = 1001;
+    manifest.files = {
+            SnapshotManifestFile {.name = "rs1_0.idx", .size = 5, .md5 = "", .sha256 = ""},
+            SnapshotManifestFile {.name = "1001.hdr",
+                                  .size = 6,
+                                  .md5 = "4f158689243a3d6030352fec3cfd3798",
+                                  .sha256 = ""}};
+    std::string old_content = manifest.serialize();
+    // without the entry it is the version 1 manifest as before
+    EXPECT_EQ(0U, old_content.find("{\"version\":1,"));
+    EXPECT_EQ(std::string::npos, old_content.find("__rdigest__"));
+    EXPECT_FALSE(manifest.has_prefix_digest());
+
+    manifest.prefix_digest_sha256 = std::string(64, 'c');
+    manifest.prefix_digest_size = 123;
+    ASSERT_TRUE(manifest.has_prefix_digest());
+    std::string content = manifest.serialize();
+    EXPECT_EQ(
+            "{\"version\":2,\"tablet_id\":1001,\"files\":[{\"n\":\"1001.hdr\",\"s\":6,\"m\":"
+            "\"4f158689243a3d6030352fec3cfd3798\"},{\"n\":\"__rdigest__\",\"s\":123,\"d\":\"" +
+                    std::string(64, 'c') + "\"},{\"n\":\"rs1_0.idx\",\"s\":5}]}",
+            content);
+    // the files of the manifest are not changed by the entry
+    ASSERT_EQ(2, manifest.files.size());
+    std::string root = sha256_hex(content);
+    EXPECT_NE(sha256_hex(old_content), root);
+
+    SnapshotManifest parsed;
+    auto st = SnapshotManifest::parse(content, root, 1001, &parsed);
+    ASSERT_TRUE(st.ok()) << st;
+    // the entry is not a file to download, link or check
+    ASSERT_EQ(2, parsed.files.size());
+    EXPECT_EQ("1001.hdr", parsed.files[0].name);
+    EXPECT_EQ("rs1_0.idx", parsed.files[1].name);
+    EXPECT_TRUE(parsed.has_prefix_digest());
+    EXPECT_EQ(std::string(64, 'c'), parsed.prefix_digest_sha256);
+    EXPECT_EQ(123, parsed.prefix_digest_size);
+    EXPECT_EQ(content, parsed.serialize());
+
+    // a manifest written before the entry is still read, and parsing resets the entry of the target
+    st = SnapshotManifest::parse(old_content, sha256_hex(old_content), 1001, &parsed);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_FALSE(parsed.has_prefix_digest());
+    EXPECT_EQ(0, parsed.prefix_digest_size);
+    EXPECT_EQ(2, parsed.files.size());
+
+    // an entry without the SHA-256, or twice
+    for (std::string bad :
+         {std::string(
+                  "{\"version\":2,\"tablet_id\":1001,\"files\":[{\"n\":\"__rdigest__\",\"s\":1}]}"),
+          std::string("{\"version\":2,\"tablet_id\":1001,\"files\":[{\"n\":\"__rdigest__\",\"s\":1,"
+                      "\"d\":\"abc\"}]}"),
+          "{\"version\":2,\"tablet_id\":1001,\"files\":[{\"n\":\"__rdigest__\",\"s\":1,\"d\":\"" +
+                  std::string(64, 'a') + "\"},{\"n\":\"__rdigest__\",\"s\":1,\"d\":\"" +
+                  std::string(64, 'a') + "\"}]}"}) {
+        st = SnapshotManifest::parse(bad, sha256_hex(bad), 1001, &parsed);
+        EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << bad << ": " << st;
+    }
+    // an unknown version
+    std::string v3 = "{\"version\":3,\"tablet_id\":1001,\"files\":[]}";
+    st = SnapshotManifest::parse(v3, sha256_hex(v3), 1001, &parsed);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+}
+
+// The entry of the decomposed digest is not a file of the tablet snapshot dir: it is never missing, and
+// the snapshot is not required to have it.
+TEST_F(SnapshotLoaderTest, CheckTabletSnapshotManifestIgnoresPrefixDigestEntry) {
+    std::string dir = storage_root_path + "/manifest_check_rdigest/2002/3003";
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(dir).ok());
+    write_test_file(dir + "/2002.hdr", "header");
+    write_test_file(dir + "/rs1_0.dat", "segment");
+    std::string dat_sha256;
+    ASSERT_TRUE(compute_file_digests(dir + "/rs1_0.dat", nullptr, &dat_sha256).ok());
+
+    SnapshotManifest manifest;
+    manifest.tablet_id = 1001;
+    manifest.files = {
+            SnapshotManifestFile {.name = "1001.hdr", .size = 6, .md5 = "", .sha256 = ""},
+            SnapshotManifestFile {.name = "rs1_0.dat", .size = 7, .md5 = "", .sha256 = dat_sha256}};
+    manifest.prefix_digest_sha256 = std::string(64, 'd');
+    manifest.prefix_digest_size = 99;
+    // through the serialized form, as a restore gets it
+    std::string content = manifest.serialize();
+    SnapshotManifest parsed;
+    ASSERT_TRUE(SnapshotManifest::parse(content, sha256_hex(content), 1001, &parsed).ok());
+
+    ManifestCheckResult result;
+    auto st = check_tablet_snapshot_manifest(dir, 2002, parsed, true, &result);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(result.checked);
+    EXPECT_TRUE(result.digest_checked);
+    // a file of the snapshot dir is still not allowed to be missing
+    ASSERT_TRUE(io::global_local_filesystem()->delete_file(dir + "/rs1_0.dat").ok());
+    st = check_tablet_snapshot_manifest(dir, 2002, parsed, true, &result);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->delete_directory(storage_root_path + "/manifest_check_rdigest")
+                        .ok());
+}
+
 TEST_F(SnapshotLoaderTest, CheckTabletSnapshotManifest) {
     // A downloaded local snapshot of local tablet 2002, the source tablet is 1001.
     std::string dir = storage_root_path + "/manifest_check/2002/3003";
@@ -827,6 +932,168 @@ TEST_F(SnapshotLoaderTest, HttpDownloadCheckManifest) {
                         ->exists(remote_snapshot.local_snapshot_path + "/manifest", &exists)
                         .ok());
     EXPECT_FALSE(exists);
+}
+
+// The decomposed digest (rdigest) of a snapshot kept on a remote BE: next to the manifest, fetched
+// over the BE http download and checked against the root of the job info.
+TEST_F(SnapshotLoaderTest, FetchPrefixDigestFromRemoteBe) {
+    const int64_t tablet_id = 2111;
+    RestoreDigestDecomposed digest;
+    digest.schema_sig = std::string(64, 'a');
+    digest.tablet_id = tablet_id;
+    digest.base_version = 3;
+    digest.root = std::string(64, 'b');
+    digest.rows = 2;
+    for (int64_t v = 1; v <= 3; ++v) {
+        RestoreDigestRowsetPart part;
+        part.rowset_id = fmt::format("rowset{}", v);
+        part.start_version = part.end_version = v;
+        part.buckets[static_cast<size_t>(v)].count = static_cast<uint64_t>(v);
+        part.buckets[static_cast<size_t>(v)].sum = static_cast<unsigned __int128>(v) << 100;
+        digest.rowsets.push_back(std::move(part));
+    }
+    RestoreDigestMarkPart mark;
+    mark.mark_version = 3;
+    mark.buckets[1].count = 1;
+    mark.buckets[1].sum = static_cast<unsigned __int128>(1) << 100;
+    digest.marks.push_back(std::move(mark));
+
+    std::string remote_dir = fmt::format("{}/remote_prefix_{}", storage_root_path, tablet_id);
+    std::string remote_tablet_path = fmt::format("{}/{}/{}", remote_dir, tablet_id, 777);
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(remote_tablet_path).ok());
+    std::string root;
+    ASSERT_TRUE(write_prefix_digest_file(digest.serialize(),
+                                         fmt::format("{}/{}/{}", remote_dir, tablet_id,
+                                                     RestoreDigestDecomposed::kLocalFileName),
+                                         &root)
+                        .ok());
+    EXPECT_EQ(digest.file_root(), root);
+    EXPECT_EQ("__rdigest__2111." + root.substr(0, 32), prefix_digest_remote_file_name(tablet_id, root));
+
+    TRemoteTabletSnapshot remote_snapshot;
+    remote_snapshot.__set_remote_tablet_id(tablet_id);
+    remote_snapshot.__set_remote_snapshot_path(remote_tablet_path);
+    TNetworkAddress addr;
+    addr.hostname = "127.0.0.1";
+    addr.port = 1234;
+    remote_snapshot.__set_remote_be_addr(addr);
+    remote_snapshot.__set_remote_token("fake_token");
+
+    RestoreDigestDecomposed fetched;
+    auto st = fetch_prefix_digest_from_remote_be(remote_snapshot, root, &fetched);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(digest.serialize(), fetched.serialize());
+    RestoreDigest composed;
+    ASSERT_TRUE(fetched.compose(2, &composed).ok());
+    EXPECT_EQ(3U, composed.rows);
+    ASSERT_TRUE(fetched.compose(3, &composed).ok());
+    EXPECT_EQ(5U, composed.rows);
+    EXPECT_TRUE(fetched.compose(0, &composed).is<ErrorCode::NOT_IMPLEMENTED_ERROR>());
+
+    // not the file recorded in the job info
+    st = fetch_prefix_digest_from_remote_be(remote_snapshot, std::string(64, '0'), &fetched);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+    // the file of another tablet
+    remote_snapshot.__set_remote_tablet_id(tablet_id + 1);
+    st = fetch_prefix_digest_from_remote_be(remote_snapshot, root, &fetched);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+    // no file next to the snapshot (a tablet without a decomposed digest)
+    remote_snapshot.__set_remote_tablet_id(tablet_id);
+    remote_snapshot.__set_remote_snapshot_path(
+            fmt::format("{}/remote_prefix_none/{}/{}", storage_root_path, tablet_id, 777));
+    st = fetch_prefix_digest_from_remote_be(remote_snapshot, root, &fetched);
+    EXPECT_FALSE(st.ok());
+}
+
+// The decomposed digest of a snapshot kept on a remote BE is located by the manifest: the manifest is next to the
+// snapshot dir, checked against the manifest root, and the SHA-256 of rdigest is the one in it.
+TEST_F(SnapshotLoaderTest, FetchPrefixDigestFromRemoteBeByManifest) {
+    const int64_t tablet_id = 2211;
+    RestoreDigestDecomposed digest;
+    digest.schema_sig = std::string(64, 'a');
+    digest.tablet_id = tablet_id;
+    digest.base_version = 1;
+    digest.root = std::string(64, 'b');
+    digest.rows = 1;
+    RestoreDigestRowsetPart part;
+    part.rowset_id = "rowset1";
+    part.start_version = part.end_version = 1;
+    part.buckets[1].count = 1;
+    part.buckets[1].sum = static_cast<unsigned __int128>(1) << 100;
+    digest.rowsets.push_back(std::move(part));
+
+    std::string remote_dir =
+            fmt::format("{}/remote_prefix_manifest_{}", storage_root_path, tablet_id);
+    std::string remote_tablet_path = fmt::format("{}/{}/{}", remote_dir, tablet_id, 777);
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(remote_tablet_path).ok());
+    std::string content = digest.serialize();
+    std::string root;
+    ASSERT_TRUE(write_prefix_digest_file(content,
+                                         fmt::format("{}/{}/{}", remote_dir, tablet_id,
+                                                     RestoreDigestDecomposed::kLocalFileName),
+                                         &root)
+                        .ok());
+    SnapshotManifest manifest;
+    manifest.tablet_id = tablet_id;
+    manifest.files = {
+            SnapshotManifestFile {.name = "rs1_0.dat", .size = 7, .md5 = "", .sha256 = ""}};
+    manifest.prefix_digest_sha256 = root;
+    manifest.prefix_digest_size = static_cast<int64_t>(content.size());
+    std::string manifest_root;
+    ASSERT_TRUE(write_snapshot_manifest(manifest,
+                                        fmt::format("{}/{}/{}", remote_dir, tablet_id,
+                                                    SnapshotManifest::kLocalFileName),
+                                        &manifest_root)
+                        .ok());
+
+    TRemoteTabletSnapshot remote_snapshot;
+    remote_snapshot.__set_remote_tablet_id(tablet_id);
+    remote_snapshot.__set_remote_snapshot_path(remote_tablet_path);
+    TNetworkAddress addr;
+    addr.hostname = "127.0.0.1";
+    addr.port = 1234;
+    remote_snapshot.__set_remote_be_addr(addr);
+    remote_snapshot.__set_remote_token("fake_token");
+
+    RestoreDigestDecomposed fetched;
+    auto st = fetch_prefix_digest_from_remote_be_by_manifest(remote_snapshot, manifest_root,
+                                                             &fetched);
+    ASSERT_TRUE(st.ok()) << st;
+    EXPECT_EQ(content, fetched.serialize());
+    // the root of the rdigest file is not the root of the manifest
+    EXPECT_NE(root, manifest_root);
+    st = fetch_prefix_digest_from_remote_be_by_manifest(remote_snapshot, root, &fetched);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+    // not the manifest recorded in the job info
+    st = fetch_prefix_digest_from_remote_be_by_manifest(remote_snapshot, std::string(64, '0'),
+                                                        &fetched);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+
+    // rdigest is not the file the manifest has: the SHA-256 in the manifest decides
+    SnapshotManifest other = manifest;
+    other.prefix_digest_sha256 = std::string(64, '1');
+    std::string other_root;
+    ASSERT_TRUE(write_snapshot_manifest(other,
+                                        fmt::format("{}/{}/{}", remote_dir, tablet_id,
+                                                    SnapshotManifest::kLocalFileName),
+                                        &other_root)
+                        .ok());
+    st = fetch_prefix_digest_from_remote_be_by_manifest(remote_snapshot, other_root, &fetched);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+
+    // a manifest without the entry (a tablet without a decomposed digest): an error, not a mismatch
+    SnapshotManifest none = manifest;
+    none.prefix_digest_sha256.clear();
+    none.prefix_digest_size = 0;
+    std::string none_root;
+    ASSERT_TRUE(write_snapshot_manifest(none,
+                                        fmt::format("{}/{}/{}", remote_dir, tablet_id,
+                                                    SnapshotManifest::kLocalFileName),
+                                        &none_root)
+                        .ok());
+    st = fetch_prefix_digest_from_remote_be_by_manifest(remote_snapshot, none_root, &fetched);
+    EXPECT_FALSE(st.ok());
+    EXPECT_FALSE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
 }
 
 TEST_F(SnapshotLoaderTest, HttpDownloadWithoutManifestOrCheckDisabled) {
@@ -1276,6 +1543,138 @@ TEST_F(SnapshotLoaderTest, DownloadStatsClassifyAndMerge) {
     EXPECT_FALSE(total.to_string().empty());
 }
 
+// ---------------------------------------------------------------------------------------------
+// The snapshot which holds only an increment: its tablet meta is "<tablet id>.hdr.increment", and there is no
+// "<tablet id>.hdr" (an old version then fails to move it instead of replacing the tablet with the increment).
+
+static bool file_exists(const std::string& path) {
+    bool exists = false;
+    EXPECT_TRUE(io::global_local_filesystem()->exists(path, &exists).ok());
+    return exists;
+}
+
+// The range (base, end] of the last rowset of the tablet meta file.
+static TRestoreIncrementalRange last_rowset_range(const std::string& hdr) {
+    TabletMetaPB meta;
+    EXPECT_TRUE(TabletMeta::load_from_file(hdr, &meta).ok());
+    int64_t start = 0;
+    int64_t end = 0;
+    for (const auto& rs : meta.rs_metas()) {
+        if (rs.end_version() >= end) {
+            start = rs.start_version();
+            end = rs.end_version();
+        }
+    }
+    TRestoreIncrementalRange range;
+    range.base_version = start - 1;
+    range.end_version = end;
+    return range;
+}
+
+static void expect_increment_only_dir(const std::string& dir, int64_t tablet_id,
+                                      const TRestoreIncrementalRange& range) {
+    EXPECT_FALSE(file_exists(fmt::format("{}/{}.hdr", dir, tablet_id)));
+    ASSERT_TRUE(file_exists(fmt::format("{}/{}.hdr.increment", dir, tablet_id)));
+    TabletMetaPB increment;
+    ASSERT_TRUE(TabletMeta::load_from_file(fmt::format("{}/{}.hdr.increment", dir, tablet_id),
+                                           &increment)
+                        .ok());
+    ASSERT_EQ(1, increment.rs_metas_size());
+    EXPECT_EQ(range.base_version + 1, increment.rs_metas(0).start_version());
+    EXPECT_EQ(range.end_version, increment.rs_metas(0).end_version());
+}
+
+TEST_F(SnapshotLoaderTest, HttpDownloadOfAnIncrementLeavesOnlyTheIncrementHdr) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3101, 3102, 3103, 3111, 3112, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest_root(
+            write_remote_manifest(remote_snapshot.remote_snapshot_path, 3111, false));
+    TRestoreIncrementalRange range =
+            last_rowset_range(fmt::format("{}/{}.hdr", remote_snapshot.remote_snapshot_path, 3111));
+    ASSERT_GE(range.base_version, 1);
+    remote_snapshot.__set_incremental(range);
+
+    // the second round is a resent task: the increment tablet meta of the first one is still in the dir, which is
+    // neither a mismatch with the manifest nor a reason to fail
+    for (int round = 0; round < 2; ++round) {
+        std::vector<int64_t> downloaded_tablet_ids;
+        SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 31L + round, 3101);
+        auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+        ASSERT_TRUE(status.ok()) << "round " << round << ": " << status;
+        expect_increment_only_dir(remote_snapshot.local_snapshot_path, 3101, range);
+        EXPECT_EQ(std::vector<int64_t> {3101}, loader.manifest_verified_tablets());
+        EXPECT_EQ(1, loader.download_stats().tablets_incremental);
+    }
+}
+
+// the download of a whole tablet keeps the name of the tablet meta file
+TEST_F(SnapshotLoaderTest, HttpDownloadOfAWholeTabletKeepsTheHdrName) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3201, 3202, 3203, 3211, 3212, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest_root(
+            write_remote_manifest(remote_snapshot.remote_snapshot_path, 3211, false));
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 32L, 3201);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_TRUE(file_exists(remote_snapshot.local_snapshot_path + "/3201.hdr"));
+    EXPECT_FALSE(file_exists(remote_snapshot.local_snapshot_path + "/3201.hdr.increment"));
+}
+
+// The same snapshot dir was used by an increment before: the tablet meta of the increment is deleted by the whole
+// download (it is no file of the remote snapshot), so that the move is not refused.
+TEST_F(SnapshotLoaderTest, HttpWholeDownloadDeletesTheLeftoverIncrementHdr) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3401, 3402, 3403, 3411, 3412, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    remote_snapshot.__set_manifest_root(
+            write_remote_manifest(remote_snapshot.remote_snapshot_path, 3411, false));
+    const std::string leftover = remote_snapshot.local_snapshot_path + "/3401.hdr.increment";
+    write_test_file(leftover, "the increment of an earlier task");
+    ASSERT_TRUE(file_exists(leftover));
+
+    std::vector<int64_t> downloaded_tablet_ids;
+    SnapshotLoader loader(*engine_ref, ExecEnv::GetInstance(), 34L, 3401);
+    auto status = loader.remote_http_download({remote_snapshot}, &downloaded_tablet_ids);
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_FALSE(file_exists(leftover));
+    EXPECT_TRUE(file_exists(remote_snapshot.local_snapshot_path + "/3401.hdr"));
+
+    TabletSharedPtr tablet = engine_ref->tablet_manager()->get_tablet(3401);
+    ASSERT_TRUE(tablet != nullptr);
+    status = loader.move(remote_snapshot.local_snapshot_path, tablet, true);
+    EXPECT_TRUE(status.ok()) << status;
+
+    // the helper: no file is fine
+    EXPECT_TRUE(remove_increment_hdr(remote_snapshot.local_snapshot_path, 3401).ok());
+}
+
+// A leftover tablet meta of an increment is not a file to check against the manifest, like the loaded tag.
+TEST_F(SnapshotLoaderTest, ManifestCheckIgnoresTheIncrementHdr) {
+    std::string dir = fmt::format("{}/manifest_check_increment_hdr", storage_root_path);
+    ASSERT_TRUE(io::global_local_filesystem()->delete_directory(dir).ok());
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(dir).ok());
+    write_test_file(dir + "/4001.hdr", "header");
+    write_test_file(dir + "/4001.hdr.increment", "the increment");
+    SnapshotManifest manifest;
+    manifest.tablet_id = 4001;
+    manifest.files = {
+            SnapshotManifestFile {.name = "4001.hdr", .size = 6, .md5 = "", .sha256 = ""}};
+    ManifestCheckResult result;
+    Status st = check_tablet_snapshot_manifest(dir, 4001, manifest, false, &result);
+    EXPECT_TRUE(st.ok()) << st;
+    EXPECT_TRUE(result.checked);
+    // a file of another name is still unexpected
+    write_test_file(dir + "/4001.hdr.other", "x");
+    st = check_tablet_snapshot_manifest(dir, 4001, manifest, false, &result);
+    EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
+}
+
 // The mismatch with the manifest is an internal error code, an old FE understands it as INTERNAL_ERROR, and the
 // current FE recognizes it by the prefix of the message.
 TEST_F(SnapshotLoaderTest, ManifestMismatchIsReportedAsInternalErrorWithPrefix) {
@@ -1431,7 +1830,7 @@ TEST_F(SnapshotLoaderTest, SnapshotTaskWritesManifestOnlyIfAsked) {
         std::vector<std::string> files;
         std::string root;
         Status st = list_snapshot_files_and_write_manifest(request, snapshot_path, write_manifest,
-                                                           &files, &root);
+                                                           nullptr, &files, &root);
         ASSERT_TRUE(st.ok()) << st;
         // the files are listed either way
         EXPECT_EQ(3, files.size());
@@ -1447,103 +1846,132 @@ TEST_F(SnapshotLoaderTest, SnapshotTaskWritesManifestOnlyIfAsked) {
     }
 }
 
-// Download a tablet from a repository by its manifest: the files are located by the md5 in the manifest, the local
-// files with the same md5 are kept, the other local files are deleted. If the downloaded snapshot does not match the
-// manifest, all the local files are cleared and downloaded again, the mismatch is reported if it is still there.
-TEST_F(SnapshotLoaderTest, RepositoryDownloadByManifest) {
-    ManifestConfigGuard guard(true, false);
-    for (bool tamper : {false, true}) {
-        int64_t tablet_id = tamper ? 3901 : 3801;
-        int32_t schema_hash = tablet_id + 1;
+// The decomposed digest file next to the snapshot is uploaded before the manifest, and the uploaded manifest has it
+// as an entry (its size and SHA-256), outside of the data files. Without the manifest it is not uploaded.
+TEST_F(SnapshotLoaderTest, UploadRecordsPrefixDigestInManifest) {
+    for (bool skip : {false, true}) {
+        int64_t tablet_id = skip ? 3701 : 3601;
         TRemoteTabletSnapshot snapshot;
-        prepare_http_snapshots(tablet_id, schema_hash, tablet_id + 2, tablet_id + 10,
+        prepare_http_snapshots(tablet_id, tablet_id + 1, tablet_id + 2, tablet_id + 10,
                                tablet_id + 11, &snapshot);
         ASSERT_FALSE(HasFatalFailure());
-        std::string remote = fmt::format("{}/repo_dl_src_{}/__idx_1/__{}", storage_root_path,
-                                         tablet_id, tablet_id);
-        ASSERT_TRUE(io::global_local_filesystem()->create_directory(remote).ok());
+        // <snapshot>/<tablet_id>/rdigest next to the snapshot dir <snapshot>/<tablet_id>/<schema_hash>
+        std::string local_parent;
+        ASSERT_TRUE(parent_path_of(snapshot.local_snapshot_path, &local_parent).ok());
+        std::string rdigest_content = "decomposed digest of the tablet";
+        write_test_file(local_parent + "/" + std::string(RestoreDigestDecomposed::kLocalFileName),
+                        rdigest_content);
+        std::string rdigest_root = sha256_hex(rdigest_content);
 
-        // the data files in the repository, without a manifest
-        RepositoryTestLoader uploader(*engine_ref, ExecEnv::GetInstance(), 80L, tablet_id);
-        uploader.use_remote_fs(std::make_shared<LocalDirUploadFileSystem>());
+        std::string idx_dir = fmt::format("{}/repo_up_rd_{}/__idx_1", storage_root_path, tablet_id);
+        std::string dest = fmt::format("{}/__{}", idx_dir, tablet_id);
+        ASSERT_TRUE(io::global_local_filesystem()->create_directory(dest).ok());
+
+        RepositoryTestLoader loader(*engine_ref, ExecEnv::GetInstance(), 78L, tablet_id);
+        loader.use_remote_fs(std::make_shared<LocalDirUploadFileSystem>());
+        loader.set_write_manifest(!skip);
         std::map<int64_t, std::vector<std::string>> tablet_files;
-        Status st = uploader.upload({{snapshot.local_snapshot_path, remote}}, &tablet_files);
+        Status st = loader.upload({{snapshot.local_snapshot_path, dest}}, &tablet_files);
         ASSERT_TRUE(st.ok()) << st;
+        // the list of the data files does not have the decomposed digest
+        ASSERT_EQ(1, tablet_files.count(tablet_id));
+        for (const auto& file : tablet_files[tablet_id]) {
+            EXPECT_EQ(std::string::npos, file.find("rdigest")) << file;
+        }
 
-        // the manifest of it, with a wrong size of a data file if tamper
-        SnapshotManifest manifest;
-        manifest.tablet_id = tablet_id;
-        std::vector<io::FileInfo> files;
-        bool exists = false;
-        ASSERT_TRUE(io::global_local_filesystem()
-                            ->list(snapshot.local_snapshot_path, true, &files, &exists)
+        std::string rdigest_object =
+                idx_dir + "/" + prefix_digest_remote_file_name(tablet_id, rdigest_root);
+        bool exists = true;
+        ASSERT_TRUE(io::global_local_filesystem()->exists(rdigest_object, &exists).ok());
+        if (skip) {
+            EXPECT_FALSE(exists);
+            EXPECT_TRUE(loader.uploaded_prefix_digest_roots().empty());
+            continue;
+        }
+        EXPECT_TRUE(exists);
+        ASSERT_EQ(1, loader.uploaded_prefix_digest_roots().count(tablet_id));
+        EXPECT_EQ(rdigest_root, loader.uploaded_prefix_digest_roots().at(tablet_id));
+
+        ASSERT_EQ(1, loader.uploaded_manifest_roots().count(tablet_id));
+        std::string manifest_root = loader.uploaded_manifest_roots().at(tablet_id);
+        std::string manifest_file =
+                idx_dir + "/" + SnapshotManifest::remote_file_name(tablet_id, manifest_root);
+        std::string manifest_content;
+        io::FileReaderSPtr reader;
+        ASSERT_TRUE(io::global_local_filesystem()->open_file(manifest_file, &reader).ok());
+        manifest_content.resize(reader->size());
+        size_t bytes_read = 0;
+        ASSERT_TRUE(reader->read_at(0, Slice(manifest_content.data(), manifest_content.size()),
+                                    &bytes_read)
                             .ok());
-        std::string kept_file;
-        for (const auto& file : files) {
-            SnapshotManifestFile mf;
-            mf.name = file.file_name;
-            std::string sha256;
-            ASSERT_TRUE(compute_file_digests(snapshot.local_snapshot_path + "/" + file.file_name,
-                                             &mf.md5, &sha256, &mf.size)
-                                .ok());
-            if (!file.file_name.ends_with(".hdr")) {
-                mf.sha256 = sha256;
-                if (kept_file.empty()) {
-                    kept_file = file.file_name;
-                    mf.size += tamper ? 1 : 0;
-                }
-            }
-            manifest.files.push_back(std::move(mf));
+        ASSERT_TRUE(reader->close().ok());
+        SnapshotManifest manifest;
+        st = SnapshotManifest::parse(manifest_content, manifest_root, tablet_id, &manifest);
+        ASSERT_TRUE(st.ok()) << st;
+        EXPECT_TRUE(manifest.has_prefix_digest());
+        EXPECT_EQ(rdigest_root, manifest.prefix_digest_sha256);
+        EXPECT_EQ(static_cast<int64_t>(rdigest_content.size()), manifest.prefix_digest_size);
+        EXPECT_FALSE(manifest.files.empty());
+        for (const auto& file : manifest.files) {
+            EXPECT_NE(SnapshotManifest::kPrefixDigestEntryName, file.name);
         }
-        ASSERT_FALSE(kept_file.empty());
-        std::string content = manifest.serialize();
-        std::string root = sha256_hex(content);
-        // next to the tablet dir, in the dir of the index
-        write_test_file(fmt::format("{}/repo_dl_src_{}/__idx_1/{}", storage_root_path, tablet_id,
-                                    SnapshotManifest::remote_file_name(tablet_id, root)),
-                        content);
-
-        // the local snapshot already has the files, and a file which is not in the manifest
-        std::string local = fmt::format("{}/repo_dl_dst_{}/{}/{}", storage_root_path, tablet_id,
-                                        tablet_id, schema_hash);
-        ASSERT_TRUE(io::global_local_filesystem()->create_directory(local).ok());
-        for (const auto& file : files) {
-            ASSERT_TRUE(io::global_local_filesystem()
-                                ->copy_path(snapshot.local_snapshot_path + "/" + file.file_name,
-                                            local + "/" + file.file_name)
-                                .ok());
-        }
-        write_test_file(local + "/stray.dat", "stray");
-        // an old modification time tells whether the file is downloaded again
-        std::filesystem::file_time_type old_time =
-                std::filesystem::file_time_type::clock::now() - std::chrono::hours(24 * 30);
-        std::filesystem::last_write_time(local + "/" + kept_file, old_time);
-
-        RepositoryTestLoader downloader(*engine_ref, ExecEnv::GetInstance(), 81L, tablet_id);
-        downloader.use_remote_fs(std::make_shared<LocalDirRemoteFileSystem>());
-        downloader.set_manifest_roots({{remote, root}});
-        std::vector<int64_t> downloaded_tablet_ids;
-        st = downloader.download({{remote, local}}, &downloaded_tablet_ids);
-
-        bool stray_exists = true;
-        ASSERT_TRUE(io::global_local_filesystem()->exists(local + "/stray.dat", &stray_exists).ok());
-        EXPECT_FALSE(stray_exists);
-        bool kept_unchanged =
-                std::filesystem::last_write_time(local + "/" + kept_file) == old_time;
-        if (!tamper) {
-            ASSERT_TRUE(st.ok()) << st;
-            // the local files with the same md5 are kept, only the tablet meta is downloaded
-            EXPECT_TRUE(kept_unchanged);
-            EXPECT_EQ(std::vector<int64_t> {tablet_id}, downloader.manifest_verified_tablets());
-            EXPECT_GT(downloader.download_stats().skipped_files, 0);
-            EXPECT_EQ(0, downloader.download_stats().downloaded_files);
-        } else {
-            // the size in the manifest never matches: the second attempt cleared the local files and downloaded
-            // them again, and the mismatch is reported
-            EXPECT_TRUE(st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << st;
-            EXPECT_FALSE(kept_unchanged);
-            EXPECT_TRUE(downloader.manifest_verified_tablets().empty());
-        }
+        EXPECT_EQ(tablet_files[tablet_id].size(), manifest.files.size());
     }
 }
+
+TEST_F(SnapshotLoaderTest, RepositoryDownloadOfAnIncrementLeavesOnlyTheIncrementHdr) {
+    ManifestConfigGuard guard(true, false);
+    TRemoteTabletSnapshot remote_snapshot;
+    prepare_http_snapshots(3301, 3302, 3303, 3311, 3312, &remote_snapshot);
+    ASSERT_FALSE(HasFatalFailure());
+    TRestoreIncrementalRange range =
+            last_rowset_range(fmt::format("{}/{}.hdr", remote_snapshot.remote_snapshot_path, 3311));
+    ASSERT_GE(range.base_version, 1);
+
+    // The repository: .../__idx_1/__3311/<file>.<md5> and .../__idx_1/__manifest__3311.<root>
+    std::string idx_dir = fmt::format("{}/repo_3311/__idx_1", storage_root_path);
+    std::string repo_path = idx_dir + "/__3311";
+    ASSERT_TRUE(io::global_local_filesystem()->delete_directory(idx_dir).ok());
+    ASSERT_TRUE(io::global_local_filesystem()->create_directory(repo_path).ok());
+    SnapshotManifest manifest;
+    manifest.tablet_id = 3311;
+    std::vector<io::FileInfo> files;
+    bool exists = false;
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->list(remote_snapshot.remote_snapshot_path, true, &files, &exists)
+                        .ok());
+    for (const auto& file : files) {
+        std::string src = remote_snapshot.remote_snapshot_path + "/" + file.file_name;
+        std::string md5;
+        ASSERT_TRUE(io::global_local_filesystem()->md5sum(src, &md5).ok());
+        ASSERT_TRUE(
+                io::global_local_filesystem()
+                        ->copy_path(src, fmt::format("{}/{}.{}", repo_path, file.file_name, md5))
+                        .ok());
+        manifest.files.push_back(SnapshotManifestFile {
+                .name = file.file_name, .size = file.file_size, .md5 = md5, .sha256 = ""});
+    }
+    std::string root;
+    ASSERT_TRUE(write_snapshot_manifest(manifest, idx_dir + "/manifest.tmp", &root).ok());
+    ASSERT_TRUE(io::global_local_filesystem()
+                        ->rename(idx_dir + "/manifest.tmp",
+                                 idx_dir + "/" + SnapshotManifest::remote_file_name(3311, root))
+                        .ok());
+
+    // a resent task: the second round finds the increment tablet meta of the first one
+    for (int round = 0; round < 2; ++round) {
+        RepositoryTestLoader loader(*engine_ref, ExecEnv::GetInstance(), 33L + round, 3301);
+        loader.use_remote_fs(std::make_shared<LocalDirRemoteFileSystem>());
+        loader.set_manifest_roots({{repo_path, root}});
+        loader.set_incremental_ranges({{repo_path, range}});
+        std::vector<int64_t> downloaded_tablet_ids;
+        Status st = loader.download({{repo_path, remote_snapshot.local_snapshot_path}},
+                                    &downloaded_tablet_ids);
+        ASSERT_TRUE(st.ok()) << "round " << round << ": " << st;
+        expect_increment_only_dir(remote_snapshot.local_snapshot_path, 3301, range);
+        EXPECT_EQ(std::vector<int64_t> {3301}, loader.manifest_verified_tablets());
+        EXPECT_EQ(1, loader.download_stats().tablets_incremental);
+    }
+}
+
 } // namespace doris

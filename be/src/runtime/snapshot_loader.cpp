@@ -33,11 +33,14 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <istream>
 #include <set>
+#include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -58,12 +61,16 @@
 #include "io/fs/s3_file_system.h"
 #include "io/hdfs_builder.h"
 #include "olap/data_dir.h"
+#include "olap/restore_digest/restore_digest.h"
 #include "olap/snapshot_manager.h"
 #include "olap/storage_engine.h"
 #include "olap/tablet.h"
 #include "olap/tablet_manager.h"
 #include "runtime/client_cache.h"
 #include "runtime/exec_env.h"
+#include "service/backend_options.h"
+#include "util/debug_points.h"
+#include "util/defer_op.h"
 #include "util/md5.h"
 #include "util/s3_uri.h"
 #include "util/s3_util.h"
@@ -72,6 +79,55 @@
 #include "util/thrift_rpc_helper.h"
 
 namespace doris {
+
+namespace {
+
+Status restore_not_retryable(const std::string& msg) {
+    return Status::InternalError("{} {}", SnapshotLoader::kRestoreNotRetryable, msg);
+}
+
+// Sleeps for the debug point `name` (param sleep_ms), if it is for this tablet (param tablet_id, any if unset)
+// and this backend (param backend, the host of the backend, any if unset).
+void restore_debug_delay(const char* name, int64_t tablet_id) {
+    DBUG_EXECUTE_IF(name, {
+        auto ptablet = dp->param<int64_t>("tablet_id", 0);
+        auto pbackend = dp->param<std::string>("backend", "");
+        if ((ptablet == 0 || ptablet == tablet_id) &&
+            (pbackend.empty() || pbackend == BackendOptions::get_localhost())) {
+            int64_t ms = dp->param<int64_t>("sleep_ms", 1000);
+            LOG(INFO) << "debug point " << name << ": sleep " << ms << " ms, tablet " << tablet_id;
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
+    });
+}
+
+// What the restore job judges the staging tablet by: the evidence in the tablet meta, the max version, and whether
+// the tablet is still the one created by the job (only the empty initial rowset).
+struct RestoreTabletState {
+    bool has_stage = false;
+    RestoreStagePB stage;
+    int64_t max_version = -1;
+    bool initial_only = false;
+};
+
+RestoreTabletState read_restore_tablet_state(const TabletSharedPtr& tablet) {
+    RestoreTabletState state;
+    std::shared_lock rdlock(tablet->get_header_lock());
+    state.has_stage = tablet->tablet_meta()->has_restore_stage();
+    if (state.has_stage) {
+        state.stage = tablet->tablet_meta()->restore_stage();
+    }
+    state.max_version = tablet->max_version_unlocked();
+    const auto& metas = tablet->tablet_meta()->all_rs_metas();
+    if (metas.size() == 1) {
+        const auto& rs_meta = metas.front();
+        state.initial_only = rs_meta->start_version() == 0 && rs_meta->num_rows() == 0 &&
+                             rs_meta->num_segments() == 0 && !rs_meta->has_delete_predicate();
+    }
+    return state;
+}
+
+} // namespace
 
 struct LocalFileStat {
     uint64_t size;
@@ -96,6 +152,7 @@ public:
               _local_path(remote_tablet_snapshot.local_snapshot_path),
               _remote_path(remote_tablet_snapshot.remote_snapshot_path),
               _remote_be_addr(remote_tablet_snapshot.remote_be_addr) {
+        _incremental = remote_tablet_snapshot.__isset.incremental;
         auto& token = remote_tablet_snapshot.remote_token;
         auto& remote_be_addr = remote_tablet_snapshot.remote_be_addr;
 
@@ -178,6 +235,11 @@ private:
     // Check the local snapshot against the manifest, if the manifest is used.
     Status _check_manifest();
 
+    // The incremental restore: cut the remote files, the manifest and the tablet meta to the increment.
+    Status _cut_to_increment();
+    // Write the tablet meta of the increment to the snapshot dir, after the check against the manifest.
+    Status _install_increment_hdr();
+
     TabletSharedPtr _tablet;
     SnapshotLoader& _snapshot_loader;
     const TRemoteTabletSnapshot& _remote_tablet_snapshot;
@@ -202,6 +264,9 @@ private:
     std::vector<std::string> _remote_file_list;
     std::unordered_map<std::string, LocalFileStat> _local_files;
     std::unordered_map<std::string, RemoteFileStat> _remote_files;
+
+    bool _incremental = false;
+    TabletMetaPB _increment;
 
     std::string _tmp_hdr_file;
     RemoteFileStat _remote_hdr_filestat;
@@ -315,16 +380,27 @@ Status parent_path_of(const std::string& path, std::string* parent) {
 std::string SnapshotManifest::serialize() {
     std::sort(files.begin(), files.end(),
               [](const auto& a, const auto& b) { return a.name < b.name; });
+    // The decomposed digest file is one more entry of the files, in the order of the names.
+    std::vector<SnapshotManifestFile> entries = files;
+    if (has_prefix_digest()) {
+        SnapshotManifestFile prefix_entry;
+        prefix_entry.name = std::string(kPrefixDigestEntryName);
+        prefix_entry.size = prefix_digest_size;
+        prefix_entry.sha256 = prefix_digest_sha256;
+        entries.push_back(std::move(prefix_entry));
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) { return a.name < b.name; });
+    }
     rapidjson::StringBuffer buffer;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
     writer.StartObject();
     writer.Key("version");
-    writer.Int(kVersion);
+    writer.Int(has_prefix_digest() ? kVersionWithPrefixDigest : kVersion);
     writer.Key("tablet_id");
     writer.Int64(tablet_id);
     writer.Key("files");
     writer.StartArray();
-    for (const auto& file : files) {
+    for (const auto& file : entries) {
         writer.StartObject();
         writer.Key("n");
         writer.String(file.name.data(), static_cast<rapidjson::SizeType>(file.name.size()));
@@ -363,7 +439,8 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
         return invalid("not a json object");
     }
     if (!doc.HasMember("version") || !doc["version"].IsInt() ||
-        doc["version"].GetInt() != kVersion) {
+        (doc["version"].GetInt() != kVersion &&
+         doc["version"].GetInt() != kVersionWithPrefixDigest)) {
         return invalid("unknown version");
     }
     if (!doc.HasMember("tablet_id") || !doc["tablet_id"].IsInt64() ||
@@ -375,6 +452,8 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
     }
     manifest->tablet_id = expected_tablet_id;
     manifest->files.clear();
+    manifest->prefix_digest_sha256.clear();
+    manifest->prefix_digest_size = 0;
     std::set<std::string> names;
     for (const auto& item : doc["files"].GetArray()) {
         if (!item.IsObject() || !item.HasMember("n") || !item["n"].IsString() ||
@@ -400,6 +479,19 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
             }
             file.sha256 = std::string(item["d"].GetString(), item["d"].GetStringLength());
         }
+        if (file.name == kPrefixDigestEntryName) {
+            // not a file of the tablet snapshot: keep it out of `files`. Only a version 2 manifest has it, an old
+            // BE only knows version 1 and would take it for a data file.
+            if (doc["version"].GetInt() != kVersionWithPrefixDigest) {
+                return invalid("a version 1 manifest has the entry of the decomposed digest");
+            }
+            if (file.sha256.size() != 64) {
+                return invalid("the entry of the decomposed digest has no SHA-256");
+            }
+            manifest->prefix_digest_sha256 = std::move(file.sha256);
+            manifest->prefix_digest_size = file.size;
+            continue;
+        }
         manifest->files.push_back(std::move(file));
     }
     return Status::OK();
@@ -407,6 +499,20 @@ Status SnapshotManifest::parse(std::string_view content, std::string_view expect
 
 std::string SnapshotManifest::remote_file_name(int64_t tablet_id, std::string_view root) {
     return fmt::format("__manifest__{}.{}", tablet_id, root.substr(0, 32));
+}
+
+std::string prefix_digest_remote_file_name(int64_t tablet_id, std::string_view root) {
+    return fmt::format("__rdigest__{}.{}", tablet_id, root.substr(0, 32));
+}
+
+Status write_prefix_digest_file(const std::string& content, const std::string& path,
+                                std::string* root) {
+    io::FileWriterPtr writer;
+    RETURN_IF_ERROR(io::global_local_filesystem()->create_file(path, &writer));
+    RETURN_IF_ERROR(writer->append(Slice(content)));
+    RETURN_IF_ERROR(writer->close());
+    *root = sha256_hex(content);
+    return Status::OK();
 }
 
 Status write_snapshot_manifest(SnapshotManifest& manifest, const std::string& path,
@@ -435,9 +541,77 @@ static Status read_local_file(const std::string& path, std::string* content) {
     return Status::OK();
 }
 
+Status fetch_prefix_digest_from_remote_be(const TRemoteTabletSnapshot& remote_tablet_snapshot,
+                                          const std::string& root, RestoreDigestDecomposed* digest) {
+    // <storage_root>/snapshot/<time>.<seq>.<timeout>/<tablet_id>/rdigest, next to the manifest
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(remote_tablet_snapshot.remote_snapshot_path, &remote_parent));
+    const auto& addr = remote_tablet_snapshot.remote_be_addr;
+    std::string url = fmt::format(
+            "http://{}:{}/api/_tablet/_download?token={}&channel=ingest_binlog&file={}/{}",
+            addr.hostname, addr.port, remote_tablet_snapshot.remote_token, remote_parent,
+            RestoreDigestDecomposed::kLocalFileName);
+    std::string content;
+    auto fetch_cb = [&url, &content](HttpClient* client) {
+        content.clear();
+        RETURN_IF_ERROR(client->init(url));
+        client->set_timeout_ms(config::download_binlog_meta_timeout_ms);
+        return client->execute(&content);
+    };
+    RETURN_IF_ERROR(HttpClient::execute_with_retry(3, 1, fetch_cb));
+    return RestoreDigestDecomposed::parse(content, root, remote_tablet_snapshot.remote_tablet_id,
+                                          digest);
+}
+
+// Get a file of the snapshot kept on a remote BE over its http download.
+static Status fetch_file_from_remote_be(const TRemoteTabletSnapshot& remote_tablet_snapshot,
+                                        const std::string& remote_file, std::string* content) {
+    const auto& addr = remote_tablet_snapshot.remote_be_addr;
+    std::string url =
+            fmt::format("http://{}:{}/api/_tablet/_download?token={}&channel=ingest_binlog&file={}",
+                        addr.hostname, addr.port, remote_tablet_snapshot.remote_token, remote_file);
+    auto fetch_cb = [&url, content](HttpClient* client) {
+        content->clear();
+        RETURN_IF_ERROR(client->init(url));
+        client->set_timeout_ms(config::download_binlog_meta_timeout_ms);
+        return client->execute(content);
+    };
+    return HttpClient::execute_with_retry(3, 1, fetch_cb);
+}
+
+Status fetch_prefix_digest_from_remote_be_by_manifest(
+        const TRemoteTabletSnapshot& remote_tablet_snapshot, const std::string& manifest_root,
+        RestoreDigestDecomposed* digest) {
+    // <storage_root>/snapshot/<time>.<seq>.<timeout>/<tablet_id>/manifest, and rdigest next to it
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(remote_tablet_snapshot.remote_snapshot_path, &remote_parent));
+    std::string content;
+    RETURN_IF_ERROR(fetch_file_from_remote_be(
+            remote_tablet_snapshot,
+            fmt::format("{}/{}", remote_parent, SnapshotManifest::kLocalFileName), &content));
+    SnapshotManifest manifest;
+    RETURN_IF_ERROR(SnapshotManifest::parse(content, manifest_root,
+                                            remote_tablet_snapshot.remote_tablet_id, &manifest));
+    if (!manifest.has_prefix_digest()) {
+        return Status::InternalError("the manifest of remote tablet {} has no decomposed digest",
+                                     remote_tablet_snapshot.remote_tablet_id);
+    }
+    content.clear();
+    RETURN_IF_ERROR(fetch_file_from_remote_be(
+            remote_tablet_snapshot,
+            fmt::format("{}/{}", remote_parent, RestoreDigestDecomposed::kLocalFileName),
+            &content));
+    return RestoreDigestDecomposed::parse(content, manifest.prefix_digest_sha256,
+                                          remote_tablet_snapshot.remote_tablet_id, digest);
+}
+
 void SnapshotDownloadStats::classify_tablet() {
     int64_t reused = linked_files + skipped_files;
     if (reused == 0 && downloaded_files == 0) {
+        return;
+    }
+    if (tablets_incremental > 0) {
+        // an increment is not a reuse of the local files
         return;
     }
     if (downloaded_files == 0) {
@@ -463,6 +637,9 @@ void SnapshotDownloadStats::merge(const SnapshotDownloadStats& other) {
     unmatched_no_source_rowset_id += other.unmatched_no_source_rowset_id;
     unmatched_source_not_in_snapshot += other.unmatched_source_not_in_snapshot;
     unmatched_version_mismatch += other.unmatched_version_mismatch;
+    tablets_incremental += other.tablets_incremental;
+    incremental_files += other.incremental_files;
+    incremental_bytes += other.incremental_bytes;
 }
 
 std::string SnapshotDownloadStats::to_string() const {
@@ -473,7 +650,11 @@ std::string SnapshotDownloadStats::to_string() const {
             linked_files, linked_bytes, skipped_files, skipped_bytes, downloaded_files,
             downloaded_bytes, tablets_full_reuse, tablets_partial_reuse, tablets_no_reuse,
             unmatched_rowsets, unmatched_no_source_rowset_id, unmatched_source_not_in_snapshot,
-            unmatched_version_mismatch);
+            unmatched_version_mismatch) +
+           (tablets_incremental > 0
+                    ? fmt::format(", incremental tablets: {} ({} files {} bytes)", tablets_incremental,
+                                  incremental_files, incremental_bytes)
+                    : std::string());
 }
 
 TDownloadStats SnapshotDownloadStats::to_thrift() const {
@@ -491,6 +672,9 @@ TDownloadStats SnapshotDownloadStats::to_thrift() const {
     result.__set_unmatched_no_source_rowset_id(unmatched_no_source_rowset_id);
     result.__set_unmatched_source_not_in_snapshot(unmatched_source_not_in_snapshot);
     result.__set_unmatched_version_mismatch(unmatched_version_mismatch);
+    result.__set_tablets_incremental(tablets_incremental);
+    result.__set_incremental_files(incremental_files);
+    result.__set_incremental_bytes(incremental_bytes);
     return result;
 }
 
@@ -560,7 +744,127 @@ void count_unmatched_rowsets(const TabletMetaPB& local_meta, const TabletMetaPB&
 }
 
 // The file which marks a tablet snapshot as moved to the tablet dir, see SnapshotLoader::move().
+
+Status select_incremental_rowsets(const TabletMetaPB& remote, int64_t base_version,
+                                  int64_t end_version, TabletMetaPB* increment,
+                                  std::vector<std::string>* rowset_ids) {
+    std::vector<const RowsetMetaPB*> selected;
+    for (const auto& rs : remote.rs_metas()) {
+        if (rs.start_version() > base_version) {
+            selected.push_back(&rs);
+        } else if (rs.end_version() > base_version) {
+            return Status::InternalError(
+                    "the remote tablet {} can not be cut at version {}: rowset [{}-{}] crosses it",
+                    remote.tablet_id(), base_version, rs.start_version(), rs.end_version());
+        }
+    }
+    std::sort(selected.begin(), selected.end(), [](const RowsetMetaPB* a, const RowsetMetaPB* b) {
+        return a->start_version() < b->start_version();
+    });
+    int64_t expected_start = base_version + 1;
+    for (const auto* rs : selected) {
+        if (rs->start_version() != expected_start || rs->end_version() < rs->start_version()) {
+            return Status::InternalError(
+                    "the rowsets of the remote tablet {} after version {} are not a chain: "
+                    "expected a rowset starting at {}, got [{}-{}]",
+                    remote.tablet_id(), base_version, expected_start, rs->start_version(),
+                    rs->end_version());
+        }
+        if (rs->has_resource_id()) {
+            return Status::InternalError("rowset [{}-{}] of the remote tablet {} is in a remote storage",
+                                         rs->start_version(), rs->end_version(),
+                                         remote.tablet_id());
+        }
+        if (rs->rowset_id_v2().empty()) {
+            return Status::InternalError("rowset [{}-{}] of the remote tablet {} has no rowset id v2",
+                                         rs->start_version(), rs->end_version(),
+                                         remote.tablet_id());
+        }
+        expected_start = rs->end_version() + 1;
+    }
+    if (selected.empty() || expected_start != end_version + 1) {
+        return Status::InternalError(
+                "the rowsets of the remote tablet {} after version {} end at version {}, expected {}",
+                remote.tablet_id(), base_version, expected_start - 1, end_version);
+    }
+    *increment = remote;
+    increment->clear_rs_metas();
+    increment->clear_inc_rs_metas();
+    increment->clear_stale_rs_metas();
+    increment->clear_delete_bitmap();
+    rowset_ids->clear();
+    for (const auto* rs : selected) {
+        *increment->add_rs_metas() = *rs;
+        rowset_ids->push_back(rs->rowset_id_v2());
+    }
+    return Status::OK();
+}
+
+bool is_rowset_file(const std::string& file_name, const std::string& rowset_id) {
+    return file_name.size() > rowset_id.size() + 1 &&
+           file_name.compare(0, rowset_id.size(), rowset_id) == 0 &&
+           file_name[rowset_id.size()] == '_';
+}
+
+Status cut_manifest_to_increment(const SnapshotManifest& manifest, const TabletMetaPB& increment,
+                                 const std::vector<std::string>& rowset_ids,
+                                 SnapshotManifest* cut) {
+    cut->tablet_id = manifest.tablet_id;
+    cut->files.clear();
+    // the decomposed digest file is not a file of the increment, but the cut manifest is still the manifest of
+    // the tablet: keep its entry
+    cut->prefix_digest_sha256 = manifest.prefix_digest_sha256;
+    cut->prefix_digest_size = manifest.prefix_digest_size;
+    std::map<std::string, int64_t> dat_files;
+    for (const auto& id : rowset_ids) {
+        dat_files[id] = 0;
+    }
+    for (const auto& file : manifest.files) {
+        if (file.name.ends_with(".hdr")) {
+            cut->files.push_back(file);
+            continue;
+        }
+        for (const auto& id : rowset_ids) {
+            if (is_rowset_file(file.name, id)) {
+                cut->files.push_back(file);
+                if (file.name.ends_with(".dat")) {
+                    ++dat_files[id];
+                }
+                break;
+            }
+        }
+    }
+    for (const auto& rs : increment.rs_metas()) {
+        if (dat_files[rs.rowset_id_v2()] != rs.num_segments()) {
+            return Status::Error<ErrorCode::RESTORE_MANIFEST_MISMATCH, false>(
+                    "the manifest of tablet {} has {} segment files of rowset {} [{}-{}], expected {}",
+                    manifest.tablet_id, dat_files[rs.rowset_id_v2()], rs.rowset_id_v2(),
+                    rs.start_version(), rs.end_version(), rs.num_segments());
+        }
+    }
+    return Status::OK();
+}
+
 static constexpr std::string_view kLoadedTagFileName = "LOADED";
+
+Status install_increment_hdr(const std::string& local_path, int64_t tablet_id,
+                             const TabletMetaPB& increment) {
+    RETURN_IF_ERROR(TabletMeta::save(
+            fmt::format("{}/{}{}", local_path, tablet_id, kIncrementHdrSuffix), increment));
+    return io::global_local_filesystem()->delete_file(
+            fmt::format("{}/{}.hdr", local_path, tablet_id));
+}
+
+Status remove_increment_hdr(const std::string& local_path, int64_t tablet_id) {
+    std::string file = fmt::format("{}/{}{}", local_path, tablet_id, kIncrementHdrSuffix);
+    bool exists = false;
+    RETURN_IF_ERROR(io::global_local_filesystem()->exists(file, &exists));
+    if (!exists) {
+        return Status::OK();
+    }
+    LOG(INFO) << "delete the leftover tablet meta of an increment: " << file;
+    return io::global_local_filesystem()->delete_file(file);
+}
 
 Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t local_tablet_id,
                                       const SnapshotManifest& manifest, bool check_digest,
@@ -593,7 +897,7 @@ Status check_tablet_snapshot_manifest(const std::string& local_path, int64_t loc
                 local_tablet_id, local_path);
     }
     for (const auto& file : files) {
-        if (file.file_name == kLoadedTagFileName) {
+        if (file.file_name == kLoadedTagFileName || file.file_name.ends_with(kIncrementHdrSuffix)) {
             continue;
         }
         local_files.emplace(file.file_name, file.file_size);
@@ -1237,6 +1541,42 @@ Status SnapshotHttpDownloader::_check_manifest() {
     return status;
 }
 
+Status SnapshotHttpDownloader::_cut_to_increment() {
+    if (!_use_manifest()) {
+        return Status::InternalError("the incremental restore of tablet {} needs the manifest",
+                                     _local_tablet_id);
+    }
+    TabletMetaPB remote_meta;
+    RETURN_IF_ERROR(TabletMeta::load_from_file(_tmp_hdr_file, &remote_meta));
+    const auto& range = _remote_tablet_snapshot.incremental;
+    std::vector<std::string> rowset_ids;
+    RETURN_IF_ERROR(select_incremental_rowsets(remote_meta, range.base_version, range.end_version,
+                                               &_increment, &rowset_ids));
+    SnapshotManifest cut;
+    Status st = cut_manifest_to_increment(_manifest, _increment, rowset_ids, &cut);
+    if (!st.ok()) {
+        _manifest_mismatch = st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>();
+        return st;
+    }
+    _manifest = std::move(cut);
+    std::vector<std::string> files;
+    for (const auto& file : _manifest.files) {
+        if (!file.name.ends_with(".hdr")) {
+            files.push_back(file.name);
+        }
+    }
+    _remote_file_list = std::move(files);
+    return Status::OK();
+}
+
+Status SnapshotHttpDownloader::_install_increment_hdr() {
+    RETURN_IF_ERROR(install_increment_hdr(_local_path, _local_tablet_id, _increment));
+    _stats.tablets_incremental = 1;
+    _stats.incremental_files = _stats.downloaded_files;
+    _stats.incremental_bytes = _stats.downloaded_bytes;
+    return Status::OK();
+}
+
 Status SnapshotHttpDownloader::download() {
     // Take a lock to protect the local snapshot path.
     auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(_local_path);
@@ -1252,6 +1592,9 @@ Status SnapshotHttpDownloader::download() {
     }
 
     // Step 2: get all local files
+    // The tablet meta of an increment left by an earlier task of the same snapshot dir is not a file of the
+    // remote snapshot, and a whole snapshot must not keep it (the move rejects it).
+    RETURN_IF_ERROR(remove_increment_hdr(_local_path, _local_tablet_id));
     if (_disable_reuse) {
         // Download all the files again, without reusing any local file.
         RETURN_IF_ERROR(_snapshot_loader._clear_local_snapshot_files(_local_path));
@@ -1269,8 +1612,13 @@ Status SnapshotHttpDownloader::download() {
     // Step 4: download hdr file to a tmp file
     RETURN_IF_ERROR(_download_hdr_file());
 
+    // The increment: only the files of the rowsets after the base version, nothing is linked.
+    if (_incremental) {
+        RETURN_IF_ERROR(_cut_to_increment());
+    }
+
     // Step 5: link same rowset files, if local tablet meta file exists
-    if (!_disable_reuse && !_local_hdr_filename.empty()) {
+    if (!_incremental && !_disable_reuse && !_local_hdr_filename.empty()) {
         RETURN_IF_ERROR(_link_same_rowset_files());
     }
 
@@ -1291,6 +1639,10 @@ Status SnapshotHttpDownloader::download() {
 
     // Step 10: check the local snapshot, including the linked files, against the manifest
     RETURN_IF_ERROR(_check_manifest());
+
+    if (_incremental) {
+        RETURN_IF_ERROR(_install_increment_hdr());
+    }
 
     return Status::OK();
 }
@@ -1427,16 +1779,29 @@ Status SnapshotLoader::upload(const std::map<std::string, std::string>& src_to_d
             RETURN_IF_ERROR(upload_with_checksum(*_remote_fs, local_path, remote_path, md5sum));
         } // end for each tablet's local files
 
-        // 2.4 upload the manifest after all the data files of the tablet, if the frontend asks for it
+        // 2.4 upload the decomposed digest, if the snapshot has one. It is an entry of the manifest, so it
+        // goes first, and nowhere to be recorded unless the frontend asks for the manifest.
+        std::string prefix_root;
+        int64_t prefix_size = 0;
+        if (_write_manifest) {
+            RETURN_IF_ERROR(_upload_prefix_digest(src_path, dest_path, tablet_id, &prefix_root,
+                                                  &prefix_size));
+        }
+
+        // 2.5 upload the manifest after all the files of the tablet, if the frontend asks for it
         std::string manifest_root;
         if (_write_manifest) {
             RETURN_IF_ERROR(_upload_manifest(src_path, dest_path, tablet_id,
-                                             std::move(manifest_files), &manifest_root));
+                                             std::move(manifest_files), prefix_root, prefix_size,
+                                             &manifest_root));
         }
 
         tablet_files->emplace(tablet_id, local_files_with_checksum);
         if (_write_manifest) {
             _uploaded_manifest_roots.emplace(tablet_id, std::move(manifest_root));
+        }
+        if (!prefix_root.empty()) {
+            _uploaded_prefix_digest_roots.emplace(tablet_id, std::move(prefix_root));
         }
         finished_num++;
         LOG(INFO) << "finished to write tablet to remote. local path: " << src_path
@@ -1496,7 +1861,18 @@ Status SnapshotLoader::download(const std::map<std::string, std::string>& src_to
 
         SnapshotDownloadStats tablet_stats;
         auto manifest_root = _manifest_roots.find(remote_path);
-        if (!config::restore_manifest_check || manifest_root == _manifest_roots.end()) {
+        auto increment = _incremental_ranges.find(remote_path);
+        if (increment != _incremental_ranges.end()) {
+            if (!config::restore_manifest_check || manifest_root == _manifest_roots.end()) {
+                return Status::InternalError(
+                        "the incremental restore of tablet {} needs the manifest of the backup",
+                        local_tablet_id);
+            }
+            RETURN_IF_ERROR(_download_tablet_incremental(
+                    remote_path, local_path, local_tablet_id, remote_tablet_id,
+                    manifest_root->second, increment->second, &report_counter, finished_num,
+                    total_num, &tablet_stats));
+        } else if (!config::restore_manifest_check || manifest_root == _manifest_roots.end()) {
             // no manifest (old backup, old FE) or the check is disabled: download by listing the
             // remote path, as before.
             RETURN_IF_ERROR(_download_tablet_from_remote(remote_path, local_path, local_tablet_id,
@@ -1696,9 +2072,75 @@ Status SnapshotLoader::_download_tablet_from_remote(const std::string& remote_pa
     return Status::OK();
 }
 
+Status SnapshotLoader::_download_tablet_incremental(
+        const std::string& remote_path, const std::string& local_path, int64_t local_tablet_id,
+        int64_t remote_tablet_id, const std::string& manifest_root,
+        const TRestoreIncrementalRange& range, int* report_counter, int finished_num,
+        int total_num, SnapshotDownloadStats* stats) {
+    auto attempt = [&]() -> Status {
+        *stats = SnapshotDownloadStats();
+        SnapshotManifest manifest;
+        RETURN_IF_ERROR(_fetch_remote_manifest(remote_path, local_path, remote_tablet_id,
+                                               manifest_root, &manifest));
+        // 1. the tablet meta file only, to know the rowsets of the increment
+        SnapshotManifest hdr_manifest;
+        hdr_manifest.tablet_id = manifest.tablet_id;
+        for (const auto& file : manifest.files) {
+            if (file.name.ends_with(".hdr")) {
+                hdr_manifest.files.push_back(file);
+            }
+        }
+        if (hdr_manifest.files.size() != 1) {
+            return Status::Error<ErrorCode::RESTORE_MANIFEST_MISMATCH, false>(
+                    "invalid manifest of remote tablet {}: {} tablet meta files", remote_tablet_id,
+                    hdr_manifest.files.size());
+        }
+        SnapshotDownloadStats hdr_stats;
+        RETURN_IF_ERROR(_download_tablet_by_manifest(remote_path, local_path, local_tablet_id,
+                                                     hdr_manifest, report_counter, finished_num,
+                                                     total_num, &hdr_stats));
+        std::string local_hdr = fmt::format("{}/{}.hdr", local_path, local_tablet_id);
+        TabletMetaPB remote_meta;
+        RETURN_IF_ERROR(TabletMeta::load_from_file(local_hdr, &remote_meta));
+        TabletMetaPB increment;
+        std::vector<std::string> rowset_ids;
+        RETURN_IF_ERROR(select_incremental_rowsets(remote_meta, range.base_version,
+                                                   range.end_version, &increment, &rowset_ids));
+        // 2. the files of these rowsets
+        SnapshotManifest cut;
+        RETURN_IF_ERROR(cut_manifest_to_increment(manifest, increment, rowset_ids, &cut));
+        RETURN_IF_ERROR(_download_tablet_by_manifest(remote_path, local_path, local_tablet_id, cut,
+                                                     report_counter, finished_num, total_num,
+                                                     stats));
+        ManifestCheckResult result;
+        RETURN_IF_ERROR(check_tablet_snapshot_manifest(
+                local_path, local_tablet_id, cut, config::restore_manifest_digest_check, &result));
+        if (result.checked) {
+            _add_manifest_verified_tablet(local_tablet_id, result.digest_checked);
+        }
+        // 3. the tablet meta of the snapshot is the increment only, in a file of another name than the tablet
+        // meta of a full snapshot
+        RETURN_IF_ERROR(install_increment_hdr(local_path, local_tablet_id, increment));
+        stats->tablets_incremental = 1;
+        stats->incremental_files = stats->downloaded_files;
+        stats->incremental_bytes = stats->downloaded_bytes;
+        return Status::OK();
+    };
+    Status st = attempt();
+    if (st.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) {
+        LOG(WARNING) << "downloaded increment of tablet " << local_tablet_id
+                     << " does not match the manifest, download it again. job: " << _job_id
+                     << ", task id: " << _task_id << ", error: " << st;
+        RETURN_IF_ERROR(_clear_local_snapshot_files(local_path));
+        st = attempt();
+    }
+    return st;
+}
+
 Status SnapshotLoader::_upload_manifest(const std::string& src_path, const std::string& dest_path,
                                         int64_t tablet_id, std::vector<SnapshotManifestFile> files,
-                                        std::string* root) {
+                                        const std::string& prefix_digest_root,
+                                        int64_t prefix_digest_size, std::string* root) {
     // local: <snapshot>/<tablet_id>/<schema_hash> -> <snapshot>/<tablet_id>/manifest.upload
     // remote: .../__idx_<id>/__<tablet_id> -> .../__idx_<id>/__manifest__<tablet_id>.<root prefix>
     std::string local_parent;
@@ -1708,6 +2150,8 @@ Status SnapshotLoader::_upload_manifest(const std::string& src_path, const std::
     SnapshotManifest manifest;
     manifest.tablet_id = tablet_id;
     manifest.files = std::move(files);
+    manifest.prefix_digest_sha256 = prefix_digest_root;
+    manifest.prefix_digest_size = prefix_digest_size;
     std::string local_file = local_parent + "/manifest.upload";
     RETURN_IF_ERROR(write_snapshot_manifest(manifest, local_file, root));
     std::string remote_name = SnapshotManifest::remote_file_name(tablet_id, *root);
@@ -1720,6 +2164,102 @@ Status SnapshotLoader::_upload_manifest(const std::string& src_path, const std::
     LOG(INFO) << "uploaded the manifest of tablet " << tablet_id << " to " << remote_parent << "/"
               << remote_name << ", root: " << *root;
     return Status::OK();
+}
+
+Status SnapshotLoader::_upload_prefix_digest(const std::string& src_path,
+                                             const std::string& dest_path, int64_t tablet_id,
+                                             std::string* root, int64_t* size) {
+    // local: <snapshot>/<tablet_id>/<schema_hash> -> <snapshot>/<tablet_id>/rdigest
+    // remote: .../__idx_<id>/__<tablet_id> -> .../__idx_<id>/__rdigest__<tablet_id>.<root prefix>
+    std::string local_parent;
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(src_path, &local_parent));
+    RETURN_IF_ERROR(parent_path_of(dest_path, &remote_parent));
+    std::string local_file =
+            fmt::format("{}/{}", local_parent, RestoreDigestDecomposed::kLocalFileName);
+    bool exists = false;
+    RETURN_IF_ERROR(io::global_local_filesystem()->exists(local_file, &exists));
+    if (!exists) {
+        root->clear();
+        *size = 0;
+        return Status::OK();
+    }
+    std::string content;
+    RETURN_IF_ERROR(read_local_file(local_file, &content));
+    *root = sha256_hex(content);
+    *size = static_cast<int64_t>(content.size());
+    std::string remote_name = prefix_digest_remote_file_name(tablet_id, *root);
+    size_t dot = remote_name.find_last_of('.');
+    RETURN_IF_ERROR(upload_with_checksum(*_remote_fs, local_file,
+                                         remote_parent + "/" + remote_name.substr(0, dot),
+                                         remote_name.substr(dot + 1)));
+    LOG(INFO) << "uploaded the decomposed digest of tablet " << tablet_id << " to " << remote_parent
+              << "/" << remote_name << ", root: " << *root;
+    return Status::OK();
+}
+
+Status SnapshotLoader::fetch_prefix_digest(const std::string& remote_path,
+                                           const std::string& local_path,
+                                           int64_t remote_tablet_id, const std::string& root,
+                                           RestoreDigestDecomposed* digest) {
+    if (!_remote_fs) {
+        return Status::InternalError("Storage backend not initialized.");
+    }
+    std::string local_parent;
+    RETURN_IF_ERROR(parent_path_of(local_path, &local_parent));
+    return fetch_prefix_digest_to_dir(remote_path, local_parent, remote_tablet_id, root, digest);
+}
+
+Status SnapshotLoader::fetch_prefix_digest_to_dir(const std::string& remote_path,
+                                                  const std::string& tmp_dir,
+                                                  int64_t remote_tablet_id,
+                                                  const std::string& root,
+                                                  RestoreDigestDecomposed* digest) {
+    if (!_remote_fs) {
+        return Status::InternalError("Storage backend not initialized.");
+    }
+    std::string remote_parent;
+    const std::string& local_parent = tmp_dir;
+    RETURN_IF_ERROR(parent_path_of(remote_path, &remote_parent));
+    std::string remote_file =
+            remote_parent + "/" + prefix_digest_remote_file_name(remote_tablet_id, root);
+    // download to a tmp file next to the local snapshot dir, never into it.
+    std::string local_file = fmt::format("{}/rdigest.{}.download", local_parent, _task_id);
+    RETURN_IF_ERROR(_remote_fs->download(remote_file, local_file));
+    std::string content;
+    Status st = read_local_file(local_file, &content);
+    static_cast<void>(io::global_local_filesystem()->delete_file(local_file));
+    RETURN_IF_ERROR(st);
+    return RestoreDigestDecomposed::parse(content, root, remote_tablet_id, digest);
+}
+
+Status SnapshotLoader::fetch_prefix_digest_by_manifest_to_dir(const std::string& remote_path,
+                                                              const std::string& tmp_dir,
+                                                              int64_t remote_tablet_id,
+                                                              const std::string& manifest_root,
+                                                              RestoreDigestDecomposed* digest) {
+    if (!_remote_fs) {
+        return Status::InternalError("Storage backend not initialized.");
+    }
+    std::string remote_parent;
+    RETURN_IF_ERROR(parent_path_of(remote_path, &remote_parent));
+    std::string remote_file = remote_parent + "/" +
+                              SnapshotManifest::remote_file_name(remote_tablet_id, manifest_root);
+    // download to a tmp file next to the local snapshot dir, never into it.
+    std::string local_file = fmt::format("{}/manifest.{}.download", tmp_dir, _task_id);
+    RETURN_IF_ERROR(_remote_fs->download(remote_file, local_file));
+    std::string content;
+    Status st = read_local_file(local_file, &content);
+    static_cast<void>(io::global_local_filesystem()->delete_file(local_file));
+    RETURN_IF_ERROR(st);
+    SnapshotManifest manifest;
+    RETURN_IF_ERROR(SnapshotManifest::parse(content, manifest_root, remote_tablet_id, &manifest));
+    if (!manifest.has_prefix_digest()) {
+        return Status::InternalError("the manifest of remote tablet {} has no decomposed digest",
+                                     remote_tablet_id);
+    }
+    return fetch_prefix_digest_to_dir(remote_path, tmp_dir, remote_tablet_id,
+                                      manifest.prefix_digest_sha256, digest);
 }
 
 Status SnapshotLoader::_fetch_remote_manifest(const std::string& remote_path,
@@ -1748,6 +2288,8 @@ Status SnapshotLoader::_download_tablet_by_manifest(const std::string& remote_pa
                                                     const SnapshotManifest& manifest,
                                                     int* report_counter, int finished_num,
                                                     int total_num, SnapshotDownloadStats* stats) {
+    // see SnapshotHttpDownloader::download()
+    RETURN_IF_ERROR(remove_increment_hdr(local_path, local_tablet_id));
     std::vector<std::string> existing_files;
     RETURN_IF_ERROR(_get_existing_files_from_local(local_path, &existing_files));
     std::set<std::string> local_files(existing_files.begin(), existing_files.end());
@@ -1941,6 +2483,20 @@ Status SnapshotLoader::remote_http_download(
 // MUST hold tablet's header lock, push lock, cumulative lock and base compaction lock
 Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr tablet,
                             bool overwrite) {
+    return move_with_restore_stage(snapshot_path, tablet, overwrite, nullptr);
+}
+
+Status SnapshotLoader::move_with_restore_stage(const std::string& snapshot_path,
+                                               TabletSharedPtr tablet, bool overwrite,
+                                               const RestoreStagePB* restore_stage) {
+    // Debug point: the move fails (params: tablet_id, any if unset), for the failure of the whole move.
+    DBUG_EXECUTE_IF("SnapshotLoader.move.fail", {
+        auto ptablet = dp->param<int64_t>("tablet_id", 0);
+        if (ptablet == 0 || ptablet == tablet->tablet_id()) {
+            return Status::InternalError("injected failure of the move of tablet {}",
+                                         tablet->tablet_id());
+        }
+    });
     // Take a lock to protect the local snapshot path.
     auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(snapshot_path);
 
@@ -2000,10 +2556,28 @@ Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr ta
         return Status::OK();
     }
 
+    // A snapshot which holds only an increment can only be appended to the tablet, never replace it. Reject it
+    // before anything is converted or removed, whether the snapshot has the tablet meta file of a full snapshot
+    // or not.
+    {
+        std::vector<std::string> files;
+        RETURN_IF_ERROR(_get_existing_files_from_local(snapshot_path, &files));
+        for (const auto& file : files) {
+            if (file.ends_with(kIncrementHdrSuffix)) {
+                return restore_not_retryable(
+                        fmt::format("the snapshot {} holds only an increment ({}), it can not "
+                                    "replace tablet {}",
+                                    snapshot_path, file, tablet_id));
+            }
+        }
+    }
+
     // rename the rowset ids and tabletid info in rowset meta
-    auto res = _engine.snapshot_mgr()->convert_rowset_ids(snapshot_path, tablet_id,
-                                                          tablet->replica_id(), tablet->table_id(),
-                                                          tablet->partition_id(), schema_hash);
+    // The restore stage of the source is dropped (the snapshot of a tablet which an earlier restore
+    // loaded has it), the one of this restore, if any, is saved with the tablet meta by the reload.
+    auto res = _engine.snapshot_mgr()->convert_rowset_ids(
+            snapshot_path, tablet_id, tablet->replica_id(), tablet->table_id(),
+            tablet->partition_id(), schema_hash, true, restore_stage);
     if (!res.has_value()) [[unlikely]] {
         auto err_msg =
                 fmt::format("failed to convert rowsetids in snapshot: {}, tablet path: {}, err: {}",
@@ -2095,6 +2669,436 @@ Status SnapshotLoader::move(const std::string& snapshot_path, TabletSharedPtr ta
     LOG(INFO) << "finished to reload header of tablet: " << tablet_id;
 
     return status;
+}
+
+Status SnapshotLoader::make_local_source_snapshot_and_load(const TSnapshotRequest& request,
+                                                           std::string* snapshot_path,
+                                                           LocalSourceStats* stats) {
+    auto tablet = _engine.tablet_manager()->get_tablet(request.tablet_id);
+    if (tablet == nullptr) {
+        return Status::Error<ErrorCode::TABLE_NOT_FOUND>("failed to get tablet. tablet={}",
+                                                         request.tablet_id);
+    }
+    restore_debug_delay("SnapshotLoader.make_local_source.delay", request.tablet_id);
+    const int64_t job_id = request.__isset.job_id ? request.job_id : _job_id;
+    if (job_id <= 0 || !request.__isset.version) {
+        return restore_not_retryable(
+                fmt::format("the snapshot task of tablet {} has no restore job id or no version",
+                            request.tablet_id));
+    }
+    const int64_t base_version = request.version;
+    // One load of a tablet at a time (the BE does not run a task twice by its signature, this is in case two tasks
+    // of the tablet are run anyway): the second one finds the evidence of the first and skips the load. The lock
+    // of the snapshot path taken by the load is another key.
+    auto tablet_guard = LocalSnapshotLock::instance().acquire(tablet->tablet_path());
+    // The load of the other task replaces the tablet object: judge the one the tablet manager has now.
+    tablet = _engine.tablet_manager()->get_tablet(request.tablet_id);
+    if (tablet == nullptr) {
+        return Status::Error<ErrorCode::TABLE_NOT_FOUND>("failed to get tablet. tablet={}",
+                                                         request.tablet_id);
+    }
+    bool already_loaded = false;
+    {
+        // A resent task: judge the tablet by the evidence of this job, never by the shape of the tablet.
+        RestoreTabletState state = read_restore_tablet_state(tablet);
+        if (state.has_stage) {
+            if (state.stage.job_id() != job_id) {
+                return restore_not_retryable(
+                        fmt::format("tablet {} was loaded by the restore job {}, not by job {}",
+                                    request.tablet_id, state.stage.job_id(), job_id));
+            }
+            const bool version_ok = state.stage.base_version() == base_version &&
+                                    ((state.stage.stage() == RestoreStagePB::LOCAL_LOADED &&
+                                      state.max_version == base_version) ||
+                                     (state.stage.stage() == RestoreStagePB::APPENDED &&
+                                      state.max_version == state.stage.end_version()));
+            if (!version_ok) {
+                return restore_not_retryable(fmt::format(
+                        "tablet {} has the evidence of job {} (stage {}, base version {}, end "
+                        "version {}) but its max version is {}, the local source of version {} "
+                        "can not be taken as loaded",
+                        request.tablet_id, job_id, static_cast<int>(state.stage.stage()),
+                        state.stage.base_version(), state.stage.end_version(), state.max_version,
+                        base_version));
+            }
+            already_loaded = true;
+        } else if (!state.initial_only) {
+            // overwriting is only allowed for the clean tablet the job created
+            return restore_not_retryable(fmt::format(
+                    "tablet {} has no evidence of the restore job {} and is not the empty tablet "
+                    "created by it, max version {}",
+                    request.tablet_id, job_id, state.max_version));
+        }
+    }
+    if (already_loaded) {
+        LOG(INFO) << "the local source of tablet " << request.tablet_id
+                  << " is already loaded by job " << job_id << ", skip loading it";
+        // The task is sent again only when the report of the load was lost (or the BE died after the load): the
+        // tablet is made from the local source and loaded all the same, count it, so that the stats of the job add
+        // up to its tablets. What was linked or copied is not known any more.
+        if (stats != nullptr) {
+            stats->tablets++;
+        }
+    } else {
+        TSnapshotRequest source_request = request;
+        source_request.__set_restore_incremental(false);
+        // The snapshot of the source lives for the load only: if the BE dies after the load and before the release
+        // below, the sweep removes it after this timeout. The sweep does not know the load is running, so it is
+        // never shorter than the timeout of the job (the one of the request): a slow load (a copy across the disks)
+        // is not removed under it.
+        int64_t source_timeout = config::restore_local_source_snapshot_timeout_s;
+        if (request.__isset.timeout) {
+            source_timeout = std::max<int64_t>(source_timeout, request.timeout);
+        }
+        source_request.__set_timeout(source_timeout);
+        std::string source_path;
+        bool allow_incremental_clone = false; // not used
+        RETURN_IF_ERROR(_engine.snapshot_mgr()->make_snapshot(source_request, &source_path,
+                                                              &allow_incremental_clone, stats));
+        Defer release_source {[&]() {
+            Status st = _engine.snapshot_mgr()->release_snapshot(source_path);
+            if (!st.ok()) {
+                LOG(WARNING) << "failed to release the local source snapshot " << source_path
+                             << ": " << st;
+            }
+        }};
+        // saved with the tablet meta of the load, so the evidence and the data are one step
+        RestoreStagePB stage;
+        stage.set_job_id(job_id);
+        stage.set_stage(RestoreStagePB::LOCAL_LOADED);
+        stage.set_base_version(base_version);
+        RETURN_IF_ERROR(move_with_restore_stage(
+                fmt::format("{}/{}/{}", source_path, request.tablet_id, request.schema_hash),
+                tablet, true, &stage));
+    }
+    TSnapshotRequest empty_request = request;
+    empty_request.__set_restore_local_source(false);
+    bool allow_incremental_clone = false; // not used
+    return _engine.snapshot_mgr()->make_snapshot(empty_request, snapshot_path,
+                                                 &allow_incremental_clone, nullptr);
+}
+
+Status SnapshotLoader::append_increment(const std::string& snapshot_path, TabletSharedPtr tablet,
+                                        const TRestoreIncrementalRange& range,
+                                        const TRestoreBackupDigest* backup_digest,
+                                        bool local_source_loaded) {
+    restore_debug_delay("SnapshotLoader.append_increment.delay", tablet->tablet_id());
+    auto local_snapshot_guard = LocalSnapshotLock::instance().acquire(snapshot_path);
+
+    auto tablet_path = tablet->tablet_path();
+    LOG(INFO) << "begin to append the increment (" << range.base_version << ", "
+              << range.end_version << "] of snapshot " << snapshot_path << " to tablet "
+              << tablet->tablet_id() << ", job: " << _job_id << ", task id: " << _task_id;
+
+    int64_t snapshot_tablet_id = 0;
+    int32_t snapshot_schema_hash = 0;
+    RETURN_IF_ERROR(_get_tablet_id_and_schema_hash_from_file_path(
+            snapshot_path, &snapshot_tablet_id, &snapshot_schema_hash));
+    int64_t tablet_id = 0;
+    int32_t schema_hash = 0;
+    RETURN_IF_ERROR(
+            _get_tablet_id_and_schema_hash_from_file_path(tablet_path, &tablet_id, &schema_hash));
+    if (tablet_id != snapshot_tablet_id || schema_hash != snapshot_schema_hash) {
+        return Status::InternalError("path does not match. snapshot: {}, tablet path: {}",
+                                     snapshot_path, tablet_path);
+    }
+    if (!local_source_loaded) {
+        // Not loaded from a local source by a restore job (the non atomic incremental restore appends to the
+        // tablet being restored): no evidence, as before.
+        bool legacy_exists = false;
+        RETURN_IF_ERROR(io::global_local_filesystem()->exists(snapshot_path, &legacy_exists));
+        if (!legacy_exists) {
+            return Status::InternalError("snapshot path does not exist: {}", snapshot_path);
+        }
+        bool already_loaded = false;
+        RETURN_IF_ERROR(io::global_local_filesystem()->exists(get_loaded_tag_path(snapshot_path),
+                                                              &already_loaded));
+        if (already_loaded) {
+            LOG(INFO) << "snapshot path already appended: " << snapshot_path;
+            return Status::OK();
+        }
+    }
+    // The same locks as the full / incremental clone and the move of the restore. They are taken before the
+    // judgement of a resent task, so that no compaction or push changes the tablet meanwhile; the header lock is
+    // not held by the judgement, as the digest it may compute takes the shared header lock.
+    std::unique_lock migration_lock(tablet->get_migration_lock(), std::try_to_lock);
+    std::unique_lock base_compact_lock(tablet->get_base_compaction_lock(), std::try_to_lock);
+    std::unique_lock cumu_compact_lock(tablet->get_cumulative_compaction_lock(), std::try_to_lock);
+    std::unique_lock cold_compact_lock(tablet->get_cold_compaction_lock(), std::try_to_lock);
+    std::unique_lock build_idx_lock(tablet->get_build_inverted_index_lock(), std::try_to_lock);
+    std::unique_lock meta_store_lock(tablet->get_meta_store_lock(), std::try_to_lock);
+    std::unique_lock push_lock(tablet->get_push_lock(), std::try_to_lock);
+    std::unique_lock rowset_update_lock(tablet->get_rowset_update_lock(), std::try_to_lock);
+    if (!migration_lock.owns_lock() || !base_compact_lock.owns_lock() ||
+        !cumu_compact_lock.owns_lock() || !cold_compact_lock.owns_lock() ||
+        !build_idx_lock.owns_lock() || !meta_store_lock.owns_lock() || !push_lock.owns_lock() ||
+        !rowset_update_lock.owns_lock()) {
+        // retryable, nothing is changed
+        return Status::ObtainLockFailed("failed to get tablet locks, tablet: {}", tablet_id);
+    }
+
+    // Judge by the evidence of this job in the tablet meta.
+    RestoreTabletState state;
+    if (local_source_loaded) {
+        state = read_restore_tablet_state(tablet);
+        if (!state.has_stage || state.stage.job_id() != _job_id) {
+            return restore_not_retryable(
+                    fmt::format("tablet {} has no evidence that the restore job {} loaded it "
+                                "(evidence of job {}), "
+                                "the increment ({}, {}] can not be appended",
+                                tablet_id, _job_id, state.has_stage ? state.stage.job_id() : -1,
+                                range.base_version, range.end_version));
+        }
+        if (state.stage.stage() == RestoreStagePB::APPENDED) {
+            if (state.max_version == range.end_version &&
+                state.stage.end_version() == range.end_version) {
+                LOG(INFO) << "the increment (" << range.base_version << ", " << range.end_version
+                          << "] is already appended to tablet " << tablet_id << " by job "
+                          << _job_id;
+                return Status::OK();
+            }
+            return restore_not_retryable(
+                    fmt::format("tablet {} has the evidence of the append up to version {} by job "
+                                "{}, but its max "
+                                "version is {}, not the requested {}",
+                                tablet_id, state.stage.end_version(), _job_id, state.max_version,
+                                range.end_version));
+        }
+        if (state.stage.base_version() != range.base_version) {
+            return restore_not_retryable(fmt::format(
+                    "tablet {} was loaded to version {} by job {}, not to the base version {} of "
+                    "the "
+                    "increment",
+                    tablet_id, state.stage.base_version(), _job_id, range.base_version));
+        }
+        if (state.max_version == range.end_version) {
+            // The increment is in the tablet but the evidence of it is not. The protection of the scheduler and the
+            // single save of the append make it impossible; if it happens check the data itself against the backup.
+            RETURN_IF_ERROR(_check_appended_tablet_equals_backup(tablet, range, backup_digest));
+            std::lock_guard wrlock(tablet->get_header_lock());
+            RestoreStagePB appended = state.stage;
+            appended.set_stage(RestoreStagePB::APPENDED);
+            appended.set_end_version(range.end_version);
+            tablet->tablet_meta()->set_restore_stage(appended);
+            tablet->save_meta();
+            LOG(INFO) << "the tablet " << tablet_id << " is at version " << range.end_version
+                      << " and equals the backup, the evidence of the append of job " << _job_id
+                      << " is written";
+            return Status::OK();
+        }
+        if (state.max_version != range.base_version) {
+            return restore_not_retryable(fmt::format(
+                    "the max version of tablet {} is {}, neither the base version {} nor the end "
+                    "version {} of the increment",
+                    tablet_id, state.max_version, range.base_version, range.end_version));
+        }
+    }
+
+    bool exists = false;
+    RETURN_IF_ERROR(io::global_local_filesystem()->exists(snapshot_path, &exists));
+    if (!exists) {
+        return Status::InternalError("snapshot path does not exist: {}", snapshot_path);
+    }
+
+    // rename the rowset ids and tablet id info in the rowset metas (and the segment files)
+    // (the tablet meta of the increment is "<tablet id>.hdr.increment")
+    auto converted = _engine.snapshot_mgr()->convert_rowset_ids(
+            snapshot_path, tablet_id, tablet->replica_id(), tablet->table_id(),
+            tablet->partition_id(), schema_hash, false, nullptr, kIncrementHdrSuffix);
+    if (!converted.has_value()) [[unlikely]] {
+        return Status::InternalError("failed to convert rowset ids in snapshot {}: {}",
+                                     snapshot_path, converted.error());
+    }
+    // keeps the new rowset ids pending until the rowsets are in the tablet
+    auto pending_guards = std::move(converted.value());
+
+    auto cloned_meta = std::make_shared<TabletMeta>();
+    RETURN_IF_ERROR(cloned_meta->create_from_file(
+            fmt::format("{}/{}{}", snapshot_path, tablet_id, kIncrementHdrSuffix)));
+    std::vector<RowsetMetaSharedPtr> rs_metas;
+    for (const auto& rs_meta : cloned_meta->all_rs_metas()) {
+        rs_metas.push_back(rs_meta);
+    }
+    std::sort(rs_metas.begin(), rs_metas.end(),
+              [](const RowsetMetaSharedPtr& a, const RowsetMetaSharedPtr& b) {
+                  return a->start_version() < b->start_version();
+              });
+    int64_t expected_start = range.base_version + 1;
+    for (const auto& rs_meta : rs_metas) {
+        if (rs_meta->start_version() != expected_start) {
+            return Status::InternalError("the increment in {} is not a chain from version {}",
+                                         snapshot_path, range.base_version + 1);
+        }
+        expected_start = rs_meta->end_version() + 1;
+    }
+    if (rs_metas.empty() || expected_start != range.end_version + 1) {
+        return Status::InternalError("the increment in {} does not end at version {}",
+                                     snapshot_path, range.end_version);
+    }
+
+    std::lock_guard wrlock(tablet->get_header_lock());
+
+    // The local tablet must be what the increment was verified against.
+    if (tablet->max_version_unlocked() != range.base_version) {
+        return Status::InternalError(
+                "the max version of tablet {} is {}, not {}, the increment can not be appended",
+                tablet_id, tablet->max_version_unlocked(), range.base_version);
+    }
+    {
+        auto captured = tablet->capture_consistent_rowsets_unlocked(
+                Version(0, range.base_version), CaptureRowsetOps {});
+        if (!captured) {
+            return Status::InternalError("tablet {} has no consistent rowsets up to version {}: {}",
+                                         tablet_id, range.base_version, captured.error());
+        }
+    }
+
+    // link the segment files into the tablet dir
+    std::vector<std::string> snapshot_files;
+    RETURN_IF_ERROR(_get_existing_files_from_local(snapshot_path, &snapshot_files));
+    std::vector<std::string> linked_files;
+    auto remove_linked = [&linked_files]() {
+        for (const auto& file : linked_files) {
+            remove(file.c_str());
+        }
+    };
+    for (const auto& file : snapshot_files) {
+        if (file.ends_with(".hdr")) {
+            continue;
+        }
+        if (!file.ends_with(".dat") && !file.ends_with(".idx")) {
+            continue;
+        }
+        auto src = fmt::format("{}/{}", snapshot_path, file);
+        auto dest = fmt::format("{}/{}", tablet_path, file);
+        bool dest_exists = false;
+        Status st = io::global_local_filesystem()->exists(dest, &dest_exists);
+        if (st.ok() && dest_exists) {
+            st = Status::InternalError("file {} already exists in tablet {}", file, tablet_id);
+        }
+        if (st.ok() && link(src.c_str(), dest.c_str()) != 0) {
+            st = Status::InternalError("failed to link {} to {}: {}", src, dest,
+                                       std::strerror(errno));
+        }
+        if (!st.ok()) {
+            remove_linked();
+            return st;
+        }
+        linked_files.push_back(dest);
+    }
+
+    std::vector<RowsetSharedPtr> rowsets;
+    for (const auto& rs_meta : rs_metas) {
+        RowsetSharedPtr rs;
+        Status st = tablet->create_rowset(rs_meta, &rs);
+        if (!st.ok()) {
+            remove_linked();
+            return st;
+        }
+        rowsets.push_back(std::move(rs));
+    }
+
+    // revise_tablet_meta adds the rowsets and, for merge-on-write, calculates the delete bitmap of
+    // them. It removes the rowsets again if that fails, but not the marks it has made on the old
+    // rowsets and the bitmap of the new ones: keep the bitmap to put it back.
+    const bool mow = tablet->keys_type() == UNIQUE_KEYS && tablet->enable_unique_key_merge_on_write();
+    std::unique_ptr<DeleteBitmap> bitmap_before;
+    if (mow) {
+        bitmap_before = std::make_unique<DeleteBitmap>(tablet->tablet_meta()->delete_bitmap()->snapshot());
+    }
+    // The evidence of the append is saved by the same save_meta as the rowsets. With the debug point the append is
+    // done without it and fails afterwards: a tablet appended with no evidence, as a crash between the two
+    // steps of an implementation with separate saves would leave it.
+    bool skip_stage = false;
+    DBUG_EXECUTE_IF("SnapshotLoader.append_increment.fail_before_stage", {
+        auto ptablet = dp->param<int64_t>("tablet_id", 0);
+        if (ptablet == 0 || ptablet == tablet_id) {
+            skip_stage = true;
+        }
+    });
+    const RestoreStagePB stage_before = state.stage;
+    if (!local_source_loaded) {
+        skip_stage = true;
+    }
+    if (!skip_stage) {
+        RestoreStagePB appended = stage_before;
+        appended.set_stage(RestoreStagePB::APPENDED);
+        appended.set_end_version(range.end_version);
+        tablet->tablet_meta()->set_restore_stage(appended);
+    }
+    const bool inject_failure = skip_stage && local_source_loaded;
+    Status st = tablet->revise_tablet_meta(rowsets, {}, true);
+    if (!st.ok()) {
+        if (local_source_loaded) {
+            tablet->tablet_meta()->set_restore_stage(stage_before);
+        }
+        if (mow) {
+            *tablet->tablet_meta()->delete_bitmap() = std::move(*bitmap_before);
+        }
+        // the files of the rowsets are removed with the rowsets, the ones not known to the tablet
+        // are removed here
+        remove_linked();
+        LOG(WARNING) << "failed to append the increment to tablet " << tablet_id
+                     << ", the tablet is unchanged: " << st;
+        return st;
+    }
+    if (inject_failure) {
+        return Status::InternalError(
+                "injected failure after the append of tablet {} and before the evidence is "
+                "written",
+                tablet_id);
+    }
+    RETURN_IF_ERROR(write_loaded_tag(snapshot_path, tablet_id));
+    LOG(INFO) << "finished to append the increment (" << range.base_version << ", "
+              << range.end_version << "] to tablet " << tablet_id << ", " << rowsets.size()
+              << " rowsets, job: " << _job_id << ", task id: " << _task_id;
+    return Status::OK();
+}
+
+Status SnapshotLoader::_check_appended_tablet_equals_backup(
+        const TabletSharedPtr& tablet, const TRestoreIncrementalRange& range,
+        const TRestoreBackupDigest* backup_digest) {
+    const int64_t tablet_id = tablet->tablet_id();
+    // The digest proves the hidden state of a unique MoW tablet (algo_version 2); MoR has no such
+    // digest.
+    const uint32_t algo_version = RestoreDigest::algo_version_for(
+            tablet->keys_type(), tablet->enable_unique_key_merge_on_write());
+    if (tablet->keys_type() == UNIQUE_KEYS && algo_version < RestoreDigest::kAlgoVersionMow) {
+        return restore_not_retryable(fmt::format(
+                "tablet {} is at version {} with no evidence of the append, and the digest can not "
+                "prove the hidden state of a unique key tablet",
+                tablet_id, range.end_version));
+    }
+    if (backup_digest == nullptr || !backup_digest->__isset.root ||
+        !backup_digest->__isset.schema_sig || !backup_digest->__isset.algo_version ||
+        !backup_digest->__isset.status_code || backup_digest->status_code != "OK") {
+        return restore_not_retryable(fmt::format(
+                "tablet {} is at version {} with no evidence of the append, and the request has no "
+                "usable digest of the backup to check it against",
+                tablet_id, range.end_version));
+    }
+    if (backup_digest->algo_version != static_cast<int32_t>(algo_version)) {
+        return restore_not_retryable(
+                fmt::format("the algorithm version {} of the digest of the backup is not {}",
+                            backup_digest->algo_version, algo_version));
+    }
+    LogicalDigestResult local;
+    Status st = get_tablet_logical_digest(_engine, tablet_id, range.end_version, 1,
+                                          RestoreDigestCache::instance(), &local);
+    if (!st.ok()) {
+        return restore_not_retryable(
+                fmt::format("failed to compute the digest of tablet {} at version {}: {}",
+                            tablet_id, range.end_version, st.to_string()));
+    }
+    if (local.algo_version != static_cast<uint32_t>(backup_digest->algo_version) ||
+        local.schema_sig != backup_digest->schema_sig || local.root != backup_digest->root ||
+        (backup_digest->__isset.rows && local.rows != static_cast<uint64_t>(backup_digest->rows))) {
+        return restore_not_retryable(fmt::format(
+                "tablet {} is at version {} with no evidence of the append and its digest differs "
+                "from the backup (local {}, backup {})",
+                tablet_id, range.end_version, local.root, backup_digest->root));
+    }
+    return Status::OK();
 }
 
 Status SnapshotLoader::_get_tablet_id_and_schema_hash_from_file_path(const std::string& src_path,
