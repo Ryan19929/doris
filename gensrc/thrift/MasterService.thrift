@@ -78,6 +78,30 @@ struct TDownloadStats {
     13: optional i64 unmatched_version_mismatch
 }
 
+// Result of the logical digest computation of a tablet, see TSnapshotRequest.compute_logical_digest and
+// TRestoreDigestReq. root is empty unless status_code is OK.
+struct TLogicalDigest {
+    1: optional i32 algo_version
+    2: optional string schema_sig
+    // hex of the root digest
+    3: optional string root
+    4: optional i64 rows
+    // OK / NOT_SUPPORTED / ERROR
+    5: optional string status_code
+    6: optional string status_msg
+    // snapshot task with compute_logical_digest: SHA-256 of the decomposed digest file (rdigest) written next
+    // to the manifest of the snapshot, from which the digest at any rowset boundary version of the snapshot
+    // can be composed. Unset if the file was not written, prefix_msg then says why (it is not an error:
+    // unique MoR and a few other models have no decomposed digest).
+    7: optional string prefix_root
+    8: optional string prefix_msg
+    9: optional i64 prefix_bytes
+    // restore digest task with prefix_source: OK if the digest of the tablet at the version equals the one composed
+    // from the decomposed digest file of the backup and the backup can be cut at the version; otherwise
+    // NOT_BOUNDARY / MISMATCH / SCHEMA_MISMATCH / ERROR (prefix_msg says why)
+    10: optional string prefix_verdict
+}
+
 struct TFinishTaskRequest {
     1: required Types.TBackend backend
     2: required Types.TTaskType task_type
