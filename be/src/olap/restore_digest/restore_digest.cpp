@@ -242,7 +242,8 @@ Status build_plan(const TabletSchema& schema, KeysType keys_type, bool enable_mo
     }
 
     plan->algo_version = RestoreDigest::algo_version_for(keys_type, enable_mow);
-    if (plan->algo_version >= RestoreDigest::kAlgoVersionMow && schema.has_sequence_col()) {
+    if (plan->algo_version >= RestoreDigest::kAlgoVersionMow &&
+        (schema.has_sequence_col() || schema.field_index(SEQUENCE_COL) >= 0)) {
         // A row the delete bitmap marks still decides the result of a later write when it has a
         // larger sequence value than the new row (the segment lookup returns KEY_ALREADY_EXISTS
         // before the bitmap is looked at), and that row is not in the digest.
@@ -701,7 +702,8 @@ Status run_mor(const RestoreDigestInput& input, const ColumnPlan& plan, RestoreD
     vectorized::BlockReader reader;
     reader.set_batch_size(input.batch_size);
     RETURN_IF_ERROR(reader.init(params));
-    vectorized::Block block = read_tablet_schema->create_block();
+    // By cids: create_block() skips the dropped columns by name and could shift the positions.
+    vectorized::Block block = merge_tablet_schema->create_block_by_cids(params.return_columns);
     const std::vector<uint32_t> digest_cids = make_read_cids(plan);
     BlockHasher hasher(plan);
     bool eof = false;
@@ -925,13 +927,40 @@ namespace {
 using restore_digest_detail::ScanView;
 
 // The part of a decomposed digest which is a scan: a part of one rowset seen at a version.
+int64_t next_scratch_bitmap_tablet_id();
+
 struct PrefixScanJob {
     size_t rowset_idx = 0;
     ScanView view;
     int64_t seg_begin = 0; // [seg_begin, seg_end), the whole rowset when both are 0
     int64_t seg_end = 0;
     size_t group = 0; // the buckets this scan adds to
+    // unique MoW: the rows of each segment which the scan has to read (they die at one version).
+    // The delete bitmap which makes the scan read only them is built when the job runs, so that
+    // the bitmaps of all the jobs are not held at the same time.
+    bool read_only_dying = false;
+    std::map<uint32_t, roaring::Roaring> dying;
+    int64_t dying_seg_lo = 0;
+    int64_t dying_seg_hi = 0;
 };
+
+// The scan skips the rows of its delete bitmap, so the bitmap to read only `job.dying` is the
+// complement of it. A segment has at most as many rows as its rowset, which bounds the complement.
+DeleteBitmapPtr make_dying_only_bitmap(const PrefixScanJob& job, const RowsetSharedPtr& rowset) {
+    constexpr uint64_t kMaxSegmentRows = 0xFFFFFFF0ULL;
+    const uint64_t upper = std::min<uint64_t>(kMaxSegmentRows, rowset->num_rows());
+    auto bitmap = std::make_shared<DeleteBitmap>(next_scratch_bitmap_tablet_id());
+    for (int64_t seg = job.dying_seg_lo; seg <= job.dying_seg_hi; ++seg) {
+        roaring::Roaring complement;
+        complement.addRange(0, upper);
+        auto it = job.dying.find(static_cast<uint32_t>(seg));
+        if (it != job.dying.end()) {
+            complement -= it->second;
+        }
+        bitmap->set({rowset->rowset_id(), static_cast<uint32_t>(seg), 1}, complement);
+    }
+    return bitmap;
+}
 
 void add_buckets(DigestBuckets* dst, const DigestBuckets& src) {
     for (size_t i = 0; i < dst->size(); ++i) {
@@ -1118,7 +1147,6 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
         job.group = group;
         jobs.push_back(std::move(job));
     };
-    constexpr uint64_t kMaxSegmentRows = 0xFFFFFFF0ULL;
 
     for (size_t i = 0; i < input.rowsets.size(); ++i) {
         const RowsetSharedPtr& rowset = input.rowsets[i];
@@ -1202,39 +1230,30 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
         if (by_version.empty()) {
             continue;
         }
-        // The rowset meta of this branch has no per segment row counts: every segment is bounded by
-        // the largest possible segment.
-        for (const auto& [k, per_segment] : by_version) {
+        for (auto& [k, per_segment] : by_version) {
             if (++extra_scans > max_scans) {
                 return Status::NotSupported(
                         "restore digest: the decomposed digest needs more than {} extra scans for "
                         "the delete bitmap versions",
                         max_scans);
             }
-            // Read only the rows which die at k: the scan skips the rows of its bitmap, so the
-            // bitmap is the complement of the set.
+            // Read only the rows which die at k.
             const int64_t lo = static_cast<int64_t>(per_segment.begin()->first);
             const int64_t hi = static_cast<int64_t>(per_segment.rbegin()->first);
-            auto bitmap = std::make_shared<DeleteBitmap>(next_scratch_bitmap_tablet_id());
-            for (int64_t seg = lo; seg <= hi; ++seg) {
-                roaring::Roaring complement;
-                complement.addRange(0, kMaxSegmentRows);
-                auto it = per_segment.find(static_cast<uint32_t>(seg));
-                if (it != per_segment.end()) {
-                    complement -= it->second;
-                }
-                bitmap->set({rowset->rowset_id(), static_cast<uint32_t>(seg), 1}, complement);
-            }
             const size_t group = groups++;
             plan_i.later.emplace_back(k, group);
             ScanView view;
             // the rows which die at k
             view.version = std::max<int64_t>(1, input.version);
-            view.delete_bitmap = std::move(bitmap);
             add_job(i, std::move(view),
                     lo == 0 && hi + 1 == num_segments ? std::pair<int64_t, int64_t> {0, 0}
                                                       : std::pair<int64_t, int64_t> {lo, hi + 1},
                     group);
+            PrefixScanJob& job = jobs.back();
+            job.read_only_dying = true;
+            job.dying = std::move(per_segment);
+            job.dying_seg_lo = lo;
+            job.dying_seg_hi = hi;
         }
     }
 
@@ -1252,8 +1271,13 @@ Status decompose_restore_digest(const RestoreDigestInput& input, int64_t tablet_
                 [&](const DigestScanTask& task, RestoreDigest*) {
                     const PrefixScanJob& job = jobs[task.rowset_idx];
                     RestoreDigest part;
+                    ScanView view = job.view;
+                    if (job.read_only_dying) {
+                        view.delete_bitmap =
+                                make_dying_only_bitmap(job, input.rowsets[job.rowset_idx]);
+                    }
                     RETURN_IF_ERROR(run_scan(input.rowsets[job.rowset_idx], input.schema,
-                                             input.batch_size, input.enable_mow, plan, job.view,
+                                             input.batch_size, input.enable_mow, plan, view,
                                              job.seg_begin, job.seg_end, &part));
                     std::lock_guard lock(mu);
                     add_buckets(&group_buckets[job.group], part.buckets);
