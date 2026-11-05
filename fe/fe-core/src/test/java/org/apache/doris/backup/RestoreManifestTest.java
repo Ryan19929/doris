@@ -62,6 +62,9 @@ import java.util.Map;
 public class RestoreManifestTest {
     private static final long TABLET_1 = 101;
     private static final long TABLET_2 = 102;
+    // the ids of the partition and the index of newJobInfo
+    private static final long PART = 3;
+    private static final long IDX = 4;
     private static final String MD5 = "4f158689243a3d6030352fec3cfd3798";
 
     private final Env env = Mockito.mock(Env.class);
@@ -156,18 +159,18 @@ public class RestoreManifestTest {
     @Test
     public void testBuildManifest() {
         BackupJobInfo jobInfo = jobInfoWithManifest(TABLET_1, TABLET_2);
-        Assertions.assertEquals(1, (int) jobInfo.manifestVersion);
+        Assertions.assertEquals(2, (int) jobInfo.manifestVersion);
         Assertions.assertEquals("sha256", jobInfo.digestAlgorithm);
-        Assertions.assertEquals(root(TABLET_1), jobInfo.getManifestRoot(TABLET_1));
-        Assertions.assertEquals(root(TABLET_2), jobInfo.getManifestRoot(TABLET_2));
-        Assertions.assertNull(jobInfo.getManifestRoot(999));
+        Assertions.assertEquals(root(TABLET_1), jobInfo.getManifestRoot(PART, IDX, TABLET_1));
+        Assertions.assertEquals(root(TABLET_2), jobInfo.getManifestRoot(PART, IDX, TABLET_2));
+        Assertions.assertNull(jobInfo.getManifestRoot(PART, IDX, 999));
 
         // a backup kept on local without manifest_digest; upper case roots are normalized
         Assertions.assertTrue(jobInfo.buildManifest(snapshotInfos(
                 snapshotInfo(TABLET_1, root(TABLET_1).toUpperCase().replace('0', 'A')),
                 snapshotInfo(TABLET_2, root(TABLET_2))), BackupJobInfo.DIGEST_NONE));
         Assertions.assertEquals("none", jobInfo.digestAlgorithm);
-        Assertions.assertEquals(root(TABLET_1).replace('0', 'a'), jobInfo.getManifestRoot(TABLET_1));
+        Assertions.assertEquals(root(TABLET_1).replace('0', 'a'), jobInfo.getManifestRoot(PART, IDX, TABLET_1));
     }
 
     @Test
@@ -179,7 +182,7 @@ public class RestoreManifestTest {
         Assertions.assertFalse(jobInfo.hasManifest());
         Assertions.assertNull(jobInfo.manifestVersion);
         Assertions.assertNull(jobInfo.digestAlgorithm);
-        Assertions.assertNull(jobInfo.getManifestRoot(TABLET_1));
+        Assertions.assertNull(jobInfo.getManifestRoot(PART, IDX, TABLET_1));
         Assertions.assertFalse(jobInfo.toJson(false).contains("manifest"));
 
         // not a SHA-256
@@ -201,7 +204,7 @@ public class RestoreManifestTest {
         Assertions.assertFalse(jobInfo.buildManifest(snapshotInfos(snapshotInfo(TABLET_1, root(TABLET_1)),
                 snapshotInfo(TABLET_2, root(TABLET_2))), BackupJobInfo.DIGEST_SHA256));
         Assertions.assertFalse(jobInfo.hasManifest());
-        Assertions.assertNull(jobInfo.getManifestRoot(TABLET_1));
+        Assertions.assertNull(jobInfo.getManifestRoot(PART, IDX, TABLET_1));
     }
 
     // ---- persisting ----
@@ -210,29 +213,30 @@ public class RestoreManifestTest {
     public void testGsonRoundTrip() {
         BackupJobInfo jobInfo = jobInfoWithManifest(TABLET_1, TABLET_2);
         String json = jobInfo.toJson(false);
-        Assertions.assertTrue(json.contains("\"manifest_version\":1"), json);
+        Assertions.assertTrue(json.contains("\"manifest_version\":2"), json);
         Assertions.assertTrue(json.contains("\"digest_algorithm\":\"sha256\""), json);
-        Assertions.assertTrue(json.contains("\"manifest_roots\":{"), json);
-        Assertions.assertTrue(json.contains("\"101\":\"" + root(TABLET_1) + "\""), json);
+        // the roots are an array aligned with tablets_order, no map with a tablet id key, and not the old names
+        Assertions.assertTrue(json.contains("\"mra\":[\"" + root(TABLET_1) + "\",\"" + root(TABLET_2) + "\"]"), json);
+        Assertions.assertFalse(json.contains("manifest_roots"), json);
 
         BackupJobInfo read = BackupJobInfo.genFromJson(json);
         Assertions.assertTrue(read.hasManifest());
         Assertions.assertEquals("sha256", read.digestAlgorithm);
-        Assertions.assertEquals(root(TABLET_1), read.getManifestRoot(TABLET_1));
-        Assertions.assertEquals(root(TABLET_2), read.getManifestRoot(TABLET_2));
+        Assertions.assertEquals(root(TABLET_1), read.getManifestRoot(PART, IDX, TABLET_1));
+        Assertions.assertEquals(root(TABLET_2), read.getManifestRoot(PART, IDX, TABLET_2));
         // the BackupTabletInfo view
         BackupIndexInfo idxInfo = read.backupOlapTableObjects.get("tbl").partitions.get("p1").indexes.get("tbl");
         Assertions.assertEquals(2, idxInfo.sortedTabletInfoList.size());
-        Assertions.assertEquals(root(TABLET_1), idxInfo.sortedTabletInfoList.get(0).manifestRoot);
+        Assertions.assertEquals(root(TABLET_1), idxInfo.getManifestRootAt(0));
         // written again, the same
         Assertions.assertEquals(json, read.toJson(false));
 
         // released after the restore: the roots are gone, the version and algorithm are kept for SHOW RESTORE.
         read.releaseSnapshotInfo();
         Assertions.assertTrue(read.hasManifest());
-        Assertions.assertNull(read.getManifestRoot(TABLET_1));
-        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).manifestRoot);
-        Assertions.assertFalse(read.toJson(false).contains("manifest_roots"));
+        Assertions.assertNull(read.getManifestRoot(PART, IDX, TABLET_1));
+        Assertions.assertNull(idxInfo.getManifestRootAt(0));
+        Assertions.assertFalse(read.toJson(false).contains("mra"));
     }
 
     @Test
@@ -248,10 +252,10 @@ public class RestoreManifestTest {
         Assertions.assertFalse(jobInfo.hasManifest());
         Assertions.assertNull(jobInfo.manifestVersion);
         Assertions.assertNull(jobInfo.digestAlgorithm);
-        Assertions.assertNull(jobInfo.getManifestRoot(101));
+        Assertions.assertNull(jobInfo.getManifestRoot(PART, IDX, 101));
         BackupIndexInfo idxInfo = jobInfo.backupOlapTableObjects.get("tbl").partitions.get("p1").indexes.get("tbl");
-        Assertions.assertNull(idxInfo.manifestRoots);
-        Assertions.assertNull(idxInfo.sortedTabletInfoList.get(0).manifestRoot);
+        Assertions.assertNull(idxInfo.manifestRootArray);
+        Assertions.assertNull(idxInfo.getManifestRootAt(0));
         Assertions.assertEquals(2, idxInfo.sortedTabletInfoList.get(0).files.size());
         Assertions.assertFalse(jobInfo.toJson(false).contains("manifest"));
     }
@@ -259,14 +263,14 @@ public class RestoreManifestTest {
     @Test
     public void testUnknownManifestVersionIsNotChecked() {
         String json = jobInfoWithManifest(TABLET_1).toJson(false)
-                .replace("\"manifest_version\":1", "\"manifest_version\":2");
+                .replace("\"manifest_version\":2", "\"manifest_version\":3");
         BackupJobInfo read = BackupJobInfo.genFromJson(json);
-        Assertions.assertEquals(2, (int) read.manifestVersion);
+        Assertions.assertEquals(3, (int) read.manifestVersion);
         Assertions.assertFalse(read.hasManifest());
-        Assertions.assertNull(read.getManifestRoot(TABLET_1));
+        Assertions.assertNull(read.getManifestRoot(PART, IDX, TABLET_1));
 
         RestoreJob job = newRestoreJob(read);
-        Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
+        Assertions.assertNull(job.getExpectedManifestRoot(PART, IDX, TABLET_1));
         Assertions.assertEquals(FeConstants.null_string, manifestCheckColumn(job));
     }
 
@@ -297,16 +301,16 @@ public class RestoreManifestTest {
         // an old backup has no manifest
         RestoreJob job = newRestoreJob(newJobInfo(TABLET_1));
         Assertions.assertEquals(FeConstants.null_string, manifestCheckColumn(job));
-        Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
+        Assertions.assertNull(job.getExpectedManifestRoot(PART, IDX, TABLET_1));
         Assertions.assertEquals(ShowRestoreStmt.BRIEF_TITLE_NAMES.size(), job.getBriefInfo().size());
     }
 
     @Test
     public void testManifestRootInDownloadTask() {
         RestoreJob job = newRestoreJob(jobInfoWithManifest(TABLET_1));
-        String manifestRoot = job.getExpectedManifestRoot(TABLET_1);
+        String manifestRoot = job.getExpectedManifestRoot(PART, IDX, TABLET_1);
         Assertions.assertEquals(root(TABLET_1), manifestRoot);
-        Assertions.assertNull(job.getExpectedManifestRoot(999));
+        Assertions.assertNull(job.getExpectedManifestRoot(PART, IDX, 999));
 
         // repository path: keyed by the src path, the same as src_dest_map
         Map<String, String> srcToDest = Maps.newHashMap();
@@ -336,7 +340,7 @@ public class RestoreManifestTest {
         String origDeployMode = Config.deploy_mode;
         try {
             Config.deploy_mode = "cloud";
-            Assertions.assertNull(job.getExpectedManifestRoot(TABLET_1));
+            Assertions.assertNull(job.getExpectedManifestRoot(PART, IDX, TABLET_1));
         } finally {
             Config.deploy_mode = origDeployMode;
         }
@@ -364,7 +368,7 @@ public class RestoreManifestTest {
                         Lists.newArrayList()));
             }
         }
-        Assertions.assertEquals("{\"version\":1,\"algo\":\"sha256\",\"verified_tablets\":0,\"unverified_tablets\":4,"
+        Assertions.assertEquals("{\"version\":2,\"algo\":\"sha256\",\"verified_tablets\":0,\"unverified_tablets\":4,"
                 + "\"digest_checked\":false}", manifestCheckColumn(job));
 
         // backend 1 is new and checked both tablets, with digest
@@ -378,12 +382,12 @@ public class RestoreManifestTest {
 
         // backend 2 is old, reports nothing: unverified, never failed
         job.recordManifestCheck(2, downloadFinished(null, null));
-        Assertions.assertEquals("{\"version\":1,\"algo\":\"sha256\",\"verified_tablets\":2,\"unverified_tablets\":2,"
+        Assertions.assertEquals("{\"version\":2,\"algo\":\"sha256\",\"verified_tablets\":2,\"unverified_tablets\":2,"
                 + "\"digest_checked\":true}", manifestCheckColumn(job));
 
         // backend 2 upgraded, checks without digest (restore_manifest_digest_check=false)
         job.recordManifestCheck(2, downloadFinished(false, Lists.newArrayList(201L, 202L)));
-        String shown = "{\"version\":1,\"algo\":\"sha256\",\"verified_tablets\":4,\"unverified_tablets\":0,"
+        String shown = "{\"version\":2,\"algo\":\"sha256\",\"verified_tablets\":4,\"unverified_tablets\":0,"
                 + "\"digest_checked\":false}";
         Assertions.assertEquals(shown, manifestCheckColumn(job));
 
@@ -394,6 +398,69 @@ public class RestoreManifestTest {
         Assertions.assertEquals(shown, manifestCheckColumn(job));
         RestoreJob readJob = writeAndRead(job);
         Assertions.assertEquals(shown, manifestCheckColumn(readJob));
+    }
+
+    private RestoreJob downloadingJobWithCheckedReplicas() {
+        RestoreJob job = newRestoreJob(jobInfoWithManifest(TABLET_1, TABLET_2));
+        for (long beId : new long[] {1, 2}) {
+            for (long tabletId : new long[] {201, 202}) {
+                job.snapshotInfos.put(tabletId, beId, new SnapshotInfo(1, 2, 3, 4, tabletId, beId, 5, "/p",
+                        Lists.newArrayList()));
+            }
+        }
+        job.recordManifestCheck(1, downloadFinished(true, Lists.newArrayList(201L, 202L)));
+        job.recordManifestCheck(2, downloadFinished(false, Lists.newArrayList(201L)));
+        Assertions.assertEquals(5, job.getManifestCheckReplicaNum());
+        Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
+        return job;
+    }
+
+    @Test
+    public void testManifestCheckReplicasAreReleasedWhenTheDownloadFinishes() {
+        RestoreJob job = downloadingJobWithCheckedReplicas();
+        Assertions.assertEquals(root(TABLET_1), job.getExpectedManifestRoot(PART, IDX, TABLET_1));
+        Deencapsulation.invoke(job, "waitingAllDownloadFinished");
+        Assertions.assertEquals(RestoreJob.RestoreJobState.COMMIT, job.getState());
+        // the result is fixed, and the sets it was computed from are gone
+        Assertions.assertEquals(0, job.getManifestCheckReplicaNum());
+        RestoreManifestCheck check = job.getManifestCheck();
+        Assertions.assertEquals(3, check.getVerifiedTablets());
+        Assertions.assertEquals(1, check.getUnverifiedTablets());
+        Assertions.assertFalse(check.isDigestChecked());
+        // the manifest roots are only needed to download, the version and the algorithm are still shown
+        Assertions.assertNull(job.getExpectedManifestRoot(PART, IDX, TABLET_1));
+        Assertions.assertTrue(job.jobInfo.hasManifest());
+        Assertions.assertEquals("{\"version\":2,\"algo\":\"sha256\",\"verified_tablets\":3,"
+                + "\"unverified_tablets\":1,\"digest_checked\":false}", manifestCheckColumn(job));
+        // the job info logged with the COMMIT state has no manifest root
+        String json = job.jobInfo.toJson(false);
+        Assertions.assertFalse(json.contains("mra"), json);
+        Assertions.assertTrue(json.contains("manifest_version"), json);
+    }
+
+    @Test
+    public void testManifestCheckReplicasAreReleasedWhenTheJobIsCancelled() {
+        RestoreJob job = downloadingJobWithCheckedReplicas();
+        Assertions.assertTrue(job.cancel().ok());
+        Assertions.assertEquals(RestoreJob.RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertEquals(0, job.getManifestCheckReplicaNum());
+        // the partial result is kept
+        Assertions.assertEquals(3, job.getManifestCheck().getVerifiedTablets());
+    }
+
+    @Test
+    public void testBackupWithoutManifestIsRestoredWithoutIt() {
+        // a backup taken with enable_backup_manifest = false: no manifest version, no root
+        BackupJobInfo jobInfo = newJobInfo(TABLET_1, TABLET_2);
+        Assertions.assertFalse(jobInfo.hasManifest());
+        RestoreJob job = newRestoreJob(jobInfo);
+        Assertions.assertNull(job.getExpectedManifestRoot(PART, IDX, TABLET_1));
+        Assertions.assertNull(job.getManifestCheck());
+        Assertions.assertEquals(FeConstants.null_string, manifestCheckColumn(job));
+        Deencapsulation.setField(job, "state", RestoreJob.RestoreJobState.DOWNLOADING);
+        Deencapsulation.invoke(job, "waitingAllDownloadFinished");
+        Assertions.assertEquals(RestoreJob.RestoreJobState.COMMIT, job.getState());
+        Assertions.assertNull(job.getManifestCheck());
     }
 
     @Test

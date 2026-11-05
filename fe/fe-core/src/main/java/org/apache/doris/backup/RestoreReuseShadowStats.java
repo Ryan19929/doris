@@ -26,8 +26,10 @@ import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.Tablet;
+import org.apache.doris.common.Config;
 import org.apache.doris.persist.gson.GsonUtils;
 
+import com.google.gson.JsonObject;
 import com.google.gson.annotations.SerializedName;
 
 /**
@@ -58,7 +60,19 @@ public class RestoreReuseShadowStats {
         // The source partition was written after the backup that the local partition was restored from.
         SOURCE_VERSION_CHANGED,
         // The commit seq of the source table is unknown, or goes backwards.
-        COMMIT_SEQ_MISMATCH
+        COMMIT_SEQ_MISMATCH,
+        // The reverse and table level checks are not allowed at the check level off and disable.
+        LEVEL_NOT_ALLOWED,
+        // The source partition in the backup has no restore lineage (reverse check).
+        NO_BACKUP_LINEAGE,
+        // The local table and the backup table have no restore source relation (table level check).
+        NO_TABLE_RELATION,
+        // The partition name or range differs from the backup (table level check).
+        PARTITION_MISMATCH,
+        // The version of the backup differs from the visible version of the local partition.
+        VERSION_MISMATCH,
+        // Both the lineage and the backup know the cluster id of the source, and they differ.
+        CLUSTER_MISMATCH
     }
 
     /**
@@ -73,7 +87,28 @@ public class RestoreReuseShadowStats {
         // The logical equivalence of an aggregate table can not be proved (e.g. SUM of floating point values).
         AGGREGATE_TABLE,
         // Part of the data is cooled down to remote storage, reading it costs about the same as downloading.
-        REMOTE_STORAGE
+        REMOTE_STORAGE,
+        // A unique merge-on-write table, and restore_reuse_mow is off (the default). With it on, the table without a
+        // sequence column is reused: its digest (algorithm version 2) covers the rows that the delete bitmap leaves,
+        // the rows with a delete sign included, which is all that the later writes read of the existing data.
+        // restore_reuse_allow_hidden_state_models does not lift it.
+        HIDDEN_STATE_MOW,
+        // A unique merge-on-write table with a sequence column (or a sequence mapping): the rows that the delete
+        // bitmap marks still decide the result of a later write (a larger sequence value makes the new row a loser),
+        // and the digest does not cover them. Never reused.
+        HIDDEN_STATE_MOW_SEQUENCE,
+        // A unique merge-on-write table whose digest in the backup is of algorithm version 1, which skips the rows
+        // with a delete sign. Never trusted, whatever restore_reuse_allow_hidden_state_models says.
+        HIDDEN_STATE_MOW_DIGEST_V1,
+        // A unique merge-on-read table: the overwritten versions of a key are hidden state, a later delete predicate
+        // makes them visible again. Not reused unless restore_reuse_allow_hidden_state_models.
+        HIDDEN_STATE_MOR,
+        // A frontend or a backend of the cluster does not report the capability of partition level reuse (an old
+        // version, a rolling upgrade or rollback), the job downloads all the data. Only the reason is counted.
+        MIXED_VERSIONS,
+        // The backup has more tablets than restore_reuse_max_tablets, the job downloads all the data. Only the reason
+        // is counted.
+        TOO_MANY_TABLETS
     }
 
     @SerializedName("partitions")
@@ -82,12 +117,34 @@ public class RestoreReuseShadowStats {
     private long reusable = 0;
     @SerializedName("reusable_bytes_single_replica")
     private long reusableBytesSingleReplica = 0;
+    // reusable, by the L0 check that passed: a forward, b reverse, c table level
+    @SerializedName("reusable_a")
+    private long reusableForward = 0;
+    @SerializedName("reusable_b")
+    private long reusableReverse = 0;
+    @SerializedName("reusable_c")
+    private long reusableTable = 0;
     @SerializedName("l0_passed_but_atomic_restore")
     private long l0PassedButAtomicRestore = 0;
     @SerializedName("l0_passed_but_aggregate_table")
     private long l0PassedButAggregateTable = 0;
     @SerializedName("l0_passed_but_remote_storage")
     private long l0PassedButRemoteStorage = 0;
+    @SerializedName("l0_passed_but_hidden_state_mow")
+    private long l0PassedButHiddenStateMow = 0;
+    @SerializedName("l0_passed_but_hidden_state_mow_sequence")
+    private long l0PassedButHiddenStateMowSequence = 0;
+    @SerializedName("l0_passed_but_hidden_state_mow_digest_v1")
+    private long l0PassedButHiddenStateMowDigestV1 = 0;
+    @SerializedName("l0_passed_but_hidden_state_mor")
+    private long l0PassedButHiddenStateMor = 0;
+    @SerializedName("l0_passed_but_mixed_versions")
+    private long l0PassedButMixedVersions = 0;
+
+    @SerializedName("l0_passed_but_too_many_tablets")
+    private long l0PassedButTooManyTablets = 0;
+    @SerializedName("cluster_mismatch")
+    private long clusterMismatch = 0;
     @SerializedName("no_local")
     private long noLocalPartition = 0;
     @SerializedName("no_lineage")
@@ -115,6 +172,16 @@ public class RestoreReuseShadowStats {
      */
     public static L0Verdict checkL0(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
             long srcVersion, long srcCommitSeq) {
+        return checkL0(localPart, srcDbId, srcTableId, srcPartitionId, srcVersion, srcCommitSeq,
+                RestoreLineage.UNKNOWN_CLUSTER_ID);
+    }
+
+    /**
+     * @param srcClusterId the cluster id of the source of the backup, {@link RestoreLineage#UNKNOWN_CLUSTER_ID} if
+     *         unknown. If both it and the one of the lineage are known they must be equal.
+     */
+    public static L0Verdict checkL0(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
+            long srcVersion, long srcCommitSeq, long srcClusterId) {
         if (localPart == null) {
             return L0Verdict.NO_LOCAL_PARTITION;
         }
@@ -125,6 +192,9 @@ public class RestoreReuseShadowStats {
         }
         if (!lineage.isSameSource(srcDbId, srcTableId, srcPartitionId)) {
             return L0Verdict.LINEAGE_MISMATCH;
+        }
+        if (RestoreReuseJudge.clusterDiffers(lineage.getSrcClusterId(), srcClusterId)) {
+            return L0Verdict.CLUSTER_MISMATCH;
         }
         // 2. no local write since the restore.
         if (localPart.getVisibleVersion() != lineage.getSrcVersion()) {
@@ -144,17 +214,78 @@ public class RestoreReuseShadowStats {
     }
 
     /**
+     * The forward L0 check without the versions: the local partition was restored from the same source partition, and
+     * the commit seq does not go backwards. Used by the incremental append, where the versions differ.
+     */
+    public static L0Verdict checkL0Relation(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
+            long srcCommitSeq) {
+        return checkL0Relation(localPart, srcDbId, srcTableId, srcPartitionId, srcCommitSeq,
+                RestoreLineage.UNKNOWN_CLUSTER_ID);
+    }
+
+    public static L0Verdict checkL0Relation(Partition localPart, long srcDbId, long srcTableId, long srcPartitionId,
+            long srcCommitSeq, long srcClusterId) {
+        if (localPart == null) {
+            return L0Verdict.NO_LOCAL_PARTITION;
+        }
+        RestoreLineage lineage = localPart.getRestoreLineage();
+        if (lineage == null) {
+            return L0Verdict.NO_LINEAGE;
+        }
+        if (!lineage.isSameSource(srcDbId, srcTableId, srcPartitionId)) {
+            return L0Verdict.LINEAGE_MISMATCH;
+        }
+        if (RestoreReuseJudge.clusterDiffers(lineage.getSrcClusterId(), srcClusterId)) {
+            return L0Verdict.CLUSTER_MISMATCH;
+        }
+        if (lineage.getSrcCommitSeq() == RestoreLineage.UNKNOWN_COMMIT_SEQ
+                || srcCommitSeq == RestoreLineage.UNKNOWN_COMMIT_SEQ
+                || srcCommitSeq < lineage.getSrcCommitSeq()) {
+            return L0Verdict.COMMIT_SEQ_MISMATCH;
+        }
+        return L0Verdict.REUSABLE;
+    }
+
+    /**
      * Whether the local partition is in a case not covered by the first version of partition level reuse.
      */
     public static Unsupported checkUnsupported(boolean isAtomicRestore, OlapTable localTbl, Partition localPart) {
-        if (isAtomicRestore) {
+        if (isAtomicRestore && !Config.enable_restore_atomic_reuse) {
             return Unsupported.ATOMIC_RESTORE;
         }
         if (localTbl.getKeysType() == KeysType.AGG_KEYS) {
             return Unsupported.AGGREGATE_TABLE;
         }
+        Unsupported hidden = checkHiddenState(localTbl);
+        if (hidden != Unsupported.NONE) {
+            return hidden;
+        }
         if (localPart.getRemoteDataSize() > 0) {
             return Unsupported.REMOTE_STORAGE;
+        }
+        return Unsupported.NONE;
+    }
+
+    /**
+     * Whether the table has a hidden state that the digest does not cover, so that the digest proves the visible rows
+     * only, not the behavior of the later writes. Duplicate tables are free of it. A unique merge-on-write table
+     * without a sequence column is covered by the digest of algorithm version 2, and is reused only when
+     * Config.restore_reuse_mow is on (it takes precedence over restore_reuse_allow_hidden_state_models, which does
+     * not apply to it); one with a sequence column never is. A unique merge-on-read table is reused only when
+     * Config.restore_reuse_allow_hidden_state_models is on.
+     */
+    public static Unsupported checkHiddenState(OlapTable localTbl) {
+        if (localTbl.getKeysType() != KeysType.UNIQUE_KEYS) {
+            return Unsupported.NONE;
+        }
+        if (!localTbl.getEnableUniqueKeyMergeOnWrite()) {
+            return Config.restore_reuse_allow_hidden_state_models ? Unsupported.NONE : Unsupported.HIDDEN_STATE_MOR;
+        }
+        if (!Config.restore_reuse_mow) {
+            return Unsupported.HIDDEN_STATE_MOW;
+        }
+        if (localTbl.hasSequenceCol() || localTbl.getSequenceMapCol() != null) {
+            return Unsupported.HIDDEN_STATE_MOW_SEQUENCE;
         }
         return Unsupported.NONE;
     }
@@ -180,6 +311,21 @@ public class RestoreReuseShadowStats {
         return dataSize;
     }
 
+    /** The local data size of all replicas of the partition (what a download of it would write). */
+    public static long getAllReplicasLocalDataSize(Partition partition) {
+        long dataSize = 0;
+        for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {
+            for (Tablet tablet : index.getTablets()) {
+                for (Replica replica : tablet.getReplicas()) {
+                    if (replica.getState() == ReplicaState.NORMAL) {
+                        dataSize += replica.getDataSize();
+                    }
+                }
+            }
+        }
+        return dataSize;
+    }
+
     /**
      * Add a partition.
      *
@@ -189,6 +335,13 @@ public class RestoreReuseShadowStats {
      *         partition is reusable
      */
     public void add(L0Verdict verdict, Unsupported unsupported, long singleReplicaBytes) {
+        add(verdict, unsupported, singleReplicaBytes, RestoreReuseJudge.L0_FORWARD);
+    }
+
+    /**
+     * @param l0Path the L0 check that passed ({@link RestoreReuseJudge#L0_FORWARD} etc), only used if L0 passes
+     */
+    public void add(L0Verdict verdict, Unsupported unsupported, long singleReplicaBytes, String l0Path) {
         partitions++;
         switch (verdict) {
             case REUSABLE:
@@ -202,9 +355,34 @@ public class RestoreReuseShadowStats {
                     case REMOTE_STORAGE:
                         l0PassedButRemoteStorage++;
                         break;
+                    case HIDDEN_STATE_MOW:
+                        l0PassedButHiddenStateMow++;
+                        break;
+                    case HIDDEN_STATE_MOW_SEQUENCE:
+                        l0PassedButHiddenStateMowSequence++;
+                        break;
+                    case HIDDEN_STATE_MOW_DIGEST_V1:
+                        l0PassedButHiddenStateMowDigestV1++;
+                        break;
+                    case HIDDEN_STATE_MOR:
+                        l0PassedButHiddenStateMor++;
+                        break;
+                    case MIXED_VERSIONS:
+                        l0PassedButMixedVersions++;
+                        break;
+                    case TOO_MANY_TABLETS:
+                        l0PassedButTooManyTablets++;
+                        break;
                     default:
                         reusable++;
                         reusableBytesSingleReplica += singleReplicaBytes;
+                        if (RestoreReuseJudge.L0_REVERSE.equals(l0Path)) {
+                            reusableReverse++;
+                        } else if (RestoreReuseJudge.L0_TABLE.equals(l0Path)) {
+                            reusableTable++;
+                        } else {
+                            reusableForward++;
+                        }
                         break;
                 }
                 break;
@@ -226,6 +404,9 @@ public class RestoreReuseShadowStats {
             case COMMIT_SEQ_MISMATCH:
                 commitSeqMismatch++;
                 break;
+            case CLUSTER_MISMATCH:
+                clusterMismatch++;
+                break;
             default:
                 break;
         }
@@ -243,6 +424,18 @@ public class RestoreReuseShadowStats {
         return reusableBytesSingleReplica;
     }
 
+    public long getReusableForward() {
+        return reusableForward;
+    }
+
+    public long getReusableReverse() {
+        return reusableReverse;
+    }
+
+    public long getReusableTable() {
+        return reusableTable;
+    }
+
     public long getL0PassedButAtomicRestore() {
         return l0PassedButAtomicRestore;
     }
@@ -253,6 +446,34 @@ public class RestoreReuseShadowStats {
 
     public long getL0PassedButRemoteStorage() {
         return l0PassedButRemoteStorage;
+    }
+
+    public long getL0PassedButHiddenStateMow() {
+        return l0PassedButHiddenStateMow;
+    }
+
+    public long getL0PassedButHiddenStateMowSequence() {
+        return l0PassedButHiddenStateMowSequence;
+    }
+
+    public long getL0PassedButHiddenStateMowDigestV1() {
+        return l0PassedButHiddenStateMowDigestV1;
+    }
+
+    public long getL0PassedButHiddenStateMor() {
+        return l0PassedButHiddenStateMor;
+    }
+
+    public long getL0PassedButMixedVersions() {
+        return l0PassedButMixedVersions;
+    }
+
+    public long getL0PassedButTooManyTablets() {
+        return l0PassedButTooManyTablets;
+    }
+
+    public long getClusterMismatch() {
+        return clusterMismatch;
     }
 
     public long getNoLocalPartition() {
@@ -282,5 +503,60 @@ public class RestoreReuseShadowStats {
     @Override
     public String toString() {
         return GsonUtils.GSON.toJson(this);
+    }
+
+    /**
+     * The estimate with the actual result of partition level reuse of the job added, for the ReuseEstimate column:
+     * the partitions kept (by the L0 check that let them in) and the bytes of a single replica, and the partitions
+     * that were candidates but are downloaded, by reason.
+     *
+     * @param actual the result of the job, null if there is none (the feature is off, or not decided yet)
+     */
+    public String toJson(RestoreReuseResult actual) {
+        if (actual == null) {
+            return toString();
+        }
+        JsonObject json = GsonUtils.GSON.toJsonTree(this).getAsJsonObject();
+        json.addProperty("kept_partitions", actual.getKeptPartitions());
+        json.addProperty("kept_bytes_single_replica", actual.getKeptBytesSingleReplica());
+        json.addProperty("kept_a", actual.getKeptByPath(RestoreReuseJudge.L0_FORWARD));
+        json.addProperty("kept_b", actual.getKeptByPath(RestoreReuseJudge.L0_REVERSE));
+        json.addProperty("kept_c", actual.getKeptByPath(RestoreReuseJudge.L0_TABLE));
+        // the check level (requested and effective), and the kept partitions not proved by a digest
+        if (!actual.isEmpty()) {
+            json.add("check_level", GsonUtils.GSON.toJsonTree(actual.levelSummary()));
+        }
+        long mixedVersions = actual.getRejected().getOrDefault(RestoreJob.MIXED_VERSIONS, 0L);
+        if (mixedVersions > 0) {
+            // the job did not decide the reuse, a node does not have the capability of it
+            json.addProperty("mixed_versions", mixedVersions);
+        }
+        long tooManyTablets = actual.getRejected().getOrDefault(RestoreJob.TOO_MANY_TABLETS, 0L);
+        if (tooManyTablets > 0) {
+            // the job did not reuse any partition, the backup has more tablets than restore_reuse_max_tablets
+            json.addProperty("too_many_tablets", tooManyTablets);
+        }
+        json.addProperty("download_digest_mismatch", actual.countReasons(
+                RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH, RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH));
+        json.addProperty("download_timeout", actual.countReasons(RestoreReuseResult.DOWNLOAD_TIMEOUT));
+        json.addProperty("download_not_supported", actual.countReasons(RestoreReuseResult.DOWNLOAD_DIGEST_ERROR));
+        json.addProperty("download_sample_failed", actual.countReasons(RestoreReuseResult.DOWNLOAD_SAMPLE_FAILED));
+        json.addProperty("download_other", actual.countReasons(RestoreReuseResult.DOWNLOAD_CHANGED,
+                RestoreReuseResult.DOWNLOAD_VERIFY_ERROR));
+        if (Config.enable_restore_atomic_reuse || actual.getKeptAtomicPartitions() > 0
+                || actual.getIncrementalAtomicPartitions() > 0) {
+            // the partitions of an atomic restore made from the local snapshot of the table being replaced
+            json.addProperty("kept_atomic", actual.getKeptAtomicPartitions());
+            json.addProperty("incremental_atomic", actual.getIncrementalAtomicPartitions());
+            json.addProperty("kept_atomic_bytes_all_replicas", actual.getKeptAtomicBytesAllReplicas());
+        }
+        if (Config.enable_restore_incremental_append || actual.getIncrementalPartitions() > 0) {
+            // the partitions that download only the rowsets after the local version, and the local data they keep
+            json.addProperty("incremental_partitions", actual.getIncrementalPartitions());
+            json.addProperty("incremental_local_bytes_all_replicas", actual.getIncrementalLocalBytesAllReplicas());
+            json.addProperty("download_not_boundary", actual.countReasons(RestoreReuseResult.DOWNLOAD_NOT_BOUNDARY));
+            json.addProperty("download_prefix_error", actual.countReasons(RestoreReuseResult.DOWNLOAD_PREFIX_ERROR));
+        }
+        return GsonUtils.GSON.toJson(json);
     }
 }
