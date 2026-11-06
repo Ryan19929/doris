@@ -39,6 +39,9 @@ import groovy.json.JsonSlurper
 //      (download_digest_mismatch), and B holds Y, row by row. Restoring S2 once more keeps everything.
 // Auto compaction is off, so the rowsets of T are what the loads made.
 suite("test_backup_restore_digest_cache_replace", "backup_restore") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_digest_cache_replace"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbT = "${suiteName}_t"
@@ -247,4 +250,5 @@ suite("test_backup_restore_digest_cache_replace", "backup_restore") {
         sql "DROP DATABASE ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }

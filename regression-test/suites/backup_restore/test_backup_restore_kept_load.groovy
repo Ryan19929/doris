@@ -30,6 +30,9 @@ import org.apache.doris.regression.util.NodeType
 // The restart of the FE or of a BE in the middle of the load needs a docker cluster, see
 // test_backup_restore_atomic_local_source_docker.
 suite("test_backup_restore_kept_load", "backup_restore,nonConcurrent") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     if (!getFeConfig("enable_debug_points").equals("true")) {
         logger.info("Config.enable_debug_points=true is required")
         return
@@ -375,4 +378,5 @@ suite("test_backup_restore_kept_load", "backup_restore,nonConcurrent") {
         sql "DROP DATABASE IF EXISTS ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }

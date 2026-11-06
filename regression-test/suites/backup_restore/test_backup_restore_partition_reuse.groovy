@@ -22,6 +22,9 @@ import groovy.json.JsonSlurper
 // What is downloaded is read from the DownloadStats column of SHOW RESTORE; the result is compared with a full
 // download of the same backup (rows, partition versions).
 suite("test_backup_restore_partition_reuse", "backup_restore") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_partition_reuse"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String srcDbName = "${suiteName}_src_db"
@@ -291,4 +294,5 @@ suite("test_backup_restore_partition_reuse", "backup_restore") {
         sql "DROP DATABASE ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }

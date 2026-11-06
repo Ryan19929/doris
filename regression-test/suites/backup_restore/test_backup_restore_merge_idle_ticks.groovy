@@ -25,6 +25,9 @@ import groovy.json.JsonSlurper
 // middle of a merged round works, and backup_restore_run_on_task_finish runs the jobs the same way.
 // The FE needs enable_debug_points=true for the pause case, which is skipped otherwise.
 suite("test_backup_restore_merge_idle_ticks", "backup_restore,nonConcurrent") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_merge_idle_ticks"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbA = "${suiteName}_a"
@@ -268,4 +271,5 @@ suite("test_backup_restore_merge_idle_ticks", "backup_restore,nonConcurrent") {
         sql "DROP DATABASE IF EXISTS ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }
