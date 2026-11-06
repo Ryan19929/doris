@@ -34,6 +34,9 @@ public class DirMoveTask extends AgentTask {
     private TRestoreBackupDigest backupLogicalDigest;
     // The tablet was loaded from a local source by the atomic restore (the backend judges the task by the evidence).
     private boolean localSourceLoaded = false;
+    // The tablet of a kept partition of the atomic restore: the snapshot task may have loaded it, then the backend
+    // only checks the evidence. Not sent to the backend, which tells the case by the snapshot dir.
+    private boolean localSourceKept = false;
 
     public DirMoveTask(TResourceInfo resourceInfo, long backendId, long signature, long jobId, long dbId,
             long tableId, long partitionId, long indexId, long tabletId, String src, int schemaHash,
@@ -81,6 +84,14 @@ public class DirMoveTask extends AgentTask {
 
     public boolean isLocalSourceLoaded() {
         return localSourceLoaded;
+    }
+
+    public void setLocalSourceKept(boolean localSourceKept) {
+        this.localSourceKept = localSourceKept;
+    }
+
+    public boolean isLocalSourceKept() {
+        return localSourceKept;
     }
 
     public TRestoreBackupDigest getBackupLogicalDigest() {

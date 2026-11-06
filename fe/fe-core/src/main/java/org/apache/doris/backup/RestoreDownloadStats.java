@@ -66,6 +66,10 @@ public class RestoreDownloadStats {
     // (another disk) from them. Reported by the snapshot tasks, not in the counts of the download.
     @SerializedName("lst")
     private long localSourceTablets;
+    // of localSourceTablets, those loaded into the staging tablet by the snapshot task itself (kept partitions with
+    // restore_reuse_kept_load_at_snapshot, the local base of incremental partitions)
+    @SerializedName("lld")
+    private long localSourceLoadedTablets;
     @SerializedName("llf")
     private long localSourceLinkedFiles;
     @SerializedName("llb")
@@ -117,6 +121,7 @@ public class RestoreDownloadStats {
     // Add the stats reported by a snapshot task made from a local tablet (restore_local_source).
     public void addLocalSource(TDownloadStats stats) {
         localSourceTablets += stats.getLocalSourceTablets();
+        localSourceLoadedTablets += stats.getLocalSourceLoadedTablets();
         localSourceLinkedFiles += stats.getLocalSourceLinkedFiles();
         localSourceLinkedBytes += stats.getLocalSourceLinkedBytes();
         localSourceCopiedFiles += stats.getLocalSourceCopiedFiles();
@@ -126,6 +131,7 @@ public class RestoreDownloadStats {
     // The counts of the local snapshots are made before the download starts, which resets the stats.
     public void carryLocalSource(RestoreDownloadStats other) {
         localSourceTablets += other.localSourceTablets;
+        localSourceLoadedTablets += other.localSourceLoadedTablets;
         localSourceLinkedFiles += other.localSourceLinkedFiles;
         localSourceLinkedBytes += other.localSourceLinkedBytes;
         localSourceCopiedFiles += other.localSourceCopiedFiles;
@@ -134,6 +140,10 @@ public class RestoreDownloadStats {
 
     public long getLocalSourceTablets() {
         return localSourceTablets;
+    }
+
+    public long getLocalSourceLoadedTablets() {
+        return localSourceLoadedTablets;
     }
 
     public long getLocalSourceLinkedBytes() {
@@ -257,6 +267,7 @@ public class RestoreDownloadStats {
             json.put("kept_atomic_bytes", keptAtomicBytes);
             Map<String, Object> atomic = new LinkedHashMap<>();
             atomic.put("local_tablets", localSourceTablets);
+            atomic.put("loaded_tablets", localSourceLoadedTablets);
             atomic.put("linked_bytes", localSourceLinkedBytes);
             atomic.put("linked_files", localSourceLinkedFiles);
             atomic.put("copied_bytes", localSourceCopiedBytes);
