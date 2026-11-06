@@ -325,12 +325,16 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         writeIntoP1(dupTable)
         String snap5 = "${suiteName}_5"
         String ts5 = backupAndWait(snap5, dupTable)
+        // The staging table is registered when the replicas are created and renamed when the job finishes, which
+        // may be well within a second with the merged rounds (backup_restore_merge_idle_ticks): pause the job after
+        // the replicas are created to look at the staging table, then fail the append of one tablet of its p1.
+        GetDebugPoint().enableDebugPointForAllFEs("FE.PAUSE_NON_PENDING_RESTORE_JOB", [value: snap5])
         startRestore(dbB, snap5, ts5, dupTable)
-        // the staging table appears when the job creates it; fail the append of one tablet of its p1
         assertTrue(waitUntil(120) { stagingTableExists(dbB, dupTable) })
         def tablets = sql_return_maparray "SHOW TABLETS FROM ${dbB}.${stagingTable(dupTable)} PARTITION (p1)"
         assertFalse(tablets.isEmpty())
         enableDebug("Tablet.revise_tablet_meta_fail", [tablet_id: tablets[0].TabletId as String])
+        GetDebugPoint().disableDebugPointForAllFEs("FE.PAUSE_NON_PENDING_RESTORE_JOB")
         job = waitRestoreDone(dbB, snap5, 600)
         assertEquals("CANCELLED", job.State)
         assertEquals(rowsBefore, rowsOf(dbB, dupTable))
@@ -342,6 +346,7 @@ suite("test_backup_restore_atomic_local_source", "backup_restore,nonConcurrent")
         assertEquals("FINISHED", job.State)
         assertSameAsSource(dbB, dupTable)
     } finally {
+        GetDebugPoint().disableDebugPointForAllFEs("FE.PAUSE_NON_PENDING_RESTORE_JOB")
         disableDebug("Tablet.revise_tablet_meta_fail")
         setConfig("restore_local_source_task_max_retry", "10")
     }
