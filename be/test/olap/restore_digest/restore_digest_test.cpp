@@ -5168,7 +5168,7 @@ protected:
         case Kind::MOW_DELETES: {
             auto rs2 = write(src, schema, 2, {{{1, 10}, {2, 20}, {3, 30}, {4, 40}, {5, 50}, {6, 60}}}, false, true);
             write(src, schema, 3, {{{3, 31}, {5, 51}}}, false, true);
-            auto& bitmap = src->tablet_meta()->delete_bitmap();
+            auto& bitmap = *src->tablet_meta()->delete_bitmap();
             bitmap.add({rs2->rowset_id(), 0, 3}, 2);
             bitmap.add({rs2->rowset_id(), 0, 3}, 4);
             write(src, schema, 4, {{{1, 0, 1}, {6, 61}}}, false, true);
@@ -5209,7 +5209,7 @@ protected:
         if (mow) {
             auto rs2 = write(src, schema, 2, {{{1, 10}, {2, 20}, {3, 30}, {4, 40}, {5, 50}, {6, 60}}}, false, true);
             auto rs3 = write(src, schema, 3, {{{3, 31}, {5, 51}}}, false, true);
-            auto& bitmap = src->tablet_meta()->delete_bitmap();
+            auto& bitmap = *src->tablet_meta()->delete_bitmap();
             bitmap.add({rs2->rowset_id(), 0, 3}, 2);
             bitmap.add({rs2->rowset_id(), 0, 3}, 4);
             auto rs4 = write(src, schema, 4, {{{1, 0, 1}, {6, 61}}}, false, true);
@@ -5400,7 +5400,7 @@ TEST_F(RestoreIncrementalAppendTest, MergeOnWriteIncrementWithSegmentsRepeatingK
     write(src, schema, 3, {}, false, true);
     write(local, local->tablet_schema(), 2, {base}, false, true);
     write(local, local->tablet_schema(), 3, {}, false, true);
-    auto& bitmap = src->tablet_meta()->delete_bitmap();
+    auto& bitmap = *src->tablet_meta()->delete_bitmap();
     // version 4: three segments, key 2 is in all of them (the last one wins), key 7 in two, and a delete sign row
     // of key 4 in the last one
     auto src4 = write(src, schema, 4,
@@ -5458,7 +5458,7 @@ TEST_F(RestoreIncrementalAppendTest, MergeOnWriteIncrementMergedByCumulativeComp
     write(src, schema, 3, {}, false, true);
     write(local, local->tablet_schema(), 2, {base}, false, true);
     write(local, local->tablet_schema(), 3, {}, false, true);
-    auto& bitmap = src->tablet_meta()->delete_bitmap();
+    auto& bitmap = *src->tablet_meta()->delete_bitmap();
     // versions 4 and 5 as they were loaded: key 2 updated, key 7 inserted and updated, key 3 deleted;
     // key 7 of version 4 died at version 5. The merged rowset keeps what is alive at 5 (the delete sign row
     // of key 3 included). The marks of the base rowset at 4 and 5 stay where they are.
@@ -5662,8 +5662,8 @@ TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
     std::string dir = make_increment_dir(src, local, 3, 6);
     auto files_before = tablet_files(local);
     RestoreDigest before = tablet_digest(7432, 3);
-    auto bitmap_count_before = local->tablet_meta()->delete_bitmap().get_delete_bitmap_count();
-    auto bitmap_card_before = local->tablet_meta()->delete_bitmap().cardinality();
+    auto bitmap_count_before = local->tablet_meta()->delete_bitmap()->get_delete_bitmap_count();
+    auto bitmap_card_before = local->tablet_meta()->delete_bitmap()->cardinality();
     size_t rowsets_before = local->tablet_meta()->all_rs_metas().size();
 
     DebugPoints::instance()->add_with_params("Tablet.revise_tablet_meta_fail", {{"tablet_id", "7432"}});
@@ -5675,8 +5675,8 @@ TEST_F(RestoreIncrementalAppendTest, FailureLeavesNoHalfAppendedState) {
     // nothing of the increment is in the tablet: version, rowsets, delete bitmap, files
     EXPECT_EQ(3, local->max_version_unlocked());
     EXPECT_EQ(rowsets_before, local->tablet_meta()->all_rs_metas().size());
-    EXPECT_EQ(bitmap_count_before, local->tablet_meta()->delete_bitmap().get_delete_bitmap_count());
-    EXPECT_EQ(bitmap_card_before, local->tablet_meta()->delete_bitmap().cardinality());
+    EXPECT_EQ(bitmap_count_before, local->tablet_meta()->delete_bitmap()->get_delete_bitmap_count());
+    EXPECT_EQ(bitmap_card_before, local->tablet_meta()->delete_bitmap()->cardinality());
     EXPECT_EQ(files_before, tablet_files(local));
     EXPECT_TRUE(digests_equal(before, tablet_digest(7432, 3)));
     EXPECT_FALSE(compute_tablet_restore_digest(*_engine, 7432, 4, &before).ok());
