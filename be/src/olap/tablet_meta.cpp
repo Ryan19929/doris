@@ -422,6 +422,8 @@ TabletMeta::TabletMeta(const TabletMeta& b)
           _enable_unique_key_merge_on_write(b._enable_unique_key_merge_on_write),
           _delete_bitmap(b._delete_bitmap),
           _binlog_config(b._binlog_config),
+          _restore_stage(b._restore_stage),
+          _has_restore_stage(b._has_restore_stage),
           _compaction_policy(b._compaction_policy),
           _time_series_compaction_goal_size_mbytes(b._time_series_compaction_goal_size_mbytes),
           _time_series_compaction_file_count_threshold(

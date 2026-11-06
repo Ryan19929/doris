@@ -1148,6 +1148,7 @@ TEST_F(SnapshotLoaderTest, HttpDownloadManifestRootMismatch) {
     EXPECT_TRUE(loader.manifest_verified_tablets().empty());
     // reported to FE as an internal error with the name of the code as the prefix of the message
     ASSERT_TRUE(status.is<ErrorCode::RESTORE_MANIFEST_MISMATCH>()) << status;
+    EXPECT_EQ(TStatusCode::INTERNAL_ERROR, status.to_thrift().status_code);
     EXPECT_NE(status.to_thrift().error_msgs[0].find("[RESTORE_MANIFEST_MISMATCH]"),
               std::string::npos);
 }
