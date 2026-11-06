@@ -3339,6 +3339,84 @@ public class RestoreReuseTest {
                 CatalogMocker.TEST_TBL2_NAME)).getId());
     }
 
+    // Adds a second table to the atomic job: the table of the db (test_tbl) is the origin table, a table registered
+    // under the temp name is its staging table, both with a local decision at the version of their partition.
+    private OlapTable addSecondAtomicTable(RestoreJob job) {
+        OlapTable originB = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_NAME);
+        Partition partB = originB.getPartitions().iterator().next();
+        OlapTable stagingB = new OlapTable(originB.getId() + 7777,
+                RestoreJob.tableAliasWithAtomicRestore(CatalogMocker.TEST_TBL_NAME), Lists.newArrayList(),
+                KeysType.DUP_KEYS, originB.getPartitionInfo(), originB.getDefaultDistributionInfo());
+        // the rename of the table looks up its base index by the name
+        Map<String, Long> indexNameToId = Deencapsulation.getField(stagingB, "indexNameToId");
+        indexNameToId.put(stagingB.getName(), stagingB.getId());
+        db.registerTable(stagingB);
+        BackupJobInfo info = Deencapsulation.getField(job, "jobInfo");
+        info.backupOlapTableObjects.put(CatalogMocker.TEST_TBL_NAME, new BackupOlapTableInfo());
+        RestoreReuseResult.Decision decision = new RestoreReuseResult.Decision();
+        decision.tableId = originB.getId();
+        decision.partitionId = partB.getId();
+        decision.tableName = originB.getName();
+        decision.partitionName = partB.getName();
+        decision.version = partB.getVisibleVersion();
+        decision.kept = true;
+        decision.atomic = true;
+        job.getReuseResult().addDecision(decision);
+        return stagingB;
+    }
+
+    @Test
+    public void testAtomicMultiTableCheckedBeforeAnyTableIsReplaced() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        OlapTable stagingA = staging(job);
+        OlapTable stagingB = addSecondAtomicTable(job);
+        OlapTable originB = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_NAME);
+        Partition partB = originB.getPartitions().iterator().next();
+        // a load of the second table is committed and not published yet: the version is the same, the next one moved
+        partB.setNextVersion(partB.getVisibleVersion() + 2);
+
+        Mockito.clearInvocations(env);
+        Status st = Deencapsulation.invoke(job, "atomicReplaceOlapTables", db, false);
+        Assertions.assertFalse(st.ok());
+        Assertions.assertTrue(st.getErrMsg().contains(partB.getName()), st.getErrMsg());
+        // whatever the order of the tables, none of them is replaced or erased
+        Assertions.assertSame(tbl2, db.getTableNullable(CatalogMocker.TEST_TBL2_NAME));
+        Assertions.assertSame(originB, db.getTableNullable(CatalogMocker.TEST_TBL_NAME));
+        Assertions.assertSame(stagingA, db.getTableNullable(
+                RestoreJob.tableAliasWithAtomicRestore(CatalogMocker.TEST_TBL2_NAME)));
+        Assertions.assertSame(stagingB, db.getTableNullable(
+                RestoreJob.tableAliasWithAtomicRestore(CatalogMocker.TEST_TBL_NAME)));
+        Mockito.verify(env, Mockito.never()).onEraseOlapTable(Mockito.any(OlapTable.class), Mockito.anyBoolean());
+        // the locks are released
+        Assertions.assertFalse(tbl2.isWriteLockHeldByCurrentThread());
+        Assertions.assertFalse(originB.isWriteLockHeldByCurrentThread());
+    }
+
+    @Test
+    public void testAtomicMultiTableAllReplacedWhenAllChecked() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        OlapTable stagingA = staging(job);
+        OlapTable stagingB = addSecondAtomicTable(job);
+        OlapTable originB = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL_NAME);
+
+        Mockito.clearInvocations(env);
+        Status st = Deencapsulation.invoke(job, "atomicReplaceOlapTables", db, false);
+        Assertions.assertTrue(st.ok(), st.toString());
+        Assertions.assertSame(stagingA, db.getTableNullable(CatalogMocker.TEST_TBL2_NAME));
+        Assertions.assertSame(stagingB, db.getTableNullable(CatalogMocker.TEST_TBL_NAME));
+        Assertions.assertNull(db.getTableNullable(RestoreJob.tableAliasWithAtomicRestore(CatalogMocker.TEST_TBL2_NAME)));
+        Mockito.verify(env).onEraseOlapTable(Mockito.same(tbl2), Mockito.eq(false));
+        Mockito.verify(env).onEraseOlapTable(Mockito.same(originB), Mockito.eq(false));
+        Assertions.assertFalse(tbl2.isWriteLockHeldByCurrentThread());
+        Assertions.assertFalse(originB.isWriteLockHeldByCurrentThread());
+    }
+
     @Test
     public void testAtomicCancelReleasesTheLocalSnapshotsAndKeepsTheTable() {
         RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
@@ -4055,9 +4133,15 @@ public class RestoreReuseTest {
         mockCluster();
         frontend(FrontendNodeType.FOLLOWER, "fe1", 1);
         backend(1, 1);
-        // a dead backend is not in the list of the alive ones
-        new Backend(2, "be2", 9050).setRestoreReuseCapability(0);
+        // a dead backend that cannot do it is in the list of the backends, and is skipped
+        Backend be2 = new Backend(2, "be2", 9050);
+        be2.setRestoreReuseCapability(0);
+        be2.setAlive(false);
+        aliveBackends.add(be2);
         Assertions.assertNull(RestoreJob.findNodeWithoutReuseCapability());
+        // once it is alive again, it is the node without the capability
+        be2.setAlive(true);
+        Assertions.assertNotNull(RestoreJob.findNodeWithoutReuseCapability());
     }
 
     @Test
