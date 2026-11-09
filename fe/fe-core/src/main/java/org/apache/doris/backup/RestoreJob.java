@@ -262,8 +262,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // The prefix of the error message of a backend which says that retrying the task cannot succeed.
     public static final String RESTORE_NOT_RETRYABLE = "[RESTORE_NOT_RETRYABLE]";
     // The version of the restore reuse protocol of this build, reported in the heartbeat of the frontend and the
-    // backend. A node of an old version reports none (0).
-    public static final int RESTORE_REUSE_CAPABILITY_REPORTED = 2;
+    // backend. A node of an old version reports none (0). 3: the load of a kept partition by the snapshot task
+    // (TSnapshotRequest.restore_kept_load), which is not required of any node: a backend without it loads by the
+    // move as before, and the move request is the same.
+    public static final int RESTORE_REUSE_CAPABILITY_REPORTED = 3;
     // What partition level reuse needs of every node: 1, the RESTORE_DIGEST task, the local source snapshot and the
     // incremental download, which an old node does not understand.
     public static final int RESTORE_REUSE_CAPABILITY_MIN_REQUIRED = 1;
@@ -427,6 +429,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                 LOG.debug("get finished snapshot info: {}, unfinished tasks num: {}, remove result: {}. {}",
                           info, unfinishedSignatureToId.size(), this, removedTabletId);
             }
+            nudgeIfIdle(unfinishedSignatureToId.isEmpty());
             return true;
         }
         return false;
@@ -470,6 +473,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
         digestResults.put(task.getSignature(), digest);
         judgeCandidate(candidate, false);
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 
@@ -505,6 +509,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         taskErrMsg.remove(task.getSignature());
         recordManifestCheck(task.getBackendId(), request);
         recordDownloadStats(task.getBackendId(), request);
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 
@@ -642,7 +647,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     }
 
     public synchronized boolean finishDirMoveTask(DirMoveTask task, TFinishTaskRequest request) {
-        if (task.getIncrementalRange() != null && task.isLocalSourceLoaded() && task.getJobId() == jobId
+        if ((task.getIncrementalRange() != null || task.isLocalSourceKept()) && task.isLocalSourceLoaded()
+                && task.getJobId() == jobId
                 && cancelOnLocalSourceTaskFailure(task, request, RestoreJobState.COMMITTING)) {
             return false;
         }
@@ -658,12 +664,14 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
 
         taskErrMsg.remove(task.getSignature());
+        nudgeIfIdle(unfinishedSignatureToId.isEmpty());
         return true;
     }
 
     /**
      * The failure of a task of the local source (the snapshot task which loads the local source into a staging
-     * tablet, the move task which appends the increment): other tasks are resent without end, but these two cannot
+     * tablet, the move task which appends the increment or confirms a kept tablet): other tasks are resent without
+     * end, but these cannot
      * succeed forever if the tablet is not what the job expects, so the job is cancelled (an atomic restore leaves
      * the original table alone) when
      *  - the backend says that retrying is useless (the error has RESTORE_NOT_RETRYABLE), or
@@ -799,47 +807,77 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         LOG.info("run restore job: {}", this);
 
-        checkIfNeedCancel();
+        // With backup_restore_merge_idle_ticks the next state is run in this round as well when the state reached
+        // waits for nothing (the cancel check and the pause of the debug point are done before every state).
+        int steps = 0;
+        do {
+            RestoreJobState before = state;
+            checkIfNeedCancel();
 
-        if (status.ok()) {
-            if (state != RestoreJobState.PENDING && state != RestoreJobState.CREATING
-                    && label.equals(DebugPointUtil.getDebugParamOrDefault("FE.PAUSE_NON_PENDING_RESTORE_JOB", ""))) {
-                LOG.info("pause restore job by debug point: {}", this);
-                return;
-            }
+            if (status.ok()) {
+                if (state != RestoreJobState.PENDING && state != RestoreJobState.CREATING
+                        && label.equals(DebugPointUtil.getDebugParamOrDefault("FE.PAUSE_NON_PENDING_RESTORE_JOB",
+                                ""))) {
+                    LOG.info("pause restore job by debug point: {}", this);
+                    return;
+                }
 
-            switch (state) {
-                case PENDING:
-                    checkAndPrepareMeta();
-                    break;
-                case CREATING:
-                    waitingAllReplicasCreated();
-                    break;
-                case VERIFYING:
-                    waitingAllDigestsFinished();
-                    break;
-                case SNAPSHOTING:
-                    waitingAllSnapshotsFinished();
-                    break;
-                case DOWNLOAD:
-                    downloadSnapshots();
-                    break;
-                case DOWNLOADING:
-                    waitingAllDownloadFinished();
-                    break;
-                case COMMIT:
-                    commit();
-                    break;
-                case COMMITTING:
-                    waitingAllTabletsCommitted();
-                    break;
-                default:
-                    break;
+                switch (state) {
+                    case PENDING:
+                        checkAndPrepareMeta();
+                        break;
+                    case CREATING:
+                        waitingAllReplicasCreated();
+                        break;
+                    case VERIFYING:
+                        waitingAllDigestsFinished();
+                        break;
+                    case SNAPSHOTING:
+                        waitingAllSnapshotsFinished();
+                        break;
+                    case DOWNLOAD:
+                        downloadSnapshots();
+                        break;
+                    case DOWNLOADING:
+                        waitingAllDownloadFinished();
+                        break;
+                    case COMMIT:
+                        commit();
+                        break;
+                    case COMMITTING:
+                        waitingAllTabletsCommitted();
+                        break;
+                    default:
+                        break;
+                }
             }
-        }
+            if (!Config.backup_restore_merge_idle_ticks || !status.ok() || state == before || isWaitingState()
+                    || ++steps >= MAX_MERGED_STEPS_RESTORE) {
+                break;
+            }
+            LOG.info("go on with state {} in the same round. {}", state, this);
+        } while (true);
 
         if (!status.ok()) {
             cancelInternal(false);
+        }
+    }
+
+    // Whether the state waits for the backends (or is done): the next round looks again, nothing to run now.
+    // CREATING polls the create replica tasks every round as before.
+    private boolean isWaitingState() {
+        switch (state) {
+            case CREATING:
+            case FINISHED:
+            case CANCELLED:
+                return true;
+            case VERIFYING:
+            case SNAPSHOTING:
+            case DOWNLOADING:
+            case COMMITTING:
+                return !unfinishedSignatureToId.isEmpty();
+            default:
+                return false;
         }
     }
 
@@ -1654,6 +1692,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     }
                     if (atomicDecision != null) {
                         task.setRestoreLocalSource(true);
+                        if (atomicDecision.kept && Config.restore_reuse_kept_load_at_snapshot) {
+                            // loaded into the staging tablet by the snapshot task, the move only confirms it
+                            task.setRestoreKeptLoad(true);
+                        }
                     }
                     if (isIncrementalPartition(tbl.getId(), part.getId())) {
                         // an empty dir, only the increment is downloaded into it
@@ -2554,6 +2596,15 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     backupTabletIds = buildBackupTabletIds();
                 }
                 task.setBackupLogicalDigest(getBackupLogicalDigest(backupTabletIds, info.getTabletId()));
+            } else {
+                RestoreReuseResult.Decision kept = getAtomicLocalDecision(info.getTblId(), info.getPartitionId());
+                if (kept != null && kept.kept) {
+                    // The snapshot task may have loaded the tablet (restore_reuse_kept_load_at_snapshot), then the
+                    // backend judges the move by the evidence of the load: its failure is converged like the one of
+                    // an append. The request of the move is the same either way.
+                    task.setLocalSourceKept(true);
+                    task.setLocalSourceLoaded(true);
+                }
             }
             batchTask.addTask(task);
             unfinishedSignatureToId.put(signature, info.getTabletId());

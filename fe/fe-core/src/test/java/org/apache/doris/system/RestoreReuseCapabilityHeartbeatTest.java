@@ -55,8 +55,9 @@ public class RestoreReuseCapabilityHeartbeatTest {
         Assertions.assertEquals(2, HeartbeatMgr.restoreReuseCapabilityOf(backendInfo));
         TFrontendPingFrontendResult ping = new TFrontendPingFrontendResult();
         ping.setRestoreReuseCapability(RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
-        Assertions.assertEquals(2, HeartbeatMgr.restoreReuseCapabilityOf(ping));
-        Assertions.assertEquals(2, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
+        // 3: the load of a kept partition by the snapshot task, which no node is required to have
+        Assertions.assertEquals(3, HeartbeatMgr.restoreReuseCapabilityOf(ping));
+        Assertions.assertEquals(3, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
         Assertions.assertEquals(1, RestoreJob.RESTORE_REUSE_CAPABILITY_MIN_REQUIRED);
         Assertions.assertTrue(RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED >= RestoreJob.RESTORE_REUSE_CAPABILITY_MOW);
 

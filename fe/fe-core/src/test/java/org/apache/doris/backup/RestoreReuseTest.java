@@ -46,6 +46,7 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
 import org.apache.doris.common.jmockit.Deencapsulation;
+import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.ha.FrontendNodeType;
@@ -90,6 +91,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
@@ -3461,6 +3465,7 @@ public class RestoreReuseTest {
         RestoreDownloadStats stats = new RestoreDownloadStats();
         TDownloadStats a = new TDownloadStats();
         a.setLocalSourceTablets(2);
+        a.setLocalSourceLoadedTablets(1);
         a.setLocalSourceLinkedFiles(5);
         a.setLocalSourceLinkedBytes(500);
         a.setLocalSourceCopiedFiles(1);
@@ -3468,6 +3473,7 @@ public class RestoreReuseTest {
         stats.addLocalSource(a);
         stats.addLocalSource(a);
         Assertions.assertEquals(4, stats.getLocalSourceTablets());
+        Assertions.assertEquals(2, stats.getLocalSourceLoadedTablets());
         Assertions.assertEquals(1000, stats.getLocalSourceLinkedBytes());
         Assertions.assertEquals(140, stats.getLocalSourceCopiedBytes());
         RestoreDownloadStats next = new RestoreDownloadStats();
@@ -3476,6 +3482,7 @@ public class RestoreReuseTest {
         Assertions.assertTrue(json.contains("\"kept_atomic_bytes\":5000"), json);
         Assertions.assertTrue(json.contains("\"copied_bytes\":140"), json);
         Assertions.assertTrue(json.contains("\"local_tablets\":4"), json);
+        Assertions.assertTrue(json.contains("\"loaded_tablets\":2"), json);
         // untouched without an atomic restore
         Config.enable_restore_atomic_reuse = false;
         Assertions.assertFalse(new RestoreDownloadStats().toJson(0, 0).contains("atomic"));
@@ -4064,9 +4071,405 @@ public class RestoreReuseTest {
     // duplicate tables only 1: a cluster in a rolling upgrade keeps reusing the latter.
     @Test
     public void testConstantsOfTheCapability() {
-        Assertions.assertEquals(2, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
+        Assertions.assertEquals(3, RestoreJob.RESTORE_REUSE_CAPABILITY_REPORTED);
         Assertions.assertEquals(1, RestoreJob.RESTORE_REUSE_CAPABILITY_MIN_REQUIRED);
         Assertions.assertEquals(2, RestoreJob.RESTORE_REUSE_CAPABILITY_MOW);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // the kept partitions loaded by the snapshot task (restore_reuse_kept_load_at_snapshot)
+    // ---------------------------------------------------------------------------------------------
+
+    // An atomic restore of the backup of the table itself, up to SNAPSHOTING: every partition is kept.
+    private RestoreJob atomicKeptJob() {
+        RestoreJob job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(job);
+        reportAll(job, newDigestTasks(), Maps.newHashMap());
+        waitDigests(job);
+        Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+        Assertions.assertEquals(2, job.getReuseResult().getKeptAtomicPartitions());
+        return job;
+    }
+
+    @Test
+    public void testKeptSnapshotTasksCarryTheKeptLoadFlag() {
+        newHandler();
+        boolean orig = Config.restore_reuse_kept_load_at_snapshot;
+        boolean origAtomic = Config.enable_restore_atomic_reuse;
+        try {
+            Config.restore_reuse_kept_load_at_snapshot = true;
+            RestoreJob job = atomicKeptJob();
+            List<SnapshotTask> snapshots = snapshotTasks(submitted);
+            Assertions.assertFalse(snapshots.isEmpty());
+            for (SnapshotTask task : snapshots) {
+                Assertions.assertTrue(task.isRestoreLocalSource());
+                Assertions.assertTrue(task.isRestoreKeptLoad());
+                Assertions.assertFalse(task.isRestoreIncremental());
+                Assertions.assertTrue(task.toThrift().isRestoreKeptLoad());
+                Assertions.assertTrue(task.toThrift().isSetJobId());
+            }
+            // one job of the tables at a time
+            Assertions.assertTrue(job.cancel().ok());
+            // the local base of an incremental partition is loaded by restore_incremental, not by the kept flag
+            submitted.clear();
+            job = atomicIncrementalJob(Maps.newHashMap());
+            for (SnapshotTask task : snapshotTasks(submitted)) {
+                Assertions.assertTrue(task.isRestoreLocalSource());
+                Assertions.assertTrue(task.isRestoreIncremental());
+                Assertions.assertFalse(task.isRestoreKeptLoad());
+                Assertions.assertFalse(task.toThrift().isSetRestoreKeptLoad());
+            }
+            Assertions.assertTrue(job.cancel().ok());
+            // the switch off: the plain local snapshot, the move loads it
+            Config.restore_reuse_kept_load_at_snapshot = false;
+            submitted.clear();
+            job = atomicKeptJob();
+            for (SnapshotTask task : snapshotTasks(submitted)) {
+                Assertions.assertTrue(task.isRestoreLocalSource());
+                Assertions.assertFalse(task.isRestoreKeptLoad());
+                Assertions.assertFalse(task.toThrift().isSetRestoreKeptLoad());
+            }
+            Assertions.assertTrue(job.cancel().ok());
+            // a snapshot of the usual restore has none of it
+            Config.enable_restore_atomic_reuse = false;
+            submitted.clear();
+            RestoreJob plain = newAtomicJob(selfBackupJobInfo(), "full");
+            Deencapsulation.invoke(plain, "checkAndPrepareMeta");
+            Deencapsulation.invoke(plain, "allReplicasCreated");
+            for (SnapshotTask task : snapshotTasks(submitted)) {
+                Assertions.assertFalse(task.isRestoreLocalSource());
+                Assertions.assertFalse(task.isRestoreKeptLoad());
+            }
+        } finally {
+            Config.restore_reuse_kept_load_at_snapshot = orig;
+            Config.enable_restore_atomic_reuse = origAtomic;
+        }
+    }
+
+    @Test
+    public void testKeptMoveTasksAreUnchangedOnTheWireButMarked() {
+        newHandler();
+        boolean orig = Config.restore_reuse_kept_load_at_snapshot;
+        try {
+            for (boolean loadAtSnapshot : new boolean[] {true, false}) {
+                Config.restore_reuse_kept_load_at_snapshot = loadAtSnapshot;
+                RestoreJob job = atomicKeptJob();
+                List<DirMoveTask> moves = toCommitting(job);
+                Assertions.assertFalse(moves.isEmpty());
+                for (DirMoveTask move : moves) {
+                    // the backend tells the case by the snapshot dir, the request is the plain move
+                    Assertions.assertTrue(move.isLocalSourceKept());
+                    Assertions.assertTrue(move.isLocalSourceLoaded());
+                    Assertions.assertNull(move.getIncrementalRange());
+                    org.apache.doris.thrift.TMoveDirReq req = move.toThrift();
+                    Assertions.assertFalse(req.isSetIncremental());
+                    Assertions.assertFalse(req.isSetLocalSourceLoaded());
+                    Assertions.assertFalse(req.isSetBackupLogicalDigest());
+                    Assertions.assertEquals(job.getJobId(), req.getJobId());
+                }
+                Assertions.assertTrue(job.cancel().ok());
+            }
+        } finally {
+            Config.restore_reuse_kept_load_at_snapshot = orig;
+        }
+    }
+
+    @Test
+    public void testNotRetryableKeptMoveCancelsAtOnce() {
+        newHandler();
+        RestoreJob job = atomicKeptJob();
+        DirMoveTask move = toCommitting(job).get(0);
+        failed(move, 1);
+        Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.INTERNAL_ERROR,
+                "(127.0.0.1)[INTERNAL_ERROR]" + RestoreJob.RESTORE_NOT_RETRYABLE + " no evidence of the load")));
+        Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+        Assertions.assertTrue(job.getStatus().getErrMsg().contains(RestoreJob.RESTORE_NOT_RETRYABLE),
+                job.getStatus().getErrMsg());
+        Assertions.assertTrue(job.getLocalSourceStagingPartitions().isEmpty());
+        // the table being replaced is not touched
+        Assertions.assertSame(tbl2, db.getTableNullable(CatalogMocker.TEST_TBL2_NAME));
+    }
+
+    @Test
+    public void testOtherKeptMoveErrorsCancelAfterTheMaxRetry() {
+        newHandler();
+        int origMax = Config.restore_local_source_task_max_retry;
+        Config.restore_local_source_task_max_retry = 2;
+        try {
+            RestoreJob job = atomicKeptJob();
+            DirMoveTask move = toCommitting(job).get(0);
+            for (int i = 1; i <= 2; i++) {
+                failed(move, 1);
+                Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.INTERNAL_ERROR, "boom")));
+                Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState(), "failure " + i);
+            }
+            failed(move, 1);
+            Assertions.assertFalse(job.finishDirMoveTask(move, failure(TStatusCode.INTERNAL_ERROR, "boom")));
+            Assertions.assertEquals(RestoreJobState.CANCELLED, job.getState());
+        } finally {
+            Config.restore_local_source_task_max_retry = origMax;
+        }
+    }
+
+    @Test
+    public void testKeptLoadedTabletsAreSummedIntoTheDownloadStats() throws Exception {
+        newHandler();
+        RestoreJob job = atomicKeptJob();
+        List<SnapshotTask> snapshots = snapshotTasks(submitted);
+        for (SnapshotTask task : snapshots) {
+            TFinishTaskRequest report = new TFinishTaskRequest();
+            report.setTaskStatus(new TStatus(TStatusCode.OK));
+            report.setSnapshotPath("/path/snapshot/" + task.getTabletId());
+            TDownloadStats stats = new TDownloadStats();
+            stats.setLocalSourceTablets(1);
+            stats.setLocalSourceLoadedTablets(1);
+            stats.setLocalSourceLinkedFiles(2);
+            stats.setLocalSourceLinkedBytes(1000);
+            report.setDownloadStats(stats);
+            Assertions.assertTrue(job.finishTabletSnapshotTask(task, report));
+        }
+        Assertions.assertEquals(snapshots.size(), job.getDownloadStats().getLocalSourceLoadedTablets());
+        String download = job.getFullInfo().stream().filter(x -> x.contains("atomic_local")).findFirst().orElse("");
+        Assertions.assertTrue(download.contains("\"loaded_tablets\":" + snapshots.size()), download);
+        // persisted with the job
+        Deencapsulation.invoke(job, "waitingAllSnapshotsFinished");
+        RestoreJob replayed = writeAndRead(job);
+        Assertions.assertEquals(snapshots.size(), replayed.getDownloadStats().getLocalSourceLoadedTablets());
+    }
+
+    @Test
+    public void testRunAfterCatalogReadyIsolatesAFailingJob() {
+        BackupHandler handler = newHandler();
+        Deencapsulation.setField(handler, "isInit", true);
+        AbstractJob bad = Mockito.mock(AbstractJob.class);
+        Mockito.when(bad.getJobId()).thenReturn(1L);
+        Mockito.doThrow(new IllegalStateException("boom")).when(bad).run();
+        AbstractJob good = Mockito.mock(AbstractJob.class);
+        Mockito.when(good.getJobId()).thenReturn(2L);
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 1L, bad);
+        Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 2L, good);
+        handler.runAfterCatalogReady();
+        // the failing job does not stop the round
+        Mockito.verify(bad).run();
+        Mockito.verify(good).run();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // backup_restore_merge_idle_ticks and backup_restore_run_on_task_finish
+    // ---------------------------------------------------------------------------------------------
+
+    // the state of the job at every edit log written from now on
+    private List<RestoreJobState> loggedStates() {
+        List<RestoreJobState> states = Lists.newArrayList();
+        Mockito.doAnswer(inv -> {
+            states.add(((RestoreJob) inv.getArgument(0)).getState());
+            return null;
+        }).when(editLog).logRestoreJob(Mockito.any(RestoreJob.class));
+        return states;
+    }
+
+    @Test
+    public void testMergedTicksRestoreSendsDownloadAndCommitInTheSameRun() {
+        newHandler();
+        boolean orig = Config.backup_restore_merge_idle_ticks;
+        try {
+            // the switch off: one state per run
+            Config.backup_restore_merge_idle_ticks = false;
+            RestoreJob job = atomicKeptJob();
+            finishSnapshots(job, snapshotTasks(submitted), 700, 0);
+            List<RestoreJobState> states = loggedStates();
+            job.run();
+            Assertions.assertEquals(RestoreJobState.DOWNLOAD, job.getState());
+            Assertions.assertEquals(Lists.newArrayList(RestoreJobState.DOWNLOAD), states);
+            job.run();
+            Assertions.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+            job.run();
+            Assertions.assertEquals(RestoreJobState.COMMIT, job.getState());
+            job.run();
+            Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
+            Assertions.assertEquals(Lists.newArrayList(RestoreJobState.DOWNLOAD, RestoreJobState.COMMIT), states);
+            Assertions.assertTrue(job.cancel().ok());
+
+            // the switch on, nothing to download: from the snapshots to the moves in one run, the same logs
+            Config.backup_restore_merge_idle_ticks = true;
+            job = atomicKeptJob();
+            finishSnapshots(job, snapshotTasks(submitted), 700, 0);
+            submitted.clear();
+            states = loggedStates();
+            job.run();
+            Assertions.assertTrue(job.getStatus().ok(), job.getStatus().toString());
+            Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
+            Assertions.assertEquals(Lists.newArrayList(RestoreJobState.DOWNLOAD, RestoreJobState.COMMIT), states);
+            Assertions.assertTrue(submitted.stream().noneMatch(t -> t instanceof DownloadTask));
+            Assertions.assertTrue(submitted.stream().anyMatch(t -> t instanceof DirMoveTask));
+            // waits for the moves
+            job.run();
+            Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
+            Assertions.assertEquals(2, states.size());
+            Assertions.assertTrue(job.cancel().ok());
+
+            // something to download: the download tasks are sent in the round of the snapshots, then it waits
+            job = atomicIncrementalJob(Maps.newHashMap());
+            finishSnapshots(job, snapshotTasks(submitted), 700, 0);
+            submitted.clear();
+            states = loggedStates();
+            job.run();
+            Assertions.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+            Assertions.assertEquals(Lists.newArrayList(RestoreJobState.DOWNLOAD), states);
+            Assertions.assertTrue(submitted.stream().anyMatch(t -> t instanceof DownloadTask));
+            job.run();
+            Assertions.assertEquals(RestoreJobState.DOWNLOADING, job.getState());
+        } finally {
+            Config.backup_restore_merge_idle_ticks = orig;
+        }
+    }
+
+    @Test
+    public void testPauseDebugPointStopsTheMergedRun() {
+        newHandler();
+        boolean orig = Config.backup_restore_merge_idle_ticks;
+        boolean origDebug = Config.enable_debug_points;
+        try {
+            Config.backup_restore_merge_idle_ticks = true;
+            Config.enable_debug_points = true;
+            RestoreJob job = atomicKeptJob();
+            finishSnapshots(job, snapshotTasks(submitted), 700, 0);
+            DebugPointUtil.addDebugPointWithValue("FE.PAUSE_NON_PENDING_RESTORE_JOB", job.getLabel());
+            job.run();
+            Assertions.assertEquals(RestoreJobState.SNAPSHOTING, job.getState());
+            DebugPointUtil.removeDebugPoint("FE.PAUSE_NON_PENDING_RESTORE_JOB");
+            job.run();
+            Assertions.assertEquals(RestoreJobState.COMMITTING, job.getState());
+        } finally {
+            DebugPointUtil.removeDebugPoint("FE.PAUSE_NON_PENDING_RESTORE_JOB");
+            Config.enable_debug_points = origDebug;
+            Config.backup_restore_merge_idle_ticks = orig;
+        }
+    }
+
+    // runs everything the nudge thread of the handler has been given so far
+    private static void drainNudges(BackupHandler handler) throws Exception {
+        ExecutorService executor = Deencapsulation.getField(handler, "nudgeExecutor");
+        executor.submit(() -> { }).get(10, TimeUnit.SECONDS);
+    }
+
+    private AbstractJob mockJob(long jobId) {
+        AbstractJob job = Mockito.mock(AbstractJob.class);
+        Mockito.when(job.getJobId()).thenReturn(jobId);
+        return job;
+    }
+
+    @Test
+    public void testNudgeRunsTheCurrentJobOnceAndDedupes() throws Exception {
+        BackupHandler handler = newHandler();
+        boolean orig = Config.backup_restore_run_on_task_finish;
+        try {
+            Deencapsulation.setField(handler, "isInit", true);
+            Mockito.when(env.isReady()).thenReturn(true);
+            Mockito.when(env.isMaster()).thenReturn(true);
+            AbstractJob job = mockJob(7);
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, job);
+            // the switch off: nothing
+            Config.backup_restore_run_on_task_finish = false;
+            handler.nudge(5, 7);
+            drainNudges(handler);
+            Mockito.verify(job, Mockito.never()).run();
+            // on: run once, and once for several nudges before it runs
+            Config.backup_restore_run_on_task_finish = true;
+            ExecutorService executor = Deencapsulation.getField(handler, "nudgeExecutor");
+            CountDownLatch gate = new CountDownLatch(1);
+            executor.execute(() -> {
+                try {
+                    gate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            handler.nudge(5, 7);
+            handler.nudge(5, 7);
+            gate.countDown();
+            drainNudges(handler);
+            Mockito.verify(job, Mockito.times(1)).run();
+            // a nudge after it ran: once more
+            handler.nudge(5, 7);
+            drainNudges(handler);
+            Mockito.verify(job, Mockito.times(2)).run();
+            // a job which is done, or of another database: not run
+            Mockito.when(job.isDone()).thenReturn(true);
+            handler.nudge(5, 7);
+            handler.nudge(6, 7);
+            drainNudges(handler);
+            Mockito.verify(job, Mockito.times(2)).run();
+        } finally {
+            Config.backup_restore_run_on_task_finish = orig;
+        }
+    }
+
+    @Test
+    public void testNudgeIsIgnoredWhenNotMaster() throws Exception {
+        BackupHandler handler = newHandler();
+        boolean orig = Config.backup_restore_run_on_task_finish;
+        try {
+            Config.backup_restore_run_on_task_finish = true;
+            Deencapsulation.setField(handler, "isInit", true);
+            Mockito.when(env.isReady()).thenReturn(true);
+            Mockito.when(env.isMaster()).thenReturn(false);
+            AbstractJob job = mockJob(7);
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, job);
+            handler.nudge(5, 7);
+            drainNudges(handler);
+            Mockito.verify(job, Mockito.never()).run();
+            // the master, but the handler not initialized yet
+            Mockito.when(env.isReady()).thenReturn(true);
+            Mockito.when(env.isMaster()).thenReturn(true);
+            Deencapsulation.setField(handler, "isInit", false);
+            handler.nudge(5, 7);
+            drainNudges(handler);
+            Mockito.verify(job, Mockito.never()).run();
+        } finally {
+            Config.backup_restore_run_on_task_finish = orig;
+        }
+    }
+
+    @Test
+    public void testNudgeIsIgnoredWhenTheJobObjectWasReplaced() throws Exception {
+        BackupHandler handler = newHandler();
+        boolean orig = Config.backup_restore_run_on_task_finish;
+        try {
+            Config.backup_restore_run_on_task_finish = true;
+            Deencapsulation.setField(handler, "isInit", true);
+            Mockito.when(env.isReady()).thenReturn(true);
+            Mockito.when(env.isMaster()).thenReturn(true);
+            AbstractJob old = mockJob(7);
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, old);
+            ExecutorService executor = Deencapsulation.getField(handler, "nudgeExecutor");
+            CountDownLatch gate = new CountDownLatch(1);
+            executor.execute(() -> {
+                try {
+                    gate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            handler.nudge(5, 7);
+            // replaced by the replay of the same job: the new object is the one run, the old one never
+            AbstractJob replayed = mockJob(7);
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, replayed);
+            gate.countDown();
+            drainNudges(handler);
+            Mockito.verify(old, Mockito.never()).run();
+            Mockito.verify(replayed, Mockito.times(1)).run();
+            // another job is the current one of the database now: the nudge of the old id does nothing
+            AbstractJob next = mockJob(8);
+            Mockito.when(replayed.isDone()).thenReturn(true);
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", 5L, next);
+            handler.nudge(5, 7);
+            drainNudges(handler);
+            Mockito.verify(replayed, Mockito.times(1)).run();
+            Mockito.verify(next, Mockito.never()).run();
+        } finally {
+            Config.backup_restore_run_on_task_finish = orig;
+        }
     }
 
     private void mockMixedCluster() {
