@@ -1735,6 +1735,21 @@ public class Config extends ConfigBase {
     @ConfField(mutable = false)
     public static long backup_handler_update_interval_millis = 3000;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether a backup or restore job goes on with the "
+            + "next state in the same round of the backup handler when the state it reached waits for nothing (for "
+            + "example the backup kept on local after its snapshots: UPLOAD_SNAPSHOT, UPLOADING, SAVE_META, "
+            + "UPLOAD_INFO; the restore after its snapshots or its download: DOWNLOAD, COMMIT), instead of one state "
+            + "per round of backup_handler_update_interval_millis. The edit logs are the same, in the same order. "
+            + "Enabled by default; if false one state per round, as before.")
+    public static boolean backup_restore_merge_idle_ticks = true;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether a backup or restore job is run once more "
+            + "as soon as the last task the state waits for is reported by a backend, instead of at the next round "
+            + "of the backup handler (backup_handler_update_interval_millis later on average half of it). The run is "
+            + "done by one thread of the backup handler, on the master, for the current job of the database only. "
+            + "Enabled by default; if false the job is run by the rounds only, as before.")
+    public static boolean backup_restore_run_on_task_finish = true;
+
 
     /**
      * Whether to enable cloud restore job.
@@ -3015,6 +3030,15 @@ public class Config extends ConfigBase {
             + "partition changed before the tables are replaced, the restore fails (the table being replaced is "
             + "not touched). Disabled by default, the atomic restore behaves as before if disabled.")
     public static boolean enable_restore_atomic_reuse = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Atomic restore with partition level reuse "
+            + "(enable_restore_atomic_reuse): whether the snapshot task loads the local data of a kept partition into "
+            + "the staging tablet at once (on the snapshot worker pool of the backend), so that the move task of the "
+            + "commit only checks it. If false the move task loads it, on the pool of one thread per backend; a failed "
+            + "move of a kept partition is retried up to restore_local_source_task_max_retry times either way. A "
+            + "backend of an old version ignores it and loads by the move. Read when the snapshot tasks are sent, a "
+            + "running job is not affected by a change.")
+    public static boolean restore_reuse_kept_load_at_snapshot = true;
 
     @ConfField(mutable = true, masterOnly = true, description = "Whether a restore job uses partition level reuse "
             + "(the digest tasks, the local source snapshot and the incremental append) only if every follower "
