@@ -2149,16 +2149,12 @@ public class BackupJobTest {
     // backup_restore_run_on_task_finish: the call sites of nudgeIfIdle in the finish reports of the tasks
     // ---------------------------------------------------------------------------------------------
 
-    // The handler is wired as in the FE: it runs the job which is nudged. The nudge goes through the real
+    // The handler is wired as in the FE (env.getBackupHandler() is the one of setUp): it runs the job which is nudged. The nudge goes through the real
     // BackupHandler, so the job advances by itself only when a nudge is let through.
     private void armNudges(BackupJob nudged) {
         Deencapsulation.setField(backupHandler, "isInit", true);
         new Expectations() {
             {
-                env.getBackupHandler();
-                minTimes = 0;
-                result = backupHandler;
-
                 env.isReady();
                 minTimes = 0;
                 result = true;
