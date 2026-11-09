@@ -2878,22 +2878,27 @@ public class RestoreReuseTest {
         return ids;
     }
 
+    // The report of a snapshot task: what it made from the local tablet.
+    private static TFinishTaskRequest snapshotReport(SnapshotTask task, long linkedBytes, long copiedBytes) {
+        TFinishTaskRequest report = new TFinishTaskRequest();
+        report.setTaskStatus(new TStatus(TStatusCode.OK));
+        report.setSnapshotPath("/path/snapshot/" + task.getTabletId());
+        if (task.isRestoreLocalSource()) {
+            TDownloadStats stats = new TDownloadStats();
+            stats.setLocalSourceTablets(1);
+            stats.setLocalSourceLinkedFiles(linkedBytes > 0 ? 2 : 0);
+            stats.setLocalSourceLinkedBytes(linkedBytes);
+            stats.setLocalSourceCopiedFiles(copiedBytes > 0 ? 3 : 0);
+            stats.setLocalSourceCopiedBytes(copiedBytes);
+            report.setDownloadStats(stats);
+        }
+        return report;
+    }
+
     // Finish the snapshot tasks, each reporting what it made from the local tablet.
     private void finishSnapshots(RestoreJob job, List<SnapshotTask> tasks, long linkedBytes, long copiedBytes) {
         for (SnapshotTask task : tasks) {
-            TFinishTaskRequest report = new TFinishTaskRequest();
-            report.setTaskStatus(new TStatus(TStatusCode.OK));
-            report.setSnapshotPath("/path/snapshot/" + task.getTabletId());
-            if (task.isRestoreLocalSource()) {
-                TDownloadStats stats = new TDownloadStats();
-                stats.setLocalSourceTablets(1);
-                stats.setLocalSourceLinkedFiles(linkedBytes > 0 ? 2 : 0);
-                stats.setLocalSourceLinkedBytes(linkedBytes);
-                stats.setLocalSourceCopiedFiles(copiedBytes > 0 ? 3 : 0);
-                stats.setLocalSourceCopiedBytes(copiedBytes);
-                report.setDownloadStats(stats);
-            }
-            Assertions.assertTrue(job.finishTabletSnapshotTask(task, report));
+            Assertions.assertTrue(job.finishTabletSnapshotTask(task, snapshotReport(task, linkedBytes, copiedBytes)));
         }
     }
 
@@ -4857,5 +4862,180 @@ public class RestoreReuseTest {
         Assertions.assertEquals("NO_DIGEST_TOO_MANY_TABLETS", RestoreReuseJudge.firstReject(in));
         in.jobInfo.logicalDigestSkipReason = null;
         Assertions.assertEquals("NO_DIGEST", RestoreReuseJudge.firstReject(in));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // backup_restore_run_on_task_finish: the call sites of nudgeIfIdle in the finish reports of a real RestoreJob
+    // ---------------------------------------------------------------------------------------------
+
+    private interface Report {
+        void send(RestoreJob job);
+    }
+
+    // The reports of the tasks a job waits for, in the order they are sent, and a repeat of the last one.
+    private static final class NudgeSite {
+        private RestoreJob job;
+        private final List<Report> reports = Lists.newArrayList();
+        private Report duplicateOfLast;
+    }
+
+    // RestoreJob.finishTabletSnapshotTask: a kept restore in SNAPSHOTING
+    private NudgeSite snapshotSite() {
+        NudgeSite site = new NudgeSite();
+        site.job = atomicKeptJob();
+        List<SnapshotTask> tasks = snapshotTasks(submitted);
+        for (SnapshotTask task : tasks) {
+            site.reports.add(job -> Assertions.assertTrue(
+                    job.finishTabletSnapshotTask(task, snapshotReport(task, 700, 0))));
+        }
+        SnapshotTask last = tasks.get(tasks.size() - 1);
+        site.duplicateOfLast = job -> Assertions.assertFalse(
+                job.finishTabletSnapshotTask(last, snapshotReport(last, 700, 0)));
+        return site;
+    }
+
+    // RestoreJob.finishRestoreDigestTask: a kept restore in VERIFYING
+    private NudgeSite digestSite() {
+        NudgeSite site = new NudgeSite();
+        site.job = prepareAtomicJob(selfBackupJobInfo(), "full");
+        toVerifying(site.job);
+        List<RestoreDigestTask> tasks = newDigestTasks();
+        for (RestoreDigestTask task : tasks) {
+            String root = task.getPartitionId() == p1().getId() ? ROOT_P1 : ROOT_P2;
+            site.reports.add(job -> Assertions.assertTrue(job.finishRestoreDigestTask(task, okReport(root, SIG, 1))));
+        }
+        RestoreDigestTask last = tasks.get(tasks.size() - 1);
+        String lastRoot = last.getPartitionId() == p1().getId() ? ROOT_P1 : ROOT_P2;
+        // the task is gone from the job, the report is dropped (and still answers true: remove it from the queue)
+        site.duplicateOfLast = job -> Assertions.assertTrue(
+                job.finishRestoreDigestTask(last, okReport(lastRoot, SIG, 1)));
+        return site;
+    }
+
+    // RestoreJob.finishTabletDownloadTask: 2 download tasks of 2 backends in DOWNLOADING. The job has no tablet to
+    // download (all kept), so the tasks are put in by hand, in place of the ones downloadSnapshots makes.
+    private NudgeSite downloadSite() {
+        NudgeSite site = new NudgeSite();
+        site.job = atomicKeptJob();
+        Map<Long, Long> unfinished = Deencapsulation.getField(site.job, "unfinishedSignatureToId");
+        unfinished.clear();
+        Deencapsulation.setField(site.job, "state", RestoreJobState.DOWNLOADING);
+        List<DownloadTask> tasks = Lists.newArrayList();
+        for (int i = 0; i < 2; i++) {
+            long beId = CatalogMocker.BACKEND1_ID + i;
+            DownloadTask task = new DownloadTask(null, beId, 7001 + i, site.job.getJobId(), db.getId(),
+                    Lists.newArrayList());
+            unfinished.put(task.getSignature(), beId);
+            tasks.add(task);
+        }
+        for (DownloadTask task : tasks) {
+            site.reports.add(job -> Assertions.assertTrue(job.finishTabletDownloadTask(task, downloadReport())));
+        }
+        DownloadTask last = tasks.get(tasks.size() - 1);
+        site.duplicateOfLast = job -> Assertions.assertFalse(job.finishTabletDownloadTask(last, downloadReport()));
+        return site;
+    }
+
+    private static TFinishTaskRequest downloadReport() {
+        TFinishTaskRequest report = new TFinishTaskRequest();
+        report.setTaskStatus(new TStatus(TStatusCode.OK));
+        report.setDownloadedTabletIds(Lists.newArrayList());
+        return report;
+    }
+
+    // RestoreJob.finishDirMoveTask: a kept restore in COMMITTING
+    private NudgeSite dirMoveSite() {
+        NudgeSite site = new NudgeSite();
+        site.job = atomicKeptJob();
+        List<DirMoveTask> moves = toCommitting(site.job);
+        Assertions.assertTrue(moves.size() >= 2, moves.toString());
+        TFinishTaskRequest ok = new TFinishTaskRequest();
+        ok.setTaskStatus(new TStatus(TStatusCode.OK));
+        for (DirMoveTask move : moves) {
+            site.reports.add(job -> Assertions.assertTrue(job.finishDirMoveTask(move, ok)));
+        }
+        DirMoveTask last = moves.get(moves.size() - 1);
+        site.duplicateOfLast = job -> Assertions.assertFalse(job.finishDirMoveTask(last, ok));
+        return site;
+    }
+
+    // Sends the reports of the site to a job of the real handler. The job is a spy whose run() does nothing, so what
+    // the nudge does is counted: handler.nudge() (the call of the site) and job.run() (the nudge let through).
+    private void sendReports(NudgeSite site, boolean switchOn) throws Exception {
+        boolean orig = Config.backup_restore_run_on_task_finish;
+        try {
+            Config.backup_restore_run_on_task_finish = switchOn;
+            Assertions.assertTrue(site.reports.size() >= 2, "the site must have other tasks outstanding");
+            BackupHandler handler = Mockito.spy(new BackupHandler(env));
+            Mockito.when(env.getBackupHandler()).thenReturn(handler);
+            Mockito.when(env.isReady()).thenReturn(true);
+            Mockito.when(env.isMaster()).thenReturn(true);
+            Deencapsulation.setField(handler, "isInit", true);
+            RestoreJob job = Mockito.spy(site.job);
+            Mockito.doNothing().when(job).run();
+            long dbId = job.getDbId();
+            long jobId = job.getJobId();
+            Deencapsulation.invoke(handler, "addBackupOrRestoreJob", dbId, job);
+
+            // other tasks outstanding: no nudge
+            for (int i = 0; i < site.reports.size() - 1; i++) {
+                site.reports.get(i).send(job);
+                drainNudges(handler);
+                Mockito.verify(handler, Mockito.never()).nudge(Mockito.anyLong(), Mockito.anyLong());
+                Mockito.verify(job, Mockito.never()).run();
+            }
+            // the last outstanding task: the site nudges the job once; it is run only with the switch on
+            site.reports.get(site.reports.size() - 1).send(job);
+            drainNudges(handler);
+            Mockito.verify(handler, Mockito.times(1)).nudge(dbId, jobId);
+            Mockito.verify(job, Mockito.times(switchOn ? 1 : 0)).run();
+            // a repeat of that report: nothing is outstanding by it, no second nudge
+            site.duplicateOfLast.send(job);
+            drainNudges(handler);
+            Mockito.verify(handler, Mockito.times(1)).nudge(Mockito.anyLong(), Mockito.anyLong());
+            Mockito.verify(job, Mockito.times(switchOn ? 1 : 0)).run();
+        } finally {
+            Config.backup_restore_run_on_task_finish = orig;
+        }
+    }
+
+    @Test
+    public void testSnapshotReportNudgesOnlyOnTheLastTask() throws Exception {
+        sendReports(snapshotSite(), true);
+    }
+
+    @Test
+    public void testSnapshotReportDoesNotRunTheJobWhenTheSwitchIsOff() throws Exception {
+        sendReports(snapshotSite(), false);
+    }
+
+    @Test
+    public void testDigestReportNudgesOnlyOnTheLastTask() throws Exception {
+        sendReports(digestSite(), true);
+    }
+
+    @Test
+    public void testDigestReportDoesNotRunTheJobWhenTheSwitchIsOff() throws Exception {
+        sendReports(digestSite(), false);
+    }
+
+    @Test
+    public void testDownloadReportNudgesOnlyOnTheLastTask() throws Exception {
+        sendReports(downloadSite(), true);
+    }
+
+    @Test
+    public void testDownloadReportDoesNotRunTheJobWhenTheSwitchIsOff() throws Exception {
+        sendReports(downloadSite(), false);
+    }
+
+    @Test
+    public void testDirMoveReportNudgesOnlyOnTheLastTask() throws Exception {
+        sendReports(dirMoveSite(), true);
+    }
+
+    @Test
+    public void testDirMoveReportDoesNotRunTheJobWhenTheSwitchIsOff() throws Exception {
+        sendReports(dirMoveSite(), false);
     }
 }
