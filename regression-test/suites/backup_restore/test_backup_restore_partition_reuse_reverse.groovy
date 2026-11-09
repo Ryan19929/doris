@@ -22,6 +22,9 @@ import groovy.json.JsonSlurper
 // lineage, but the source partitions in the backup of B carry one that points to them, so the partitions of A that B
 // did not change are kept and not downloaded, and the one that B changed is downloaded.
 suite("test_backup_restore_partition_reuse_reverse", "backup_restore") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_partition_reuse_reverse"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbA = "${suiteName}_a"
@@ -193,4 +196,5 @@ suite("test_backup_restore_partition_reuse_reverse", "backup_restore") {
         sql "DROP DATABASE ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }

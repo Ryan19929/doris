@@ -24,6 +24,9 @@ import groovy.json.JsonSlurper
 //      the estimate says MIXED_VERSIONS.
 //   3. With restore_reuse_require_capability = false the debug point is not looked at, the partitions are kept again.
 suite("test_backup_restore_mixed_versions", "backup_restore,nonConcurrent") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_mixed_versions"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbA = "${suiteName}_a"
@@ -163,5 +166,6 @@ suite("test_backup_restore_mixed_versions", "backup_restore,nonConcurrent") {
         sql "DROP DATABASE IF EXISTS ${dbA} FORCE"
         sql "DROP DATABASE IF EXISTS ${dbB} FORCE"
         sql "DROP REPOSITORY `${repoName}`"
+    }
     }
 }

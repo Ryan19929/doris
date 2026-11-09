@@ -25,6 +25,9 @@ import groovy.json.JsonSlurper
 // downloads the files in it and checks the downloaded snapshot against it on BE. The result is shown in the
 // ManifestCheck column of SHOW RESTORE; a mismatch cancels the restore at once.
 suite("test_backup_restore_manifest", "backup_restore") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_manifest"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String srcDbName = "${suiteName}_src_db"
@@ -302,4 +305,5 @@ suite("test_backup_restore_manifest", "backup_restore") {
         sql "DROP DATABASE ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }

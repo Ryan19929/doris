@@ -22,6 +22,9 @@ import groovy.json.JsonSlurper
 // again. The reuse of the http snapshot path (CCR full sync) needs an upstream cluster and is checked
 // outside of the regression tests.
 suite("test_backup_restore_download_stats", "backup_restore") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_download_stats"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String srcDbName = "${suiteName}_src_db"
@@ -135,4 +138,5 @@ suite("test_backup_restore_download_stats", "backup_restore") {
     sql "DROP DATABASE IF EXISTS ${srcDbName} FORCE"
     sql "DROP DATABASE IF EXISTS ${dbName} FORCE"
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }

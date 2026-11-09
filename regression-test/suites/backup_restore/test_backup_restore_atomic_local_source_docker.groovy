@@ -36,6 +36,7 @@ import org.apache.doris.regression.suite.ClusterOptions
 suite("test_backup_restore_atomic_local_source_docker", "backup_restore,docker") {
     def options = new ClusterOptions()
     options.feConfigs += [
+        "enable_backup_manifest=true",
         "enable_restore_partition_reuse=true",
         "enable_restore_incremental_append=true",
         "enable_restore_atomic_reuse=true",

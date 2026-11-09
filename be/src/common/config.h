@@ -329,6 +329,7 @@ DECLARE_mInt32(restore_digest_prefix_max_scans);
 // unique merge on read: the number of most recent rowset boundary versions for which a whole digest
 // is computed, 0 disables the decomposed digest of merge on read tablets
 DECLARE_mInt32(restore_digest_mor_prefix_boundaries);
+DECLARE_mBool(enable_restore_digest_http_api);
 // how long (seconds) the snapshot of the local source of a tablet lives in the snapshot dir, see config.cpp
 DECLARE_mInt32(restore_local_source_snapshot_timeout_s);
 // download binlog meta timeout

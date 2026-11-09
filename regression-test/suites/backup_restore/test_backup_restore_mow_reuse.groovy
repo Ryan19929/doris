@@ -30,6 +30,9 @@ import groovy.json.JsonSlurper
 //   3. A table with a sequence column is never reused (HIDDEN_STATE_MOW_SEQUENCE), whatever the switch says.
 // Single replica, auto compaction is off, all the configs it changes are restored at the end.
 suite("test_backup_restore_mow_reuse", "backup_restore") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_mow_reuse"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbA = "${suiteName}_a"
@@ -381,4 +384,5 @@ suite("test_backup_restore_mow_reuse", "backup_restore") {
         sql "DROP DATABASE ${db} FORCE"
     }
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }
