@@ -47,6 +47,10 @@
 #include "agent/task_worker_pool.h"
 #include "common/config.h"
 #include "common/status.h"
+#include "http/action/restore_digest_action.h"
+#include "http/ev_http_server.h"
+#include "http/http_client.h"
+#include "http/http_method.h"
 #include "io/fs/local_file_system.h"
 #include "olap/data_dir.h"
 #include "olap/delete_handler.h"
@@ -6846,6 +6850,57 @@ TEST_F(RestoreKeptLoadTest, MergeOnWriteKeptLoadThenCompactionThenConfirmEqualsS
 // the BE config is set (RestoreDigestAction answers 403 then).
 TEST(RestoreDigestHttpApiTest, OffByDefault) {
     EXPECT_FALSE(config::enable_restore_digest_http_api);
+}
+
+// Goes through RestoreDigestAction::handle() over a real EvHttpServer (HttpChannel cannot be mocked): the switch is read
+// per request, so flipping the config at runtime changes the answer without registering the handler again.
+TEST(RestoreDigestHttpApiTest, SwitchIsReadPerRequest) {
+    const bool saved = config::enable_restore_digest_http_api;
+    Defer restore_config {[&]() { config::enable_restore_digest_http_api = saved; }};
+
+    // The handler only needs an engine reference; the paths below never reach it.
+    auto engine = std::make_unique<StorageEngine>(EngineOptions {});
+    StorageEngine* engine_ptr = engine.get();
+    ExecEnv::GetInstance()->set_storage_engine(std::move(engine));
+    Defer reset_engine {[&]() { ExecEnv::GetInstance()->set_storage_engine(nullptr); }};
+
+    RestoreDigestAction action(ExecEnv::GetInstance(), *engine_ptr, TPrivilegeHier::GLOBAL,
+                               TPrivilegeType::ADMIN);
+    EvHttpServer server(0);
+    server.register_handler(HttpMethod::GET, "/api/_restore_digest", &action);
+    server.start();
+    Defer stop_server {[&]() { server.stop(); }};
+    ASSERT_NE(0, server.get_real_port());
+    const std::string url =
+            "http://127.0.0.1:" + std::to_string(server.get_real_port()) + "/api/_restore_digest";
+
+    // returns the HTTP status of one GET and the body
+    auto get = [&](const std::string& query, std::string* body) -> long {
+        HttpClient client;
+        EXPECT_TRUE(client.init(url + query, /*set_fail_on_error=*/false).ok());
+        client.set_method(GET);
+        body->clear();
+        Status st = client.execute(body);
+        EXPECT_TRUE(st.ok()) << st;
+        return client.get_http_status();
+    };
+
+    std::string body;
+    config::enable_restore_digest_http_api = false;
+    // off: 403 even for a well-formed request, and the message names the switch
+    EXPECT_EQ(403, get("?tablet_id=1&version=1", &body));
+    EXPECT_NE(std::string::npos, body.find("enable_restore_digest_http_api")) << body;
+    EXPECT_EQ(403, get("", &body));
+
+    // flipped at runtime on the same server: now the request is processed; missing parameters are a 400, not a 403
+    config::enable_restore_digest_http_api = true;
+    EXPECT_EQ(400, get("", &body));
+    EXPECT_NE(std::string::npos, body.find("tablet_id")) << body;
+    EXPECT_EQ(400, get("?tablet_id=abc&version=1", &body));
+
+    // and back off again
+    config::enable_restore_digest_http_api = false;
+    EXPECT_EQ(403, get("?tablet_id=1&version=1", &body));
 }
 
 } // namespace doris
