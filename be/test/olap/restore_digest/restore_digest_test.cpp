@@ -6842,4 +6842,10 @@ TEST_F(RestoreKeptLoadTest, MergeOnWriteKeptLoadThenCompactionThenConfirmEqualsS
                               tablet_digest(p.target->tablet_id(), 3)));
 }
 
+// The debug HTTP API /api/_restore_digest reads a whole tablet and is not authenticated by default: it is off unless
+// the BE config is set (RestoreDigestAction answers 403 then).
+TEST(RestoreDigestHttpApiTest, OffByDefault) {
+    EXPECT_FALSE(config::enable_restore_digest_http_api);
+}
+
 } // namespace doris

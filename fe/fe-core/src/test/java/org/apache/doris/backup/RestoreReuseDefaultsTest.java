@@ -31,6 +31,7 @@ public class RestoreReuseDefaultsTest {
 
     @Test
     public void testSwitchesWhichChangeTheOriginalPathAreOff() {
+        Assertions.assertFalse(Config.enable_backup_manifest);
         Assertions.assertFalse(Config.backup_restore_merge_idle_ticks);
         Assertions.assertFalse(Config.backup_restore_run_on_task_finish);
     }

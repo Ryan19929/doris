@@ -180,6 +180,7 @@ public class BackupJobTest {
     private Status uploadStatus = Status.OK;
     private boolean origMergeIdleTicks;
     private boolean origRunOnTaskFinish;
+    private boolean origBackupManifest;
 
     @Before
     public void setUp() {
@@ -188,6 +189,9 @@ public class BackupJobTest {
         origRunOnTaskFinish = Config.backup_restore_run_on_task_finish;
         Config.backup_restore_merge_idle_ticks = false;
         Config.backup_restore_run_on_task_finish = false;
+        // the manifest is off by default in branch-3.1, the tests of the backup job look at the tasks with it
+        origBackupManifest = Config.enable_backup_manifest;
+        Config.enable_backup_manifest = true;
         loggedStates.clear();
         uploadStatus = Status.OK;
         // the task queue is static, other cases leave their tasks in it
@@ -292,6 +296,7 @@ public class BackupJobTest {
     public void tearDown() {
         Config.backup_restore_merge_idle_ticks = origMergeIdleTicks;
         Config.backup_restore_run_on_task_finish = origRunOnTaskFinish;
+        Config.enable_backup_manifest = origBackupManifest;
         AgentTaskQueue.clearAllTasks();
     }
 

@@ -28,6 +28,9 @@ import groovy.json.JsonSlurper
 // compaction is off: a compaction of A could merge the rowsets across the version of B, and the partition would be
 // downloaded whole, which is correct but not what this test is about.
 suite("test_backup_restore_incremental_append_unique", "backup_restore") {
+    // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
+    // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
+    setFeConfigTemporary([enable_backup_manifest: true]) {
     String suiteName = "test_backup_restore_incremental_append_unique"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String morTable = "${suiteName}_mor"
@@ -262,4 +265,5 @@ suite("test_backup_restore_incremental_append_unique", "backup_restore") {
     setConfig("restore_reuse_default_check_level", "full")
     setConfig("enable_restore_atomic_reuse", "false")
     sql "DROP REPOSITORY `${repoName}`"
+    }
 }
