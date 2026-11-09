@@ -88,6 +88,8 @@ import java.util.Deque;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -131,6 +133,15 @@ public class BackupJobTest {
     private final class MockBackupHandler extends BackupHandler {
         public MockBackupHandler(Env env) {
             super(env);
+        }
+
+        // the jobs nudged, whether or not Config.backup_restore_run_on_task_finish lets the nudge through
+        private final List<Long> nudgedJobIds = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void nudge(long dbId, long jobId) {
+            nudgedJobIds.add(jobId);
+            super.nudge(dbId, jobId);
         }
 
         @Override
@@ -2132,5 +2143,189 @@ public class BackupJobTest {
         } finally {
             Config.backup_restore_merge_idle_ticks = orig;
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // backup_restore_run_on_task_finish: the call sites of nudgeIfIdle in the finish reports of the tasks
+    // ---------------------------------------------------------------------------------------------
+
+    // The handler is wired as in the FE: it runs the job which is nudged. The nudge goes through the real
+    // BackupHandler, so the job advances by itself only when a nudge is let through.
+    private void armNudges(BackupJob nudged) {
+        Deencapsulation.setField(backupHandler, "isInit", true);
+        new Expectations() {
+            {
+                env.getBackupHandler();
+                minTimes = 0;
+                result = backupHandler;
+
+                env.isReady();
+                minTimes = 0;
+                result = true;
+
+                env.isMaster();
+                minTimes = 0;
+                result = true;
+            }
+        };
+        Deencapsulation.invoke(backupHandler, "addBackupOrRestoreJob", dbId, nudged);
+        backupHandler.nudgedJobIds.clear();
+    }
+
+    // waits until everything the nudge thread has been given so far has run
+    private void drainNudges() throws Exception {
+        ExecutorService executor = Deencapsulation.getField(backupHandler, "nudgeExecutor");
+        executor.submit(() -> { }).get(10, TimeUnit.SECONDS);
+    }
+
+    private BackupJob twoTablesJob() {
+        List<TableRef> tableRefs = Lists.newArrayList();
+        tableRefs.add(new TableRef(
+                new TableName(InternalCatalog.INTERNAL_CATALOG_NAME, UnitTestUtil.DB_NAME, UnitTestUtil.TABLE_NAME),
+                null));
+        tableRefs.add(new TableRef(
+                new TableName(InternalCatalog.INTERNAL_CATALOG_NAME, UnitTestUtil.DB_NAME, table2Name), null));
+        return new BackupJob("label", dbId, UnitTestUtil.DB_NAME, tableRefs, 13600 * 1000,
+                BackupStmt.BackupContent.ALL, env, repo.getId(), 0);
+    }
+
+    private TFinishTaskRequest snapshotReport(SnapshotTask task) {
+        TFinishTaskRequest request = new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.MAKE_SNAPSHOT,
+                task.getSignature(), new TStatus(TStatusCode.OK));
+        request.setSnapshotFiles(Lists.newArrayList("1.dat", "1.idx", "1.hdr"));
+        request.setSnapshotPath("/path/to/snapshot");
+        return request;
+    }
+
+    // a job with 2 snapshot tasks (SnapshotTask.getTabletId() tells them apart), armed for the nudges
+    private List<SnapshotTask> snapshotingJobWithTwoTasks() {
+        AgentTaskQueue.clearAllTasks();
+        job = twoTablesJob();
+        job.run();
+        Assert.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+        List<SnapshotTask> tasks = new ArrayList<>();
+        for (AgentTask task : AgentTaskQueue.getTask(TTaskType.MAKE_SNAPSHOT)) {
+            tasks.add((SnapshotTask) task);
+        }
+        Assert.assertEquals(2, tasks.size());
+        armNudges(job);
+        return tasks;
+    }
+
+    // BackupJob.finishTabletSnapshotTask
+    @Test
+    public void testNudgeOnTheReportOfTheLastSnapshotTask() throws Exception {
+        Config.backup_restore_run_on_task_finish = true;
+        List<SnapshotTask> tasks = snapshotingJobWithTwoTasks();
+
+        // the first report: the other task is still outstanding
+        Assert.assertTrue(job.finishTabletSnapshotTask(tasks.get(0), snapshotReport(tasks.get(0))));
+        drainNudges();
+        Assert.assertTrue(backupHandler.nudgedJobIds.toString(), backupHandler.nudgedJobIds.isEmpty());
+        Assert.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+
+        // the last report: nudged once, and the nudge runs the job, which moves on without waiting for its round
+        Assert.assertTrue(job.finishTabletSnapshotTask(tasks.get(1), snapshotReport(tasks.get(1))));
+        drainNudges();
+        Assert.assertEquals(Lists.newArrayList(job.getJobId()), backupHandler.nudgedJobIds);
+        Assert.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+
+        // a duplicate report of either task: not accepted, no nudge
+        Assert.assertFalse(job.finishTabletSnapshotTask(tasks.get(1), snapshotReport(tasks.get(1))));
+        Assert.assertFalse(job.finishTabletSnapshotTask(tasks.get(0), snapshotReport(tasks.get(0))));
+        drainNudges();
+        Assert.assertEquals(1, backupHandler.nudgedJobIds.size());
+    }
+
+    @Test
+    public void testNoNudgeOnTheSnapshotReportWhenTheSwitchIsOff() throws Exception {
+        Config.backup_restore_run_on_task_finish = false;
+        List<SnapshotTask> tasks = snapshotingJobWithTwoTasks();
+        Assert.assertTrue(job.finishTabletSnapshotTask(tasks.get(0), snapshotReport(tasks.get(0))));
+        Assert.assertTrue(job.finishTabletSnapshotTask(tasks.get(1), snapshotReport(tasks.get(1))));
+        drainNudges();
+        // all tasks are reported, but the job waits for its next round
+        Assert.assertEquals(BackupJobState.SNAPSHOTING, job.getState());
+        job.run();
+        Assert.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+    }
+
+    // the job of setUp, to UPLOADING with its (single) upload task, armed for the nudges
+    private UploadTask uploadingJob() {
+        boolean orig = Config.backup_restore_merge_idle_ticks;
+        try {
+            Config.backup_restore_merge_idle_ticks = true;
+            finishTheSnapshot(job);
+            AgentTaskQueue.clearAllTasks();
+            job.run();
+        } finally {
+            Config.backup_restore_merge_idle_ticks = orig;
+        }
+        Assert.assertEquals(BackupJobState.UPLOADING, job.getState());
+        armNudges(job);
+        return (UploadTask) AgentTaskQueue.getTask(backendId, TTaskType.UPLOAD, id.get() - 1);
+    }
+
+    private TFinishTaskRequest uploadReport(UploadTask task, List<String> files) {
+        Map<Long, List<String>> tabletFileMap = Maps.newHashMap();
+        tabletFileMap.put(tabletId, files);
+        TFinishTaskRequest request = new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.UPLOAD,
+                task.getSignature(), new TStatus(TStatusCode.OK));
+        request.setTabletFiles(tabletFileMap);
+        return request;
+    }
+
+    private static final List<String> UPLOADED_FILES = Lists.newArrayList("1.dat.4f158689243a3d6030352fec3cfd3798",
+            "1.idx.4f158689243a3d6030352fec3cfd3798", "1.hdr.4f158689243a3d6030352fec3cfd3798");
+
+    // BackupJob.finishSnapshotUploadTask
+    @Test
+    public void testNudgeOnTheReportOfTheLastUploadTask() throws Exception {
+        Config.backup_restore_run_on_task_finish = true;
+        UploadTask upTask = uploadingJob();
+
+        // a report which is not accepted (the files of the tablet differ): the task stays, no nudge
+        Assert.assertFalse(job.finishSnapshotUploadTask(upTask,
+                uploadReport(upTask, Lists.newArrayList("1.dat.4f158689243a3d6030352fec3cfd3798"))));
+        drainNudges();
+        Assert.assertTrue(backupHandler.nudgedJobIds.isEmpty());
+        Assert.assertEquals(BackupJobState.UPLOADING, job.getState());
+
+        // the last (only) task: nudged once, and the nudge runs the job to the end
+        Assert.assertTrue(job.finishSnapshotUploadTask(upTask, uploadReport(upTask, UPLOADED_FILES)));
+        drainNudges();
+        Assert.assertEquals(Lists.newArrayList(job.getJobId()), backupHandler.nudgedJobIds);
+        Assert.assertNotEquals(BackupJobState.UPLOADING, job.getState());
+
+        // a duplicate report: no nudge
+        Assert.assertFalse(job.finishSnapshotUploadTask(upTask, uploadReport(upTask, UPLOADED_FILES)));
+        drainNudges();
+        Assert.assertEquals(1, backupHandler.nudgedJobIds.size());
+    }
+
+    @Test
+    public void testNoNudgeOnTheUploadReportWhileAnotherTaskIsOutstanding() throws Exception {
+        Config.backup_restore_run_on_task_finish = true;
+        UploadTask upTask = uploadingJob();
+        Map<Long, Long> unfinished = Deencapsulation.getField(job, "unfinishedTaskIds");
+        long other = 987654321L;
+        unfinished.put(other, backendId);
+
+        Assert.assertTrue(job.finishSnapshotUploadTask(upTask, uploadReport(upTask, UPLOADED_FILES)));
+        drainNudges();
+        Assert.assertTrue(backupHandler.nudgedJobIds.isEmpty());
+        Assert.assertEquals(BackupJobState.UPLOADING, job.getState());
+        Assert.assertEquals(1, unfinished.size());
+    }
+
+    @Test
+    public void testNoNudgeOnTheUploadReportWhenTheSwitchIsOff() throws Exception {
+        Config.backup_restore_run_on_task_finish = false;
+        UploadTask upTask = uploadingJob();
+        Assert.assertTrue(job.finishSnapshotUploadTask(upTask, uploadReport(upTask, UPLOADED_FILES)));
+        drainNudges();
+        Assert.assertEquals(BackupJobState.UPLOADING, job.getState());
+        job.run();
+        Assert.assertNotEquals(BackupJobState.UPLOADING, job.getState());
     }
 }
