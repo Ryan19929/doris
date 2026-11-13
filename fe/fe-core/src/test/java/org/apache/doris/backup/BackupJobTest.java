@@ -2233,6 +2233,34 @@ public class BackupJobTest {
         Assert.assertEquals(1, backupHandler.nudgedJobIds.size());
     }
 
+    // a TABLET_MISSING report handled as a drop (the table was dropped meanwhile) is the last report: nudged too
+    @Test
+    public void testNudgeOnTheTabletMissingReportOfTheLastSnapshotTask() throws Exception {
+        Config.backup_restore_run_on_task_finish = true;
+        List<SnapshotTask> tasks = snapshotingJobWithTwoTasks();
+        SnapshotTask existing = tasks.get(0).getTabletId() == tabletId ? tasks.get(0) : tasks.get(1);
+        SnapshotTask dropped = existing == tasks.get(0) ? tasks.get(1) : tasks.get(0);
+        db.unregisterTable(table2Name);
+        try {
+            Assert.assertTrue(job.finishTabletSnapshotTask(existing, snapshotReport(existing)));
+            drainNudges();
+            Assert.assertTrue(backupHandler.nudgedJobIds.toString(), backupHandler.nudgedJobIds.isEmpty());
+
+            TStatus missing = new TStatus(TStatusCode.TABLET_MISSING);
+            missing.setErrorMsgs(Lists.newArrayList("Tablet missing"));
+            Assert.assertTrue(job.finishTabletSnapshotTask(dropped,
+                    new TFinishTaskRequest(new TBackend("", 0, 1), TTaskType.MAKE_SNAPSHOT, dropped.getSignature(),
+                            missing)));
+            drainNudges();
+            Assert.assertEquals(Lists.newArrayList(job.getJobId()), backupHandler.nudgedJobIds);
+            Assert.assertEquals(BackupJobState.UPLOAD_SNAPSHOT, job.getState());
+        } finally {
+            if (db.getTableNullable(table2Name) == null && table2 != null) {
+                db.registerTable(table2);
+            }
+        }
+    }
+
     @Test
     public void testNoNudgeOnTheSnapshotReportWhenTheSwitchIsOff() throws Exception {
         Config.backup_restore_run_on_task_finish = false;
