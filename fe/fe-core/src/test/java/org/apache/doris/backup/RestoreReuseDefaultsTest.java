@@ -18,6 +18,7 @@
 package org.apache.doris.backup;
 
 import org.apache.doris.common.Config;
+import org.apache.doris.common.ConfigBase.ConfField;
 
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -59,5 +60,27 @@ public class RestoreReuseDefaultsTest {
         Assertions.assertEquals(10, Config.restore_local_source_task_max_retry);
         Assertions.assertEquals(0L, Config.backup_logical_digest_max_tablets);
         Assertions.assertEquals(0L, Config.restore_reuse_max_tablets);
+    }
+
+    // branch-3.1 keeps a description of each config in Chinese and in English ({"中文", "English"}): the doc
+    // generator reads the one of a language by its index
+    @Test
+    public void testTheConfigsOfTheReuseHaveTheTwoDescriptions() throws Exception {
+        String[] names = {"enable_backup_manifest", "backup_restore_merge_idle_ticks",
+                "backup_restore_run_on_task_finish", "enable_restore_partition_reuse",
+                "restore_reuse_default_check_level", "restore_reuse_allow_unverified_keep",
+                "restore_reuse_allow_hidden_state_models", "restore_reuse_mow", "restore_local_source_task_max_retry",
+                "restore_reuse_sample_ratio", "restore_reuse_force_full_for_relation",
+                "restore_reuse_min_partition_bytes", "restore_digest_timeout_s", "enable_restore_incremental_append",
+                "enable_restore_atomic_reuse", "restore_reuse_kept_load_at_snapshot",
+                "restore_reuse_require_capability", "backup_logical_digest_max_tablets", "restore_reuse_max_tablets"};
+        for (String name : names) {
+            String[] description = Config.class.getField(name).getAnnotation(ConfField.class).description();
+            Assertions.assertEquals(2, description.length, name);
+            Assertions.assertTrue(description[0].codePoints().anyMatch(c -> c >= 0x4e00 && c <= 0x9fff),
+                    name + ": the first one is in Chinese");
+            Assertions.assertTrue(description[1].codePoints().allMatch(c -> c < 0x2e80),
+                    name + ": the second one is in English");
+        }
     }
 }
