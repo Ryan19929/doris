@@ -1406,11 +1406,11 @@ public class DatabaseTransactionMgr {
                 String next = adopted ? source.token
                         : PartitionStateToken.fresh(prev, clusterId, partition.getId(), info.getVersion());
                 info.setStateTokens(prev, next);
+                // the state names are not secrets, they name the content of a partition
+                String how = source == null ? "local" : (adopted ? "ccr adopted" : "ccr not continuous, source "
+                        + source.srcPartitionId + " v" + source.srcVersion + " prev " + source.prevToken);
                 LOG.info("partition {} v{} content state: {} -> {} ({}), txn: {}", partition.getId(),
-                        info.getVersion(), prev, next, source == null ? "local"
-                                : (adopted ? "ccr adopted" : "ccr not continuous, source "
-                                        + source.srcPartitionId + " v" + source.srcVersion + " prev "
-                                        + source.prevToken), transactionState.getTransactionId());
+                        info.getVersion(), prev, next, how, transactionState.getTransactionId());
             }
         }
     }
