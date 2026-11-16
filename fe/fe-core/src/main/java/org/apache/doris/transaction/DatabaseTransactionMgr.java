@@ -1406,7 +1406,7 @@ public class DatabaseTransactionMgr {
                 String next = adopted ? source.token
                         : PartitionStateToken.fresh(prev, clusterId, partition.getId(), info.getVersion());
                 info.setStateTokens(prev, next);
-                LOG.info("state token of partition {} v{}: {} -> {} ({}), txn: {}", partition.getId(),
+                LOG.info("partition {} v{} content state: {} -> {} ({}), txn: {}", partition.getId(),
                         info.getVersion(), prev, next, source == null ? "local"
                                 : (adopted ? "ccr adopted" : "ccr not continuous, source "
                                         + source.srcPartitionId + " v" + source.srcVersion + " prev "
