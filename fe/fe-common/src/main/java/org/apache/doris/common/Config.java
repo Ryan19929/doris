@@ -2964,6 +2964,20 @@ public class Config extends ConfigBase {
             + "wait. For experiments only.")
     public static boolean restore_reuse_require_capability = true;
 
+    @ConfField(mutable = true, masterOnly = true, description = "Whether the master tracks the state token of the "
+            + "partitions (see PartitionStateToken): a transaction made visible gives each partition it writes a "
+            + "token, a CCR increment adopts the token of the source version when it continues the local state, and "
+            + "a restore adopts the token of the backup. It only changes the metadata. Read only when the master "
+            + "logs a transaction, never on replay.")
+    public static boolean restore_state_token_track = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = "Whether partition level reuse keeps a partition "
+            + "without a digest when its state token equals the one of the backup partition, the versions are equal "
+            + "and the schemas are the same (KEPT_STATE_TOKEN). The proof is the history of the partition, not its "
+            + "content: it relies on the replicas of a tablet agreeing and on CCR applying the versions of the source "
+            + "as they are. Off by default.")
+    public static boolean restore_reuse_trust_state_token = false;
+
     @ConfField(mutable = true, masterOnly = true, description = "The maximum number of tablets of a backup job for "
             + "which the logical digest is recorded. If a backup involves more tablets, the backup does not ask the "
             + "backends to compute the logical digest and does not write it (nor the decomposed digest) into the job "

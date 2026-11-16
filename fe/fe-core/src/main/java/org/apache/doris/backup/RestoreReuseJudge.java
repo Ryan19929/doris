@@ -20,6 +20,7 @@ package org.apache.doris.backup;
 import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
+import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
@@ -189,6 +190,10 @@ public final class RestoreReuseJudge {
         public RestoreLineage backupLineage;
         public RestoreSource backupTableSource;
         public OlapTable backupOlapTable;
+        // The effective state token of the local partition and the one the backup recorded for the partition, see
+        // PartitionStateToken. Null if there is none.
+        public String localStateToken;
+        public String backupStateToken;
         // Set by checkL0: the L0 check that passed, null if none did.
         public String l0Path;
         // Set with l0Path: the cluster id of the source was compared on both sides and equal, see clusterProven.
@@ -232,6 +237,8 @@ public final class RestoreReuseJudge {
     public static final String L0_FORWARD = "a";
     public static final String L0_REVERSE = "b";
     public static final String L0_TABLE = "c";
+    // Not an L0 check: the partition is kept because its state token equals the one of the backup partition.
+    public static final String L0_TOKEN = "t";
 
     /** a. forward: the local partition has the lineage of the source partition of this backup. */
     public static final L0Check FORWARD_L0 = new L0Check(L0_FORWARD) {
@@ -379,6 +386,104 @@ public final class RestoreReuseJudge {
             String reason = condition.check(in);
             if (reason != null) {
                 return reason;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The conditions of a keep proved by the state token instead of a digest (Config#restore_reuse_trust_state_token):
+     * the same as the chain above with the state token in place of L0 and no digest needed.
+     */
+    public static final List<Condition> TOKEN_CONDITIONS = ImmutableList.of(
+            RestoreReuseJudge::checkMode,
+            RestoreReuseJudge::checkToken,
+            RestoreReuseJudge::checkSupported,
+            RestoreReuseJudge::checkSize,
+            RestoreReuseJudge::checkReplicas);
+
+    /** Returns the reason that the partition can not be kept by its state token, null if it can. */
+    public static String firstRejectByToken(Input in) {
+        for (Condition condition : TOKEN_CONDITIONS) {
+            String reason = condition.check(in);
+            if (reason != null) {
+                return reason;
+            }
+        }
+        return null;
+    }
+
+    /** Whether the local partition and the backup partition have the same effective state token. */
+    public static boolean tokenEqual(Input in) {
+        return in.localStateToken != null && in.localStateToken.equals(in.backupStateToken);
+    }
+
+    // the state token, the version and the structure of the partition are the same as the backup
+    static String checkToken(Input in) {
+        if (!tokenEqual(in)) {
+            if (in.backupStateToken == null) {
+                return "TOKEN_ABSENT_BACKUP";
+            }
+            return in.localStateToken == null ? "TOKEN_ABSENT_LOCAL" : "TOKEN_MISMATCH";
+        }
+        if (in.backupPartition.version != in.localPartition.getVisibleVersion()) {
+            return "TOKEN_VERSION_MISMATCH";
+        }
+        String structure = checkSameStructure(in);
+        if (structure != null) {
+            return structure;
+        }
+        in.l0Path = L0_TOKEN;
+        in.clusterProven = true;
+        return null;
+    }
+
+    /**
+     * Without a digest the schema signature in it does not compare the schemas, so compare them here: the model,
+     * the range, the visible indexes (by name), the tablets of each index, and every column of each index.
+     */
+    static String checkSameStructure(Input in) {
+        OlapTable local = in.localTable;
+        OlapTable backup = in.backupOlapTable;
+        if (backup == null) {
+            return "STRUCTURE_UNKNOWN";
+        }
+        if (local.getKeysType() != backup.getKeysType() || isMow(local) != isMow(backup)
+                || local.hasSequenceCol().booleanValue() != backup.hasSequenceCol().booleanValue()) {
+            return "STRUCTURE_MODEL";
+        }
+        if (!sameRange(in)) {
+            return "STRUCTURE_RANGE";
+        }
+        Partition backupPart = backup.getPartition(in.localPartition.getName(), false);
+        if (backupPart == null) {
+            return "STRUCTURE_PARTITION";
+        }
+        List<MaterializedIndex> localIndexes = in.localPartition.getMaterializedIndices(IndexExtState.VISIBLE);
+        if (localIndexes.size() != backupPart.getMaterializedIndices(IndexExtState.VISIBLE).size()) {
+            return "STRUCTURE_INDEX";
+        }
+        for (MaterializedIndex localIdx : localIndexes) {
+            String name = local.getIndexNameById(localIdx.getId());
+            Long backupIdxId = backup.getIndexIdByName(name);
+            BackupIndexInfo backupIdx = in.backupPartition.getIdx(name);
+            if (backupIdxId == null || backupIdx == null
+                    || backupIdx.sortedTabletInfoList.size() != localIdx.getTablets().size()) {
+                return "STRUCTURE_INDEX";
+            }
+            List<Column> localCols = local.getSchemaByIndexId(localIdx.getId(), true);
+            List<Column> backupCols = backup.getSchemaByIndexId(backupIdxId, true);
+            if (localCols == null || backupCols == null || localCols.size() != backupCols.size()) {
+                return "STRUCTURE_COLUMN";
+            }
+            for (int i = 0; i < localCols.size(); i++) {
+                Column a = localCols.get(i);
+                Column b = backupCols.get(i);
+                if (!a.getName().equals(b.getName()) || a.getUniqueId() != b.getUniqueId()
+                        || !a.getType().equals(b.getType()) || a.isKey() != b.isKey()
+                        || a.isAllowNull() != b.isAllowNull() || a.getAggregationType() != b.getAggregationType()) {
+                    return "STRUCTURE_COLUMN";
+                }
             }
         }
         return null;

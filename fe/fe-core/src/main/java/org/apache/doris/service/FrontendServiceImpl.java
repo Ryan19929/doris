@@ -169,6 +169,7 @@ import org.apache.doris.thrift.TBeginRemoteTxnResult;
 import org.apache.doris.thrift.TBeginTxnRequest;
 import org.apache.doris.thrift.TBeginTxnResult;
 import org.apache.doris.thrift.TBinlog;
+import org.apache.doris.thrift.TCcrPartitionSource;
 import org.apache.doris.thrift.TCertBasedAuth;
 import org.apache.doris.thrift.TCheckAuthRequest;
 import org.apache.doris.thrift.TCheckAuthResult;
@@ -2009,6 +2010,36 @@ public class FrontendServiceImpl implements FrontendService.Iface {
         return result;
     }
 
+    /**
+     * The CCR sources of the partitions the transaction writes (see PartitionStateToken), kept in the transaction
+     * state only if the master tracks the state tokens and the request was authenticated by a password of a user
+     * with the ADMIN privilege. Otherwise they are ignored and the transaction is a local write.
+     */
+    private void acceptCcrPartitionSources(TCommitTxnRequest request, TransactionState transactionState,
+            UserIdentity currentUser) {
+        if (!request.isSetCcrPartitionSources() || request.getCcrPartitionSources().isEmpty()) {
+            return;
+        }
+        if (!Config.restore_state_token_track) {
+            return;
+        }
+        if (currentUser == null || !Env.getCurrentEnv().getAccessManager()
+                .checkGlobalPriv(currentUser, PrivPredicate.ADMIN)) {
+            LOG.info("ignore the ccr partition sources of txn {}: user {} has no ADMIN privilege",
+                    request.getTxnId(), request.getUser());
+            return;
+        }
+        Map<Long, TransactionState.CcrPartitionSource> sources = Maps.newHashMap();
+        for (TCcrPartitionSource src : request.getCcrPartitionSources()) {
+            if (!src.isSetTargetPartitionId() || !src.isSetToken() || !src.isSetPrevToken()) {
+                continue;
+            }
+            sources.put(src.getTargetPartitionId(), new TransactionState.CcrPartitionSource(
+                    src.getSrcPartitionId(), src.getSrcVersion(), src.getPrevToken(), src.getToken()));
+        }
+        transactionState.setCcrPartitionSources(sources.isEmpty() ? null : sources);
+    }
+
     // return true if commit success and publish success, return false if publish
     // timeout
     private boolean commitTxnImpl(TCommitTxnRequest request) throws UserException {
@@ -2070,8 +2101,9 @@ public class FrontendServiceImpl implements FrontendService.Iface {
             checkTokenOrThrow(request.getToken());
         } else {
             List<String> tables = tableList.stream().map(Table::getName).collect(Collectors.toList());
-            checkPasswordAndPrivs(request.getUser(), request.getPasswd(), request.getDb(), tables,
-                    request.getUserIp(), PrivPredicate.LOAD);
+            UserIdentity currentUser = checkPasswordAndPrivs(request.getUser(), request.getPasswd(),
+                    request.getDb(), tables, request.getUserIp(), PrivPredicate.LOAD);
+            acceptCcrPartitionSources(request, transactionState, currentUser);
         }
 
         // Step 4: get timeout

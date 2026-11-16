@@ -102,6 +102,9 @@ public class Partition extends MetaObject {
     // was never restored. See RestoreLineage.
     @SerializedName(value = "rl")
     private RestoreLineage restoreLineage;
+    // The state token of the partition, null if it never got one. See PartitionStateToken.
+    @SerializedName(value = "stk")
+    private PartitionStateToken stateToken;
 
     private transient volatile String remoteMetaChecksum;
 
@@ -535,5 +538,13 @@ public class Partition extends MetaObject {
 
     public void setRestoreLineage(RestoreLineage restoreLineage) {
         this.restoreLineage = restoreLineage;
+    }
+
+    public PartitionStateToken getStateToken() {
+        return stateToken;
+    }
+
+    public void setStateToken(PartitionStateToken stateToken) {
+        this.stateToken = stateToken;
     }
 }

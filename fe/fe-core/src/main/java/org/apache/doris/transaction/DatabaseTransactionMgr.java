@@ -29,6 +29,7 @@ import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
 import org.apache.doris.catalog.PartitionInfo;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Table;
@@ -1306,6 +1307,7 @@ public class DatabaseTransactionMgr {
                 transactionState.clearErrorMsg();
                 transactionState.setTransactionStatus(TransactionStatus.VISIBLE);
                 setTableVersion(transactionState, db);
+                assignStateTokens(transactionState, db);
                 unprotectUpdateInMemoryState(transactionState, false);
                 if (Config.enable_txn_log_outside_lock) {
                     logItem = enqueueTransactionState(transactionState);
@@ -1370,6 +1372,46 @@ public class DatabaseTransactionMgr {
             }
             tableCommitInfo.setVersion(table.getNextVersion());
             tableCommitInfo.setVersionTime(System.currentTimeMillis());
+        }
+    }
+
+    /**
+     * Master only, before the transaction is logged as visible: the state token of each partition after the version
+     * this transaction writes. A CCR increment whose source partition had, before the write, the token the partition
+     * has now adopts the token of the source after the write; any other write gets a new token. The tokens are
+     * logged with the partition commit infos and applied by updateCatalogAfterVisible, on the master and on replay.
+     * A transaction of sub transactions gets no token: the partitions lose the binding of their token.
+     */
+    private void assignStateTokens(TransactionState transactionState, Database db) {
+        if (!Config.restore_state_token_track || !transactionState.getSubTxnIdToTableCommitInfo().isEmpty()) {
+            return;
+        }
+        long clusterId = Env.getCurrentEnv().getClusterId();
+        Map<Long, TransactionState.CcrPartitionSource> sources = transactionState.getCcrPartitionSources();
+        for (TableCommitInfo tableCommitInfo : transactionState.getIdToTableCommitInfos().values()) {
+            OlapTable table = (OlapTable) db.getTableNullable(tableCommitInfo.getTableId());
+            if (table == null) {
+                continue;
+            }
+            for (PartitionCommitInfo info : tableCommitInfo.getIdToPartitionCommitInfo().values()) {
+                Partition partition = table.getPartition(info.getPartitionId());
+                if (partition == null || info.isTempPartition()) {
+                    continue;
+                }
+                String prev = PartitionStateToken.effective(partition, clusterId);
+                TransactionState.CcrPartitionSource source = sources == null ? null
+                        : sources.get(info.getPartitionId());
+                boolean adopted = source != null && prev != null && prev.equals(source.prevToken)
+                        && source.token != null;
+                String next = adopted ? source.token
+                        : PartitionStateToken.fresh(prev, clusterId, partition.getId(), info.getVersion());
+                info.setStateTokens(prev, next);
+                LOG.info("state token of partition {} v{}: {} -> {} ({}), txn: {}", partition.getId(),
+                        info.getVersion(), prev, next, source == null ? "local"
+                                : (adopted ? "ccr adopted" : "ccr not continuous, source "
+                                        + source.srcPartitionId + " v" + source.srcVersion + " prev "
+                                        + source.prevToken), transactionState.getTransactionId());
+            }
         }
     }
 
@@ -2534,6 +2576,8 @@ public class DatabaseTransactionMgr {
             tableCommitInfos = transactionState.getIdToTableCommitInfos().values();
         }
         Map<Long, Triple<Long, Pair<Long, Long>, Partition>> partitionMap = new HashMap<>();
+        // partition id -> (the highest version written, its state token, null if none was assigned)
+        Map<Long, Pair<Long, String>> partitionTokens = new HashMap<>();
         Map<Long, Triple<Long, Long, OlapTable>> tableMap = new HashMap<>();
         for (TableCommitInfo tableCommitInfo : tableCommitInfos) {
             long tableId = tableCommitInfo.getTableId();
@@ -2633,6 +2677,12 @@ public class DatabaseTransactionMgr {
                     }
                     return v;
                 });
+                partitionTokens.compute(partitionId, (k, v) -> {
+                    if (v == null || version > v.first) {
+                        return Pair.of(version, partitionCommitInfo.getStateToken());
+                    }
+                    return v;
+                });
             }
 
             tableMap.compute(tableId, (k, v) -> {
@@ -2648,6 +2698,10 @@ public class DatabaseTransactionMgr {
             long tso = entry.getValue().getMiddle().second;
             Partition partition = entry.getValue().getRight();
             partition.updateVisibleVersionAndTime(version, versionTime, tso);
+            Pair<Long, String> token = partitionTokens.get(partition.getId());
+            if (token != null && token.second != null && token.first == version) {
+                partition.setStateToken(new PartitionStateToken(token.second, version, versionTime));
+            }
             partitionVisibleVersions.put(partition.getId(), version);
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction state {} set partition {}'s visible version to [{}]",

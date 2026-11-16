@@ -522,6 +522,9 @@ public class RestoreReuseShadowStats {
         json.addProperty("kept_a", actual.getKeptByPath(RestoreReuseJudge.L0_FORWARD));
         json.addProperty("kept_b", actual.getKeptByPath(RestoreReuseJudge.L0_REVERSE));
         json.addProperty("kept_c", actual.getKeptByPath(RestoreReuseJudge.L0_TABLE));
+        json.addProperty("kept_token", actual.countReasons(RestoreReuseResult.KEPT_STATE_TOKEN));
+        json.addProperty("token_equal", actual.getTokenEqualPartitions());
+        json.addProperty("token_equal_digest_mismatch", actual.getTokenEqualDigestMismatch());
         // the check level (requested and effective), and the kept partitions not proved by a digest
         if (!actual.isEmpty()) {
             json.add("check_level", GsonUtils.GSON.toJsonTree(actual.levelSummary()));

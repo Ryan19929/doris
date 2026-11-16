@@ -44,6 +44,7 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionItem;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
@@ -3321,7 +3322,23 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         RestoreReuseJudge.Input in = buildReuseInput(tblEntry.getKey(), tblInfo,
                                 partEntry.getKey(), partEntry.getValue(), localOlapTbl, localPart, level);
                         in.atomicReject = atomicReject;
-                        String reject = RestoreReuseJudge.firstReject(in);
+                        boolean tokenEqual = RestoreReuseJudge.tokenEqual(in);
+                        boolean keptByToken = false;
+                        if (Config.restore_reuse_trust_state_token) {
+                            String tokenReject = RestoreReuseJudge.firstRejectByToken(in);
+                            keptByToken = tokenReject == null;
+                            if (!keptByToken && tokenEqual) {
+                                LOG.info("restore reuse: partition {}.{} has the state token of the backup but is "
+                                        + "not kept by it: {}, job: {}", localOlapTbl.getName(), partEntry.getKey(),
+                                        tokenReject, jobId);
+                            }
+                        }
+                        String reject = null;
+                        if (!keptByToken) {
+                            in.l0Path = null;
+                            in.clusterProven = false;
+                            reject = RestoreReuseJudge.firstReject(in);
+                        }
                         boolean incremental = false;
                         if (reject != null) {
                             // a partition that is behind the backup may download only the rowsets after its version
@@ -3371,6 +3388,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         }
                         if (candidate.level == CheckLevel.OFF && !incremental) {
                             candidate.decide(true, RestoreReuseResult.KEPT_L0_ONLY);
+                        }
+                        candidate.tokenEqual = tokenEqual;
+                        if (keptByToken) {
+                            candidate.decide(true, RestoreReuseResult.KEPT_STATE_TOKEN);
                         }
                         candidates.add(candidate);
                     }
@@ -3792,6 +3813,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             candidate.decide(true, RestoreReuseResult.KEPT_DIGEST_VERIFIED);
         } else {
             candidate.decide(false, reason);
+            if (candidate.tokenEqual && (RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH.equals(reason)
+                    || RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH.equals(reason))) {
+                LOG.warn("restore reuse: partition {}.{} has the state token of the backup but its digest differs: "
+                        + "{}, job: {}", candidate.tableName, candidate.partitionName, reason, jobId);
+            }
         }
         for (ReuseTabletCheck check : candidate.tablets) {
             for (long signature : check.signatures) {
@@ -4006,6 +4032,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         in.localClusterId = getLocalClusterId();
         in.localTable = localTbl;
         in.localPartition = localPart;
+        in.localStateToken = PartitionStateToken.effective(localPart, getLocalClusterId());
+        in.backupStateToken = partInfo.stateToken;
         BackupStamps stamps = backupStamps.get(backupTableName);
         if (stamps != null) {
             in.backupTableSource = stamps.tableSource;
@@ -4055,6 +4083,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         boolean incremental = false;
         // in the sample of the check level sample
         boolean sampled = false;
+        // the local partition has the state token of the backup partition (whether or not it was kept by it)
+        boolean tokenEqual = false;
         boolean decided = false;
         boolean kept = false;
         String reason;
@@ -4095,6 +4125,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             decision.atomic = atomic;
             decision.stagingTableId = stagingTableId;
             decision.stagingPartitionId = stagingPartitionId;
+            decision.tokenEqual = tokenEqual;
             return decision;
         }
     }
@@ -4242,6 +4273,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     Partition part = olapTbl.getPartition(partId);
                     if (part != null) {
                         part.setRestoreLineage(null);
+                        // the data of the partition is being replaced: it has no state until the job stamps it
+                        part.setStateToken(PartitionStateToken.invalid());
                     }
                 }
             } finally {
@@ -4260,6 +4293,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             ((OlapTable) remoteTbl).setRestoreSource(null);
             for (Partition remotePart : ((OlapTable) remoteTbl).getAllPartitions()) {
                 remotePart.setRestoreLineage(null);
+                remotePart.setStateToken(null);
             }
         }
     }
@@ -4290,6 +4324,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         continue;
                     }
                     part.setRestoreLineage(buildRestoreLineage(jobInfo, tblInfo, partEntry.getValue(), restoreTime));
+                    // the restored partition is the backup partition: it adopts its state token, bound to the
+                    // version this frontend has for it (both are deterministic on replay)
+                    String token = partEntry.getValue().stateToken;
+                    part.setStateToken(token == null ? null : new PartitionStateToken(token,
+                            part.getVisibleVersion(), part.getVisibleVersionTime()));
                 }
             } finally {
                 olapTbl.writeUnlock();

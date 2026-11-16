@@ -7366,6 +7366,8 @@ public class Env {
                 Long oldVersion = partition.getVisibleVersion();
                 partition.updateVisibleVersion(visibleVersion);
                 partition.setNextVersion(visibleVersion + 1);
+                // the version no longer names the data of the partition: no state token until the next write
+                partition.setStateToken(PartitionStateToken.invalid());
                 result = 0;
                 if (!isReplay) {
                     SetPartitionVersionOperationLog log = new SetPartitionVersionOperationLog(

@@ -25,6 +25,7 @@ import org.apache.doris.catalog.OdbcCatalogResource;
 import org.apache.doris.catalog.OdbcTable;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.Partition;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Resource;
 import org.apache.doris.catalog.RestoreLineage;
 import org.apache.doris.catalog.Table;
@@ -455,6 +456,10 @@ public class BackupJobInfo implements GsonPostProcessable {
         public long id;
         @SerializedName("version")
         public long version;
+        // the effective state token of the partition at the backup version, see PartitionStateToken; null if it
+        // has none, or the source does not track the tokens
+        @SerializedName("stk")
+        public String stateToken;
         @SerializedName("indexes")
         public Map<String, BackupIndexInfo> indexes = Maps.newHashMap();
 
@@ -1028,6 +1033,8 @@ public class BackupJobInfo implements GsonPostProcessable {
                     BackupPartitionInfo partitionInfo = new BackupPartitionInfo();
                     partitionInfo.id = partition.getId();
                     partitionInfo.version = partition.getVisibleVersion();
+                    partitionInfo.stateToken = PartitionStateToken.effective(partition,
+                            Env.getCurrentEnv().getClusterId());
                     tableInfo.partitions.put(partition.getName(), partitionInfo);
                     // indexes
                     for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.VISIBLE)) {

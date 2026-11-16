@@ -731,6 +731,14 @@ struct TLoadTxnCommitResult {
     1: required Status.TStatus status
 }
 
+struct TCcrPartitionSource {
+    1: optional i64 target_partition_id
+    2: optional i64 src_partition_id
+    3: optional i64 src_version
+    4: optional string prev_token
+    5: optional string token
+}
+
 struct TCommitTxnRequest {
     1: optional string cluster
     2: optional string user
@@ -748,6 +756,8 @@ struct TCommitTxnRequest {
     13: optional bool txn_insert
     14: optional list<TSubTxnInfo> sub_txn_infos
     15: optional bool only_commit   // only commit txn, without waiting txn publish
+    // restore reuse: the source of each target partition a CCR increment writes, see PartitionStateToken
+    7601: optional list<TCcrPartitionSource> ccr_partition_sources
 }
 
 struct TCommitTxnResult {

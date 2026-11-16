@@ -336,6 +336,38 @@ public class TransactionState implements Writable {
     @SerializedName(value = "sui")
     private List<TableStreamUpdateInfo> streamUpdateInfos;
 
+    /**
+     * The source of a partition written by a CCR increment: the state token the source partition had before and
+     * after the version applied, see PartitionStateToken. Set on the master from the commit request of ccr-syncer.
+     */
+    public static class CcrPartitionSource {
+        @SerializedName("sp")
+        public long srcPartitionId;
+        @SerializedName("sv")
+        public long srcVersion;
+        @SerializedName("ptk")
+        public String prevToken;
+        @SerializedName("tk")
+        public String token;
+
+        public CcrPartitionSource() {
+        }
+
+        public CcrPartitionSource(long srcPartitionId, long srcVersion, String prevToken, String token) {
+            this.srcPartitionId = srcPartitionId;
+            this.srcVersion = srcVersion;
+            this.prevToken = prevToken;
+            this.token = token;
+        }
+    }
+
+    // target partition id -> the CCR source of the version this transaction writes into it, null if not a CCR
+    // increment (or the master did not accept the source, see FrontendServiceImpl#commitTxnImpl)
+    @Getter
+    @Setter
+    @SerializedName(value = "ccrsrc")
+    private Map<Long, CcrPartitionSource> ccrPartitionSources;
+
     public TransactionState() {
         this.dbId = -1;
         this.tableIdList = Lists.newArrayList();

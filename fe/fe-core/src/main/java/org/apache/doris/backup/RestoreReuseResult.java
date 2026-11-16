@@ -43,6 +43,9 @@ public class RestoreReuseResult {
     // The partition was not sampled and the sampled partitions are all consistent (check level sample). Not proved:
     // only seen with Config.restore_reuse_allow_unverified_keep.
     public static final String KEPT_SAMPLE_PASSED = "KEPT_SAMPLE_PASSED";
+    // The partition has the state token of the backup partition, the same version and the same structure, see
+    // PartitionStateToken (Config#restore_reuse_trust_state_token). Proved by the history, no digest computed.
+    public static final String KEPT_STATE_TOKEN = "KEPT_STATE_TOKEN";
 
     // incremental append (see Decision#incremental): the local partition is behind the backup, its data up to its own
     // version was proved equal to the backup at that version on every replica, and the backup can be cut there, so
@@ -126,6 +129,9 @@ public class RestoreReuseResult {
         public long stagingTableId;
         @SerializedName("spid")
         public long stagingPartitionId;
+        // the local partition had the state token of the backup partition
+        @SerializedName("te")
+        public boolean tokenEqual;
 
         /** The table the tasks of the restore work on: the staging table in an atomic restore. */
         public long restoredTableId() {
@@ -272,6 +278,17 @@ public class RestoreReuseResult {
     /** The local data size of all replicas of the kept partitions, the bytes that were not downloaded. */
     public long getKeptBytesAllReplicas() {
         return decisions.stream().filter(d -> d.kept).mapToLong(d -> d.bytesAllReplicas).sum();
+    }
+
+    /** The partitions whose local state token equals the one of the backup partition. */
+    public long getTokenEqualPartitions() {
+        return decisions.stream().filter(d -> d.tokenEqual).count();
+    }
+
+    /** The partitions with the state token of the backup whose digest differs: must stay 0. */
+    public long getTokenEqualDigestMismatch() {
+        return decisions.stream().filter(d -> d.tokenEqual && (DOWNLOAD_ROOT_MISMATCH.equals(d.reason)
+                || DOWNLOAD_SCHEMA_MISMATCH.equals(d.reason))).count();
     }
 
     /** The kept partitions that passed L0 by the given check. */
