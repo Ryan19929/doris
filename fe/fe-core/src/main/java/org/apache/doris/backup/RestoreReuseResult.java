@@ -332,6 +332,11 @@ public class RestoreReuseResult {
         return count;
     }
 
+    /** The kept partitions that are kept for the reason. */
+    public long countKeptReason(String reason) {
+        return decisions.stream().filter(d -> d.kept && reason.equals(d.reason)).count();
+    }
+
     /** The candidate partitions that are downloaded as a whole (neither kept nor incremental). */
     public long getDownloadedPartitions() {
         return decisions.stream().filter(d -> !d.kept && !d.incremental).count();
