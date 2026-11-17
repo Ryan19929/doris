@@ -463,7 +463,9 @@ public final class RestoreReuseJudge {
         }
         for (MaterializedIndex localIdx : localIndexes) {
             String name = local.getIndexNameById(localIdx.getId());
-            Long backupIdxId = backup.getIndexIdByName(name);
+            // the base index is named by the table, which an atomic restore renames to the temp name
+            Long backupIdxId = localIdx.getId() == local.getBaseIndexId() ? Long.valueOf(backup.getBaseIndexId())
+                    : backup.getIndexIdByName(name);
             BackupIndexInfo backupIdx = in.backupPartition.getIdx(name);
             if (backupIdxId == null || backupIdx == null) {
                 return "STRUCTURE_INDEX_NAME";
