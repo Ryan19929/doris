@@ -455,21 +455,21 @@ public final class RestoreReuseJudge {
         if (!sameRange(in)) {
             return "STRUCTURE_RANGE";
         }
-        Partition backupPart = backup.getPartition(in.localPartition.getName(), false);
-        if (backupPart == null) {
-            return "STRUCTURE_PARTITION";
-        }
+        // the indexes and the tablets of the backup are those of the job info: the partitions of the backup meta
+        // table are reset by the restore and do not tell them
         List<MaterializedIndex> localIndexes = in.localPartition.getMaterializedIndices(IndexExtState.VISIBLE);
-        if (localIndexes.size() != backupPart.getMaterializedIndices(IndexExtState.VISIBLE).size()) {
-            return "STRUCTURE_INDEX";
+        if (localIndexes.size() != in.backupPartition.indexes.size()) {
+            return "STRUCTURE_INDEX_COUNT";
         }
         for (MaterializedIndex localIdx : localIndexes) {
             String name = local.getIndexNameById(localIdx.getId());
             Long backupIdxId = backup.getIndexIdByName(name);
             BackupIndexInfo backupIdx = in.backupPartition.getIdx(name);
-            if (backupIdxId == null || backupIdx == null
-                    || backupIdx.sortedTabletInfoList.size() != localIdx.getTablets().size()) {
-                return "STRUCTURE_INDEX";
+            if (backupIdxId == null || backupIdx == null) {
+                return "STRUCTURE_INDEX_NAME";
+            }
+            if (backupIdx.sortedTabletInfoList.size() != localIdx.getTablets().size()) {
+                return "STRUCTURE_INDEX_TABLETS";
             }
             List<Column> localCols = local.getSchemaByIndexId(localIdx.getId(), true);
             List<Column> backupCols = backup.getSchemaByIndexId(backupIdxId, true);
