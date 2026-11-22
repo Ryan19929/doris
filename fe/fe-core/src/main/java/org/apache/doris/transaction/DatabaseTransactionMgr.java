@@ -27,6 +27,7 @@ import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
 import org.apache.doris.catalog.PartitionInfo;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.catalog.TableIf;
@@ -1143,6 +1144,7 @@ public class DatabaseTransactionMgr {
                 transactionState.clearErrorMsg();
                 transactionState.setTransactionStatus(TransactionStatus.VISIBLE);
                 setTableVersion(transactionState, db);
+                assignStateTokens(transactionState, db);
                 unprotectUpsertTransactionState(transactionState, false);
                 txnOperated = true;
                 // TODO(cmy): We found a very strange problem. When delete-related transactions are processed here,
@@ -1201,6 +1203,48 @@ public class DatabaseTransactionMgr {
             }
             tableCommitInfo.setVersion(table.getNextVersion());
             tableCommitInfo.setVersionTime(System.currentTimeMillis());
+        }
+    }
+
+    /**
+     * Master only, before the transaction is logged as visible: the state token of each partition after the version
+     * this transaction writes, a new token for each write. The tokens are logged with the partition commit infos and
+     * applied by updateCatalogAfterVisible, on the master and on replay.
+     * A transaction of sub transactions gets no token: the partitions lose the binding of their token. A tainted
+     * partition gets none either, and stays tainted.
+     */
+    private void assignStateTokens(TransactionState transactionState, Database db) {
+        if (!Config.restore_state_token_track || !transactionState.getSubTxnIdToTableCommitInfo().isEmpty()) {
+            return;
+        }
+        long clusterId = Env.getCurrentEnv().getClusterId();
+        for (TableCommitInfo tableCommitInfo : transactionState.getIdToTableCommitInfos().values()) {
+            OlapTable table = (OlapTable) db.getTableNullable(tableCommitInfo.getTableId());
+            if (table == null) {
+                continue;
+            }
+            for (PartitionCommitInfo info : tableCommitInfo.getIdToPartitionCommitInfo().values()) {
+                Partition partition = table.getPartition(info.getPartitionId());
+                if (partition == null || info.isTempPartition()) {
+                    continue;
+                }
+                if (PartitionStateToken.isTainted(partition)) {
+                    // the replicas may not agree: the write gives no name and the partition stays tainted
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("partition {} v{} is tainted, no content state, txn: {}", partition.getId(),
+                                info.getVersion(), transactionState.getTransactionId());
+                    }
+                    continue;
+                }
+                String prev = PartitionStateToken.effective(partition);
+                String next = PartitionStateToken.fresh(prev, clusterId, partition.getId(), info.getVersion());
+                info.setStateTokens(prev, next);
+                // the state names are not secrets, they name the content of a partition
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("partition {} v{} content state: {} -> {}, txn: {}", partition.getId(),
+                            info.getVersion(), prev, next, transactionState.getTransactionId());
+                }
+            }
         }
     }
 
@@ -2190,6 +2234,8 @@ public class DatabaseTransactionMgr {
             tableCommitInfos = transactionState.getIdToTableCommitInfos().values();
         }
         Map<Long, Triple<Long, Long, Partition>> partitionMap = new HashMap<>();
+        // partition id -> (the highest version written, its state token, null if none was assigned)
+        Map<Long, Pair<Long, String>> partitionTokens = new HashMap<>();
         Map<Long, Triple<Long, Long, OlapTable>> tableMap = new HashMap<>();
         for (TableCommitInfo tableCommitInfo : tableCommitInfos) {
             long tableId = tableCommitInfo.getTableId();
@@ -2288,6 +2334,12 @@ public class DatabaseTransactionMgr {
                     }
                     return v;
                 });
+                partitionTokens.compute(partitionId, (k, v) -> {
+                    if (v == null || version > v.first) {
+                        return Pair.of(version, partitionCommitInfo.getStateToken());
+                    }
+                    return v;
+                });
             }
 
             tableMap.compute(tableId, (k, v) -> {
@@ -2302,6 +2354,10 @@ public class DatabaseTransactionMgr {
             long versionTime = entry.getValue().getMiddle();
             Partition partition = entry.getValue().getRight();
             partition.updateVisibleVersionAndTime(version, versionTime);
+            Pair<Long, String> token = partitionTokens.get(partition.getId());
+            if (token != null && token.second != null && token.first == version) {
+                partition.setStateToken(new PartitionStateToken(token.second, version, versionTime));
+            }
             partitionVisibleVersions.put(partition.getId(), version);
             if (LOG.isDebugEnabled()) {
                 LOG.debug("transaction state {} set partition {}'s visible version to [{}]",

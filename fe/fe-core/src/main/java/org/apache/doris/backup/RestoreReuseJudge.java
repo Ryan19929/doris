@@ -20,9 +20,12 @@ package org.apache.doris.backup;
 import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
+import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Index;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
+import org.apache.doris.catalog.MaterializedIndexMeta;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
@@ -37,10 +40,14 @@ import org.apache.doris.common.Config;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
+import java.util.Set;
 
 /**
  * The decisions of partition level reuse that need no catalog changes: the check level, the chain of conditions that
@@ -189,6 +196,10 @@ public final class RestoreReuseJudge {
         public RestoreLineage backupLineage;
         public RestoreSource backupTableSource;
         public OlapTable backupOlapTable;
+        // The effective state token of the local partition and the one the backup recorded for the partition, see
+        // PartitionStateToken. Null if there is none.
+        public String localStateToken;
+        public String backupStateToken;
         // Set by checkL0: the L0 check that passed, null if none did.
         public String l0Path;
         // Set with l0Path: the cluster id of the source was compared on both sides and equal, see clusterProven.
@@ -232,6 +243,8 @@ public final class RestoreReuseJudge {
     public static final String L0_FORWARD = "a";
     public static final String L0_REVERSE = "b";
     public static final String L0_TABLE = "c";
+    // Not an L0 check: the partition is kept because its state token equals the one of the backup partition.
+    public static final String L0_TOKEN = "t";
 
     /** a. forward: the local partition has the lineage of the source partition of this backup. */
     public static final L0Check FORWARD_L0 = new L0Check(L0_FORWARD) {
@@ -382,6 +395,197 @@ public final class RestoreReuseJudge {
             }
         }
         return null;
+    }
+
+    /**
+     * The conditions of a keep proved by the state token instead of a digest (Config#restore_reuse_trust_state_token):
+     * the same as the chain above with the state token in place of L0 and no digest needed.
+     */
+    public static final List<Condition> TOKEN_CONDITIONS = ImmutableList.of(
+            RestoreReuseJudge::checkMode,
+            RestoreReuseJudge::checkToken,
+            RestoreReuseJudge::checkSupported,
+            RestoreReuseJudge::checkSize,
+            RestoreReuseJudge::checkReplicas);
+
+    /** Returns the reason that the partition can not be kept by its state token, null if it can. */
+    public static String firstRejectByToken(Input in) {
+        for (Condition condition : TOKEN_CONDITIONS) {
+            String reason = condition.check(in);
+            if (reason != null) {
+                return reason;
+            }
+        }
+        return null;
+    }
+
+    /** Whether the local partition and the backup partition have the same effective state token. */
+    public static boolean tokenEqual(Input in) {
+        return in.localStateToken != null && in.localStateToken.equals(in.backupStateToken);
+    }
+
+    // the state token, the version and the structure of the partition are the same as the backup
+    static String checkToken(Input in) {
+        if (!tokenEqual(in)) {
+            if (in.backupStateToken == null) {
+                return "TOKEN_ABSENT_BACKUP";
+            }
+            return in.localStateToken == null ? "TOKEN_ABSENT_LOCAL" : "TOKEN_MISMATCH";
+        }
+        if (in.backupPartition.version != in.localPartition.getVisibleVersion()) {
+            return "TOKEN_VERSION_MISMATCH";
+        }
+        String structure = checkSameStructure(in);
+        if (structure != null) {
+            return structure;
+        }
+        in.l0Path = L0_TOKEN;
+        in.clusterProven = true;
+        return null;
+    }
+
+    /**
+     * Without a digest the schema signature in it does not compare the schemas, so compare them here. The state
+     * token says that the data of the two partitions is the same; this is a second line against a path that changed
+     * the data or what it is read as and missed the invalidation, and it covers the changes that are not meant to
+     * invalidate (a light schema change). The kept files are read by the metadata of the backup after an atomic
+     * restore, and keep the local metadata after a non-atomic one, so everything the reading of the files depends
+     * on must be the same on both sides:
+     * <ul>
+     * <li>the model (keys type, merge-on-write, sequence column): how the rows of the files are merged;</li>
+     * <li>the range: which rows the partition stands for;</li>
+     * <li>the distribution (type, bucket columns, bucket number): which rows a tablet holds, the bucket pruning of
+     * a query relies on it;</li>
+     * <li>the visible indexes (by name) and the tablets of each index;</li>
+     * <li>the short key column count of each index: the short key index of the files is built with it, and a seek
+     * by the short keys reads it;</li>
+     * <li>the definition of each materialized index (its define statement, which holds the define expressions of
+     * its columns and its WHERE): the index has the rows the definition made, and a query rewritten to the index
+     * trusts the definition;</li>
+     * <li>every column of each index, see sameColumn;</li>
+     * <li>the indexes of the table (inverted, ngram bloom filter, ...), see sameIndexes;</li>
+     * <li>the bloom filter columns and their fpp: the bloom filter in the files is built by them. A bloom filter
+     * stores its own parameters, so a difference is not known to change a result: it is compared to keep the kept
+     * files the same as the files a download would make, at the cost of a download after a change of them.</li>
+     * </ul>
+     */
+    static String checkSameStructure(Input in) {
+        OlapTable local = in.localTable;
+        OlapTable backup = in.backupOlapTable;
+        if (backup == null) {
+            return "STRUCTURE_UNKNOWN";
+        }
+        if (local.getKeysType() != backup.getKeysType() || isMow(local) != isMow(backup)
+                || local.hasSequenceCol().booleanValue() != backup.hasSequenceCol().booleanValue()) {
+            return "STRUCTURE_MODEL";
+        }
+        if (!sameRange(in)) {
+            return "STRUCTURE_RANGE";
+        }
+        // sameRange found the partition of the same name in the backup
+        Partition backupPart = backup.getPartition(in.localPartition.getName(), false);
+        if (!in.localPartition.getDistributionInfo().equals(backupPart.getDistributionInfo())) {
+            return "STRUCTURE_DISTRIBUTION";
+        }
+        if (!sameIndexes(local.getIndexes(), backup.getIndexes())) {
+            return "STRUCTURE_TABLE_INDEX";
+        }
+        if (!sameBloomFilter(local, backup)) {
+            return "STRUCTURE_BLOOM_FILTER";
+        }
+        // the indexes and the tablets of the backup are those of the job info: the partitions of the backup meta
+        // table are reset by the restore and do not tell them
+        List<MaterializedIndex> localIndexes = in.localPartition.getMaterializedIndices(IndexExtState.VISIBLE);
+        if (localIndexes.size() != in.backupPartition.indexes.size()) {
+            return "STRUCTURE_INDEX_COUNT";
+        }
+        for (MaterializedIndex localIdx : localIndexes) {
+            String name = local.getIndexNameById(localIdx.getId());
+            // the base index is named by the table, which an atomic restore renames to the temp name
+            Long backupIdxId = localIdx.getId() == local.getBaseIndexId() ? Long.valueOf(backup.getBaseIndexId())
+                    : backup.getIndexIdByName(name);
+            BackupIndexInfo backupIdx = in.backupPartition.getIdx(name);
+            if (backupIdxId == null || backupIdx == null) {
+                return "STRUCTURE_INDEX_NAME";
+            }
+            if (backupIdx.sortedTabletInfoList.size() != localIdx.getTablets().size()) {
+                return "STRUCTURE_INDEX_TABLETS";
+            }
+            MaterializedIndexMeta localMeta = local.getIndexMetaByIndexId(localIdx.getId());
+            MaterializedIndexMeta backupMeta = backup.getIndexMetaByIndexId(backupIdxId);
+            if (localMeta.getShortKeyColumnCount() != backupMeta.getShortKeyColumnCount()
+                    || !Objects.equals(defineStmtOf(localMeta), defineStmtOf(backupMeta))) {
+                return "STRUCTURE_INDEX_DEFINE";
+            }
+            List<Column> localCols = local.getSchemaByIndexId(localIdx.getId(), true);
+            List<Column> backupCols = backup.getSchemaByIndexId(backupIdxId, true);
+            if (localCols == null || backupCols == null || localCols.size() != backupCols.size()) {
+                return "STRUCTURE_COLUMN";
+            }
+            for (int i = 0; i < localCols.size(); i++) {
+                if (!sameColumn(localCols.get(i), backupCols.get(i))) {
+                    return "STRUCTURE_COLUMN";
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Column#equals, but the comment, with the unique id and the exact name. Column#equals compares what the data
+     * of the files is read as: the type, key, nullable, aggregation, the default value and the real default value
+     * (a file written before the column was added by a light schema change is read with it), auto increment, the
+     * visibility (a hidden column), the sub columns of a complex type and the cluster key id (the sort order of a
+     * merge-on-write table). The comment is metadata only, a change of it must not break the reuse. The unique id is
+     * how the files name the column. Not compared, as they only matter to the rows written later, which the restore
+     * does not keep: the expression of a generated column and the ON UPDATE default.
+     */
+    static boolean sameColumn(Column local, Column backup) {
+        Column backupWithLocalComment = new Column(backup);
+        backupWithLocalComment.setComment(local.getComment());
+        return local.getName().equals(backup.getName()) && local.getUniqueId() == backup.getUniqueId()
+                && local.equals(backupWithLocalComment);
+    }
+
+    /**
+     * The indexes of the table by name: the id (an inverted index file is named by it, and the BE finds the index
+     * of a kept file by the id of the restored metadata), the type, the columns and the properties (the parser of an
+     * inverted index decides what a MATCH finds, the gram size of an ngram bloom filter what it filters). Not the
+     * comment.
+     */
+    static boolean sameIndexes(List<Index> local, List<Index> backup) {
+        if (local.size() != backup.size()) {
+            return false;
+        }
+        Map<String, Index> backupByName = Maps.newHashMap();
+        for (Index index : backup) {
+            backupByName.put(index.getIndexName(), index);
+        }
+        for (Index a : local) {
+            Index b = backupByName.get(a.getIndexName());
+            if (b == null || a.getIndexId() != b.getIndexId() || a.getIndexType() != b.getIndexType()
+                    || !a.getColumns().equals(b.getColumns()) || !a.getProperties().equals(b.getProperties())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // the bloom filter columns, and the fpp if there are any
+    private static boolean sameBloomFilter(OlapTable local, OlapTable backup) {
+        Set<String> localBf = local.getCopiedBfColumns();
+        Set<String> backupBf = backup.getCopiedBfColumns();
+        boolean localHas = localBf != null && !localBf.isEmpty();
+        boolean backupHas = backupBf != null && !backupBf.isEmpty();
+        if (localHas != backupHas) {
+            return false;
+        }
+        return !localHas || (localBf.equals(backupBf) && local.getBfFpp() == backup.getBfFpp());
+    }
+
+    // the define statement of a materialized index, null for the base index and an index without one
+    private static String defineStmtOf(MaterializedIndexMeta meta) {
+        return meta.getDefineStmt() == null ? null : meta.getDefineStmt().originStmt;
     }
 
     // 1. non-atomic restore into an existing table that is forbidden to write, or an atomic restore whose staging

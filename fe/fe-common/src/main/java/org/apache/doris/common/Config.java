@@ -3156,6 +3156,30 @@ public class Config extends ConfigBase {
     public static boolean restore_reuse_require_capability = true;
 
     @ConfField(mutable = true, masterOnly = true, description = {
+            "master 是否跟踪分区的状态令牌（见 PartitionStateToken）：可见的事务给它写的每个分区一个令牌，"
+                    + "CCR 增量在延续本地状态时沿用源版本的令牌，恢复沿用备份的令牌。只改变元数据。"
+                    + "只在 master 记录事务日志时读取，回放时不读。为 false（默认）时不写任何新的元数据"
+                    + "（没有新的日志类型，备份里没有令牌），可以回滚到没有这个功能的 FE。",
+            "Whether the master tracks the state token of the partitions (see PartitionStateToken): a transaction "
+                    + "made visible gives each partition it writes a token, a CCR increment adopts the token of the "
+                    + "source version when it continues the local state, and a restore adopts the token of the "
+                    + "backup. It only changes the metadata. Read only when the master logs a transaction, never on "
+                    + "replay. If false (the default) nothing new is persisted (no new kind of log, no token in a "
+                    + "backup), so the frontends can be rolled back to a version without it."})
+    public static boolean restore_state_token_track = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
+            "分区级复用在分区的状态令牌与备份分区的相同、版本相同、结构相同时，是否不做摘要直接保留它"
+                    + "（KEPT_STATE_TOKEN）。证据是分区的历史而不是它的内容：依赖一个 tablet 的副本一致，"
+                    + "以及 CCR 按源的原样应用版本。默认关闭。",
+            "Whether partition level reuse keeps a partition without a digest when its state token equals the one "
+                    + "of the backup partition, the versions are equal and the schemas are the same "
+                    + "(KEPT_STATE_TOKEN). The proof is the history of the partition, not its content: it relies on "
+                    + "the replicas of a tablet agreeing and on CCR applying the versions of the source as they are. "
+                    + "Off by default."})
+    public static boolean restore_reuse_trust_state_token = false;
+
+    @ConfField(mutable = true, masterOnly = true, description = {
             "备份作业记录逻辑摘要的最大 tablet 数。备份涉及的 tablet 更多时，不让 BE 计算逻辑摘要，"
                     + "也不把它（以及分解摘要）写进 job info，原因（TOO_MANY_TABLETS）"
                     + "显示在 SHOW BACKUP 的 LogicalDigest 列，备份照常成功。恢复这样的备份不复用分区。"

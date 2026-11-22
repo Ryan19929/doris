@@ -45,6 +45,7 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Partition.PartitionState;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionItem;
+import org.apache.doris.catalog.PartitionStateToken;
 import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
@@ -247,6 +248,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
     // written when entering DOWNLOAD), kept after the job finishes.
     @SerializedName("rru")
     private RestoreReuseResult reuseResult;
+    // whether the master tracked the state tokens when it committed the job: the restored partitions adopt the
+    // tokens of the backup only then, see stampStateToken. Set on the master before the stamp, persisted with the
+    // finished job for the replay.
+    @SerializedName("stt")
+    private boolean stampStateTokens;
 
     // The ids of the staging partitions of an atomic restore whose data is loaded from a local source (kept or
     // incrementally appended partitions): the tablet scheduler must not repair their replicas by clone while the job
@@ -2732,6 +2738,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
 
         // Use the same time on replay, it is persisted as the finished time of the job.
         long commitTime = isReplay ? finishedTime : System.currentTimeMillis();
+        if (!isReplay) {
+            // persisted with the job finished, see stampStateToken
+            stampStateTokens = Config.restore_state_token_track;
+        }
         stampRestoreLineage(db, commitTime);
 
         // Drop the exists but non-restored table/partitions.
@@ -3213,7 +3223,23 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         RestoreReuseJudge.Input in = buildReuseInput(tblEntry.getKey(), tblInfo,
                                 partEntry.getKey(), partEntry.getValue(), localOlapTbl, localPart, level);
                         in.atomicReject = atomicReject;
-                        String reject = RestoreReuseJudge.firstReject(in);
+                        boolean tokenEqual = RestoreReuseJudge.tokenEqual(in);
+                        boolean keptByToken = false;
+                        if (Config.restore_reuse_trust_state_token) {
+                            String tokenReject = RestoreReuseJudge.firstRejectByToken(in);
+                            keptByToken = tokenReject == null;
+                            if (!keptByToken && tokenEqual) {
+                                LOG.info("restore reuse: partition {}.{} has the state token of the backup but is "
+                                        + "not kept by it: {}, job: {}", localOlapTbl.getName(), partEntry.getKey(),
+                                        tokenReject, jobId);
+                            }
+                        }
+                        String reject = null;
+                        if (!keptByToken) {
+                            in.l0Path = null;
+                            in.clusterProven = false;
+                            reject = RestoreReuseJudge.firstReject(in);
+                        }
                         boolean incremental = false;
                         if (reject != null) {
                             // a partition that is behind the backup may download only the rowsets after its version
@@ -3263,6 +3289,10 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         }
                         if (candidate.level == CheckLevel.OFF && !incremental) {
                             candidate.decide(true, RestoreReuseResult.KEPT_L0_ONLY);
+                        }
+                        candidate.tokenEqual = tokenEqual;
+                        if (keptByToken) {
+                            candidate.decide(true, RestoreReuseResult.KEPT_STATE_TOKEN);
                         }
                         candidates.add(candidate);
                     }
@@ -3684,6 +3714,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             candidate.decide(true, RestoreReuseResult.KEPT_DIGEST_VERIFIED);
         } else {
             candidate.decide(false, reason);
+            if (candidate.tokenEqual && (RestoreReuseResult.DOWNLOAD_ROOT_MISMATCH.equals(reason)
+                    || RestoreReuseResult.DOWNLOAD_SCHEMA_MISMATCH.equals(reason))) {
+                LOG.warn("restore reuse: partition {}.{} has the state token of the backup but its digest differs: "
+                        + "{}, job: {}", candidate.tableName, candidate.partitionName, reason, jobId);
+            }
         }
         for (ReuseTabletCheck check : candidate.tablets) {
             for (long signature : check.signatures) {
@@ -3835,11 +3870,40 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                             + " changed from " + decision.version + " to " + part.getVisibleVersion()
                             + " during the restore, the local data is not what was verified any more");
                 }
+                if (!stillHasKeptStateToken(db, decision, part)) {
+                    return new Status(ErrCode.COMMON_ERROR, "the state token of the partition "
+                            + decision.tableName + "." + decision.partitionName + " that keeps its local data by it"
+                            + " changed during the restore (" + PartitionStateToken.effective(part) + ", a change"
+                            + " that keeps the version), the local data is not what was verified any more");
+                }
             } finally {
                 tbl.writeUnlock();
             }
         }
         return Status.OK;
+    }
+
+    /**
+     * Whether a partition kept by its state token (KEPT_STATE_TOKEN) still has the token of the backup partition, as
+     * when it was judged: a change that keeps the version (a schema change or rollup job that finished, an admin
+     * operation on a replica) invalidates or taints the token, which the check of the version does not see. True for
+     * a decision of another reason. The caller holds the write lock of the table, and the backup table of the
+     * decision is found as the candidate was, by the name the restore gives it.
+     */
+    private boolean stillHasKeptStateToken(Database db, RestoreReuseResult.Decision decision, Partition part) {
+        if (!RestoreReuseResult.KEPT_STATE_TOKEN.equals(decision.reason)) {
+            return true;
+        }
+        String backupToken = null;
+        for (Map.Entry<String, BackupOlapTableInfo> tblEntry : jobInfo.backupOlapTableObjects.entrySet()) {
+            Table tbl = db.getTableNullable(jobInfo.getAliasByOriginNameIfSet(tblEntry.getKey()));
+            if (tbl != null && tbl.getId() == decision.tableId) {
+                backupToken = tblEntry.getValue().getPartInfo(decision.partitionName).stateToken;
+                break;
+            }
+        }
+        String localToken = PartitionStateToken.effective(part);
+        return localToken != null && localToken.equals(backupToken);
     }
 
     // The restore source of a table in the backup meta and the restore lineage of its partitions, as the backup
@@ -3898,6 +3962,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         in.localClusterId = getLocalClusterId();
         in.localTable = localTbl;
         in.localPartition = localPart;
+        in.localStateToken = PartitionStateToken.effective(localPart);
+        in.backupStateToken = partInfo.stateToken;
         BackupStamps stamps = backupStamps.get(backupTableName);
         if (stamps != null) {
             in.backupTableSource = stamps.tableSource;
@@ -3947,6 +4013,8 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         boolean incremental = false;
         // in the sample of the check level sample
         boolean sampled = false;
+        // the local partition has the state token of the backup partition (whether or not it was kept by it)
+        boolean tokenEqual = false;
         boolean decided = false;
         boolean kept = false;
         String reason;
@@ -3987,6 +4055,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             decision.atomic = atomic;
             decision.stagingTableId = stagingTableId;
             decision.stagingPartitionId = stagingPartitionId;
+            decision.tokenEqual = tokenEqual;
             return decision;
         }
     }
@@ -4134,6 +4203,9 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     Partition part = olapTbl.getPartition(partId);
                     if (part != null) {
                         part.setRestoreLineage(null);
+                        // the data of the partition is being replaced: it has no state until the job stamps it.
+                        // A taint is kept.
+                        PartitionStateToken.invalidate(part);
                     }
                 }
             } finally {
@@ -4152,6 +4224,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             ((OlapTable) remoteTbl).setRestoreSource(null);
             for (Partition remotePart : ((OlapTable) remoteTbl).getAllPartitions()) {
                 remotePart.setRestoreLineage(null);
+                remotePart.setStateToken(null);
             }
         }
     }
@@ -4182,11 +4255,57 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         continue;
                     }
                     part.setRestoreLineage(buildRestoreLineage(jobInfo, tblInfo, partEntry.getValue(), restoreTime));
+                    stampStateToken(olapTbl, part, partEntry.getValue());
                 }
             } finally {
                 olapTbl.writeUnlock();
             }
         }
+    }
+
+    /**
+     * The state token of a partition this job restored, see PartitionStateToken. Called on the master and on replay
+     * with the write lock of the table; everything it reads is persisted with the job or replayed before it.
+     * <ul>
+     * <li>If the master did not track the tokens (restore_state_token_track) when it committed the job, no name
+     * is given: the partitions are invalidated. A cluster that does not track the tokens gives no names.</li>
+     * <li>A tainted partition stays tainted. Taint wins in any order of the taint and of this, so the master, which
+     * may run this before the operation that taints and log it after, and a follower, which replays the operation
+     * first, agree.</li>
+     * <li>A partition kept without a digest (an unverified keep, restore_reuse_allow_unverified_keep) is not proved
+     * to be the backup partition: invalidated, no name.</li>
+     * <li>A partition that is not at the version of the backup, which is the version the job set (a load made
+     * visible in between): invalidated, the name of the backup would be bound to other data.</li>
+     * <li>Otherwise it is the backup partition and adopts its token, bound to the version this frontend has for it.
+     * A backup partition without a token leaves none, and the partition is EMPTY only if it was restored at the
+     * initial version, as the empty partition of the backup.</li>
+     * </ul>
+     */
+    private void stampStateToken(OlapTable olapTbl, Partition part, BackupPartitionInfo partInfo) {
+        if (PartitionStateToken.isTainted(part)) {
+            LOG.info("restore: partition {} is tainted, it keeps the taint, job: {}", part.getId(), jobId);
+            return;
+        }
+        if (!stampStateTokens) {
+            // the master did not track the tokens when it committed the job: no name
+            PartitionStateToken.invalidate(part);
+            return;
+        }
+        RestoreReuseResult.Decision kept = reuseResult == null ? null
+                : reuseResult.getKept(olapTbl.getId(), part.getId());
+        if (kept != null && kept.isUnverifiedKeep()) {
+            PartitionStateToken.invalidate(part);
+            return;
+        }
+        if (part.getVisibleVersion() != partInfo.version) {
+            LOG.info("restore: partition {} is at version {}, not at the version {} of the backup, no state token, "
+                    + "job: {}", part.getId(), part.getVisibleVersion(), partInfo.version, jobId);
+            PartitionStateToken.invalidate(part);
+            return;
+        }
+        String token = partInfo.stateToken;
+        part.setStateToken(token == null ? null : new PartitionStateToken(token, part.getVisibleVersion(),
+                part.getVisibleVersionTime()));
     }
 
     private String getRestoreObjs() {
@@ -4413,6 +4532,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      */
     @VisibleForTesting
     Status checkAtomicLocalVersions(OlapTable originTbl) {
+        Database db = env.getInternalCatalog().getDbNullable(dbId);
         for (RestoreReuseResult.Decision decision : getAtomicLocalDecisions(originTbl.getId())) {
             Partition part = originTbl.getPartition(decision.partitionId);
             if (part == null) {
@@ -4425,6 +4545,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                         + " changed from " + decision.version + " to " + part.getVisibleVersion() + " (next version "
                         + part.getNextVersion() + ") during the restore, the local data is not what was verified any"
                         + " more. The table is not replaced, restore again");
+            }
+            if (!stillHasKeptStateToken(db, decision, part)) {
+                return new Status(ErrCode.COMMON_ERROR, "the state token of the partition "
+                        + decision.tableName + "." + decision.partitionName + " that the restored data is made from"
+                        + " by it changed during the restore (" + PartitionStateToken.effective(part) + ", a change"
+                        + " that keeps the version), the local data is not what was verified any more. The table is"
+                        + " not replaced, restore again");
             }
         }
         return Status.OK;

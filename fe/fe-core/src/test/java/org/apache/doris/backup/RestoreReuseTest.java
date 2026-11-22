@@ -17,6 +17,7 @@
 
 package org.apache.doris.backup;
 
+import org.apache.doris.analysis.IndexDef.IndexType;
 import org.apache.doris.backup.BackupJobInfo.BackupIndexInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupOlapTableInfo;
 import org.apache.doris.backup.BackupJobInfo.BackupPartitionInfo;
@@ -26,6 +27,7 @@ import org.apache.doris.backup.RestoreReuseJudge.CheckLevel;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.Index;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.MaterializedIndex;
 import org.apache.doris.catalog.MaterializedIndex.IndexExtState;
@@ -34,6 +36,8 @@ import org.apache.doris.catalog.OlapTable.OlapTableState;
 import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.PartitionInfo;
 import org.apache.doris.catalog.PartitionItem;
+import org.apache.doris.catalog.PartitionStateToken;
+import org.apache.doris.catalog.RandomDistributionInfo;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.ReplicaAllocation;
@@ -52,6 +56,7 @@ import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.ha.FrontendNodeType;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.qe.OriginStatement;
 import org.apache.doris.resource.Tag;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.Frontend;
@@ -5093,5 +5098,217 @@ public class RestoreReuseTest {
     @Test
     public void testDirMoveReportDoesNotRunTheJobWhenTheSwitchIsOff() throws Exception {
         sendReports(dirMoveSite(), false);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // the structure check of a keep by the state token
+    // ---------------------------------------------------------------------------------------------
+
+    // the backup table: a copy of test_tbl2 as the backup meta has it
+    private OlapTable backupCopy() {
+        return tbl2.selectiveCopy(null, IndexExtState.VISIBLE, true);
+    }
+
+    private String structure(OlapTable backupTbl) {
+        RestoreReuseJudge.Input in = input(CheckLevel.FULL);
+        in.backupOlapTable = backupTbl;
+        return RestoreReuseJudge.checkSameStructure(in);
+    }
+
+    @Test
+    public void testStructureComparesTheColumnsAsTheyAreRead() {
+        Assertions.assertNull(structure(backupCopy()));
+        // a comment is metadata only
+        OlapTable backup = backupCopy();
+        backup.getBaseSchema().get(0).setComment("another comment");
+        Assertions.assertNull(structure(backup));
+        // the default value: a file without the column (added by a light schema change) is read with it
+        backup = backupCopy();
+        Deencapsulation.setField(backup.getBaseSchema().get(1), "defaultValue", "42");
+        Assertions.assertEquals("STRUCTURE_COLUMN", structure(backup));
+        // the unique id names the column in the files
+        backup = backupCopy();
+        backup.getBaseSchema().get(0).setUniqueId(12345);
+        Assertions.assertEquals("STRUCTURE_COLUMN", structure(backup));
+        // nullable
+        backup = backupCopy();
+        Column col = backup.getBaseSchema().get(2);
+        col.setIsAllowNull(!col.isAllowNull());
+        Assertions.assertEquals("STRUCTURE_COLUMN", structure(backup));
+    }
+
+    @Test
+    public void testStructureComparesTheIndexesAndTheDefinitions() {
+        Index inverted = new Index(70001L, "idx_k1", Lists.newArrayList("k1"), IndexType.INVERTED,
+                Maps.newHashMap(), "a comment");
+        // an index of the table only on one side
+        OlapTable backup = backupCopy();
+        backup.setIndexes(Lists.newArrayList(inverted.clone()));
+        Assertions.assertEquals("STRUCTURE_TABLE_INDEX", structure(backup));
+        tbl2.setIndexes(Lists.newArrayList(inverted.clone()));
+        try {
+            Assertions.assertNull(structure(backup));
+            // another comment: the same index
+            Index other = inverted.clone();
+            other.setComment("another comment");
+            backup.setIndexes(Lists.newArrayList(other));
+            Assertions.assertNull(structure(backup));
+            // another parser: MATCH finds other rows
+            Map<String, String> parser = Maps.newHashMap();
+            parser.put("parser", "english");
+            backup.setIndexes(Lists.newArrayList(new Index(70001L, "idx_k1", Lists.newArrayList("k1"),
+                    IndexType.INVERTED, parser, null)));
+            Assertions.assertEquals("STRUCTURE_TABLE_INDEX", structure(backup));
+            // another id: the BE finds the index files of a kept tablet by it
+            backup.setIndexes(Lists.newArrayList(new Index(70002L, "idx_k1", Lists.newArrayList("k1"),
+                    IndexType.INVERTED, Maps.newHashMap(), null)));
+            Assertions.assertEquals("STRUCTURE_TABLE_INDEX", structure(backup));
+        } finally {
+            tbl2.setIndexes(Lists.newArrayList());
+        }
+
+        // the bloom filter columns
+        backup = backupCopy();
+        backup.setBloomFilterInfo(Sets.newHashSet("k1"), 0.05);
+        Assertions.assertEquals("STRUCTURE_BLOOM_FILTER", structure(backup));
+
+        // the definition of a materialized index: another WHERE
+        backup = backupCopy();
+        Deencapsulation.setField(backup.getIndexMetaByIndexId(CatalogMocker.TEST_ROLLUP_ID), "defineStmt",
+                new OriginStatement("CREATE MATERIALIZED VIEW test_rollup AS SELECT k1, k2, v1 FROM test_tbl2 "
+                        + "WHERE k1 > 1", 0));
+        Assertions.assertEquals("STRUCTURE_INDEX_DEFINE", structure(backup));
+
+        // the short key column count
+        backup = backupCopy();
+        Deencapsulation.setField(backup.getIndexMetaByIndexId(backup.getBaseIndexId()), "shortKeyColumnCount",
+                (short) (tbl2.getIndexMetaByIndexId(tbl2.getBaseIndexId()).getShortKeyColumnCount() + 1));
+        Assertions.assertEquals("STRUCTURE_INDEX_DEFINE", structure(backup));
+
+        // the distribution of the partition
+        backup = backupCopy();
+        Partition backupPart = backup.getPartition(CatalogMocker.TEST_PARTITION1_NAME);
+        Deencapsulation.setField(backupPart, "distributionInfo",
+                new RandomDistributionInfo(backupPart.getDistributionInfo().getBucketNum() + 1));
+        Assertions.assertEquals("STRUCTURE_DISTRIBUTION", structure(backup));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // the recheck of a keep by the state token before the commit
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    public void testKeptByTokenIsCheckedAgainBeforeTheCommit() {
+        BackupJobInfo info = selfBackupJobInfo();
+        info.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME).getPartInfo(CatalogMocker.TEST_PARTITION1_NAME)
+                .stateToken = "tk1";
+        RestoreJob job = newJob(info, "full");
+        p1().setStateToken(new PartitionStateToken("tk1", V1, p1().getVisibleVersionTime()));
+        RestoreReuseResult.Decision decision = new RestoreReuseResult.Decision();
+        decision.tableId = tbl2.getId();
+        decision.partitionId = p1().getId();
+        decision.tableName = tbl2.getName();
+        decision.partitionName = p1().getName();
+        decision.version = V1;
+        decision.kept = true;
+        decision.reason = RestoreReuseResult.KEPT_STATE_TOKEN;
+        RestoreReuseResult result = new RestoreReuseResult();
+        result.addDecision(decision);
+        Deencapsulation.setField(job, "reuseResult", result);
+
+        // non-atomic
+        Assertions.assertTrue(job.checkKeptPartitions().ok());
+        // a schema change job finished since the judgement: the same version, the token is invalidated
+        tbl2.invalidatePartitionStateTokens();
+        Status st = job.checkKeptPartitions();
+        Assertions.assertFalse(st.ok());
+        Assertions.assertTrue(st.getErrMsg().contains("state token"), st.getErrMsg());
+        // an admin operation on a replica taints it
+        PartitionStateToken.taint(p1());
+        Assertions.assertFalse(job.checkKeptPartitions().ok());
+
+        // atomic: the check under the lock of the table being replaced
+        decision.atomic = true;
+        st = job.checkAtomicLocalVersions(tbl2);
+        Assertions.assertFalse(st.ok());
+        Assertions.assertTrue(st.getErrMsg().contains("The table is not replaced"), st.getErrMsg());
+        p1().setStateToken(new PartitionStateToken("tk1", V1, p1().getVisibleVersionTime()));
+        Assertions.assertTrue(job.checkAtomicLocalVersions(tbl2).ok());
+        // another token (a write that the version check would also see, here only the token)
+        p1().setStateToken(new PartitionStateToken("tk2", V1, p1().getVisibleVersionTime()));
+        Assertions.assertFalse(job.checkAtomicLocalVersions(tbl2).ok());
+
+        // a partition kept by its digest is not checked by the token
+        decision.reason = RestoreReuseResult.KEPT_DIGEST_VERIFIED;
+        tbl2.invalidatePartitionStateTokens();
+        Assertions.assertTrue(job.checkAtomicLocalVersions(tbl2).ok());
+        Assertions.assertTrue(job.checkKeptPartitions().ok());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // the state token a restore leaves: the stamp, the cancel, the download
+    // ---------------------------------------------------------------------------------------------
+
+    private static boolean writeAndReadFlag(RestoreJob job) {
+        try {
+            return Deencapsulation.getField(writeAndRead(job), "stampStateTokens");
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private RestoreJob jobWithTokens() {
+        BackupJobInfo info = selfBackupJobInfo();
+        for (BackupPartitionInfo partInfo : info.getOlapTableInfo(CatalogMocker.TEST_TBL2_NAME).partitions.values()) {
+            partInfo.stateToken = "tk1";
+        }
+        return newJob(info, "full");
+    }
+
+    private static RestoreReuseResult.Decision keptDecision(Partition part, String reason) {
+        RestoreReuseResult.Decision decision = new RestoreReuseResult.Decision();
+        decision.tableId = CatalogMocker.TEST_TBL2_ID;
+        decision.partitionId = part.getId();
+        decision.tableName = CatalogMocker.TEST_TBL2_NAME;
+        decision.partitionName = part.getName();
+        decision.version = V1;
+        decision.kept = true;
+        decision.reason = reason;
+        return decision;
+    }
+
+    @Test
+    public void testStampOfTheStateToken() {
+        RestoreJob job = jobWithTokens();
+        RestoreReuseResult result = new RestoreReuseResult();
+        // kept by the lineage only, without a digest (restore_reuse_allow_unverified_keep)
+        result.addDecision(keptDecision(p2(), RestoreReuseResult.KEPT_L0_ONLY));
+        Deencapsulation.setField(job, "reuseResult", result);
+        p2().setStateToken(new PartitionStateToken("local", V1, p2().getVisibleVersionTime()));
+
+        // the master did not track the tokens when it committed the job: no name
+        job.stampRestoreLineage(db, RESTORE_TIME);
+        Assertions.assertTrue(p1().getStateToken().isBad());
+        // it did (set by allTabletCommitted on the master, persisted for the replay)
+        Deencapsulation.setField(job, "stampStateTokens", true);
+        Assertions.assertTrue(writeAndReadFlag(job));
+        job.stampRestoreLineage(db, RESTORE_TIME);
+        // the backup partition: its token
+        Assertions.assertEquals("tk1", PartitionStateToken.effective(p1()));
+        // an unverified keep is not proved to be the backup partition
+        Assertions.assertNull(PartitionStateToken.effective(p2()));
+        Assertions.assertTrue(p2().getStateToken().isBad());
+
+        // a taint is kept, whichever came first
+        PartitionStateToken.taint(p1());
+        job.stampRestoreLineage(db, RESTORE_TIME);
+        Assertions.assertTrue(PartitionStateToken.isTainted(p1()));
+
+        // a load made visible after the version of the backup was set: the name is not bound to it
+        p1().setStateToken(null);
+        p1().updateVisibleVersionAndTime(V1 + 1, 5000L);
+        job.stampRestoreLineage(db, RESTORE_TIME);
+        Assertions.assertNull(PartitionStateToken.effective(p1()));
+        Assertions.assertTrue(p1().getStateToken().isBad());
     }
 }

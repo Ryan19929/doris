@@ -225,6 +225,7 @@ import org.apache.doris.persist.ModifyTableDefaultDistributionBucketNumOperation
 import org.apache.doris.persist.ModifyTablePropertyOperationLog;
 import org.apache.doris.persist.OperationType;
 import org.apache.doris.persist.PartitionPersistInfo;
+import org.apache.doris.persist.PartitionStateTokenLog;
 import org.apache.doris.persist.RecoverInfo;
 import org.apache.doris.persist.RefreshExternalTableInfo;
 import org.apache.doris.persist.ReplacePartitionOperationLog;
@@ -6619,6 +6620,93 @@ public class Env {
         }
 
         getInternalCatalog().erasePartitionDropBackendReplicas(Lists.newArrayList(partition));
+    }
+
+    // The most partitions one OP_SET_PARTITION_STATE_TOKEN names: a table that was never named (one created before
+    // the tokens were tracked) may have a hundred thousand partitions, which in one log would hit the size limit of
+    // a journal entry.
+    public static final int MAX_PARTITIONS_PER_STATE_TOKEN_LOG = 1000;
+
+    /**
+     * Master only, before a backup takes the versions of the table: gives a new state token to the partitions that
+     * have none (see PartitionStateToken#effective) and are not tainted and logs the tokens, at most
+     * MAX_PARTITIONS_PER_STATE_TOKEN_LOG partitions in a log. The backup then records a token for them, the
+     * partitions restored from it adopt that token, and they are kept the next time. The tokens are set and logged
+     * with the write lock of the table, as every other change of them, so that the log has them in the order they
+     * were set.
+     */
+    public void namePartitionsWithoutStateToken(Database db, OlapTable olapTable) {
+        if (!Config.restore_state_token_track) {
+            return;
+        }
+        // The backup job calls this with its own lock held, so do not wait for the table. A table that is busy or
+        // was dropped is not named this time: its partitions without a token are not kept from this backup.
+        if (!olapTable.tryWriteLockIfExist(Table.TRY_LOCK_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            LOG.info("can not lock table {} to give state tokens to its partitions before a backup",
+                    olapTable.getId());
+            return;
+        }
+        try {
+            Map<Long, PartitionStateToken> tokens = Maps.newHashMap();
+            for (Partition partition : olapTable.getPartitions()) {
+                if (PartitionStateToken.effective(partition) != null || PartitionStateToken.isTainted(partition)) {
+                    continue;
+                }
+                long version = partition.getVisibleVersion();
+                tokens.put(partition.getId(), new PartitionStateToken(
+                        PartitionStateToken.fresh(null, getClusterId(), partition.getId(), version), version,
+                        partition.getVisibleVersionTime()));
+                if (tokens.size() == MAX_PARTITIONS_PER_STATE_TOKEN_LOG) {
+                    setAndLogPartitionStateTokens(db.getId(), olapTable, tokens, "named before a backup");
+                    tokens = Maps.newHashMap();
+                }
+            }
+            if (!tokens.isEmpty()) {
+                setAndLogPartitionStateTokens(db.getId(), olapTable, tokens, "named before a backup");
+            }
+        } finally {
+            olapTable.writeUnlock();
+        }
+    }
+
+    // the caller holds the write lock of the table
+    private void setAndLogPartitionStateTokens(long dbId, OlapTable olapTable, Map<Long, PartitionStateToken> tokens,
+            String why) {
+        PartitionStateTokenLog log = new PartitionStateTokenLog(dbId, olapTable.getId(), tokens);
+        setPartitionStateTokens(olapTable, log);
+        getEditLog().logSetPartitionStateToken(log);
+        LOG.info("set the state tokens of {} partitions of table {}, {}: {}", tokens.size(), olapTable.getId(), why,
+                tokens.keySet());
+    }
+
+    public void replaySetPartitionStateToken(PartitionStateTokenLog log) throws MetaNotFoundException {
+        Database db = getInternalCatalog().getDbOrMetaException(log.getDbId());
+        OlapTable olapTable = (OlapTable) db.getTableOrMetaException(log.getTableId(), TableType.OLAP);
+        olapTable.writeLock();
+        try {
+            for (Map.Entry<Long, PartitionStateToken> entry : log.getTokens().entrySet()) {
+                Partition partition = olapTable.getPartition(entry.getKey());
+                if (partition == null) {
+                    // The master logs the tokens of partitions of the table under its write lock, before any drop
+                    // of them is logged: only a broken metadata gets here. Skip the partition, not the others.
+                    LOG.warn("[INCONSISTENT META] partition {} of table {} does not exist, skip its state token",
+                            entry.getKey(), olapTable.getId());
+                    continue;
+                }
+                partition.setStateToken(entry.getValue().boundTo(partition));
+            }
+            LOG.info("replay the state tokens given to {} partitions of table {}: {}", log.getTokens().size(),
+                    olapTable.getId(), log.getTokens().keySet());
+        } finally {
+            olapTable.writeUnlock();
+        }
+    }
+
+    // the master, which logs the tokens of partitions of the table under its write lock
+    private void setPartitionStateTokens(OlapTable olapTable, PartitionStateTokenLog log) {
+        for (Map.Entry<Long, PartitionStateToken> entry : log.getTokens().entrySet()) {
+            olapTable.getPartition(entry.getKey()).setStateToken(entry.getValue());
+        }
     }
 
     public void cleanTrash(AdminCleanTrashStmt stmt) {
