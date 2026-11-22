@@ -50,15 +50,16 @@ import java.security.SecureRandom;
  * past it (a temporary partition left at the initial version is empty); a RESTORE sets the version of the backup on
  * the partitions it restores (one restored at the initial version is the empty partition of the backup) and adopts
  * the token of the backup, also when that is none; ADMIN SET PARTITION VERSION invalidates the token, so a partition
- * set back to the initial version is not EMPTY. A schema change or rollup job invalidates, also at the initial
- * version.
+ * set back to the initial version is not EMPTY. A schema change, rollup or finished inverted index job invalidates,
+ * also at the initial version.
  *
  * <p>A path that changes the data and keeps the version (a schema change job rewrites the data in the new schema, a
- * rollup job builds the data of a new index, an admin operation sets the version, a restore overwrites the data), or
- * that changes the data an index name stands for (a rollup is renamed), must invalidate the token: the binding still
- * holds there, and nothing else tells that the token no longer names the data. A column type changed and changed
- * back, a materialized view dropped and created again under its name with another WHERE, or two rollups of the same
- * columns that swap their names, leave the same structure and the same version with other data. A change of the
+ * rollup job builds the data of a new index, an inverted index job of BUILD INDEX or DROP INDEX that finishes wrote or
+ * deleted the index files of the rowsets of its partition, an admin operation sets the version, a restore overwrites
+ * the data), or that changes the data an index name stands for (a rollup is renamed), must invalidate the token: the
+ * binding still holds there, and nothing else tells that the token no longer names the data. A column type changed and
+ * changed back, a materialized view dropped and created again under its name with another WHERE, or two rollups of the
+ * same columns that swap their names, leave the same structure and the same version with other data. A change of the
  * metadata that leaves the data files and the names of the indexes as they are (a light schema change) does not
  * invalidate the token: the schemas are compared, and the kept files are read by the metadata of the backup.
  *
@@ -66,14 +67,15 @@ import java.security.SecureRandom;
  * versions (logged as OP_SET_PARTITION_STATE_TOKEN), so that the partition restored from the backup has the token of
  * the source and is kept the next time.
  *
- * <p>A tainted partition (see {@link #taint}) had an operation on one of its replicas outside of the versions
- * (ADMIN SET REPLICA VERSION, ADMIN SET REPLICA STATUS to BAD or OK), a consistency check that failed, or a lost
- * replica made empty (Config#recover_with_empty_tablet): its replicas may not agree any more or lost data, so no
- * name may be given to it, for another cluster would adopt a name of content this cluster does not have on every
- * replica. A write keeps the taint (and names nothing), a backup names nothing, an invalidation keeps it. Only a
- * restore that adopts the token of the backup for the partition clears it: a restore keeps the local data of a
- * partition by its token or by the digest of every replica (unless Config#restore_reuse_allow_unverified_keep, for
- * experiments only), and a tainted partition has no token, so it is downloaded or proved the same on every replica.
+ * <p>A tainted partition (see {@link #taint}) had an operation on one of its replicas outside of the versions (ADMIN
+ * SET REPLICA VERSION, ADMIN SET REPLICA STATUS to BAD or OK), a consistency check that failed, a lost replica made
+ * empty (Config#recover_with_empty_tablet), or a cancelled inverted index job (its tasks may have changed the index
+ * files of some of its replicas, in any state of the job): its replicas may not agree any more or lost data, so no name
+ * may be given to it, for another cluster would adopt a name of content this cluster does not have on every replica. A
+ * write keeps the taint (and names nothing), a backup names nothing, an invalidation keeps it. Only a restore that
+ * adopts the token of the backup for the partition clears it: a restore keeps the local data of a partition by its
+ * token or by the digest of every replica (unless Config#restore_reuse_allow_unverified_keep, for experiments only),
+ * and a tainted partition has no token, so it is downloaded or proved the same on every replica.
  *
  * <p>The object is immutable. The serialized names are part of the persisted metadata and must not be changed.
  */
