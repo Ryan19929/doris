@@ -1142,9 +1142,13 @@ public class DatabaseTransactionMgr {
                 transactionState.setErrorReplicas(errorReplicaIds);
                 transactionState.setFinishTime(System.currentTimeMillis());
                 transactionState.clearErrorMsg();
-                transactionState.setTransactionStatus(TransactionStatus.VISIBLE);
-                setTableVersion(transactionState, db);
-                assignStateTokens(transactionState, db);
+                // the state tokens are set with the status, with the lock of the transaction state: a commit that
+                // reads them once the transaction is visible takes it (FrontendServiceImpl#commitTxnImpl)
+                synchronized (transactionState) {
+                    transactionState.setTransactionStatus(TransactionStatus.VISIBLE);
+                    setTableVersion(transactionState, db);
+                    assignStateTokens(transactionState, db);
+                }
                 unprotectUpsertTransactionState(transactionState, false);
                 txnOperated = true;
                 // TODO(cmy): We found a very strange problem. When delete-related transactions are processed here,
@@ -1208,8 +1212,9 @@ public class DatabaseTransactionMgr {
 
     /**
      * Master only, before the transaction is logged as visible: the state token of each partition after the version
-     * this transaction writes, a new token for each write. The tokens are logged with the partition commit infos and
-     * applied by updateCatalogAfterVisible, on the master and on replay.
+     * this transaction writes. A CCR increment whose source partition had, before the write, the token the partition
+     * has now adopts the token of the source after the write; any other write gets a new token. The tokens are
+     * logged with the partition commit infos and applied by updateCatalogAfterVisible, on the master and on replay.
      * A transaction of sub transactions gets no token: the partitions lose the binding of their token. A tainted
      * partition gets none either, and stays tainted.
      */
@@ -1218,6 +1223,7 @@ public class DatabaseTransactionMgr {
             return;
         }
         long clusterId = Env.getCurrentEnv().getClusterId();
+        Map<Long, TransactionState.CcrPartitionSource> sources = transactionState.getCcrPartitionSources();
         for (TableCommitInfo tableCommitInfo : transactionState.getIdToTableCommitInfos().values()) {
             OlapTable table = (OlapTable) db.getTableNullable(tableCommitInfo.getTableId());
             if (table == null) {
@@ -1237,12 +1243,23 @@ public class DatabaseTransactionMgr {
                     continue;
                 }
                 String prev = PartitionStateToken.effective(partition);
-                String next = PartitionStateToken.fresh(prev, clusterId, partition.getId(), info.getVersion());
+                TransactionState.CcrPartitionSource source = sources == null ? null
+                        : sources.get(info.getPartitionId());
+                boolean adopted = source != null && prev != null && prev.equals(source.prevToken)
+                        && source.token != null;
+                String next = adopted ? source.token
+                        : PartitionStateToken.fresh(prev, clusterId, partition.getId(), info.getVersion());
                 info.setStateTokens(prev, next);
                 // the state names are not secrets, they name the content of a partition
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("partition {} v{} content state: {} -> {}, txn: {}", partition.getId(),
-                            info.getVersion(), prev, next, transactionState.getTransactionId());
+                if (source != null && !adopted) {
+                    String how = "ccr not continuous, source " + source.srcPartitionId + " v" + source.srcVersion
+                            + " prev " + source.prevToken;
+                    LOG.info("partition {} v{} content state: {} -> {} ({}), txn: {}", partition.getId(),
+                            info.getVersion(), prev, next, how, transactionState.getTransactionId());
+                } else if (LOG.isDebugEnabled()) {
+                    LOG.debug("partition {} v{} content state: {} -> {} ({}), txn: {}", partition.getId(),
+                            info.getVersion(), prev, next, source == null ? "local" : "ccr adopted",
+                            transactionState.getTransactionId());
                 }
             }
         }

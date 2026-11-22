@@ -32,8 +32,16 @@ import org.apache.doris.persist.SetReplicaVersionOperationLog;
 import org.apache.doris.persist.TableInfo;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.thrift.TStorageType;
+import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.FakeTransactionIDGenerator;
+import org.apache.doris.transaction.PartitionCommitInfo;
+import org.apache.doris.transaction.TableCommitInfo;
+import org.apache.doris.transaction.TransactionState;
+import org.apache.doris.transaction.TransactionState.LoadJobSourceType;
+import org.apache.doris.transaction.TransactionState.TxnCoordinator;
+import org.apache.doris.transaction.TransactionState.TxnSourceType;
 
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
@@ -373,5 +381,51 @@ public class PartitionStateTokenInvalidateTest {
         partition.setStateToken(PartitionStateToken.invalid());
         env.replaySetPartitionStateToken(log);
         Assertions.assertEquals("cccc", PartitionStateToken.effective(partition));
+    }
+
+    @Test
+    public void testCcrNotContinuousIsToldBeforeTheTransactionIsVisible() {
+        // ccr-syncer commits with only_commit: the commit returns before the transaction is visible
+        name("src4");
+        long next = partition.getVisibleVersion() + 1;
+        TransactionState transactionState = ccrCommitted(next);
+        // not a CCR increment
+        Assertions.assertTrue(transactionState.getCcrNotContinuousPartitionIdsBeforeVisible(db).isEmpty());
+        // the partition has the token the source had before the write: it will adopt
+        Map<Long, TransactionState.CcrPartitionSource> sources = Maps.newHashMap();
+        sources.put(partition.getId(), new TransactionState.CcrPartitionSource(101L, next, "src4", "src5"));
+        transactionState.setCcrPartitionSources(sources);
+        Assertions.assertTrue(transactionState.getCcrNotContinuousPartitionIdsBeforeVisible(db).isEmpty());
+        // it has another one
+        name("local4");
+        Assertions.assertEquals(Lists.newArrayList(partition.getId()),
+                transactionState.getCcrNotContinuousPartitionIdsBeforeVisible(db));
+        // a transaction before this one is not visible yet and may change the token: not told this time
+        Assertions.assertTrue(ccrCommittedFrom(next + 1, sources).getCcrNotContinuousPartitionIdsBeforeVisible(db)
+                .isEmpty());
+        // tainted: no token to continue
+        name("src4");
+        PartitionStateToken.taint(partition);
+        Assertions.assertEquals(Lists.newArrayList(partition.getId()),
+                transactionState.getCcrNotContinuousPartitionIdsBeforeVisible(db));
+    }
+
+    private TransactionState ccrCommittedFrom(long version, Map<Long, TransactionState.CcrPartitionSource> sources) {
+        TransactionState transactionState = ccrCommitted(version);
+        transactionState.setCcrPartitionSources(sources);
+        return transactionState;
+    }
+
+    // a committed transaction that writes the version into the partition of the test table
+    private TransactionState ccrCommitted(long version) {
+        TransactionState transactionState = new TransactionState(db.getId(), Lists.newArrayList(table.getId()),
+                3000, "label_ccr", new TUniqueId(1, 2), LoadJobSourceType.BACKEND_STREAMING,
+                new TxnCoordinator(TxnSourceType.BE, 0, "127.0.0.1", System.currentTimeMillis()), 50000L,
+                60 * 1000L);
+        TableCommitInfo tableCommitInfo = new TableCommitInfo(table.getId());
+        tableCommitInfo.addPartitionCommitInfo(new PartitionCommitInfo(partition.getId(), "", version, 1000L,
+                false));
+        transactionState.putIdToTableCommitInfo(table.getId(), tableCommitInfo);
+        return transactionState;
     }
 }
