@@ -2039,6 +2039,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
 
         invalidateRestoreLineageOfOverwrittenPartitions(db);
+        clearTaintOfDownloadedPartitions(db);
 
         // replay set all existing tables's state to RESTORE
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
@@ -2156,7 +2157,27 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
             snapshotFinishedTime = System.currentTimeMillis();
             state = RestoreJobState.DOWNLOAD;
 
-            env.getEditLog().logRestoreJob(this);
+            // the taint of the partitions to download is cleared with the log, under the locks of their tables
+            Database db = env.getInternalCatalog().getDbNullable(dbId);
+            List<Table> locked = Lists.newArrayList();
+            if (db != null) {
+                for (long tblId : Sets.newTreeSet(restoredVersionInfo.rowKeySet())) {
+                    Table tbl = db.getTableNullable(tblId);
+                    if (tbl != null && tbl.writeLockIfExist()) {
+                        locked.add(tbl);
+                    }
+                }
+            }
+            try {
+                if (db != null) {
+                    clearTaintOfDownloadedPartitions(db);
+                }
+                env.getEditLog().logRestoreJob(this);
+            } finally {
+                for (int i = locked.size() - 1; i >= 0; i--) {
+                    locked.get(i).writeUnlock();
+                }
+            }
             LOG.info("finished making snapshots. {}", this);
             return;
         }
@@ -4204,7 +4225,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     if (part != null) {
                         part.setRestoreLineage(null);
                         // the data of the partition is being replaced: it has no state until the job stamps it.
-                        // A taint is kept.
+                        // A taint is kept until the download is logged, see clearTaintOfDownloadedPartitions.
                         PartitionStateToken.invalidate(part);
                     }
                 }
@@ -4269,9 +4290,11 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
      * <ul>
      * <li>If the master did not track the tokens (restore_state_token_track) when it committed the job, no name
      * is given: the partitions are invalidated. A cluster that does not track the tokens gives no names.</li>
-     * <li>A tainted partition stays tainted. Taint wins in any order of the taint and of this, so the master, which
-     * may run this before the operation that taints and log it after, and a follower, which replays the operation
-     * first, agree.</li>
+     * <li>A tainted partition stays tainted. The taint of a partition that is downloaded as a whole was cleared when
+     * the download was logged (clearTaintOfDownloadedPartitions), so a taint here came later, or is the one of a
+     * partition that keeps its local data (kept, or the base of an incremental append), whose replicas the restore
+     * did not replace. Taint wins in any order of the taint and of this, so the master, which may run this before
+     * the operation that taints and log it after, and a follower, which replays the operation first, agree.</li>
      * <li>A partition kept without a digest (an unverified keep, restore_reuse_allow_unverified_keep) is not proved
      * to be the backup partition: invalidated, no name.</li>
      * <li>A partition that is not at the version of the backup, which is the version the job set (a load made
@@ -4306,6 +4329,70 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         String token = partInfo.stateToken;
         part.setStateToken(token == null ? null : new PartitionStateToken(token, part.getVisibleVersion(),
                 part.getVisibleVersionTime()));
+    }
+
+    /**
+     * Non-atomic restore: the partitions in restoredVersionInfo that are downloaded as a whole (not an incremental
+     * append, whose base is the local data) get all their replicas from the backup, so their taint is cleared
+     * (invalid until stampStateToken). Done where the DOWNLOAD state is logged, with the write locks of the tables
+     * held until it is logged on the master, and on the replay of that log: an operation that taints is ordered
+     * before or after it the same way on every frontend. If the job is cancelled from then on, the partitions are
+     * tainted again (taintOverwrittenPartitions), as their tablets may be in part moved.
+     */
+    @VisibleForTesting
+    void clearTaintOfDownloadedPartitions(Database db) {
+        for (long tblId : restoredVersionInfo.rowKeySet()) {
+            Table tbl = db.getTableNullable(tblId);
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    Partition part = ((OlapTable) tbl).getPartition(partId);
+                    if (part != null && PartitionStateToken.isTainted(part)
+                            && !isIncrementalPartition(tblId, partId)) {
+                        part.setStateToken(PartitionStateToken.invalid());
+                    }
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+    }
+
+    /**
+     * Non-atomic restore cancelled after the DOWNLOAD state was logged: in COMMITTING a part of the tablets of a
+     * partition may be moved to the backup data (or appended) and the others not, so the replicas of the partitions
+     * the job overwrites do not agree: taint them (see PartitionStateToken). From DOWNLOAD on, the master and the
+     * followers have the same restoredVersionInfo, and a follower has the job in DOWNLOAD or COMMIT (COMMITTING is
+     * not logged), so both taint the same partitions. An atomic restore does not touch the table it replaces, and
+     * its restoredVersionInfo is empty.
+     */
+    @VisibleForTesting
+    void taintOverwrittenPartitions(Database db) {
+        for (long tblId : restoredVersionInfo.rowKeySet()) {
+            Table tbl = db.getTableNullable(tblId);
+            if (!(tbl instanceof OlapTable) || !tbl.writeLockIfExist()) {
+                continue;
+            }
+            try {
+                for (long partId : restoredVersionInfo.row(tblId).keySet()) {
+                    Partition part = ((OlapTable) tbl).getPartition(partId);
+                    if (part != null) {
+                        PartitionStateToken.taint(part);
+                    }
+                }
+            } finally {
+                tbl.writeUnlock();
+            }
+        }
+        LOG.info("restore job {} is cancelled after the download began, taint the partitions it overwrites: {}",
+                jobId, restoredVersionInfo.cellSet().size());
+    }
+
+    private static boolean isAfterDownloadLogged(RestoreJobState state) {
+        return state == RestoreJobState.DOWNLOAD || state == RestoreJobState.DOWNLOADING
+                || state == RestoreJobState.COMMIT || state == RestoreJobState.COMMITTING;
     }
 
     private String getRestoreObjs() {
@@ -4374,6 +4461,13 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     break;
                 default:
                     break;
+            }
+        }
+
+        if (isAfterDownloadLogged(state)) {
+            Database db = env.getInternalCatalog().getDbNullable(dbId);
+            if (db != null) {
+                taintOverwrittenPartitions(db);
             }
         }
 
@@ -4611,6 +4705,28 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
         }
     }
 
+    /**
+     * Atomic restore: a staging partition made from the local data of the table being replaced (kept, or the base of
+     * an incremental append) has the replicas of that data, so it takes over the taint of the local partition (see
+     * PartitionStateToken). The local partition may have been tainted after it was judged. Run on the master and on
+     * replay, as the tables are replaced; the caller holds the write lock of the origin table.
+     */
+    private void carryTaintToStagingPartitions(OlapTable originTbl, OlapTable stagingTbl) {
+        stagingTbl.writeLock();
+        try {
+            for (RestoreReuseResult.Decision decision : getAtomicLocalDecisions(originTbl.getId())) {
+                Partition originPart = originTbl.getPartition(decision.partitionId);
+                if (originPart != null && PartitionStateToken.isTainted(originPart)) {
+                    PartitionStateToken.taint(stagingTbl.getPartition(decision.stagingPartitionId));
+                    LOG.info("restore: the staging partition {} takes over the taint of partition {}, job: {}",
+                            decision.stagingPartitionId, decision.partitionId, jobId);
+                }
+            }
+        } finally {
+            stagingTbl.writeUnlock();
+        }
+    }
+
     private Status replaceOlapTablesAndViews(Database db, boolean isReplay) {
         for (String tableName : jobInfo.backupOlapTableObjects.keySet()) {
             String originName = jobInfo.getAliasByOriginNameIfSet(tableName);
@@ -4683,6 +4799,7 @@ public class RestoreJob extends AbstractJob implements GsonPostProcessable {
                     // The origin table is not used anymore, need to drop all its tablets.
                     originOlapTbl.writeLock();
                     try {
+                        carryTaintToStagingPartitions(originOlapTbl, newOlapTbl);
                         LOG.info("drop the origin olap table {}. table={}" + " isAtomicRestore: {}",
                                 originOlapTbl.getName(), originOlapTbl.getId(), isAtomicRestore);
                         Env.getCurrentEnv().onEraseOlapTable(originOlapTbl, isReplay);

@@ -17,11 +17,21 @@
 
 package org.apache.doris.catalog;
 
+import org.apache.doris.analysis.AdminSetReplicaStatusStmt;
+import org.apache.doris.analysis.RollupRenameClause;
+import org.apache.doris.catalog.Replica.ReplicaStatus;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeMetaVersion;
+import org.apache.doris.consistency.ConsistencyChecker;
 import org.apache.doris.meta.MetaContext;
+import org.apache.doris.persist.ConsistencyCheckInfo;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.persist.PartitionStateTokenLog;
+import org.apache.doris.persist.SetReplicaStatusOperationLog;
+import org.apache.doris.persist.SetReplicaVersionOperationLog;
+import org.apache.doris.persist.TableInfo;
+import org.apache.doris.persist.gson.GsonUtils;
+import org.apache.doris.thrift.TStorageType;
 import org.apache.doris.transaction.FakeTransactionIDGenerator;
 
 import com.google.common.collect.Maps;
@@ -40,6 +50,8 @@ import java.util.Map;
 
 /** The changes of a table outside of a transaction that invalidate the state tokens, and the backup that names. */
 public class PartitionStateTokenInvalidateTest {
+    private static final long ROLLUP_ID = 90001L;
+
     private FakeEnv fakeEnv;
     private FakeEditLog fakeEditLog;
     private FakeTransactionIDGenerator fakeTransactionIDGenerator;
@@ -74,6 +86,22 @@ public class PartitionStateTokenInvalidateTest {
         partition.setStateToken(new PartitionStateToken(token, partition.getVisibleVersion(),
                 partition.getVisibleVersionTime()));
         Assertions.assertEquals(token, PartitionStateToken.effective(partition));
+    }
+
+    @Test
+    public void testRenameRollupInvalidates() throws Exception {
+        table.setIndexMeta(ROLLUP_ID, "r1", table.getBaseSchema(), 0, 1, (short) 1, TStorageType.COLUMN,
+                table.getKeysType());
+        // two rollups of the same columns may swap their names: the name then stands for other data
+        name("aaaa");
+        env.renameRollup(db, table, new RollupRenameClause("r1", "r2"));
+        Assertions.assertEquals(ROLLUP_ID, table.getIndexIdByName("r2").longValue());
+        Assertions.assertNull(PartitionStateToken.effective(partition));
+        // on replay
+        name("bbbb");
+        env.replayRenameRollup(TableInfo.createForRollupRename(db.getId(), table.getId(), ROLLUP_ID, "r2", "r3"));
+        Assertions.assertEquals(ROLLUP_ID, table.getIndexIdByName("r3").longValue());
+        Assertions.assertNull(PartitionStateToken.effective(partition));
     }
 
     @Test
@@ -124,6 +152,171 @@ public class PartitionStateTokenInvalidateTest {
         for (Partition p : table.getPartitions()) {
             Assertions.assertNotNull(PartitionStateToken.effective(p));
         }
+    }
+
+    @Test
+    public void testTaintIsKeptUntilARestore() throws Exception {
+        name("aaaa");
+        PartitionStateToken.taint(partition);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        Assertions.assertNull(PartitionStateToken.effective(partition));
+        // an invalidation keeps it: a schema change or rollup job, ADMIN SET PARTITION VERSION
+        table.invalidatePartitionStateTokens();
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        env.setPartitionVersionInternal(db.getFullName(), table.getName(), partition.getId(),
+                partition.getVisibleVersion(), true);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        // a backup does not name it
+        Config.restore_state_token_track = true;
+        env.namePartitionsWithoutStateToken(db, table);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        Mockito.verify(env.getEditLog(), Mockito.never()).logSetPartitionStateToken(Mockito.any());
+        // persisted
+        Partition q = GsonUtils.GSON.fromJson(GsonUtils.GSON.toJson(partition), Partition.class);
+        Assertions.assertTrue(PartitionStateToken.isTainted(q));
+        Assertions.assertNull(PartitionStateToken.effective(q));
+        // a restore stamps the token of the backup
+        partition.setStateToken(new PartitionStateToken("bbbb", partition.getVisibleVersion(),
+                partition.getVisibleVersionTime()));
+        Assertions.assertFalse(PartitionStateToken.isTainted(partition));
+    }
+
+    @Test
+    public void testAdminReplicaOperationsTaint() throws Exception {
+        long backendId = CatalogTestUtil.testBackendId1;
+        long tabletId = CatalogTestUtil.testTabletId1;
+        // ADMIN SET REPLICA VERSION, as the follower replays it (the master runs the same code before it logs)
+        name("aaaa");
+        env.replaySetReplicaVersion(new SetReplicaVersionOperationLog(backendId, tabletId,
+                partition.getVisibleVersion(), null, null, 1000L));
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        // ADMIN SET REPLICA STATUS to BAD and back to OK
+        name("bbbb");
+        env.replaySetReplicaStatus(new SetReplicaStatusOperationLog(backendId, tabletId, ReplicaStatus.BAD, -1L));
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        name("cccc");
+        env.replaySetReplicaStatus(new SetReplicaStatusOperationLog(backendId, tabletId, ReplicaStatus.OK, -1L));
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        // DROP only asks the scheduler to drop the replica first, which repairs from the others
+        name("dddd");
+        env.replaySetReplicaStatus(new SetReplicaStatusOperationLog(backendId, tabletId, ReplicaStatus.DROP,
+                2000L));
+        Assertions.assertFalse(PartitionStateToken.isTainted(partition));
+        Assertions.assertEquals("dddd", PartitionStateToken.effective(partition));
+    }
+
+    @Test
+    public void testLostReplicaTaintsAndLogsAReplicaStatus() throws Exception {
+        // recover_with_empty_tablet: a lost replica is made empty at the same version
+        long backendId = CatalogTestUtil.testBackendId1;
+        long tabletId = CatalogTestUtil.testTabletId1;
+        Replica replica = Env.getCurrentInvertedIndex().getReplica(tabletId, backendId);
+        // a partition that never had a name (the tokens were never tracked): nothing is logged
+        Partition unnamed = addPartition(80002L);
+        unnamed.updateVisibleVersionAndTime(2, 1000);
+        env.taintPartitionOfLostReplica(unnamed, tabletId, backendId, replica);
+        Assertions.assertNull(unnamed.getStateToken());
+        // EMPTY has no data to lose
+        Partition empty = addPartition(80001L);
+        env.taintPartitionOfLostReplica(empty, tabletId, backendId, replica);
+        Assertions.assertEquals(PartitionStateToken.EMPTY, PartitionStateToken.effective(empty));
+        Mockito.verify(env.getEditLog(), Mockito.never()).logSetReplicaStatus(Mockito.any());
+
+        // a name given while the tokens were tracked is tainted, also with the tracking off, by a log that a
+        // frontend that does not know the state tokens reads
+        name("aaaa");
+        replica.setBad(true);
+        env.taintPartitionOfLostReplica(partition, tabletId, backendId, replica);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        // the replica keeps its status until the empty one is created
+        Assertions.assertTrue(replica.isBad());
+        ArgumentCaptor<SetReplicaStatusOperationLog> logs = ArgumentCaptor.forClass(
+                SetReplicaStatusOperationLog.class);
+        Mockito.verify(env.getEditLog(), Mockito.times(1)).logSetReplicaStatus(logs.capture());
+        Assertions.assertEquals(ReplicaStatus.BAD, logs.getValue().getReplicaStatus());
+        Assertions.assertEquals(tabletId, logs.getValue().getTabletId());
+        Assertions.assertEquals(backendId, logs.getValue().getBackendId());
+        Mockito.verify(env.getEditLog(), Mockito.never()).logSetPartitionStateToken(Mockito.any());
+        // tainted already: no name to lose, nothing logged
+        env.taintPartitionOfLostReplica(partition, tabletId, backendId, replica);
+        Mockito.verify(env.getEditLog(), Mockito.times(1)).logSetReplicaStatus(Mockito.any());
+
+        // the follower replays the log on a replica that has the status already, and taints
+        name("bbbb");
+        env.replaySetReplicaStatus(logs.getValue());
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        Assertions.assertTrue(replica.isBad());
+
+        // a lost replica that is good is logged as good, and the replay taints all the same
+        replica.setBad(false);
+        name("cccc");
+        env.taintPartitionOfLostReplica(partition, tabletId, backendId, replica);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        Mockito.verify(env.getEditLog(), Mockito.times(2)).logSetReplicaStatus(logs.capture());
+        Assertions.assertEquals(ReplicaStatus.OK, logs.getValue().getReplicaStatus());
+        name("dddd");
+        env.replaySetReplicaStatus(logs.getValue());
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        Assertions.assertFalse(replica.isBad());
+    }
+
+    @Test
+    public void testAdminReplicaStatusNotChangedOnTheMasterDoesNotTaint() throws Exception {
+        // the master logs and taints a change only; the replay taints whatever the replica is, so the master
+        // must not log a status that is not a change
+        long backendId = CatalogTestUtil.testBackendId1;
+        long tabletId = CatalogTestUtil.testTabletId1;
+        Replica replica = Env.getCurrentInvertedIndex().getReplica(tabletId, backendId);
+        replica.setBad(false);
+        AdminSetReplicaStatusStmt command = Mockito.mock(AdminSetReplicaStatusStmt.class);
+        Mockito.when(command.getTabletId()).thenReturn(tabletId);
+        Mockito.when(command.getBackendId()).thenReturn(backendId);
+        Mockito.when(command.getStatus()).thenReturn(ReplicaStatus.OK);
+        name("aaaa");
+        env.setReplicaStatus(command);
+        Assertions.assertEquals("aaaa", PartitionStateToken.effective(partition));
+        Mockito.verify(env.getEditLog(), Mockito.never()).logSetReplicaStatus(Mockito.any());
+        Mockito.when(command.getStatus()).thenReturn(ReplicaStatus.BAD);
+        env.setReplicaStatus(command);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+        Mockito.verify(env.getEditLog(), Mockito.times(1)).logSetReplicaStatus(Mockito.any());
+        replica.setBad(false);
+    }
+
+    @Test
+    public void testRecoverPartitionInvalidates() throws Exception {
+        // RECOVER PARTITION, as the follower replays it: while the partition was in the recycle bin its replicas
+        // could be changed and its indexes renamed with nothing to invalidate it
+        CatalogRecycleBin recycleBin = new CatalogRecycleBin();
+        name("aaaa");
+        Assertions.assertTrue(recycleBin.recyclePartition(db.getId(), table.getId(), table.getName(), partition,
+                null, null, new DataProperty(DataProperty.DEFAULT_STORAGE_MEDIUM),
+                new ReplicaAllocation((short) 3), false, true));
+        recycleBin.replayRecoverPartition(table, partition.getId(), null);
+        Assertions.assertNull(PartitionStateToken.effective(partition));
+        Assertions.assertTrue(partition.getStateToken().isBad());
+        // a tainted one stays tainted
+        PartitionStateToken.taint(partition);
+        Assertions.assertTrue(recycleBin.recyclePartition(db.getId(), table.getId(), table.getName(), partition,
+                null, null, new DataProperty(DataProperty.DEFAULT_STORAGE_MEDIUM),
+                new ReplicaAllocation((short) 3), false, true));
+        recycleBin.replayRecoverPartition(table, partition.getId(), null);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
+    }
+
+    @Test
+    public void testInconsistentChecksumTaints() throws Exception {
+        // the replay of a finished consistency check (CheckConsistencyJob#tryFinishJob taints the same way)
+        ConsistencyChecker checker = new ConsistencyChecker();
+        name("aaaa");
+        checker.replayFinishConsistencyCheck(new ConsistencyCheckInfo(db.getId(), table.getId(), partition.getId(),
+                CatalogTestUtil.testIndexId1, CatalogTestUtil.testTabletId1, 1000L, partition.getVisibleVersion(),
+                true), env);
+        Assertions.assertEquals("aaaa", PartitionStateToken.effective(partition));
+        checker.replayFinishConsistencyCheck(new ConsistencyCheckInfo(db.getId(), table.getId(), partition.getId(),
+                CatalogTestUtil.testIndexId1, CatalogTestUtil.testTabletId1, 2000L, partition.getVisibleVersion(),
+                false), env);
+        Assertions.assertTrue(PartitionStateToken.isTainted(partition));
     }
 
     @Test

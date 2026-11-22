@@ -5215,6 +5215,8 @@ public class Env {
 
             long indexId = indexNameToIdMap.remove(rollupName);
             indexNameToIdMap.put(newRollupName, indexId);
+            // a restore matches the indexes of a backup by their names: the name may now stand for other data
+            table.invalidatePartitionStateTokens();
 
             // log
             TableInfo tableInfo = TableInfo.createForRollupRename(db.getId(), table.getId(), indexId,
@@ -5240,6 +5242,7 @@ public class Env {
             Map<String, Long> indexNameToIdMap = olapTable.getIndexNameToId();
             indexNameToIdMap.remove(rollupName);
             indexNameToIdMap.put(newRollupName, indexId);
+            olapTable.invalidatePartitionStateTokens();
 
             LOG.info("replay rename rollup[{}] to {}", rollupName, newRollupName);
         } finally {
@@ -6505,8 +6508,15 @@ public class Env {
                 boolean updated = false;
                 if (status == ReplicaStatus.BAD || status == ReplicaStatus.OK) {
                     replica.setUserDropTime(-1L);
-                    if (replica.setBad(status == ReplicaStatus.BAD)) {
+                    boolean changed = replica.setBad(status == ReplicaStatus.BAD);
+                    // The master logs a change only, or a lost replica made empty (taintPartitionOfLostReplica),
+                    // whose status does not change. Both taint the partition on the master, so the replay does,
+                    // whatever the replica is here.
+                    if (changed || isReplay) {
                         updated = true;
+                        // a replica the user takes as bad may have been read or backed up, one forced back to ok
+                        // is not repaired: the replicas of the tablet may not agree
+                        taintPartitionOfTablet(table, meta);
                         LOG.info("set replica {} of tablet {} on backend {} as {}. is replay: {}", replica.getId(),
                                 tabletId, backendId, status, isReplay);
                     }
@@ -6526,6 +6536,19 @@ public class Env {
             }
         } catch (MetaNotFoundException e) {
             throw new MetaNotFoundException("set replica status failed, tabletId=" + tabletId, e);
+        }
+    }
+
+    /**
+     * An admin operation on a replica of the tablet outside of the versions: the replicas may not agree any more,
+     * so the partition is tainted (see PartitionStateToken). Called with the write lock of the table, on the master
+     * and on replay, by the operations that log themselves. The tablet of a partition in the recycle bin is still
+     * in the inverted index: such a partition is not in the table and is not tainted.
+     */
+    private static void taintPartitionOfTablet(Table table, TabletMeta meta) {
+        Partition partition = ((OlapTable) table).getPartition(meta.getPartitionId());
+        if (partition != null) {
+            PartitionStateToken.taint(partition);
         }
     }
 
@@ -6566,6 +6589,8 @@ public class Env {
                     throw new MetaNotFoundException("replica does not exist on backend, beId=" + backendId);
                 }
                 replica.adminUpdateVersionInfo(version, lastFailedVersion, lastSuccessVersion, updateTime);
+                // the version of the replica no longer tells which data it has: the replicas may not agree
+                taintPartitionOfTablet(table, meta);
                 if (!isReplay) {
                     SetReplicaVersionOperationLog log = new SetReplicaVersionOperationLog(backendId, tabletId,
                             version, lastSuccessVersion, lastFailedVersion, updateTime);
@@ -6669,6 +6694,35 @@ public class Env {
         }
     }
 
+    /**
+     * Master only, the caller holds the write lock of the table: a lost replica of the partition is replaced by an
+     * empty one at the visible version (Config#recover_with_empty_tablet), so the partition lost data and kept its
+     * version, and its state token no longer names it: the partition is tainted. A partition with no token or EMPTY
+     * is not touched: it has no name to lose, or it has no data.
+     *
+     * <p>The recovery sets the replica good again when the empty one is created (MasterImpl) and writes no edit log.
+     * So the taint is logged here as the replica set to the status it has (OP_SET_REPLICA_STATUS), as ADMIN SET
+     * REPLICA STATUS logs it, and the replay taints the partition (setReplicaStatusInternal). Not as an
+     * OP_SET_PARTITION_STATE_TOKEN: a name given while the tokens were tracked
+     * (Config#restore_state_token_track) is still bound to the version after the tracking is switched off, so this
+     * must be logged then too, and a frontend that does not know the state tokens must be able to read what is
+     * logged with the tracking off. It reads this one, and its replay leaves the replica as it is.
+     */
+    public void taintPartitionOfLostReplica(Partition partition, long tabletId, long backendId, Replica replica) {
+        String name = PartitionStateToken.effective(partition);
+        if (name == null || PartitionStateToken.EMPTY.equals(name)) {
+            return;
+        }
+        // the status the replica has: the replay leaves it as it is, the recovery sets it good when the empty
+        // replica is created. The replay of the log clears the user drop time, so does the master.
+        ReplicaStatus status = replica.isBad() ? ReplicaStatus.BAD : ReplicaStatus.OK;
+        replica.setUserDropTime(-1L);
+        PartitionStateToken.taint(partition);
+        getEditLog().logSetReplicaStatus(new SetReplicaStatusOperationLog(backendId, tabletId, status, -1L));
+        LOG.info("taint partition {}: replica {} of tablet {} on backend {} is lost and made empty",
+                partition.getId(), replica.getId(), tabletId, backendId);
+    }
+
     // the caller holds the write lock of the table
     private void setAndLogPartitionStateTokens(long dbId, OlapTable olapTable, Map<Long, PartitionStateToken> tokens,
             String why) {
@@ -6766,6 +6820,8 @@ public class Env {
                 Long oldVersion = partition.getVisibleVersion();
                 partition.updateVisibleVersion(visibleVersion);
                 partition.setNextVersion(visibleVersion + 1);
+                // the version no longer names the data of the partition: no state token until the next write
+                PartitionStateToken.invalidate(partition);
                 result = 0;
                 if (!isReplay) {
                     SetPartitionVersionOperationLog log = new SetPartitionVersionOperationLog(

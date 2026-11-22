@@ -3067,6 +3067,8 @@ public class RestoreReuseTest {
             report.setTaskStatus(new TStatus(TStatusCode.OK));
             Assertions.assertTrue(job.finishDirMoveTask(move, report));
         }
+        // an admin operation on a replica of the local p1 after it was judged: the staging p1 has its data
+        PartitionStateToken.taint(p1());
         Status st = job.allTabletCommitted(false);
         Assertions.assertTrue(st.ok(), st.toString());
         OlapTable replaced = (OlapTable) db.getTableNullable(CatalogMocker.TEST_TBL2_NAME);
@@ -3079,6 +3081,8 @@ public class RestoreReuseTest {
                 Assertions.assertEquals(V1, replica.getVersion());
             }
         }
+        Assertions.assertTrue(PartitionStateToken.isTainted(replaced.getPartition(stagingP1.getId())));
+        Assertions.assertFalse(PartitionStateToken.isTainted(replaced.getPartition(stagingP2.getId())));
         Assertions.assertEquals(RestoreJobState.FINISHED, job.getState());
     }
 
@@ -5310,5 +5314,47 @@ public class RestoreReuseTest {
         job.stampRestoreLineage(db, RESTORE_TIME);
         Assertions.assertNull(PartitionStateToken.effective(p1()));
         Assertions.assertTrue(p1().getStateToken().isBad());
+    }
+
+    @Test
+    public void testDownloadClearsTheTaintAndACancelTaintsAgain() {
+        RestoreJob job = jobWithTokens();
+        versionInfo(job).put(tbl2.getId(), p1().getId(), V1);
+        versionInfo(job).put(tbl2.getId(), p2().getId(), V1);
+        // p2 is restored by appending the increment to its local data
+        RestoreReuseResult result = new RestoreReuseResult();
+        RestoreReuseResult.Decision incremental = keptDecision(p2(), RestoreReuseResult.INCREMENTAL_VERIFIED);
+        incremental.kept = false;
+        incremental.incremental = true;
+        result.addDecision(incremental);
+        Deencapsulation.setField(job, "reuseResult", result);
+        PartitionStateToken.taint(p1());
+        PartitionStateToken.taint(p2());
+
+        // the download replaces every replica of p1, not those of p2
+        job.clearTaintOfDownloadedPartitions(db);
+        Assertions.assertFalse(PartitionStateToken.isTainted(p1()));
+        Assertions.assertTrue(p1().getStateToken().isBad());
+        Assertions.assertTrue(PartitionStateToken.isTainted(p2()));
+
+        // cancelled before the download was logged: nothing is moved, nothing tainted
+        p2().setStateToken(null);
+        Deencapsulation.setField(job, "state", RestoreJobState.SNAPSHOTING);
+        job.replayCancel();
+        Assertions.assertFalse(PartitionStateToken.isTainted(p1()));
+        Assertions.assertFalse(PartitionStateToken.isTainted(p2()));
+
+        // cancelled after it (a follower has the job in COMMIT then): the tablets may be moved in part
+        for (RestoreJobState state : Lists.newArrayList(RestoreJobState.DOWNLOAD, RestoreJobState.COMMIT)) {
+            p1().setStateToken(null);
+            p2().setStateToken(null);
+            RestoreJob cancelled = jobWithTokens();
+            versionInfo(cancelled).put(tbl2.getId(), p1().getId(), V1);
+            versionInfo(cancelled).put(tbl2.getId(), p2().getId(), V1);
+            Deencapsulation.setField(cancelled, "state", state);
+            cancelled.replayCancel();
+            Assertions.assertTrue(PartitionStateToken.isTainted(p1()), state.name());
+            Assertions.assertTrue(PartitionStateToken.isTainted(p2()), state.name());
+        }
     }
 }
