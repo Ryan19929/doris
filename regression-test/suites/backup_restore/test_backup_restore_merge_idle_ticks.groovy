@@ -27,7 +27,10 @@ import groovy.json.JsonSlurper
 suite("test_backup_restore_merge_idle_ticks", "backup_restore,nonConcurrent") {
     // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
     // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
-    setFeConfigTemporary([enable_backup_manifest: true]) {
+    setFeConfigTemporary([enable_backup_manifest: true, enable_restore_partition_reuse: false,
+            enable_restore_incremental_append: false, enable_restore_atomic_reuse: false,
+            restore_reuse_min_partition_bytes: 0, restore_reuse_default_check_level: "full",
+            backup_restore_merge_idle_ticks: false, backup_restore_run_on_task_finish: false]) {
     String suiteName = "test_backup_restore_merge_idle_ticks"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbA = "${suiteName}_a"

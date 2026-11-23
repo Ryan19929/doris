@@ -41,7 +41,9 @@ import groovy.json.JsonSlurper
 suite("test_backup_restore_digest_cache_replace", "backup_restore") {
     // enable_backup_manifest is off by default in branch-3.1: the case depends on the manifest of the backup,
     // turn it on for the whole case (restored when the case ends). The body is not indented, to keep the diff small.
-    setFeConfigTemporary([enable_backup_manifest: true]) {
+    setFeConfigTemporary([enable_backup_manifest: true, enable_restore_partition_reuse: false,
+            restore_reuse_min_partition_bytes: 0, restore_reuse_default_check_level: "full",
+            restore_reuse_allow_hidden_state_models: false, restore_reuse_mow: false]) {
     String suiteName = "test_backup_restore_digest_cache_replace"
     String repoName = "${suiteName}_repo_" + UUID.randomUUID().toString().replace("-", "")
     String dbT = "${suiteName}_t"
